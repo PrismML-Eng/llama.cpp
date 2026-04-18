@@ -958,6 +958,8 @@ class ModelBase:
                         data_qtype = gguf.GGMLQuantizationType.TQ1_0
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ2_0:
                         data_qtype = gguf.GGMLQuantizationType.TQ2_0
+                    elif self.ftype == gguf.LlamaFileType.MOSTLY_Q2_0:
+                        data_qtype = gguf.GGMLQuantizationType.Q2_0
                     else:
                         raise ValueError(f"Unknown file type: {self.ftype.name}")
 

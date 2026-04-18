@@ -208,6 +208,7 @@ def main() -> None:
         "q8_0": gguf.LlamaFileType.MOSTLY_Q8_0,
         "tq1_0": gguf.LlamaFileType.MOSTLY_TQ1_0,
         "tq2_0": gguf.LlamaFileType.MOSTLY_TQ2_0,
+        "q2_0": gguf.LlamaFileType.MOSTLY_Q2_0,
         "auto": gguf.LlamaFileType.GUESSED,
     }
 
