@@ -51,10 +51,12 @@ static_assert(sizeof(block_q2_0) == 2 + 32, "block_q2_0 must be 34 bytes");
 
 // fp16 <-> fp32 (ieee 754 half precision).
 //
-// we need an exact match with ggml's GGML_FP32_TO_FP16 / GGML_FP16_TO_FP32. the
-// simplest deterministic conversion is via union punning of float and uint32_t.
-// we use the standard bit-twiddling versions. for the values we'll feed
-// (positive, finite, no subnormals), they agree with ggml
+// we need a behavioural match with ggml's GGML_FP32_TO_FP16 / GGML_FP16_TO_FP32.
+// the simplest deterministic conversion is via memcpy bit-punning between float
+// and uint32_t. we use the standard bit-twiddling versions, with one important
+// invariant ggml requires: a finite fp32 input that overflows the fp16 range
+// must clamp to (signed) infinity, NOT become NaN. a NaN result is reserved
+// for actual fp32 NaN inputs (raw exponent 0xff, non-zero mantissa)
 
 static float fp16_to_fp32(uint16_t h) {
     const uint32_t s = (h & 0x8000u) << 16;
@@ -90,10 +92,22 @@ static float fp16_to_fp32(uint16_t h) {
 static uint16_t fp32_to_fp16(float x) {
     uint32_t f;
     std::memcpy(&f, &x, 4);
-    const uint32_t s = (f >> 16) & 0x8000u;
-    int32_t e = (int32_t)((f >> 23) & 0xffu) - 127 + 15;
-    uint32_t m = f & 0x7fffffu;
-    if (e >= 31) { return (uint16_t)(s | 0x7c00u | (m ? 0x200u : 0u)); } // inf/nan
+    const uint32_t s     = (f >> 16) & 0x8000u;
+    const uint32_t raw_e = (f >> 23) & 0xffu;
+    uint32_t       m     =  f        & 0x7fffffu;
+    int32_t        e     = (int32_t)raw_e - 127 + 15;
+
+    // fp32 nan or inf (raw exponent all-ones)
+    if (raw_e == 0xffu) {
+        if (m == 0) return (uint16_t)(s | 0x7c00u);                       // signed inf
+        const uint32_t hm = m >> 13;                                      // top 10 bits of mantissa
+        return (uint16_t)(s | 0x7c00u | (hm ? hm : 0x200u));              // nan, preserve a payload
+    }
+
+    // finite, but exponent overflows fp16. clamp to signed inf (matches ggml)
+    if (e >= 31) { return (uint16_t)(s | 0x7c00u); }
+
+    // subnormal or underflow
     if (e <= 0) {
         if (e < -10) return (uint16_t)s;
         m = (m | 0x800000u) >> (1 - e);
@@ -101,6 +115,8 @@ static uint16_t fp32_to_fp16(float x) {
         if (m & 0x1000u) m += 0x2000u;
         return (uint16_t)(s | (m >> 13));
     }
+
+    // normal range, with rounding (and possible carry into exponent)
     if (m & 0x1000u) {
         m += 0x2000u;
         if (m & 0x800000u) {
