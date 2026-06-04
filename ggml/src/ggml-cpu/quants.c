@@ -14,17 +14,6 @@
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
 
-#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
-#include <immintrin.h>
-// AVX-512-VNNI dot-products for Bonsai Q1_0/Q2_0 (else scalar via arch-fallback).
-static inline int ggml_hsum_i32_8_vnni(__m256i v) {
-    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
-    s = _mm_add_epi32(s, _mm_unpackhi_epi64(s, s));
-    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 1, 1, 1)));
-    return _mm_cvtsi128_si32(s);
-}
-#endif
-
 #define GROUP_MAX_EPS 1e-15f
 #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
 #define GROUP_MAX_EPS_IQ2_S 1e-8f
@@ -151,27 +140,6 @@ void ggml_vec_dot_q1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 
     float sumf = 0.0f;
 
-#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
-    // AVX-512-VNNI: weight is ±1 (sign bit). Negate activations where the bit is clear,
-    // then horizontal-sum the signed int8s via dpbusd(ones, signed_qy).
-    const __m256i ones = _mm256_set1_epi8(1);
-    for (int i = 0; i < nb; i++) {
-        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
-        float sumi = 0.0f;
-        for (int k = 0; k < 4; k++) {
-            const block_q8_0 * GGML_RESTRICT yb = &y[i * 4 + k];
-            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
-            const __m256i qy = _mm256_loadu_si256((const __m256i *) yb->qs); // 32 int8
-            uint32_t mbits; memcpy(&mbits, &x[i].qs[k * 4], 4);
-            const __mmask32 m = (__mmask32) mbits;                            // bit p = sign of elem p
-            const __m256i neg = _mm256_sub_epi8(_mm256_setzero_si256(), qy);
-            const __m256i sq  = _mm256_mask_blend_epi8(m, neg, qy);           // bit set? +qy : -qy
-            const __m256i acc = _mm256_dpbusd_epi32(_mm256_setzero_si256(), ones, sq);
-            sumi += d1 * (float) ggml_hsum_i32_8_vnni(acc);
-        }
-        sumf += d0 * sumi;
-    }
-#else
     for (int i = 0; i < nb; i++) {
         const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
 
@@ -202,7 +170,6 @@ void ggml_vec_dot_q1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 
         sumf += d0 * sumi;
     }
-#endif
 
     *s = sumf;
 }
@@ -223,36 +190,6 @@ void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 
     float sumf = 0.0f;
 
-#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
-    // AVX-512-VNNI: unpack 2-bit codes c in {0,1,2,3} (value = c-1), then
-    // dot((c-1), qy) = dpbusd(c, qy) - dpbusd(1, qy).
-    const __m256i ones   = _mm256_set1_epi8(1);
-    const __m128i idxlo  = _mm_setr_epi8(0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3);
-    const __m128i idxhi  = _mm_setr_epi8(4,4,4,4,5,5,5,5,6,6,6,6,7,7,7,7);
-    const __m256i mul    = _mm256_setr_epi16(64,16,4,1, 64,16,4,1, 64,16,4,1, 64,16,4,1); // <<(6-2c)
-    const __m256i three  = _mm256_set1_epi16(3);
-    for (int i = 0; i < nb; i++) {
-        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
-        float sumi = 0.0f;
-        for (int k = 0; k < 4; k++) {
-            const block_q8_0 * GGML_RESTRICT yb = &y[i * 4 + k];
-            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
-            const __m256i qy = _mm256_loadu_si256((const __m256i *) yb->qs);
-            const __m128i src = _mm_loadl_epi64((const __m128i *) &x[i].qs[k * 8]); // 8 bytes
-            // replicate each byte 4x, then extract field c via (b<<(6-2c))>>6 & 3
-            const __m256i rep = _mm256_set_m128i(_mm_shuffle_epi8(src, idxhi), _mm_shuffle_epi8(src, idxlo));
-            __m256i r0 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(rep));
-            __m256i r1 = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(rep, 1));
-            r0 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r0, mul), 6), three);
-            r1 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r1, mul), 6), three);
-            __m256i codes = _mm256_permute4x64_epi64(_mm256_packus_epi16(r0, r1), 0xD8); // 32 codes in order
-            const int dp = ggml_hsum_i32_8_vnni(_mm256_dpbusd_epi32(_mm256_setzero_si256(), codes, qy));
-            const int sy = ggml_hsum_i32_8_vnni(_mm256_dpbusd_epi32(_mm256_setzero_si256(), ones,  qy));
-            sumi += d1 * (float)(dp - sy);
-        }
-        sumf += d0 * sumi;
-    }
-#else
     for (int i = 0; i < nb; i++) {
         const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
 
@@ -280,7 +217,6 @@ void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 
         sumf += d0 * sumi;
     }
-#endif
 
     *s = sumf;
 }
