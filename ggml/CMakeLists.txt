@@ -199,7 +199,7 @@ option(GGML_LLAMAFILE                       "ggml: use LLAMAFILE"               
 option(GGML_CUDA                            "ggml: use CUDA"                                  OFF)
 option(GGML_MUSA                            "ggml: use MUSA"                                  OFF)
 option(GGML_CUDA_FORCE_MMQ                  "ggml: use mmq kernels instead of cuBLAS"         OFF)
-option(GGML_CUDA_HOPPER_Q1                  "ggml: opt-in sm_90a wgmma path for Q1_0 prefill" OFF)
+option(GGML_CUDA_HOPPER_Q1                  "ggml: opt-in sm_90a wgmma path for Q1_0/Q2_0 prefill" OFF)
 set   (GGML_CUDA_CUTLASS_DIR "" CACHE PATH    "ggml: CUTLASS checkout root for GGML_CUDA_HOPPER_Q1")
 option(GGML_CUDA_FORCE_CUBLAS               "ggml: always use cuBLAS instead of mmq kernels"  OFF)
 set   (GGML_CUDA_PEER_MAX_BATCH_SIZE "128" CACHE STRING

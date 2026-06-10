@@ -5,6 +5,7 @@
 // caller falls through to the standard MMQ path.
 #include "common.cuh"
 #include <unordered_map>
+#include <mutex>
 
 #if defined(GGML_USE_HOPPER_Q1)  // built only when CUTLASS include dir is provided
 #include <cuda_pipeline.h>
@@ -32,8 +33,13 @@ __global__ void quant_act_per128(const float* __restrict__ x, int8_t* __restrict
   for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
   const float scale = amax / 127.0f;
   const float inv = scale > 0.f ? 1.0f / scale : 0.f;
-  char4 out = make_char4((char)lrintf(v.x * inv), (char)lrintf(v.y * inv), (char)lrintf(v.z * inv),
-                         (char)lrintf(v.w * inv));
+  // scale maps |x|<=amax to <=127, so this cannot overflow in exact arithmetic;
+  // clamp anyway to be robust to fp rounding at the boundary.
+  auto q8 = [] (float f) -> signed char {
+    long r = lrintf(f);
+    return (signed char)(r < -127 ? -127 : (r > 127 ? 127 : r));
+  };
+  char4 out = make_char4(q8(v.x * inv), q8(v.y * inv), q8(v.z * inv), q8(v.w * inv));
   *(reinterpret_cast<char4*>(q + (size_t)m * K + kc * 128) + lane) = out;
   if (lane == 0) d[(size_t)m * (K / 128) + kc] = scale;
 }
@@ -64,22 +70,49 @@ __global__ void repack_q2_dense(const block_q2_0* __restrict__ W, unsigned* __re
 }
 
 struct DenseW { unsigned* bits; float* dw; };
-// experiment-grade cache: weights static for process lifetime; freed at exit by the driver.
+// Cache key: the weight pointer alone is ambiguous across devices and reshaped views,
+// so key on (device, wdata, N, K, wbits). Weights are static for the process lifetime;
+// the repacked buffers are freed at exit by the driver.
 // wbits = 1 (Q1_0 sign bits) or 2 (Q2_0 (q-1) fields); words per 128-block = 4*wbits.
-static DenseW get_dense_w(const void* wdata, long N, long K, int wbits, cudaStream_t stream) {
-  static std::unordered_map<const void*, DenseW> cache;
-  auto it = cache.find(wdata);
+struct DenseKey {
+  int device; const void* wdata; long N; long K; int wbits;
+  bool operator==(const DenseKey& o) const {
+    return device == o.device && wdata == o.wdata && N == o.N && K == o.K && wbits == o.wbits;
+  }
+};
+struct DenseKeyHash {
+  size_t operator()(const DenseKey& k) const {
+    size_t h = std::hash<const void*>()(k.wdata);
+    h ^= std::hash<long>()(k.N) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    h ^= std::hash<long>()(k.K) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    h ^= std::hash<int>()((k.device << 4) | k.wbits) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    return h;
+  }
+};
+static DenseW get_dense_w(const void* wdata, long N, long K, int wbits, int device, cudaStream_t stream) {
+  static std::unordered_map<DenseKey, DenseW, DenseKeyHash> cache;
+  static std::mutex cache_mutex;  // ggml may dispatch from one host thread per device concurrently
+  const DenseKey key{device, wdata, N, K, wbits};
+
+  std::lock_guard<std::mutex> lock(cache_mutex);
+  auto it = cache.find(key);
   if (it != cache.end()) return it->second;
+
   DenseW d{};
   const long nb = N * (K / 128);
-  cudaMalloc(&d.bits, nb * 16 * wbits);
-  cudaMalloc(&d.dw, nb * sizeof(float));
+  CUDA_CHECK(cudaMalloc(&d.bits, nb * 16 * wbits));  // 4*wbits words/block, 4 B/word
+  CUDA_CHECK(cudaMalloc(&d.dw, nb * sizeof(float)));
   if (wbits == 1) {
     repack_q1_dense<<<(unsigned)((nb + 255) / 256), 256, 0, stream>>>((const block_q1_0*)wdata, d.bits, d.dw, nb);
   } else {
     repack_q2_dense<<<(unsigned)((nb + 255) / 256), 256, 0, stream>>>((const block_q2_0*)wdata, d.bits, d.dw, nb);
   }
-  cache.emplace(wdata, d);
+  // Publish only after repack is observably complete. A consumer GEMM may run on a
+  // different stream than the one used here, which would otherwise have no ordering
+  // dependency on the repack kernel and could read uninitialized dense buffers. The
+  // sync is one-time per (tensor,device); subsequent calls hit the cache.
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+  cache.emplace(key, d);
   return d;
 }
 
@@ -340,7 +373,7 @@ bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context& ctx, const ggml_tens
     return false;
   }
   cudaStream_t stream = ctx.stream();
-  hopper_q1::DenseW wq = hopper_q1::get_dense_w(src0->data, (long)N, (long)K, is_q2 ? 2 : 1, stream);
+  hopper_q1::DenseW wq = hopper_q1::get_dense_w(src0->data, (long)N, (long)K, is_q2 ? 2 : 1, ctx.device, stream);
   ggml_cuda_pool_alloc<int8_t> act_q(ctx.pool(), (size_t)M * K);
   ggml_cuda_pool_alloc<float> act_d(ctx.pool(), (size_t)M * (K / 128));
   {
@@ -352,24 +385,28 @@ bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context& ctx, const ggml_tens
                              2 * (hopper_q1::bM + hopper_q1::bN) * (int)sizeof(float);
   auto* kern_fixed = is_q2 ? hopper_q1::lowbit_wgmma_ggml<2> : hopper_q1::lowbit_wgmma_ggml<1>;
   auto* kern_sk = is_q2 ? hopper_q1::lowbit_wgmma_ggml_sk<2> : hopper_q1::lowbit_wgmma_ggml_sk<1>;
-  static bool attr_set = false;
-  if (!attr_set) {
-    cudaFuncSetAttribute(hopper_q1::lowbit_wgmma_ggml<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
-    cudaFuncSetAttribute(hopper_q1::lowbit_wgmma_ggml<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
-    cudaFuncSetAttribute(hopper_q1::lowbit_wgmma_ggml_sk<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
-    cudaFuncSetAttribute(hopper_q1::lowbit_wgmma_ggml_sk<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
-    attr_set = true;
+  // Both the dynamic-SMEM opt-in and the SM count are per-device; cache them per device
+  // so additional GPUs in a multi-GPU run don't skip the opt-in (launch failure) or
+  // reuse device 0's SM count (wrong stream-K dispatch / grid size).
+  static bool attr_set[GGML_CUDA_MAX_DEVICES] = {false};
+  if (!attr_set[ctx.device]) {
+    CUDA_CHECK(cudaFuncSetAttribute(hopper_q1::lowbit_wgmma_ggml<1>,    cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
+    CUDA_CHECK(cudaFuncSetAttribute(hopper_q1::lowbit_wgmma_ggml<2>,    cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
+    CUDA_CHECK(cudaFuncSetAttribute(hopper_q1::lowbit_wgmma_ggml_sk<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
+    CUDA_CHECK(cudaFuncSetAttribute(hopper_q1::lowbit_wgmma_ggml_sk<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
+    attr_set[ctx.device] = true;
   }
   const int ntm = (int)(M / hopper_q1::bM), ntn = (int)(N / hopper_q1::bN);
   const int ntiles = ntm * ntn;
-  static int NSM = 0;
-  if (NSM == 0) cudaDeviceGetAttribute(&NSM, cudaDevAttrMultiProcessorCount, ctx.device);
-  if (ntiles < 8 * NSM) {
+  static int NSM[GGML_CUDA_MAX_DEVICES] = {0};
+  if (NSM[ctx.device] == 0) CUDA_CHECK(cudaDeviceGetAttribute(&NSM[ctx.device], cudaDevAttrMultiProcessorCount, ctx.device));
+  const int nsm = NSM[ctx.device];
+  if (ntiles < 8 * nsm) {
     // starved grid -> stream-K (persistent; fp32-additive atomic flush into zeroed C)
     const long total = (long)ntiles * (K / 128);
     cudaMemsetAsync(dst->data, 0, (size_t)M * N * sizeof(float), stream);
-    kern_sk<<<NSM, 512, SMEM_BYTES, stream>>>(act_q.get(), act_d.get(),
-        wq.bits, wq.dw, (float*)dst->data, (int)M, (int)N, (int)K, ntn, total, NSM);
+    kern_sk<<<nsm, 512, SMEM_BYTES, stream>>>(act_q.get(), act_d.get(),
+        wq.bits, wq.dw, (float*)dst->data, (int)M, (int)N, (int)K, ntn, total, nsm);
   } else {
     dim3 grid(ntm, ntn);
     kern_fixed<<<grid, 512, SMEM_BYTES, stream>>>(act_q.get(), act_d.get(),
