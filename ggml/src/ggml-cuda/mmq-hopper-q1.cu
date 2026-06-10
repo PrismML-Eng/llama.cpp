@@ -52,22 +52,39 @@ __global__ void repack_q1_dense(const block_q1_0* __restrict__ W, unsigned* __re
     bits[b * 4 + w] = (unsigned)u16[1 + 2 * w] | ((unsigned)u16[2 + 2 * w] << 16);
 }
 
-struct DenseQ1 { unsigned* bits; float* dw; };
+__global__ void repack_q2_dense(const block_q2_0* __restrict__ W, unsigned* __restrict__ bits,
+                                float* __restrict__ dw, long nblocks_total) {
+  long b = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= nblocks_total) return;
+  const uint16_t* u16 = reinterpret_cast<const uint16_t*>(W + b);  // [0]=d, [1..16]=2-bit field halves
+  dw[b] = __half2float(*reinterpret_cast<const __half*>(W + b));
+#pragma unroll
+  for (int w = 0; w < 8; ++w)
+    bits[b * 8 + w] = (unsigned)u16[1 + 2 * w] | ((unsigned)u16[2 + 2 * w] << 16);
+}
+
+struct DenseW { unsigned* bits; float* dw; };
 // experiment-grade cache: weights static for process lifetime; freed at exit by the driver.
-static DenseQ1 get_dense_q1(const void* wdata, long N, long K, cudaStream_t stream) {
-  static std::unordered_map<const void*, DenseQ1> cache;
+// wbits = 1 (Q1_0 sign bits) or 2 (Q2_0 (q-1) fields); words per 128-block = 4*wbits.
+static DenseW get_dense_w(const void* wdata, long N, long K, int wbits, cudaStream_t stream) {
+  static std::unordered_map<const void*, DenseW> cache;
   auto it = cache.find(wdata);
   if (it != cache.end()) return it->second;
-  DenseQ1 d{};
+  DenseW d{};
   const long nb = N * (K / 128);
-  cudaMalloc(&d.bits, nb * 16);
+  cudaMalloc(&d.bits, nb * 16 * wbits);
   cudaMalloc(&d.dw, nb * sizeof(float));
-  repack_q1_dense<<<(unsigned)((nb + 255) / 256), 256, 0, stream>>>((const block_q1_0*)wdata, d.bits, d.dw, nb);
+  if (wbits == 1) {
+    repack_q1_dense<<<(unsigned)((nb + 255) / 256), 256, 0, stream>>>((const block_q1_0*)wdata, d.bits, d.dw, nb);
+  } else {
+    repack_q2_dense<<<(unsigned)((nb + 255) / 256), 256, 0, stream>>>((const block_q2_0*)wdata, d.bits, d.dw, nb);
+  }
   cache.emplace(wdata, d);
   return d;
 }
 
-__global__ __launch_bounds__(512) void q1_wgmma_ggml(const int8_t* __restrict__ Aq, const float* __restrict__ dA,
+template <int WBITS>
+__global__ __launch_bounds__(512) void lowbit_wgmma_ggml(const int8_t* __restrict__ Aq, const float* __restrict__ dA,
                                                      const unsigned* __restrict__ Wbits, const float* __restrict__ Wd,
                                                      float* __restrict__ C,
                                                      int M, int N, int K) {
@@ -106,22 +123,39 @@ __global__ __launch_bounds__(512) void q1_wgmma_ggml(const int8_t* __restrict__ 
       __pipeline_memcpy_async(&tA(r, c16), Aq + (size_t)(mblk * bM + r) * K + kc * bK + c16, 16);
     }
     __pipeline_commit();
-    constexpr int B_WORDS = bN * (bK / 32);
-    for (int i = threadIdx.x; i < B_WORDS; i += 512) {
-      int r = i / (bK / 32), w = i % (bK / 32);
-      unsigned bits = Wbits[((size_t)(nblk * bN + r) * nblocks_row + kc) * 4 + w];
-      unsigned out[8];
+    if constexpr (WBITS == 1) {
+      constexpr int B_WORDS = bN * (bK / 32);
+      for (int i = threadIdx.x; i < B_WORDS; i += 512) {
+        int r = i / (bK / 32), w = i % (bK / 32);
+        unsigned bits = Wbits[((size_t)(nblk * bN + r) * nblocks_row + kc) * 4 + w];
+        unsigned out[8];
 #pragma unroll
-      for (int nib = 0; nib < 8; ++nib) {
-        // branchless bit -> {+1,-1} byte expansion. NOT a __constant__ LUT: divergent indices
-        // serialize the constant cache (one address per warp per cycle) and real weight bits are
-        // high-entropy, costing ~1.7x end-to-end. Synthetic uniform test data hides this entirely.
-        unsigned nb = (bits >> (nib * 4)) & 0xF;
-        unsigned spread = (nb & 1u) | ((nb & 2u) << 7) | ((nb & 4u) << 14) | ((nb & 8u) << 21);
-        out[nib] = __vadd4(0xFFFFFFFFu, spread << 1);  // per-byte 0xFF + 2*bit, no cross-byte carry
+        for (int nib = 0; nib < 8; ++nib) {
+          // branchless bit -> {+1,-1} byte expansion. NOT a __constant__ LUT: divergent indices
+          // serialize the constant cache (one address per warp per cycle) and real weight bits are
+          // high-entropy, costing ~1.7x end-to-end. Synthetic uniform test data hides this entirely.
+          unsigned nb = (bits >> (nib * 4)) & 0xF;
+          unsigned spread = (nb & 1u) | ((nb & 2u) << 7) | ((nb & 4u) << 14) | ((nb & 8u) << 21);
+          out[nib] = __vadd4(0xFFFFFFFFu, spread << 1);  // per-byte 0xFF + 2*bit, no cross-byte carry
+        }
+        *reinterpret_cast<int4*>(&tB(r, w * 32)) = make_int4(out[0], out[1], out[2], out[3]);
+        *reinterpret_cast<int4*>(&tB(r, w * 32 + 16)) = make_int4(out[4], out[5], out[6], out[7]);
       }
-      *reinterpret_cast<int4*>(&tB(r, w * 32)) = make_int4(out[0], out[1], out[2], out[3]);
-      *reinterpret_cast<int4*>(&tB(r, w * 32 + 16)) = make_int4(out[4], out[5], out[6], out[7]);
+    } else {
+      // Q2_0: 16x 2-bit fields per word, value = q - 1 in {-1,0,+1,+2}; same no-LUT rule as above
+      constexpr int B_WORDS = bN * (bK / 16);
+      for (int i = threadIdx.x; i < B_WORDS; i += 512) {
+        int r = i / (bK / 16), w = i % (bK / 16);
+        unsigned bits = Wbits[((size_t)(nblk * bN + r) * nblocks_row + kc) * 8 + w];
+        unsigned out[4];
+#pragma unroll
+        for (int b8 = 0; b8 < 4; ++b8) {
+          unsigned f = (bits >> (b8 * 8)) & 0xFFu;
+          unsigned spread = (f & 0x03u) | ((f & 0x0Cu) << 6) | ((f & 0x30u) << 12) | ((f & 0xC0u) << 18);
+          out[b8] = __vsub4(spread, 0x01010101u);  // per-byte q - 1, no cross-byte borrow
+        }
+        *reinterpret_cast<int4*>(&tB(r, w * 16)) = make_int4(out[0], out[1], out[2], out[3]);
+      }
     }
     for (int i = threadIdx.x; i < bM; i += 512) sDa[buf][i] = dA[(size_t)(mblk * bM + i) * nblocks_row + kc];
     for (int i = threadIdx.x; i < bN; i += 512) sDw[buf][i] = Wd[(size_t)(nblk * bN + i) * nblocks_row + kc];
@@ -163,7 +197,8 @@ __global__ __launch_bounds__(512) void q1_wgmma_ggml(const int8_t* __restrict__ 
 
 
 // stream-K variant: persistent work-centric loop; scaled fp32 partials atomicAdd'd into pre-zeroed C
-__global__ __launch_bounds__(512) void q1_wgmma_ggml_sk(const int8_t* __restrict__ Aq, const float* __restrict__ dA,
+template <int WBITS>
+__global__ __launch_bounds__(512) void lowbit_wgmma_ggml_sk(const int8_t* __restrict__ Aq, const float* __restrict__ dA,
                                                         const unsigned* __restrict__ Wbits, const float* __restrict__ Wd,
                                                      float* __restrict__ C,
                                                         int M, int N, int K, int ntn, long total, int ncta) {
@@ -193,22 +228,39 @@ __global__ __launch_bounds__(512) void q1_wgmma_ggml_sk(const int8_t* __restrict
       __pipeline_memcpy_async(&tA(r, c16), Aq + (size_t)(mblk * bM + r) * K + kc * bK + c16, 16);
     }
     __pipeline_commit();
-    constexpr int B_WORDS = bN * (bK / 32);
-    for (int i = threadIdx.x; i < B_WORDS; i += 512) {
-      int r = i / (bK / 32), w = i % (bK / 32);
-      unsigned bits = Wbits[((size_t)(nblk * bN + r) * nblocks_row + kc) * 4 + w];
-      unsigned out[8];
+    if constexpr (WBITS == 1) {
+      constexpr int B_WORDS = bN * (bK / 32);
+      for (int i = threadIdx.x; i < B_WORDS; i += 512) {
+        int r = i / (bK / 32), w = i % (bK / 32);
+        unsigned bits = Wbits[((size_t)(nblk * bN + r) * nblocks_row + kc) * 4 + w];
+        unsigned out[8];
 #pragma unroll
-      for (int nib = 0; nib < 8; ++nib) {
-        // branchless bit -> {+1,-1} byte expansion. NOT a __constant__ LUT: divergent indices
-        // serialize the constant cache (one address per warp per cycle) and real weight bits are
-        // high-entropy, costing ~1.7x end-to-end. Synthetic uniform test data hides this entirely.
-        unsigned nb = (bits >> (nib * 4)) & 0xF;
-        unsigned spread = (nb & 1u) | ((nb & 2u) << 7) | ((nb & 4u) << 14) | ((nb & 8u) << 21);
-        out[nib] = __vadd4(0xFFFFFFFFu, spread << 1);  // per-byte 0xFF + 2*bit, no cross-byte carry
+        for (int nib = 0; nib < 8; ++nib) {
+          // branchless bit -> {+1,-1} byte expansion. NOT a __constant__ LUT: divergent indices
+          // serialize the constant cache (one address per warp per cycle) and real weight bits are
+          // high-entropy, costing ~1.7x end-to-end. Synthetic uniform test data hides this entirely.
+          unsigned nb = (bits >> (nib * 4)) & 0xF;
+          unsigned spread = (nb & 1u) | ((nb & 2u) << 7) | ((nb & 4u) << 14) | ((nb & 8u) << 21);
+          out[nib] = __vadd4(0xFFFFFFFFu, spread << 1);  // per-byte 0xFF + 2*bit, no cross-byte carry
+        }
+        *reinterpret_cast<int4*>(&tB(r, w * 32)) = make_int4(out[0], out[1], out[2], out[3]);
+        *reinterpret_cast<int4*>(&tB(r, w * 32 + 16)) = make_int4(out[4], out[5], out[6], out[7]);
       }
-      *reinterpret_cast<int4*>(&tB(r, w * 32)) = make_int4(out[0], out[1], out[2], out[3]);
-      *reinterpret_cast<int4*>(&tB(r, w * 32 + 16)) = make_int4(out[4], out[5], out[6], out[7]);
+    } else {
+      // Q2_0: 16x 2-bit fields per word, value = q - 1 in {-1,0,+1,+2}; same no-LUT rule as above
+      constexpr int B_WORDS = bN * (bK / 16);
+      for (int i = threadIdx.x; i < B_WORDS; i += 512) {
+        int r = i / (bK / 16), w = i % (bK / 16);
+        unsigned bits = Wbits[((size_t)(nblk * bN + r) * nblocks_row + kc) * 8 + w];
+        unsigned out[4];
+#pragma unroll
+        for (int b8 = 0; b8 < 4; ++b8) {
+          unsigned f = (bits >> (b8 * 8)) & 0xFFu;
+          unsigned spread = (f & 0x03u) | ((f & 0x0Cu) << 6) | ((f & 0x30u) << 12) | ((f & 0xC0u) << 18);
+          out[b8] = __vsub4(spread, 0x01010101u);  // per-byte q - 1, no cross-byte borrow
+        }
+        *reinterpret_cast<int4*>(&tB(r, w * 16)) = make_int4(out[0], out[1], out[2], out[3]);
+      }
     }
     for (int i = threadIdx.x; i < bM; i += 512) sDa[buf][i] = dA[(size_t)(mblk * bM + i) * nblocks_row + kc];
     for (int i = threadIdx.x; i < bN; i += 512) sDw[buf][i] = Wd[(size_t)(nblk * bN + i) * nblocks_row + kc];
@@ -279,14 +331,16 @@ bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context& ctx, const ggml_tens
   if (!enabled) return false;
   const int cc = ggml_cuda_info().devices[ctx.device].cc;
   const int64_t K = src0->ne[0], N = src0->ne[1], M = src1->ne[1];
+  const bool is_q1 = src0->type == GGML_TYPE_Q1_0;
+  const bool is_q2 = src0->type == GGML_TYPE_Q2_0;
   if (cc < 900 ||  // 900 = Hopper; no GGML_CUDA_CC_HOPPER macro in this tree
-       src0->type != GGML_TYPE_Q1_0 || src1->type != GGML_TYPE_F32 ||
+       (!is_q1 && !is_q2) || src1->type != GGML_TYPE_F32 ||
       dst->type != GGML_TYPE_F32 || src1->ne[2] * src1->ne[3] != 1 || src0->ne[2] * src0->ne[3] != 1 ||
       (M % 128) || (N % 128) || (K % 128) || !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
     return false;
   }
   cudaStream_t stream = ctx.stream();
-  hopper_q1::DenseQ1 wq = hopper_q1::get_dense_q1(src0->data, (long)N, (long)K, stream);
+  hopper_q1::DenseW wq = hopper_q1::get_dense_w(src0->data, (long)N, (long)K, is_q2 ? 2 : 1, stream);
   ggml_cuda_pool_alloc<int8_t> act_q(ctx.pool(), (size_t)M * K);
   ggml_cuda_pool_alloc<float> act_d(ctx.pool(), (size_t)M * (K / 128));
   {
@@ -296,9 +350,14 @@ bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context& ctx, const ggml_tens
   }
   constexpr int SMEM_BYTES = 2 * (hopper_q1::bM * hopper_q1::bK) + 2 * (hopper_q1::bN * hopper_q1::bK) +
                              2 * (hopper_q1::bM + hopper_q1::bN) * (int)sizeof(float);
+  auto* kern_fixed = is_q2 ? hopper_q1::lowbit_wgmma_ggml<2> : hopper_q1::lowbit_wgmma_ggml<1>;
+  auto* kern_sk = is_q2 ? hopper_q1::lowbit_wgmma_ggml_sk<2> : hopper_q1::lowbit_wgmma_ggml_sk<1>;
   static bool attr_set = false;
   if (!attr_set) {
-    cudaFuncSetAttribute(hopper_q1::q1_wgmma_ggml, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
+    cudaFuncSetAttribute(hopper_q1::lowbit_wgmma_ggml<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
+    cudaFuncSetAttribute(hopper_q1::lowbit_wgmma_ggml<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
+    cudaFuncSetAttribute(hopper_q1::lowbit_wgmma_ggml_sk<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
+    cudaFuncSetAttribute(hopper_q1::lowbit_wgmma_ggml_sk<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
     attr_set = true;
   }
   const int ntm = (int)(M / hopper_q1::bM), ntn = (int)(N / hopper_q1::bN);
@@ -307,18 +366,13 @@ bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context& ctx, const ggml_tens
   if (NSM == 0) cudaDeviceGetAttribute(&NSM, cudaDevAttrMultiProcessorCount, ctx.device);
   if (ntiles < 8 * NSM) {
     // starved grid -> stream-K (persistent; fp32-additive atomic flush into zeroed C)
-    static bool attr_sk = false;
-    if (!attr_sk) {
-      cudaFuncSetAttribute(hopper_q1::q1_wgmma_ggml_sk, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
-      attr_sk = true;
-    }
     const long total = (long)ntiles * (K / 128);
     cudaMemsetAsync(dst->data, 0, (size_t)M * N * sizeof(float), stream);
-    hopper_q1::q1_wgmma_ggml_sk<<<NSM, 512, SMEM_BYTES, stream>>>(act_q.get(), act_d.get(),
+    kern_sk<<<NSM, 512, SMEM_BYTES, stream>>>(act_q.get(), act_d.get(),
         wq.bits, wq.dw, (float*)dst->data, (int)M, (int)N, (int)K, ntn, total, NSM);
   } else {
     dim3 grid(ntm, ntn);
-    hopper_q1::q1_wgmma_ggml<<<grid, 512, SMEM_BYTES, stream>>>(act_q.get(), act_d.get(),
+    kern_fixed<<<grid, 512, SMEM_BYTES, stream>>>(act_q.get(), act_d.get(),
         wq.bits, wq.dw, (float*)dst->data, (int)M, (int)N, (int)K);
   }
   return true;

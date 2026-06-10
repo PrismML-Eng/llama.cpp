@@ -1749,7 +1749,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
-        if (src0->type == GGML_TYPE_Q1_0 && ne11 >= 128 && ggml_cuda_mul_mat_q1_hopper(ctx, src0, src1, dst)) {
+        if ((src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_Q2_0) && ne11 >= 128 && ggml_cuda_mul_mat_q1_hopper(ctx, src0, src1, dst)) {
             // handled by the opt-in Hopper wgmma path (returns false to fall through when unsupported)
             return;
         }
