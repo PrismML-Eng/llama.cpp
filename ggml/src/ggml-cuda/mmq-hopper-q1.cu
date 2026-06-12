@@ -446,7 +446,7 @@ bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context & ctx,
     const int64_t K = src0->ne[0], N = src0->ne[1], M = src1->ne[1];
     const bool    is_q1 = src0->type == GGML_TYPE_Q1_0;
     const bool    is_q2 = src0->type == GGML_TYPE_Q2_0;
-    if (cc < 900 ||  // 900 = Hopper; no GGML_CUDA_CC_HOPPER macro in this tree
+    if (cc < 900 || cc >= GGML_CUDA_CC_BLACKWELL ||  // sm_90a wgmma only: not Ada, not Blackwell (no wgmma; needs the tcgen05 path)  // 900 = Hopper; no GGML_CUDA_CC_HOPPER macro in this tree
         (!is_q1 && !is_q2) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
         src1->ne[2] * src1->ne[3] != 1 || src0->ne[2] * src0->ne[3] != 1 || (M % 128) || (N % 128) || (K % 128) ||
         !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
