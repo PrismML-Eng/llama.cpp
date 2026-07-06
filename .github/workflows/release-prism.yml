@@ -236,7 +236,13 @@ jobs:
 
       - name: Pack artifacts
         run: |
-          Copy-Item "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC\14.44.35112\debug_nonredist\${{ matrix.arch }}\Microsoft.VC143.OpenMP.LLVM\libomp140.${{ matrix.arch == 'x64' && 'x86_64' || 'aarch64' }}.dll" .\build\bin\Release\
+          # Resolve the LLVM OpenMP runtime DLL by glob: the MSVC redist version
+          # directory (and VS product dir) changes with runner-image updates, so a
+          # hardcoded path rots (upstream pins it and bumps it by hand each time).
+          $OmpDll = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\*\Enterprise\VC\Redist\MSVC\*\debug_nonredist\${{ matrix.arch }}\Microsoft.VC14*.OpenMP.LLVM\libomp140.${{ matrix.arch == 'x64' && 'x86_64' || 'aarch64' }}.dll" -ErrorAction SilentlyContinue | Sort-Object FullName | Select-Object -Last 1
+          if (-not $OmpDll) { throw "libomp140 DLL not found under any MSVC redist version" }
+          Write-Host "Using OpenMP runtime: $($OmpDll.FullName)"
+          Copy-Item $OmpDll.FullName .\build\bin\Release\
           7z a -snl llama-bin-win-cpu-${{ matrix.arch }}.zip .\build\bin\Release\*
 
       - name: Upload artifacts
