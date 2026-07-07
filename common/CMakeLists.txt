@@ -83,6 +83,8 @@ add_library(${TARGET}
     json-partial.cpp
     json-partial.h
     json-schema-to-grammar.cpp
+    kv-mean-center.cpp
+    kv-mean-center.h
     llguidance.cpp
     log.cpp
     log.h
