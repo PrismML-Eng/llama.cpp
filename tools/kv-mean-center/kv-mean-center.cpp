@@ -32,6 +32,7 @@ public:
 private:
     std::mutex m_mutex;
     std::vector<uint8_t> m_host_buf;
+    std::vector<float>   m_f32_buf; // scratch space for F16/BF16 -> F32 conversion
 
     std::unordered_map<int32_t, std::vector<double>> m_sum;   // il -> [n_embd_head * n_head]
     std::unordered_map<int32_t, int64_t>              m_count; // il -> total tokens seen
@@ -69,7 +70,8 @@ bool kv_mean_collector::collect(struct ggml_tensor * t, bool ask) {
 
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    GGML_ASSERT(t->type == GGML_TYPE_F32);
+    // cpy_k() can be fed an F32, F16, or BF16 Kcur depending on backend/compute settings.
+    GGML_ASSERT(t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16);
     GGML_ASSERT(ggml_is_contiguous(t));
 
     const bool is_host = ggml_backend_buffer_is_host(t->buffer);
@@ -88,6 +90,7 @@ bool kv_mean_collector::collect(struct ggml_tensor * t, bool ask) {
     const int64_t n_embd_head = t->ne[0];
     const int64_t n_head      = t->ne[1];
     const int64_t n_tokens    = t->ne[2];
+    const int64_t n_elem      = n_embd_head*n_head*n_tokens;
 
     auto & sum = m_sum[il];
     if (sum.empty()) {
@@ -95,7 +98,20 @@ bool kv_mean_collector::collect(struct ggml_tensor * t, bool ask) {
     }
     GGML_ASSERT(sum.size() == (size_t) (n_embd_head*n_head));
 
-    const float * f = (const float *) data;
+    // the raw bytes are only directly reinterpretable as float* for F32; F16/BF16 need to be
+    // converted to F32 first, otherwise the mean below is computed over garbage
+    const float * f;
+    if (t->type == GGML_TYPE_F32) {
+        f = (const float *) data;
+    } else {
+        m_f32_buf.resize(n_elem);
+        if (t->type == GGML_TYPE_F16) {
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) data, m_f32_buf.data(), n_elem);
+        } else {
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) data, m_f32_buf.data(), n_elem);
+        }
+        f = m_f32_buf.data();
+    }
 
     for (int64_t i2 = 0; i2 < n_tokens; ++i2) {
         for (int64_t i1 = 0; i1 < n_head; ++i1) {

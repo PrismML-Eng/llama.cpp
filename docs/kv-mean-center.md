@@ -9,7 +9,7 @@ This is currently scoped to `GGML_TYPE_Q4_0` only.
 ## The idea
 
 `GGML_TYPE_Q4_0` is a symmetric (zero-point-free) block quantizer: each block is represented as
-`value ≈ scale * q`, where `q` is a signed low-bit integer and there is no bias/zero-point term.
+`value ~= scale * q`, where `q` is a signed low-bit integer and there is no bias/zero-point term.
 If a given (kv-head, channel) position's real K activations have a nonzero mean across tokens,
 symmetric quantization wastes some of its dynamic range encoding that constant bias, which
 increases quantization error for that channel.
@@ -26,10 +26,10 @@ every cached key is centered by the same `k_bar` before being quantized and stor
 product decomposes as:
 
 ```
-q · k_i = q · (k_i - k_bar) + q · k_bar = q · k_i_stored + q · k_bar
+q . k_i = q . (k_i - k_bar) + q . k_bar = q . k_i_stored + q . k_bar
 ```
 
-The `q · k_bar` term does not depend on `i` (the key's position) -- it is added identically to
+The `q . k_bar` term does not depend on `i` (the key's position) -- it is added identically to
 every logit in that query's row. Softmax is invariant to a constant additive shift applied to
 every logit in the same row (`softmax(x + c) == softmax(x)`), so the attention weights, and
 therefore the rest of the model's output, are unaffected. This means the technique is exactly
