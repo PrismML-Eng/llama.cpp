@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -319,6 +320,17 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        if (params.path_kv_mean_center != nullptr) {
+            auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
+            if (!kv) {
+                throw std::runtime_error("path_kv_mean_center is only supported for the standard KV cache "
+                        "(not recurrent, hybrid or MLA/DSA memory types)");
+            }
+            if (!kv->load_kv_mean_center(params.path_kv_mean_center)) {
+                throw std::runtime_error("failed to load K-cache mean-centering bias file");
+            }
+        }
     }
 
     // init backends
@@ -3376,6 +3388,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.path_kv_mean_center         =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -3450,6 +3463,12 @@ llama_context * llama_init_from_model(
 
     if (ggml_is_quantized(params.type_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
         LLAMA_LOG_ERROR("%s: V cache quantization requires flash_attn\n", __func__);
+        return nullptr;
+    }
+
+    if (params.path_kv_mean_center != nullptr && params.type_k != GGML_TYPE_Q4_0) {
+        LLAMA_LOG_ERROR("%s: path_kv_mean_center requires the K cache type to be Q4_0 (got %s)\n",
+                __func__, ggml_type_name(params.type_k));
         return nullptr;
     }
 
