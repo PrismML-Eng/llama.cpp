@@ -25,6 +25,37 @@ iterations, and the reasons matter for anyone extending it.
 4. If you change anything in `ggml-metal.metal`, see "Gotcha: the embedded-metallib build cache"
    below before you trust a `cmake --build` that reports no work to do.
 
+## THE HEADLINE: GDN recurrent-state optimizations (added after the fusion work below)
+
+A calibrated graph triage (`scripts/graph-triage-metal.py` + `GGML_METAL_GRAPH_TSV=1`) found
+that the largest untapped decode cost was not kernels but GDN recurrent-state MOVEMENT:
+~700MB/token of identity gathers and copy-backs. Three env-gated flags landed for it:
+
+| Flag | What it does | Measured (M5 Pro, quiet box) |
+|---|---|---|
+| `GGML_GDN_STATE_INPLACE=1` | GDN kernel reads the recurrent-cache slot via a direct view (skips the identity `get_rows`) and writes the final state back in place (skips the copy-back `cpy`). `=2` gives the read-view half only, for bisecting. | binary tg128 35.32 -> 41.25 (+16.8%) |
+| + `GGML_RECURRENT_STATE_F16=1` | Stores the S cache in f16 (144 -> 72 MiB); the GDN kernel reads/writes f16 state directly in the in-place path. | binary 41.25 -> 42.70 (**+20.9% total**); ternary 24.38 -> 28.07 (**+15.1%**) |
+| + `GGML_GDN_FUSED_BA=1` | Folds the beta/gate elementwise glue (sigmoid/add/softplus/mul, ~190 dispatches/token) into the GDN kernel. qwen35 arch only. | NEUTRAL (within noise) -- kept because it is harmless, but tiny-ALU-op dispatch cost is evidently far below the streaming-dispatch 6.8us tax; don't model them alike |
+
+All three verified BYTE-IDENTICAL to baseline through 512-token greedy generations on both the
+binary (q1_0) and ternary (vision3000-Q2_0) checkpoints.
+
+**Recommended serving config on M5-class Metal (plain decode, full offload):**
+`GGML_GDN_STATE_INPLACE=1 GGML_RECURRENT_STATE_F16=1`
+
+Why they stay env-gated: Metal-only (the CPU GDN op ignores the op_params flags -- CPU
+execution would silently stale the cache / compute garbage on raw inputs); the mem-ranges
+hazard tracker sees the state as a read-only src while the kernel writes it (no intra-graph
+reader exists today); the speculative-rollback snapshot path (`n_rs_seq > 0`) deliberately
+falls through to the old code and is untested with these flags. Path to default-on: CPU-op
+flag support, hazard-tracker write registration, a KLD gate.
+
+**Open extension with a sized payoff**: the same in-place technique applies to the speculative
+K-SNAPSHOT path (`build_recurrent_attn`'s `keep==true` branch does K cpy's per layer per draft
+round -- ~3.5GB/round at block-7, ~16ms at measured bandwidth). That is a direct cut to the
+per-round overhead that caps Apple-side speculative-decode speedup, and is likely worth more
+there than accept-rate improvements.
+
 ## Why this exists
 
 Real per-decode-step tracing on this model found that RMSNorm's output almost never feeds
