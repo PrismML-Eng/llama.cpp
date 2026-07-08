@@ -2042,11 +2042,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
 
+                // EXPERIMENT (env-gated): store the recurrent S state (GDN/SSM matrix state) in
+                // f16 instead of f32 -- halves the largest recurrent-cache traffic (144 MiB f32
+                // on Bonsai-27B = ~288MB R+W per decoded token). Read path goes through
+                // get_rows (f16 src supported, f32 out), write-back through cpy (f32->f16
+                // supported), so no kernel changes -- the GDN kernel itself still computes in
+                // f32. Numerics NOT validated yet; opt-in only.
+                const ggml_type type_state_s = getenv("GGML_RECURRENT_STATE_F16") ? GGML_TYPE_F16 : GGML_TYPE_F32;
+
                 if (llm_arch_is_recurrent(arch)) {
                     res = new llama_memory_recurrent(
                             *this,
                             GGML_TYPE_F32,
-                            GGML_TYPE_F32,
+                            type_state_s,
                             cparams.offload_kqv,
                             std::max((uint32_t) 1, cparams.n_seq_max),
                             cparams.n_seq_max,
@@ -2088,7 +2096,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_ubatch     */ cparams.n_ubatch,
                             /* attn_n_pad        */ 1,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
-                            /* recurrent_type_s  */ GGML_TYPE_F32,
+                            /* recurrent_type_s  */ type_state_s,
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
@@ -2107,7 +2115,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
-                            /* recurrent_type_v  */ GGML_TYPE_F32,
+                            /* recurrent_type_v  */ type_state_s, // maps to type_s in llama_memory_recurrent
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
