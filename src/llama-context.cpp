@@ -1422,7 +1422,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    const bool reuse_ok = !graph_reuse_disable && res->can_reuse(gparams);
+    if (getenv("LLAMA_REUSE_TRACE")) {
+        LLAMA_LOG_INFO("[reuse-trace] process_ubatch n_tokens=%d gtype=%d reuse=%d\n",
+            (int) ubatch.n_tokens, (int) gtype, (int) reuse_ok);
+    }
+    if (reuse_ok) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
