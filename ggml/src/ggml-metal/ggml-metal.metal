@@ -2627,6 +2627,8 @@ constant short FC_gated_delta_net_K    [[function_constant(FC_GATED_DELTA_NET + 
 // the dst tail, eliminating the graph-level gather + copy-back round-trip (~700MB/token on
 // Bonsai-27B -- see graph-triage). Host sets this from op_params[0].
 constant bool  FC_gated_delta_net_inplace [[function_constant(FC_GATED_DELTA_NET + 3)]];
+// state input/output is f16 (recurrent cache stored as f16); only valid with inplace
+constant bool  FC_gated_delta_net_state_f16 [[function_constant(FC_GATED_DELTA_NET + 4)]];
 
 #if 1
 template<short NSG>
@@ -2661,13 +2663,14 @@ kernel void kernel_gated_delta_net_impl(
     // input state layout (D, K, n_seqs): per-seq stride is K*H*D; we read slot 0.
     // state is stored transposed: M[i20][is] = S[is][i20], so row i20 is contiguous
     const uint state_in_base = (i23*K*args.ne21 + i21)*S_v*S_v + i20*S_v;
-    device const float * s_ptr = (device const float *) (s) + state_in_base;
+    device const float * s_ptr   = (device const float *) (s) + state_in_base;
+    device const half  * s_ptr_h = (device const half  *) (s) + state_in_base;
 
     float ls[NSG];
 
     FOR_UNROLL (short j = 0; j < NSG; j++) {
         const short is = tx*NSG + j;
-        ls[j] = s_ptr[is];
+        ls[j] = FC_gated_delta_net_state_f16 ? (float) s_ptr_h[is] : s_ptr[is];
     }
 
     device float * dst_attn = (device float *) (dst) + (i23*args.ne22*args.ne21 + i21)*S_v + i20;
@@ -2755,12 +2758,20 @@ kernel void kernel_gated_delta_net_impl(
         // recurrent cache), skipping the dst tail + graph-level copy-back entirely. Safe
         // per-thread: each thread reads its own state row into registers up front and is the
         // only writer of that row.
-        device float * dst_state = FC_gated_delta_net_inplace
-            ? (device float *) (s) + state_in_base
-            : (device float *) (dst) + attn_size + state_out_base;
-        FOR_UNROLL (short j = 0; j < NSG; j++) {
-            const short is = tx*NSG + j;
-            dst_state[is] = ls[j];
+        if (FC_gated_delta_net_inplace && FC_gated_delta_net_state_f16) {
+            device half * dst_state_h = (device half *) (s) + state_in_base;
+            FOR_UNROLL (short j = 0; j < NSG; j++) {
+                const short is = tx*NSG + j;
+                dst_state_h[is] = (half) ls[j];
+            }
+        } else {
+            device float * dst_state = FC_gated_delta_net_inplace
+                ? (device float *) (s) + state_in_base
+                : (device float *) (dst) + attn_size + state_out_base;
+            FOR_UNROLL (short j = 0; j < NSG; j++) {
+                const short is = tx*NSG + j;
+                dst_state[is] = ls[j];
+            }
         }
     }
 

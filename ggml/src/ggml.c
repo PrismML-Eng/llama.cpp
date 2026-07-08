@@ -6208,7 +6208,7 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(v->type == GGML_TYPE_F32);
     GGML_ASSERT(g->type == GGML_TYPE_F32);
     GGML_ASSERT(beta->type == GGML_TYPE_F32);
-    GGML_ASSERT(state->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->type == GGML_TYPE_F32 || state->type == GGML_TYPE_F16); // f16: Metal in-place path only
 
     const int64_t S_v      = v->ne[0];
     const int64_t H        = v->ne[1];
