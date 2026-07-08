@@ -2629,6 +2629,10 @@ constant short FC_gated_delta_net_K    [[function_constant(FC_GATED_DELTA_NET + 
 constant bool  FC_gated_delta_net_inplace [[function_constant(FC_GATED_DELTA_NET + 3)]];
 // state input/output is f16 (recurrent cache stored as f16); only valid with inplace
 constant bool  FC_gated_delta_net_state_f16 [[function_constant(FC_GATED_DELTA_NET + 4)]];
+// fused beta/alpha glue (G==1 only): the g/b inputs carry RAW alpha/beta (pre-activation);
+// the kernel computes gate = ssm_a[h]*softplus(alpha+ssm_dt[h]) and beta = sigmoid(raw)
+// inline, eliminating 4 elementwise dispatches per GDN layer (sigmoid/add/softplus/mul).
+constant bool  FC_gated_delta_net_fused_ba [[function_constant(FC_GATED_DELTA_NET + 5)]];
 
 #if 1
 template<short NSG>
@@ -2641,6 +2645,8 @@ kernel void kernel_gated_delta_net_impl(
         device const char * b,
         device       char * s,   // non-const: written back in the FC_..._inplace variant
         device       char * dst,
+        device const char * dt_bias, // [H] ssm_dt, used only when FC_..._fused_ba
+        device const char * a_scale, // [H] ssm_a  (-exp(A_log)), used only when FC_..._fused_ba
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]])  {
@@ -2682,6 +2688,10 @@ kernel void kernel_gated_delta_net_impl(
     device const float * b_ptr = (device const float *) (b) + (i23*args.ne22*args.ne21 + i21);
     device const float * g_ptr = (device const float *) (g) + (i23*args.ne22*args.ne21 + i21)*G;
 
+    // fused-glue per-head constants (loaded once; g/b pointers walk per-token raw values)
+    const float fba_dt = FC_gated_delta_net_fused_ba ? ((device const float *) dt_bias)[i21] : 0.0f;
+    const float fba_a  = FC_gated_delta_net_fused_ba ? ((device const float *) a_scale)[i21] : 0.0f;
+
     // snapshot slot mapping: target_slot = t - shift. When n_tokens < K, only the last
     // n_tokens slots are written; earlier slots are left untouched (caller-owned).
     const int shift = (int)args.ne22 - (int)K;
@@ -2697,7 +2707,14 @@ kernel void kernel_gated_delta_net_impl(
         float s_k = 0.0f;
 
         if (G == 1) {
-            const float g_exp = exp(g_ptr[0]);
+            float gv = g_ptr[0];
+            if (FC_gated_delta_net_fused_ba) {
+                // gate = ssm_a * softplus(alpha_raw + ssm_dt); formulas match the Metal
+                // unary kernels exactly (softplus: x>20 ? x : log(1+exp(x)))
+                const float ax = gv + fba_dt;
+                gv = fba_a * select(log(1 + exp(ax)), ax, ax > 20.0f);
+            }
+            const float g_exp = exp(gv);
 
             FOR_UNROLL (short j = 0; j < NSG; j++) {
                 const short is = tx*NSG + j;
@@ -2717,7 +2734,11 @@ kernel void kernel_gated_delta_net_impl(
 
         s_k = simd_sum(s_k);
 
-        const float d = (v_ptr[i20] - s_k)*b_ptr[0];
+        float bv = b_ptr[0];
+        if (FC_gated_delta_net_fused_ba) {
+            bv = 1 / (1 + exp(-bv)); // sigmoid, matching the Metal unary kernel exactly
+        }
+        const float d = (v_ptr[i20] - s_k)*bv;
 
         float y = 0.0f;
 
@@ -2852,7 +2873,11 @@ kernel void kernel_gated_delta_net_impl(
 
         const float s_k = simd_sum(dot(*ls, kt_ptr[tx]));
 
-        const float d = (v_ptr[i20] - s_k)*b_ptr[0];
+        float bv = b_ptr[0];
+        if (FC_gated_delta_net_fused_ba) {
+            bv = 1 / (1 + exp(-bv)); // sigmoid, matching the Metal unary kernel exactly
+        }
+        const float d = (v_ptr[i20] - s_k)*bv;
 
         *ls += kt_ptr[tx]*d;
 

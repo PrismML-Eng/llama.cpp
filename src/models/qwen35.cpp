@@ -356,25 +356,41 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
+    // EXPERIMENT (env-gated): fold the beta/gate elementwise glue (sigmoid + add + softplus +
+    // mul = 4 dispatches/layer, ~190 dispatches/token of nearly-pure launch overhead per the
+    // graph triage) into the fused GDN Metal kernel: pass RAW beta/alpha and let the kernel
+    // apply the activations inline (formulas match the Metal unary kernels exactly). Requires
+    // the fused GDN kernel path (Metal); the op-level flag is set after build_recurrent_attn.
+    static const bool gdn_fused_ba = getenv("GGML_GDN_FUSED_BA") != nullptr;
+
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
-    beta = ggml_sigmoid(ctx0, beta);
-    cb(beta, "beta_sigmoid", il);
+    ggml_tensor * gate = nullptr;
 
-    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
-    alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
-    cb(alpha, "alpha", il);
+    if (gdn_fused_ba && cparams.fused_gdn_ar && cparams.fused_gdn_ch) {
+        // raw path: beta stays pre-sigmoid; gate carries raw alpha
+        ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+        gate = ggml_reshape_4d(ctx0, alpha, 1, num_v_heads, n_seq_tokens, n_seqs);
+        cb(gate, "gate_raw", il);
+    } else {
+        beta = ggml_sigmoid(ctx0, beta);
+        cb(beta, "beta_sigmoid", il);
 
-    ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
-    ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
-    cb(alpha_softplus, "a_softplus", il);
+        ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+        alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+        cb(alpha, "alpha", il);
 
-    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
-    cb(gate, "gate", il);
+        ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
+        ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
+        cb(alpha_softplus, "a_softplus", il);
 
-    gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+        gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
+        cb(gate, "gate", il);
+
+        gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+    }
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
@@ -446,6 +462,15 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(v_conv, "v_conv_predelta", il);
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+
+    if (gdn_fused_ba && cparams.fused_gdn_ar && cparams.fused_gdn_ch) {
+        // mark the GDN op for inline beta/gate computation and attach the per-head constants
+        GGML_ASSERT(output->view_src != nullptr && output->view_src->op == GGML_OP_GATED_DELTA_NET);
+        ggml_tensor * gdn = output->view_src;
+        gdn->op_params[1] = 1;
+        gdn->src[6] = model.layers[il].ssm_dt;
+        gdn->src[7] = model.layers[il].ssm_a;
+    }
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);

@@ -604,13 +604,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
     // state through get_rows -> f32 gather, so the kernel never sees f16 there)
     const bool state_f16 = op->src[5]->type == GGML_TYPE_F16;
 
+    // fused beta/alpha glue: g/b srcs carry raw pre-activation values, srcs 6/7 = ssm_dt/ssm_a
+    const bool fused_ba = op->op_params[1] != 0;
+
+    GGML_ASSERT(!fused_ba || (ne30 == 1 && op->src[6] && op->src[7]));
     GGML_ASSERT(!inplace || K == 1);
     GGML_ASSERT(op->src[5]->type == GGML_TYPE_F32 || (state_f16 && inplace));
     GGML_ASSERT(op->ne[0] == ne20 * ne21);
     GGML_ASSERT(ne20 % 32 == 0);
 
     snprintf(base, 256, "kernel_gated_delta_net_%s_%d", ggml_type_name(op->src[0]->type), nsg);
-    snprintf(name, 256, "%s_ne20=%d_ne30=%d_K=%d_inp=%d_sf16=%d", base, ne20, ne30, K, inplace ? 1 : 0, state_f16 ? 1 : 0);
+    snprintf(name, 256, "%s_ne20=%d_ne30=%d_K=%d_inp=%d_sf16=%d_fba=%d", base, ne20, ne30, K, inplace ? 1 : 0, state_f16 ? 1 : 0, fused_ba ? 1 : 0);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -621,6 +625,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
         ggml_metal_cv_set_int16(cv, K,    FC_GATED_DELTA_NET + 2);
         ggml_metal_cv_set_bool (cv, inplace, FC_GATED_DELTA_NET + 3);
         ggml_metal_cv_set_bool (cv, state_f16, FC_GATED_DELTA_NET + 4);
+        ggml_metal_cv_set_bool (cv, fused_ba,  FC_GATED_DELTA_NET + 5);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
