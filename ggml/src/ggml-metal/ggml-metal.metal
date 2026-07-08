@@ -2622,6 +2622,11 @@ kernel void kernel_rwkv_wkv7_f32(
 constant short FC_gated_delta_net_ne20 [[function_constant(FC_GATED_DELTA_NET + 0)]];
 constant short FC_gated_delta_net_ne30 [[function_constant(FC_GATED_DELTA_NET + 1)]];
 constant short FC_gated_delta_net_K    [[function_constant(FC_GATED_DELTA_NET + 2)]];
+// in-place state update (plain decode, K=1, no speculative snapshots): write the final
+// recurrent state back into the state INPUT buffer (a view of the recurrent cache) instead of
+// the dst tail, eliminating the graph-level gather + copy-back round-trip (~700MB/token on
+// Bonsai-27B -- see graph-triage). Host sets this from op_params[0].
+constant bool  FC_gated_delta_net_inplace [[function_constant(FC_GATED_DELTA_NET + 3)]];
 
 #if 1
 template<short NSG>
@@ -2632,7 +2637,7 @@ kernel void kernel_gated_delta_net_impl(
         device const char * v,
         device const char * g,
         device const char * b,
-        device const char * s,
+        device       char * s,   // non-const: written back in the FC_..._inplace variant
         device       char * dst,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
@@ -2746,7 +2751,13 @@ kernel void kernel_gated_delta_net_impl(
     }
 
     if (K == 1) {
-        device float * dst_state = (device float *) (dst) + attn_size + state_out_base;
+        // inplace: write the final state straight back into the state input (a view of the
+        // recurrent cache), skipping the dst tail + graph-level copy-back entirely. Safe
+        // per-thread: each thread reads its own state row into registers up front and is the
+        // only writer of that row.
+        device float * dst_state = FC_gated_delta_net_inplace
+            ? (device float *) (s) + state_in_base
+            : (device float *) (dst) + attn_size + state_out_base;
         FOR_UNROLL (short j = 0; j < NSG; j++) {
             const short is = tx*NSG + j;
             dst_state[is] = ls[j];

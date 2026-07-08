@@ -346,7 +346,9 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_n_rs();
 
-    if (s_copy) {
+    // s_copy can be legitimately unallocated: the identity-gather fast path (see build_rs)
+    // leaves it without consumers, so the scheduler never allocates it.
+    if (s_copy && s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
         int32_t * data = (int32_t *) s_copy->data;
 
@@ -672,7 +674,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // buffer can be legitimately null under the identity-gather fast path (see build_rs)
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -716,7 +719,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // buffer can be legitimately null under the identity-gather fast path (see build_rs)
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -790,7 +794,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // buffer can be legitimately null under the identity-gather fast path (see build_rs)
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -2739,6 +2744,17 @@ ggml_tensor * llm_graph_context::build_rs(
     // Note that this is a no-op when the view is zero-sized.
     ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
     ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+
+    // EXPERIMENT (env-gated): at plain batch=1 decode (single seq, single rs slot) the state
+    // gather below is an IDENTITY permutation -- measured at ~270MB/token of pure copy traffic
+    // on Bonsai-27B (see scripts/graph-triage-metal.py). Return a view of the cache slot
+    // directly instead. Correct because the graph is rebuilt whenever the rs head/rs_z change
+    // (llm_graph_input_rs::can_reuse checks both), so the slot offset baked into this view
+    // cannot go stale within a reused graph.
+    static const bool rs_inplace = getenv("GGML_GDN_STATE_INPLACE") != nullptr;
+    if (rs_inplace && n_seqs == 1 && n_rs == 1) {
+        return ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], rs_head*states->nb[1]);
+    }
 
     // copy states
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs

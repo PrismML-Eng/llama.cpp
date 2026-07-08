@@ -553,6 +553,20 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         cb(output, "attn_output", il);
         cb(new_state, "new_state", il);
 
+        // EXPERIMENT (env-gated, pairs with the build_rs identity-gather elimination): when
+        // the state INPUT is already a view of the recurrent cache (n_seqs==1, n_rs==1, fused
+        // K=1 path), tell the Metal GDN kernel to write the final state back in place
+        // (op_params[0]) and skip the ~430MB/token copy-back below entirely. Plain decode
+        // only -- the speculative-rollback snapshot path (keep==true) is untouched.
+        // env=1: full (read-view + write-inplace); env=2: read-view only (bisect mode)
+        static const char * gdn_env = getenv("GGML_GDN_STATE_INPLACE");
+        static const bool gdn_inplace = gdn_env != nullptr && atoi(gdn_env) == 1;
+        if (gdn_inplace && n_seqs == 1 && cparams.fused_gdn_ar && new_state->view_src != nullptr &&
+            new_state->view_src->op == GGML_OP_GATED_DELTA_NET) {
+            new_state->view_src->op_params[0] = 1;
+            return output;
+        }
+
         ggml_build_forward_expand(gf,
                 ggml_cpy(ctx0, new_state,
                     ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
