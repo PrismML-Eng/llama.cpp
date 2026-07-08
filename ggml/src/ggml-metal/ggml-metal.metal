@@ -3775,6 +3775,129 @@ kernel void kernel_mul_mv_q2_0_f32(
     kernel_mul_mv_q2_0_f32_impl<N_R0_Q2_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
+// Fused RMS_NORM(x)*norm_w -> quantized mat-vec, batch=1 decode only.
+// Replaces two dispatches (kernel_rms_norm_mul_f32 + kernel_mul_mv_{q1_0,q2_0}_f32) with one:
+// the normed vector never leaves threadgroup memory. Reuses this file's own block_q1_0/
+// block_q2_0 dequant/dot-product primitives verbatim (block_q_n_dot_y overloads above) --
+// same NSG/NR0 simdgroup tiling convention as kernel_mul_mv_{q1_0,q2_0}_f32_impl.
+#define NSG_RMSNORM_QMV 4
+#define NR0_RMSNORM_QMV 8
+
+template<typename block_t, int QK, int nr0>
+void kernel_rmsnorm_qmv_impl(
+        constant ggml_metal_kargs_rmsnorm_qmv & args,
+        device const char  * src0,   // quantized weight [ne00, ne01]
+        device const float * x,      // [ne00]
+        device const float * norm_w, // [ne00]
+        device       float * dst,    // [ne01]
+        threadgroup  float * xn,     // ne00 floats
+        threadgroup  float * red,    // >= 32 floats
+        ushort3 tpitg,
+        ushort3 ntg,
+        ushort  tiisg,
+        ushort  sgitg,
+        ushort  sgpg,   // simdgroups per threadgroup (== NSG_RMSNORM_QMV at dispatch)
+        uint    tgx) {
+    if (sgitg == 0) {
+        red[tiisg] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float sumsq = 0.0f;
+    for (int i = tpitg.x; i < args.ne00; i += ntg.x) {
+        const float v = x[i];
+        sumsq += v * v;
+    }
+    sumsq = simd_sum(sumsq);
+
+    if (tiisg == 0) {
+        red[sgitg] = sumsq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float total = red[tiisg];
+    total = simd_sum(total);
+
+    const float scale = 1.0f / sqrt(total / (float) args.ne00 + args.eps);
+
+    for (int i = tpitg.x; i < args.ne00; i += ntg.x) {
+        xn[i] = x[i] * scale * norm_w[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int nb = args.ne00 / QK;
+    const int first_row = (int(tgx) * sgpg + sgitg) * nr0;
+
+    device const block_t * ax[nr0];
+    for (int row = 0; row < nr0; ++row) {
+        const int64_t row_idx = first_row + row;
+        ax[row] = (device const block_t *) (src0 + row_idx * args.nb01);
+    }
+
+    float yl[16];
+    float sumf[nr0] = {0.0f};
+
+    const short ix = tiisg / 8;
+    const short il = (tiisg % 8) * 16;
+
+    threadgroup const float * yb = xn + ix * QK + il;
+
+    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH / 8) {
+        float sumy = 0.0f;
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            yl[i] = yb[i];
+            sumy += yb[i];
+        }
+        FOR_UNROLL (short row = 0; row < nr0; row++) {
+            sumf[row] += block_q_n_dot_y(ax[row] + ib, sumy, yl, il);
+        }
+        yb += QK * (N_SIMDWIDTH / 8);
+    }
+
+    for (int row = 0; row < nr0; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < args.ne01) {
+            dst[first_row + row] = tot;
+        }
+    }
+}
+
+[[host_name("kernel_rmsnorm_mv_q1_0_f32")]]
+kernel void kernel_rmsnorm_mv_q1_0_f32(
+        constant ggml_metal_kargs_rmsnorm_qmv & args    [[buffer(0)]],
+        device const char  * src0                        [[buffer(1)]],
+        device const float * x                            [[buffer(2)]],
+        device const float * norm_w                       [[buffer(3)]],
+        device       float * dst                          [[buffer(4)]],
+        threadgroup  float * xn                            [[threadgroup(0)]],
+        threadgroup  float * red                           [[threadgroup(1)]],
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort3 ntg   [[threads_per_threadgroup]],
+        ushort  tiisg [[thread_index_in_simdgroup]],
+        ushort  sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_rmsnorm_qmv_impl<block_q1_0, QK1_0, NR0_RMSNORM_QMV>(
+        args, src0, x, norm_w, dst, xn, red, tpitg, ntg, tiisg, sgitg, NSG_RMSNORM_QMV, tgpig.x);
+}
+
+[[host_name("kernel_rmsnorm_mv_q2_0_f32")]]
+kernel void kernel_rmsnorm_mv_q2_0_f32(
+        constant ggml_metal_kargs_rmsnorm_qmv & args    [[buffer(0)]],
+        device const char  * src0                        [[buffer(1)]],
+        device const float * x                            [[buffer(2)]],
+        device const float * norm_w                       [[buffer(3)]],
+        device       float * dst                          [[buffer(4)]],
+        threadgroup  float * xn                            [[threadgroup(0)]],
+        threadgroup  float * red                           [[threadgroup(1)]],
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort3 ntg   [[threads_per_threadgroup]],
+        ushort  tiisg [[thread_index_in_simdgroup]],
+        ushort  sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_rmsnorm_qmv_impl<block_q2_0, QK2_0, NR0_RMSNORM_QMV>(
+        args, src0, x, norm_w, dst, xn, red, tpitg, ntg, tiisg, sgitg, NSG_RMSNORM_QMV, tgpig.x);
+}
+
 kernel void kernel_mul_mv_q4_0_f32(
         constant ggml_metal_kargs_mul_mv & args,
         device const char * src0,

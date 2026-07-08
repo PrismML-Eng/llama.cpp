@@ -566,6 +566,15 @@ typedef struct {
     uint64_t nbf3[3];
 } ggml_metal_kargs_norm;
 
+// RMS_NORM + MUL + MUL_MAT(q1_0|q2_0) fused, batch=1 decode only.
+// x [ne00], norm_w [ne00], weight [ne00, ne01] quantized -> dst [ne01].
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    uint64_t nb01;   // weight row stride, bytes
+    float    eps;
+} ggml_metal_kargs_rmsnorm_qmv;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;

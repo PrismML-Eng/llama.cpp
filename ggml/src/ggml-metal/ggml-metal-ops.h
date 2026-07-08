@@ -72,6 +72,10 @@ int ggml_metal_op_bin               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_l2_norm           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_group_norm        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_norm              (ggml_metal_op_t ctx, int idx);
+// Tries to fuse RMS_NORM -> MUL -> MUL_MAT(q1_0|q2_0) at idx into one dispatch (batch=1 decode
+// only). Returns n_fuse (3) on success, 0 if the pattern doesn't match -- caller must fall back
+// to ggml_metal_op_norm(ctx, idx) in that case. Opt-in via GGML_METAL_RMSNORM_QMV_FUSE=1.
+int ggml_metal_op_rmsnorm_qmv_try   (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_rope              (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_im2col            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_conv_2d           (ggml_metal_op_t ctx, int idx);

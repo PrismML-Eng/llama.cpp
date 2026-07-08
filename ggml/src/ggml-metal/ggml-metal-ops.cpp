@@ -88,6 +88,14 @@ struct ggml_metal_op {
         return ggml_can_fuse_ext(gf, idxs.data() + i0, ops, n_ops);
     }
 
+    // like can_fuse, but without the same-shape requirement ggml_can_fuse_ext imposes --
+    // needed for RMS_NORM -> MUL -> MUL_MAT, where the mat-vec output shape differs from its
+    // input. Only checks "does node i have exactly one consumer".
+    bool has_single_use(int i) const {
+        assert(i >= 0 && i < n_nodes());
+        return ggml_node_has_n_uses(gf, idxs[i], 1);
+    }
+
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
     ggml_metal_encoder_t enc;
@@ -370,9 +378,15 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                 n_fuse = ggml_metal_op_group_norm(ctx, idx);
             } break;
         case GGML_OP_NORM:
-        case GGML_OP_RMS_NORM:
             {
                 n_fuse = ggml_metal_op_norm(ctx, idx);
+            } break;
+        case GGML_OP_RMS_NORM:
+            {
+                n_fuse = ggml_metal_op_rmsnorm_qmv_try(ctx, idx);
+                if (n_fuse == 0) {
+                    n_fuse = ggml_metal_op_norm(ctx, idx);
+                }
             } break;
         case GGML_OP_ROPE:
             {
@@ -3482,6 +3496,130 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
 
     return n_fuse;
+}
+
+// batch=1 decode fusion: RMS_NORM -> MUL -> MUL_MAT(q1_0|q2_0) into one dispatch.
+// ggml_can_fuse_ext can't be reused here -- it requires every fused op to be the same SHAPE,
+// which MUL_MAT never is (output rows != input hidden dim). This does the same "single
+// consumer, correct src linkage" safety checks by hand, plus the domain-specific gates
+// (quant type, batch=1, no broadcast).
+// Opt-in via GGML_METAL_RMSNORM_QMV_FUSE=1 while this is unvalidated at full-graph scale.
+int ggml_metal_op_rmsnorm_qmv_try(ggml_metal_op_t ctx, int idx) {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_METAL_RMSNORM_QMV_FUSE");
+        return env && atoi(env) != 0;
+    }();
+
+    if (!enabled || !ctx->use_fusion) {
+        return 0;
+    }
+
+    if (idx + 2 >= ctx->n_nodes()) {
+        return 0;
+    }
+
+    ggml_tensor * norm = ctx->node(idx);
+    ggml_tensor * mul  = ctx->node(idx + 1);
+    ggml_tensor * mm   = ctx->node(idx + 2);
+
+    GGML_ASSERT(norm->op == GGML_OP_RMS_NORM);
+
+    if (getenv("GGML_METAL_RMSNORM_QMV_TRACE")) {
+        GGML_LOG_DEBUG("%s: idx=%d norm=%s mul=%s(%s) mm=%s(%s)\n", __func__, idx,
+            ggml_op_name(norm->op), ggml_op_name(mul->op), mul->name, ggml_op_name(mm->op), mm->name);
+    }
+
+    const bool trace = getenv("GGML_METAL_RMSNORM_QMV_TRACE") != nullptr;
+#define QMV_REJECT(reason) do { \
+        if (trace) GGML_LOG_DEBUG("%s: idx=%d REJECT: %s\n", __func__, idx, reason); \
+        return 0; \
+    } while (0)
+
+    if (mul->op != GGML_OP_MUL || mm->op != GGML_OP_MUL_MAT) {
+        QMV_REJECT("op mismatch");
+    }
+
+    if (!ctx->has_single_use(idx) || !ctx->has_single_use(idx + 1)) {
+        QMV_REJECT("multi-use");
+    }
+
+    if (mul->src[0] != norm) {
+        QMV_REJECT("mul->src[0] != norm");
+    }
+    if (mul->src[1]->ne[0] != norm->ne[0] || mul->src[1]->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous_rows(mul->src[1])) {
+        QMV_REJECT("norm_w shape/type/contig");
+    }
+
+    // mul_mat(a, b): a = weight (src[0]), b = activation (src[1])
+    if (mm->src[1] != mul) {
+        QMV_REJECT("mm->src[1] != mul");
+    }
+    if (mm->src[0]->type != GGML_TYPE_Q1_0 && mm->src[0]->type != GGML_TYPE_Q2_0) {
+        QMV_REJECT("weight not q1_0/q2_0");
+    }
+    // batch=1 decode only -- no GQA/MoE-style broadcast dims either
+    if (mm->src[1]->ne[1] != 1 || mm->src[1]->ne[2] != 1 || mm->src[1]->ne[3] != 1 ||
+        mm->src[0]->ne[2] != 1 || mm->src[0]->ne[3] != 1) {
+        QMV_REJECT("batch != 1 or broadcast dims");
+    }
+    if (mm->src[0]->ne[0] % 128 != 0) {
+        QMV_REJECT("ne00 not multiple of 128");
+    }
+    if (!ggml_is_contiguous_rows(mm->src[0])) {
+        QMV_REJECT("weight not contiguous rows");
+    }
+#undef QMV_REJECT
+
+    if (ctx->debug_fusion > 1) {
+        GGML_LOG_DEBUG("%s: fuse: RMS_NORM + MUL + MUL_MAT(%s)\n", __func__, ggml_type_name(mm->src[0]->type));
+    }
+
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(float));
+
+    ggml_metal_kargs_rmsnorm_qmv args = {
+        /*.ne00 =*/ (int32_t) norm->ne[0],
+        /*.ne01 =*/ (int32_t) mm->src[0]->ne[1],
+        /*.nb01 =*/ mm->src[0]->nb[1],
+        /*.eps  =*/ eps,
+    };
+
+    ggml_metal_buffer_id bid_weight = ggml_metal_get_buffer_id(mm->src[0]);
+    ggml_metal_buffer_id bid_x      = ggml_metal_get_buffer_id(norm->src[0]);
+    ggml_metal_buffer_id bid_normw  = ggml_metal_get_buffer_id(mul->src[1]);
+    ggml_metal_buffer_id bid_dst    = ggml_metal_get_buffer_id(mm);
+
+    auto pipeline = ggml_metal_library_get_pipeline_rmsnorm_qmv(ctx->lib, mm->src[0]->type);
+
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, bid_weight, 1);
+    ggml_metal_encoder_set_buffer  (enc, bid_x,      2);
+    ggml_metal_encoder_set_buffer  (enc, bid_normw,  3);
+    ggml_metal_encoder_set_buffer  (enc, bid_dst,    4);
+
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, args.ne00 * sizeof(float), 0);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, 32 * sizeof(float), 1);
+
+    const int NSG_HOST = 4; // must match NSG_RMSNORM_QMV in ggml-metal.metal
+    const int NR0_HOST = 8; // must match NR0_RMSNORM_QMV in ggml-metal.metal
+
+    const int rows_per_tg = NSG_HOST * NR0_HOST;
+    const int num_tg      = (args.ne01 + rows_per_tg - 1) / rows_per_tg;
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, num_tg, 1, 1, NSG_HOST * 32, 1, 1);
+
+    for (int i = 1; i < 3; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    return 3;
 }
 
 int ggml_metal_op_rope(ggml_metal_op_t ctx, int idx) {
