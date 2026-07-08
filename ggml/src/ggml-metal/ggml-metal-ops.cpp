@@ -63,10 +63,18 @@ struct ggml_metal_op {
     }
 
     ~ggml_metal_op() {
+        if (getenv("GGML_METAL_CONCURRENCY_STATS") && stat_nodes > 0) {
+            GGML_LOG_ERROR("[concurrency-stats] nodes=%lld barriers=%lld avg_group=%.2f\n",
+                (long long) stat_nodes, (long long) stat_barriers,
+                stat_barriers ? (double) stat_nodes / stat_barriers : 0.0);
+        }
         ggml_metal_encoder_end_encoding(this->enc);
         ggml_metal_encoder_free(this->enc);
         ggml_mem_ranges_free(this->mem_ranges);
     }
+
+    int64_t stat_nodes    = 0;
+    int64_t stat_barriers = 0;
 
     int n_nodes() const {
         return idxs.size();
@@ -230,6 +238,13 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
 
         if (!is_concurrent) {
             ggml_metal_op_concurrency_reset(ctx);
+        }
+
+        if (getenv("GGML_METAL_CONCURRENCY_STATS")) {
+            ctx->stat_nodes++;
+            if (!is_concurrent) {
+                ctx->stat_barriers++;
+            }
         }
 
         if (ctx->debug_graph > 0) {

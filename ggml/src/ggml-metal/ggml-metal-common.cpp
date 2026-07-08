@@ -260,6 +260,12 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
         switch (op) {
             case GGML_OP_MUL_MAT:
             case GGML_OP_MUL_MAT_ID:
+            case GGML_OP_GATED_DELTA_NET: // EXPERIMENT: recurrent state is explicit src/dst
+                                          // tensors (like SSM_SCAN below), not hidden state --
+                                          // should be equally mem-range-safe. Gated behind
+                                          // correctness verification (bit-exact vs baseline).
+            case GGML_OP_FLASH_ATTN_EXT: // EXPERIMENT: same rationale -- KV-cache reads are
+                                         // explicit view srcs, resolved to base tensor range.
             case GGML_OP_ROPE:
             case GGML_OP_NORM:
             case GGML_OP_RMS_NORM:
