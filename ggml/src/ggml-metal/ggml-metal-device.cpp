@@ -1713,6 +1713,22 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rmsnorm_qmv(ggml
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rmsnorm_qmv_multi(ggml_metal_library_t lib, enum ggml_type qtype, int32_t n) {
+    GGML_ASSERT(qtype == GGML_TYPE_Q1_0 || qtype == GGML_TYPE_Q2_0);
+    GGML_ASSERT(n == 2 || n == 3 || n == 4);
+
+    char base[256];
+
+    snprintf(base, 256, "kernel_rmsnorm_mv%d_%s_f32", n, qtype == GGML_TYPE_Q1_0 ? "q1_0" : "q2_0");
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, base);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rope(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_ROPE);
 

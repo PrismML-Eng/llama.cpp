@@ -104,6 +104,11 @@ struct ggml_metal_op {
         return ggml_node_has_n_uses(gf, idxs[i], 1);
     }
 
+    int32_t use_count(int i) const {
+        assert(i >= 0 && i < n_nodes());
+        return ggml_node_get_use_count(gf, idxs[i]);
+    }
+
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
     ggml_metal_encoder_t enc;
@@ -399,6 +404,9 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         case GGML_OP_RMS_NORM:
             {
                 n_fuse = ggml_metal_op_rmsnorm_qmv_try(ctx, idx);
+                if (n_fuse == 0) {
+                    n_fuse = ggml_metal_op_rmsnorm_qmv_multi_try(ctx, idx);
+                }
                 if (n_fuse == 0) {
                     n_fuse = ggml_metal_op_norm(ctx, idx);
                 }
@@ -3555,7 +3563,11 @@ int ggml_metal_op_rmsnorm_qmv_try(ggml_metal_op_t ctx, int idx) {
     }
 
     if (!ctx->has_single_use(idx) || !ctx->has_single_use(idx + 1)) {
-        QMV_REJECT("multi-use");
+        if (trace) {
+            GGML_LOG_DEBUG("%s: idx=%d REJECT: multi-use norm_uses=%d mul_uses=%d\n", __func__,
+                idx, ctx->use_count(idx), ctx->use_count(idx + 1));
+        }
+        return 0;
     }
 
     if (mul->src[0] != norm) {
@@ -3635,6 +3647,162 @@ int ggml_metal_op_rmsnorm_qmv_try(ggml_metal_op_t ctx, int idx) {
     }
 
     return 3;
+}
+
+// Generalized batch=1 decode fusion: RMS_NORM -> MUL -> {MUL_MAT(q1_0|q2_0)}xN, N in {2,3,4}.
+// Real fan-outs measured live on Bonsai-27B (gate+up MLP, wqkv+wqkv_gate GDN input, attention
+// QKV-family) -- see bonsai-27b-megakernel-repo memory. Requires the N sibling matmuls to be
+// CONTIGUOUS immediately after the norm+mul (idx+2 .. idx+1+N) -- ggml-metal's fusion/n_fuse
+// mechanism only supports contiguous node ranges, it cannot "skip forward" over interleaved
+// unrelated nodes. Verified true in practice (natural construction order: build_ffn/build_qkvz
+// emit sibling matmuls back-to-back, confirmed via GGML_METAL_GRAPH_DEBUG=1 on real traces for
+// both N=2 and N=4 cases) -- if a future graph shape breaks that assumption, this simply
+// declines to fuse (falls through) rather than mis-firing.
+// Opt-in via GGML_METAL_RMSNORM_QMV_FUSE=1 (same flag as the single-consumer version).
+int ggml_metal_op_rmsnorm_qmv_multi_try(ggml_metal_op_t ctx, int idx) {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_METAL_RMSNORM_QMV_FUSE");
+        return env && atoi(env) != 0;
+    }();
+
+    const bool trace = getenv("GGML_METAL_RMSNORM_QMV_TRACE") != nullptr;
+
+    if (!enabled || !ctx->use_fusion) {
+        return 0;
+    }
+
+    if (idx + 3 >= ctx->n_nodes()) {
+        return 0;
+    }
+
+    ggml_tensor * norm = ctx->node(idx);
+    ggml_tensor * mul  = ctx->node(idx + 1);
+
+    GGML_ASSERT(norm->op == GGML_OP_RMS_NORM);
+
+    if (mul->op != GGML_OP_MUL) {
+        return 0;
+    }
+    if (!ctx->has_single_use(idx)) {
+        return 0;
+    }
+    if (mul->src[0] != norm) {
+        return 0;
+    }
+    if (mul->src[1]->ne[0] != norm->ne[0] || mul->src[1]->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous_rows(mul->src[1])) {
+        return 0;
+    }
+
+    const int32_t n = ctx->use_count(idx + 1);
+    if (n != 2 && n != 3 && n != 4) {
+        return 0;
+    }
+    if (idx + 1 + n >= ctx->n_nodes()) {
+        return 0;
+    }
+
+    ggml_tensor * mms[4] = {};
+    enum ggml_type qtype = GGML_TYPE_COUNT;
+
+    for (int32_t k = 0; k < n; ++k) {
+        ggml_tensor * cand = ctx->node(idx + 2 + k);
+
+        if (cand->op != GGML_OP_MUL_MAT || cand->src[1] != mul) {
+            if (trace) {
+                GGML_LOG_DEBUG("%s: idx=%d REJECT(multi n=%d): slot %d is %s, not a sibling MUL_MAT\n",
+                    __func__, idx, n, k, ggml_op_name(cand->op));
+            }
+            return 0;
+        }
+        if (cand->src[0]->type != GGML_TYPE_Q1_0 && cand->src[0]->type != GGML_TYPE_Q2_0) {
+            return 0;
+        }
+        if (k == 0) {
+            qtype = cand->src[0]->type;
+        } else if (cand->src[0]->type != qtype) {
+            return 0; // mixed quant types across siblings -- not supported, decline
+        }
+        if (cand->src[1]->ne[1] != 1 || cand->src[1]->ne[2] != 1 || cand->src[1]->ne[3] != 1 ||
+            cand->src[0]->ne[2] != 1 || cand->src[0]->ne[3] != 1) {
+            return 0;
+        }
+        if (cand->src[0]->ne[0] % 128 != 0 || !ggml_is_contiguous_rows(cand->src[0])) {
+            return 0;
+        }
+
+        mms[k] = cand;
+    }
+
+    if (trace) {
+        GGML_LOG_DEBUG("%s: idx=%d MATCHED n=%d qtype=%s\n", __func__, idx, n, ggml_type_name(qtype));
+    }
+
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(float));
+
+    ggml_metal_kargs_rmsnorm_qmv_multi args = {};
+    args.ne00 = (int32_t) norm->ne[0];
+    args.eps  = eps;
+    for (int32_t k = 0; k < 4; ++k) {
+        args.ne01[k] = k < n ? (int32_t) mms[k]->src[0]->ne[1] : 0;
+        args.nb01[k] = k < n ? mms[k]->src[0]->nb[1] : 0;
+    }
+
+    ggml_metal_buffer_id bid_src0[4] = {};
+    ggml_metal_buffer_id bid_dst[4]  = {};
+    for (int32_t k = 0; k < n; ++k) {
+        bid_src0[k] = ggml_metal_get_buffer_id(mms[k]->src[0]);
+        bid_dst[k]  = ggml_metal_get_buffer_id(mms[k]);
+    }
+    // pad unused buffer slots by repeating slot 0 -- kernel never reads them (gated by tgpig.y < n)
+    for (int32_t k = n; k < 4; ++k) {
+        bid_src0[k] = bid_src0[0];
+        bid_dst[k]  = bid_dst[0];
+    }
+
+    ggml_metal_buffer_id bid_x     = ggml_metal_get_buffer_id(norm->src[0]);
+    ggml_metal_buffer_id bid_normw = ggml_metal_get_buffer_id(mul->src[1]);
+
+    auto pipeline = ggml_metal_library_get_pipeline_rmsnorm_qmv_multi(ctx->lib, qtype, n);
+
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, bid_src0[0], 1);
+    ggml_metal_encoder_set_buffer  (enc, bid_src0[1], 2);
+    ggml_metal_encoder_set_buffer  (enc, bid_src0[2], 3);
+    ggml_metal_encoder_set_buffer  (enc, bid_src0[3], 4);
+    ggml_metal_encoder_set_buffer  (enc, bid_x,       5);
+    ggml_metal_encoder_set_buffer  (enc, bid_normw,   6);
+    ggml_metal_encoder_set_buffer  (enc, bid_dst[0],  7);
+    ggml_metal_encoder_set_buffer  (enc, bid_dst[1],  8);
+    ggml_metal_encoder_set_buffer  (enc, bid_dst[2],  9);
+    ggml_metal_encoder_set_buffer  (enc, bid_dst[3], 10);
+
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, args.ne00 * sizeof(float), 0);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, 32 * sizeof(float), 1);
+
+    const int NSG_HOST = 4; // must match NSG_RMSNORM_QMV in ggml-metal.metal
+    const int NR0_HOST = 8; // must match NR0_RMSNORM_QMV in ggml-metal.metal
+    const int rows_per_tg = NSG_HOST * NR0_HOST;
+
+    int max_tg = 0;
+    for (int32_t k = 0; k < n; ++k) {
+        max_tg = std::max(max_tg, (args.ne01[k] + rows_per_tg - 1) / rows_per_tg);
+    }
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, max_tg, n, 1, NSG_HOST * 32, 1, 1);
+
+    for (int32_t i = 1; i < 2 + n; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    return 2 + n;
 }
 
 int ggml_metal_op_rope(ggml_metal_op_t ctx, int idx) {

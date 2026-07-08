@@ -575,6 +575,18 @@ typedef struct {
     float    eps;
 } ggml_metal_kargs_rmsnorm_qmv;
 
+// RMS_NORM + MUL + N x MUL_MAT(q1_0|q2_0) fused, batch=1 decode only, N in {2,3,4}.
+// One shared normed x [ne00] feeds N independently-shaped quantized mat-vecs
+// weight_n [ne00, ne01[n]] -> dst_n [ne01[n]]. Real fan-outs observed on Bonsai-27B
+// (Qwen3-Next hybrid): gate+up MLP (N=2), wqkv+wqkv_gate GDN input (N=2),
+// q/k/v-family attention input (N=3,4) -- see bonsai-27b-megakernel-repo memory.
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01[4];
+    uint64_t nb01[4];
+    float    eps;
+} ggml_metal_kargs_rmsnorm_qmv_multi;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;

@@ -76,6 +76,8 @@ int ggml_metal_op_norm              (ggml_metal_op_t ctx, int idx);
 // only). Returns n_fuse (3) on success, 0 if the pattern doesn't match -- caller must fall back
 // to ggml_metal_op_norm(ctx, idx) in that case. Opt-in via GGML_METAL_RMSNORM_QMV_FUSE=1.
 int ggml_metal_op_rmsnorm_qmv_try   (ggml_metal_op_t ctx, int idx);
+// Same idea, generalized to N in {2,3,4} matmul consumers sharing one norm -- see .cpp comment.
+int ggml_metal_op_rmsnorm_qmv_multi_try (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_rope              (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_im2col            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_conv_2d           (ggml_metal_op_t ctx, int idx);
