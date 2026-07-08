@@ -1713,13 +1713,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rmsnorm_qmv(ggml
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rmsnorm_qmv_multi(ggml_metal_library_t lib, enum ggml_type qtype, int32_t n) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rmsnorm_qmv_multi(ggml_metal_library_t lib, enum ggml_type qtype, int32_t n, bool small_nr0) {
     GGML_ASSERT(qtype == GGML_TYPE_Q1_0 || qtype == GGML_TYPE_Q2_0);
     GGML_ASSERT(n == 2 || n == 3 || n == 4);
 
     char base[256];
 
-    snprintf(base, 256, "kernel_rmsnorm_mv%d_%s_f32", n, qtype == GGML_TYPE_Q1_0 ? "q1_0" : "q2_0");
+    // "_small" = nr0=1 variant, for tiny-ne01 siblings that would otherwise dispatch too few
+    // threadgroups to occupy the GPU (see ggml-metal.metal's NR0_RMSNORM_QMV_SMALL comment).
+    snprintf(base, 256, "kernel_rmsnorm_mv%d_%s%s_f32", n, qtype == GGML_TYPE_Q1_0 ? "q1_0" : "q2_0",
+        small_nr0 ? "_small" : "");
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, base);
     if (!res.pipeline) {

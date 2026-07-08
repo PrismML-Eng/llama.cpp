@@ -3819,9 +3819,6 @@ int ggml_metal_op_rmsnorm_qmv_multi_try(ggml_metal_op_t ctx, int idx) {
     // sync: the n matvec dispatches below read bid_scale, must see the write above complete first
     ggml_metal_op_concurrency_reset(ctx);
 
-    auto pipeline = ggml_metal_library_get_pipeline_rmsnorm_qmv_multi(ctx->lib, qtype, n);
-
-    ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_buffer  (enc, bid_src0[0], 1);
     ggml_metal_encoder_set_buffer  (enc, bid_src0[1], 2);
     ggml_metal_encoder_set_buffer  (enc, bid_src0[2], 3);
@@ -3833,21 +3830,39 @@ int ggml_metal_op_rmsnorm_qmv_multi_try(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, bid_dst[1],  9);
     ggml_metal_encoder_set_buffer  (enc, bid_dst[2], 10);
     ggml_metal_encoder_set_buffer  (enc, bid_dst[3], 11);
+    // buffer bindings persist across pipeline switches within one encoder -- set once here.
 
-    const int NSG_HOST = 2; // must match NSG_RMSNORM_QMV in ggml-metal.metal (== N_SG_Q1_0/Q2_0)
-    const int NR0_HOST = 8; // must match NR0_RMSNORM_QMV in ggml-metal.metal (== N_R0_Q1_0/Q2_0)
-    const int rows_per_tg = NSG_HOST * NR0_HOST;
+    const int NSG_HOST      = 2; // must match NSG_RMSNORM_QMV in ggml-metal.metal (== N_SG_Q1_0/Q2_0)
+    const int NR0_HOST      = 8; // must match NR0_RMSNORM_QMV in ggml-metal.metal (== N_R0_Q1_0/Q2_0)
+    const int NR0_HOST_SMALL = 1; // must match NR0_RMSNORM_QMV_SMALL
+    // Below this many threadgroups, switch to the nr0=1 "_small" variant (see its metal-side
+    // comment): real fan-outs include ne01 as low as 48, which at NR0_HOST=8 dispatches only
+    // ceil(48/16)=3 threadgroups total -- most of the GPU sits idle for that whole dispatch.
+    const int MIN_THREADGROUPS = 16;
 
-    // Dispatch once per sibling, each with a grid sized to THAT sibling's own ne01 -- a
-    // uniform (max_tg, n) grid wastes threadgroups (up to >99% observed) whenever siblings are
-    // imbalanced, since every dispatched threadgroup pays a full norm reduction regardless of
-    // whether it's in-bounds. Same pipeline/bind state reused across the n calls (cheap --
-    // no PSO rebind, just a bytes update + dispatch).
+    // Dispatch once per sibling, each with a grid sized to THAT sibling's own ne01 AND its own
+    // nr0 choice -- a uniform grid/nr0 wastes threadgroups (up to >99% observed) whenever
+    // siblings are imbalanced, since every dispatched threadgroup pays a full reduction
+    // regardless of whether it's in-bounds. Pipeline only gets rebound when the nr0 choice
+    // actually changes between consecutive siblings (typically 0-2 times per fusion site).
+    bool bound_small = false;
+    bool have_bound = false;
     for (int32_t k = 0; k < n; ++k) {
+        const bool want_small = (args.ne01[k] + NSG_HOST * NR0_HOST - 1) / (NSG_HOST * NR0_HOST) < MIN_THREADGROUPS;
+
+        if (!have_bound || want_small != bound_small) {
+            auto pipeline = ggml_metal_library_get_pipeline_rmsnorm_qmv_multi(ctx->lib, qtype, n, want_small);
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            bound_small = want_small;
+            have_bound  = true;
+        }
+
         args.which = k;
         ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
 
-        const int tg_k = (args.ne01[k] + rows_per_tg - 1) / rows_per_tg;
+        const int nr0_k       = want_small ? NR0_HOST_SMALL : NR0_HOST;
+        const int rows_per_tg = NSG_HOST * nr0_k;
+        const int tg_k        = (args.ne01[k] + rows_per_tg - 1) / rows_per_tg;
         ggml_metal_encoder_dispatch_threadgroups(enc, tg_k, 1, 1, NSG_HOST * 32, 1, 1);
     }
 

@@ -4013,7 +4013,16 @@ void kernel_rmsnorm_qmv_multi_impl(
     }
 }
 
-#define QMV_MULTI_KERNEL(NAME, BLOCK_T, QK, N) \
+// Tiny-ne01 corner case (found via live tracing: some GDN gating projections have ne01 as low
+// as 48): with NR0_RMSNORM_QMV=8, a 48-row matrix dispatches ceil(48/16)=3 threadgroups TOTAL,
+// leaving most of the GPU idle for that whole dispatch regardless of core count. The "_small"
+// variant uses nr0=1 (rows_per_tg drops from 16 to 2), giving 8x more threadgroups to spread
+// across the GPU for the same tiny amount of work -- trades a little per-thread efficiency
+// (less row-reuse of the loaded activation) for dramatically better occupancy on shapes this
+// small. Host picks between the two per-sibling based on ne01[k] (see dispatch loop).
+#define NR0_RMSNORM_QMV_SMALL 1
+
+#define QMV_MULTI_KERNEL(NAME, BLOCK_T, QK, N, NR0) \
 [[host_name(#NAME)]] \
 kernel void NAME( \
         constant ggml_metal_kargs_rmsnorm_qmv_multi & args [[buffer(0)]], \
@@ -4033,16 +4042,23 @@ kernel void NAME( \
         ushort  sgitg [[simdgroup_index_in_threadgroup]]) { \
     device const char * srcs[4] = { src0_0, src0_1, src0_2, src0_3 }; \
     device float * dsts[4] = { dst_0, dst_1, dst_2, dst_3 }; \
-    kernel_rmsnorm_qmv_multi_impl<BLOCK_T, QK, NR0_RMSNORM_QMV, N>( \
+    kernel_rmsnorm_qmv_multi_impl<BLOCK_T, QK, NR0, N>( \
         args, srcs, x, norm_w, scale_in, dsts, tiisg, sgitg, NSG_RMSNORM_QMV, tgpig); \
 }
 
-QMV_MULTI_KERNEL(kernel_rmsnorm_mv2_q1_0_f32, block_q1_0, QK1_0, 2)
-QMV_MULTI_KERNEL(kernel_rmsnorm_mv3_q1_0_f32, block_q1_0, QK1_0, 3)
-QMV_MULTI_KERNEL(kernel_rmsnorm_mv4_q1_0_f32, block_q1_0, QK1_0, 4)
-QMV_MULTI_KERNEL(kernel_rmsnorm_mv2_q2_0_f32, block_q2_0, QK2_0, 2)
-QMV_MULTI_KERNEL(kernel_rmsnorm_mv3_q2_0_f32, block_q2_0, QK2_0, 3)
-QMV_MULTI_KERNEL(kernel_rmsnorm_mv4_q2_0_f32, block_q2_0, QK2_0, 4)
+QMV_MULTI_KERNEL(kernel_rmsnorm_mv2_q1_0_f32, block_q1_0, QK1_0, 2, NR0_RMSNORM_QMV)
+QMV_MULTI_KERNEL(kernel_rmsnorm_mv3_q1_0_f32, block_q1_0, QK1_0, 3, NR0_RMSNORM_QMV)
+QMV_MULTI_KERNEL(kernel_rmsnorm_mv4_q1_0_f32, block_q1_0, QK1_0, 4, NR0_RMSNORM_QMV)
+QMV_MULTI_KERNEL(kernel_rmsnorm_mv2_q2_0_f32, block_q2_0, QK2_0, 2, NR0_RMSNORM_QMV)
+QMV_MULTI_KERNEL(kernel_rmsnorm_mv3_q2_0_f32, block_q2_0, QK2_0, 3, NR0_RMSNORM_QMV)
+QMV_MULTI_KERNEL(kernel_rmsnorm_mv4_q2_0_f32, block_q2_0, QK2_0, 4, NR0_RMSNORM_QMV)
+
+QMV_MULTI_KERNEL(kernel_rmsnorm_mv2_q1_0_small_f32, block_q1_0, QK1_0, 2, NR0_RMSNORM_QMV_SMALL)
+QMV_MULTI_KERNEL(kernel_rmsnorm_mv3_q1_0_small_f32, block_q1_0, QK1_0, 3, NR0_RMSNORM_QMV_SMALL)
+QMV_MULTI_KERNEL(kernel_rmsnorm_mv4_q1_0_small_f32, block_q1_0, QK1_0, 4, NR0_RMSNORM_QMV_SMALL)
+QMV_MULTI_KERNEL(kernel_rmsnorm_mv2_q2_0_small_f32, block_q2_0, QK2_0, 2, NR0_RMSNORM_QMV_SMALL)
+QMV_MULTI_KERNEL(kernel_rmsnorm_mv3_q2_0_small_f32, block_q2_0, QK2_0, 3, NR0_RMSNORM_QMV_SMALL)
+QMV_MULTI_KERNEL(kernel_rmsnorm_mv4_q2_0_small_f32, block_q2_0, QK2_0, 4, NR0_RMSNORM_QMV_SMALL)
 #undef QMV_MULTI_KERNEL
 
 kernel void kernel_mul_mv_q4_0_f32(
