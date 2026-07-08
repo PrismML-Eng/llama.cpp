@@ -147,6 +147,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_group_nor
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm              (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t n_fuse);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rmsnorm_qmv       (ggml_metal_library_t lib, enum ggml_type qtype);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rmsnorm_qmv_multi (ggml_metal_library_t lib, enum ggml_type qtype, int32_t n);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rmsnorm_scale     (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rope              (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_1d (ggml_metal_library_t lib, const struct ggml_tensor * op);

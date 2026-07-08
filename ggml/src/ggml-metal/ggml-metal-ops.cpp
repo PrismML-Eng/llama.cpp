@@ -3617,20 +3617,48 @@ int ggml_metal_op_rmsnorm_qmv_try(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_normw  = ggml_metal_get_buffer_id(mul->src[1]);
     ggml_metal_buffer_id bid_dst    = ggml_metal_get_buffer_id(mm);
 
-    auto pipeline = ggml_metal_library_get_pipeline_rmsnorm_qmv(ctx->lib, mm->src[0]->type);
+    // v3: use the RMS_NORM node's OWN (now-otherwise-unused) output allocation as the 1-float
+    // scratch slot for the precomputed scale -- no new buffer allocation needed. Safe because
+    // ggml's allocator keeps it live until its one declared consumer (MUL, subsumed here) has
+    // run. Guard against the (normally-impossible, but cheap to check) case where the allocator
+    // aliased norm's output with its own input buffer -- writing scale there would corrupt x
+    // before the matvec dispatch reads it.
+    ggml_metal_buffer_id bid_scale = ggml_metal_get_buffer_id(norm);
+    if (bid_scale.metal == bid_x.metal) {
+        return 0;
+    }
 
     ggml_metal_encoder_t enc = ctx->enc;
+
+    // conservative: this fusion computes across norm/mul/mm's combined effect in two internal
+    // dispatches below (with their own barrier in between) -- ensure nothing already queued as
+    // "concurrent" from earlier, unrelated nodes could race with either of them. The generic
+    // caller (ggml_metal_op_encode_impl) registers OUR ranges for whatever comes after once we
+    // return n_fuse; we only need to guard against what came BEFORE.
+    ggml_metal_op_concurrency_reset(ctx);
+
+    {
+        auto pipeline_scale = ggml_metal_library_get_pipeline_rmsnorm_scale(ctx->lib);
+        ggml_metal_encoder_set_pipeline(enc, pipeline_scale);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_x,     1);
+        ggml_metal_encoder_set_buffer  (enc, bid_scale, 2);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, 32 * sizeof(float), 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 128, 1, 1);
+    }
+
+    // sync: the matvec dispatch below reads bid_scale, must see the write above complete first
+    ggml_metal_op_concurrency_reset(ctx);
+
+    auto pipeline = ggml_metal_library_get_pipeline_rmsnorm_qmv(ctx->lib, mm->src[0]->type);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, bid_weight, 1);
     ggml_metal_encoder_set_buffer  (enc, bid_x,      2);
     ggml_metal_encoder_set_buffer  (enc, bid_normw,  3);
-    ggml_metal_encoder_set_buffer  (enc, bid_dst,    4);
-
-    // v2: no threadgroup-staged normed vector (see ggml-metal.metal comment) -- only the small
-    // reduction scratch remains, at threadgroup(0) now that xn is gone.
-    ggml_metal_encoder_set_threadgroup_memory_size(enc, 32 * sizeof(float), 0);
+    ggml_metal_encoder_set_buffer  (enc, bid_scale,  4);
+    ggml_metal_encoder_set_buffer  (enc, bid_dst,    5);
 
     const int NSG_HOST = 2; // must match NSG_RMSNORM_QMV in ggml-metal.metal (== N_SG_Q1_0/Q2_0)
     const int NR0_HOST = 8; // must match NR0_RMSNORM_QMV in ggml-metal.metal (== N_R0_Q1_0/Q2_0)
@@ -3639,13 +3667,6 @@ int ggml_metal_op_rmsnorm_qmv_try(ggml_metal_op_t ctx, int idx) {
     const int num_tg      = (args.ne01 + rows_per_tg - 1) / rows_per_tg;
 
     ggml_metal_encoder_dispatch_threadgroups(enc, num_tg, 1, 1, NSG_HOST * 32, 1, 1);
-
-    for (int i = 1; i < 3; ++i) {
-        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
-            ggml_metal_op_concurrency_reset(ctx);
-            break;
-        }
-    }
 
     return 3;
 }
@@ -3771,25 +3792,47 @@ int ggml_metal_op_rmsnorm_qmv_multi_try(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_x     = ggml_metal_get_buffer_id(norm->src[0]);
     ggml_metal_buffer_id bid_normw = ggml_metal_get_buffer_id(mul->src[1]);
 
-    auto pipeline = ggml_metal_library_get_pipeline_rmsnorm_qmv_multi(ctx->lib, qtype, n);
+    // v3: same scratch-reuse trick as the single-consumer path -- see its comment.
+    ggml_metal_buffer_id bid_scale = ggml_metal_get_buffer_id(norm);
+    if (bid_scale.metal == bid_x.metal) {
+        return 0;
+    }
 
     ggml_metal_encoder_t enc = ctx->enc;
 
+    // conservative: guard against prior, unrelated work racing with the dispatches below (see
+    // single-consumer path's identical comment for why this is enough -- the generic caller
+    // registers OUR ranges for whatever comes after once we return n_fuse).
+    ggml_metal_op_concurrency_reset(ctx);
+
+    {
+        ggml_metal_kargs_rmsnorm_qmv scale_args = { args.ne00, 0, 0, args.eps };
+        auto pipeline_scale = ggml_metal_library_get_pipeline_rmsnorm_scale(ctx->lib);
+        ggml_metal_encoder_set_pipeline(enc, pipeline_scale);
+        ggml_metal_encoder_set_bytes   (enc, &scale_args, sizeof(scale_args), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_x,     1);
+        ggml_metal_encoder_set_buffer  (enc, bid_scale, 2);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, 32 * sizeof(float), 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 128, 1, 1);
+    }
+
+    // sync: the n matvec dispatches below read bid_scale, must see the write above complete first
+    ggml_metal_op_concurrency_reset(ctx);
+
+    auto pipeline = ggml_metal_library_get_pipeline_rmsnorm_qmv_multi(ctx->lib, qtype, n);
+
     ggml_metal_encoder_set_pipeline(enc, pipeline);
-    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, bid_src0[0], 1);
     ggml_metal_encoder_set_buffer  (enc, bid_src0[1], 2);
     ggml_metal_encoder_set_buffer  (enc, bid_src0[2], 3);
     ggml_metal_encoder_set_buffer  (enc, bid_src0[3], 4);
     ggml_metal_encoder_set_buffer  (enc, bid_x,       5);
     ggml_metal_encoder_set_buffer  (enc, bid_normw,   6);
-    ggml_metal_encoder_set_buffer  (enc, bid_dst[0],  7);
-    ggml_metal_encoder_set_buffer  (enc, bid_dst[1],  8);
-    ggml_metal_encoder_set_buffer  (enc, bid_dst[2],  9);
-    ggml_metal_encoder_set_buffer  (enc, bid_dst[3], 10);
-
-    // v2: no threadgroup-staged normed vector -- only the small reduction scratch remains.
-    ggml_metal_encoder_set_threadgroup_memory_size(enc, 32 * sizeof(float), 0);
+    ggml_metal_encoder_set_buffer  (enc, bid_scale,   7);
+    ggml_metal_encoder_set_buffer  (enc, bid_dst[0],  8);
+    ggml_metal_encoder_set_buffer  (enc, bid_dst[1],  9);
+    ggml_metal_encoder_set_buffer  (enc, bid_dst[2], 10);
+    ggml_metal_encoder_set_buffer  (enc, bid_dst[3], 11);
 
     const int NSG_HOST = 2; // must match NSG_RMSNORM_QMV in ggml-metal.metal (== N_SG_Q1_0/Q2_0)
     const int NR0_HOST = 8; // must match NR0_RMSNORM_QMV in ggml-metal.metal (== N_R0_Q1_0/Q2_0)
@@ -3806,13 +3849,6 @@ int ggml_metal_op_rmsnorm_qmv_multi_try(ggml_metal_op_t ctx, int idx) {
 
         const int tg_k = (args.ne01[k] + rows_per_tg - 1) / rows_per_tg;
         ggml_metal_encoder_dispatch_threadgroups(enc, tg_k, 1, 1, NSG_HOST * 32, 1, 1);
-    }
-
-    for (int32_t i = 1; i < 2 + n; ++i) {
-        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
-            ggml_metal_op_concurrency_reset(ctx);
-            break;
-        }
     }
 
     return 2 + n;
