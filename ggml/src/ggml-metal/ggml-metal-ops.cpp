@@ -245,6 +245,22 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         if (ctx->debug_graph > 0) {
             GGML_LOG_DEBUG("%s: node[%5d] - %-12s %-12s %s\n", __func__, idx, ggml_op_name(node->op), ggml_get_name(node), is_concurrent ? "(concurrent)" : "");
         }
+        // machine-parseable one-line-per-node dump for graph triage: op|name|dst dims|dst type|src0 dims/type|src1 dims/type
+        if (getenv("GGML_METAL_GRAPH_TSV")) {
+            char s0[128] = "-", s1[128] = "-";
+            if (node->src[0]) {
+                snprintf(s0, sizeof(s0), "%lld,%lld,%lld,%lld:%s", (long long) node->src[0]->ne[0], (long long) node->src[0]->ne[1],
+                    (long long) node->src[0]->ne[2], (long long) node->src[0]->ne[3], ggml_type_name(node->src[0]->type));
+            }
+            if (node->src[1]) {
+                snprintf(s1, sizeof(s1), "%lld,%lld,%lld,%lld:%s", (long long) node->src[1]->ne[0], (long long) node->src[1]->ne[1],
+                    (long long) node->src[1]->ne[2], (long long) node->src[1]->ne[3], ggml_type_name(node->src[1]->type));
+            }
+            GGML_LOG_ERROR("GRAPH_TSV\t%d\t%s\t%s\t%lld,%lld,%lld,%lld:%s\t%s\t%s\n",
+                idx, ggml_op_name(node->op), ggml_get_name(node),
+                (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3],
+                ggml_type_name(node->type), s0, s1);
+        }
         if (ctx->debug_graph > 1) {
             GGML_TENSOR_LOCALS( int64_t, ne0, node->src[0], ne);
             GGML_TENSOR_LOCALS(uint64_t, nb0, node->src[0], nb);
