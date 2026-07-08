@@ -3983,26 +3983,52 @@ void kernel_rmsnorm_qmv_multi_impl(
         ax[row] = (device const block_t *) (src0 + row_idx * args.nb01[n]);
     }
 
-    float yl[16];
+    float yl_a[16];
+    float yl_b[16];
     float sumf[nr0] = {0.0f};
 
     const short ix = tiisg / 8;
     const short il = (tiisg % 8) * 16;
+    const int   step = N_SIMDWIDTH / 8; // 4
 
-    device const float * xb = x      + ix * QK + il;
-    device const float * wb = norm_w + ix * QK + il;
+    device const float * xb_a = x      + ix * QK + il;
+    device const float * wb_a = norm_w + ix * QK + il;
+    device const float * xb_b = x      + (ix + step) * QK + il;
+    device const float * wb_b = norm_w + (ix + step) * QK + il;
 
-    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH / 8) {
-        float sumy = 0.0f;
+    // 2-blocks-per-iteration unroll: measured 1.13-1.29x on an isolated Q1_0 GEMV microbench
+    // (real ffn_gate-sized shape, M5 Pro) -- see q1-q2-bandwidth-efficiency-gap memory. Root
+    // cause: Q1_0/Q2_0 share identical QK=128 block size and NSG/NR0 tiling, so this loop runs
+    // the same iteration count for both; Q1_0's smaller per-block byte count (16B vs 32B) makes
+    // this loop's fixed per-iteration overhead (pointer arithmetic, loop control) a
+    // proportionally bigger tax. Halving iteration count for the same total work amortizes it.
+    int ib = ix;
+    for (; ib + step < nb; ib += 2 * step) {
+        float sumy_a = 0.0f, sumy_b = 0.0f;
         FOR_UNROLL (short i = 0; i < 16; i++) {
-            yl[i] = xb[i] * scale * wb[i];
-            sumy += yl[i];
+            yl_a[i] = xb_a[i] * scale * wb_a[i];
+            sumy_a += yl_a[i];
+            yl_b[i] = xb_b[i] * scale * wb_b[i];
+            sumy_b += yl_b[i];
         }
         FOR_UNROLL (short row = 0; row < nr0; row++) {
-            sumf[row] += block_q_n_dot_y(ax[row] + ib, sumy, yl, il);
+            sumf[row] += block_q_n_dot_y(ax[row] + ib,        sumy_a, yl_a, il);
+            sumf[row] += block_q_n_dot_y(ax[row] + ib + step, sumy_b, yl_b, il);
         }
-        xb += QK * (N_SIMDWIDTH / 8);
-        wb += QK * (N_SIMDWIDTH / 8);
+        xb_a += QK * 2 * step; wb_a += QK * 2 * step;
+        xb_b += QK * 2 * step; wb_b += QK * 2 * step;
+    }
+    // tail: at most one remaining block per lane-group when nb/step is odd
+    for (; ib < nb; ib += step) {
+        float sumy = 0.0f;
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            yl_a[i] = xb_a[i] * scale * wb_a[i];
+            sumy += yl_a[i];
+        }
+        FOR_UNROLL (short row = 0; row < nr0; row++) {
+            sumf[row] += block_q_n_dot_y(ax[row] + ib, sumy, yl_a, il);
+        }
+        xb_a += QK * step; wb_a += QK * step;
     }
 
     for (int row = 0; row < nr0; ++row) {
