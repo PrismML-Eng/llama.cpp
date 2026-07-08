@@ -206,6 +206,25 @@ tempted to "simplify" the design, re-read this section first.
    yet isolated as its own measured win (the tiny matmuls' own share of aggregate decode time is
    too small for `llama-bench`'s aggregate `tg128` to resolve it) — would need a targeted
    microbenchmark of just those dispatches to confirm.
+6. **Q1_0 2-blocks-per-iteration unroll — real isolated win, NO end-to-end win (negative
+   result, kept anyway).** Separate investigation: found Q1_0 (binary) decode gets ~21.5% LESS
+   implied bandwidth than Q2_0 (ternary) despite moving half the bytes — both share identical
+   `QK=128` block size and `NSG=2/NR0=8` tiling, so the decode loop runs the same iteration
+   count for both; Q1_0's smaller per-block byte count (16B vs 32B) makes fixed per-iteration
+   overhead a proportionally bigger tax. Prototyped a fix in isolation
+   (`bonsai-27b-megakernel` repo, `metal/q1_unroll_experiment.metal`): process 2 blocks per
+   loop body instead of 1. **Isolated microbenchmark: 1.13x-1.29x speedup**, verified correct,
+   stable across 4 repeated runs, real ffn_gate-sized shape. Ported the same technique into
+   `kernel_rmsnorm_qmv_multi_impl` (generic across Q1_0/Q2_0 via the existing `block_q_n_dot_y`
+   overload). Bit-exact on both checkpoints. **Real end-to-end measurement: NO consistent
+   direction across 3 repeated A/B runs** — statistically indistinguishable from before the
+   unroll. Kept the change (bit-exact, zero risk, may matter more on M5 Max where fixed
+   overhead is a larger fraction of a shorter per-token budget — untested, no M5 Max hardware
+   available) but this is explicitly NOT a demonstrated end-to-end win. See
+   `q1-q2-bandwidth-efficiency-gap` memory for full numbers. This is the clearest example in
+   this whole design history of "isolated benchmark ≠ end-to-end result" — even a real,
+   carefully-validated per-kernel speedup can vanish into noise if that kernel isn't a big
+   enough slice of total per-token time.
 
 ### Scheduling fix (separate from the fusion work, same branch)
 
