@@ -3776,35 +3776,48 @@ kernel void kernel_mul_mv_q2_0_f32(
 }
 
 // Fused RMS_NORM(x)*norm_w -> quantized mat-vec, batch=1 decode only.
-// Replaces two dispatches (kernel_rms_norm_mul_f32 + kernel_mul_mv_{q1_0,q2_0}_f32) with one:
-// the normed vector never leaves threadgroup memory. Reuses this file's own block_q1_0/
-// block_q2_0 dequant/dot-product primitives verbatim (block_q_n_dot_y overloads above) --
-// same NSG/NR0 simdgroup tiling convention as kernel_mul_mv_{q1_0,q2_0}_f32_impl.
-#define NSG_RMSNORM_QMV 4
+// REDESIGNED (v2): v1 staged the full ne00-element normed vector in THREADGROUP memory
+// (~20KB/threadgroup for ne00=5120) to avoid a device round-trip. Measured on real hardware:
+// that regressed tg128 decode ~38% (41.35->25.62 t/s) despite cutting node/barrier counts,
+// because a ~20KB threadgroup memory footprint caps occupancy to ~1 resident threadgroup/core
+// on Apple GPUs -- exactly wrong for a bandwidth-bound batch-1 decode kernel, where occupancy
+// is what hides DRAM latency while streaming the (much larger) quantized weight matrix.
+//
+// The v1 premise was wrong: eliminating "redundant" per-threadgroup reads of x/norm_w was
+// never the real saving -- x and norm_w are tiny (~20KB each) and stay resident in Apple
+// Silicon's SLC after the first touch, so every threadgroup re-reading them from "device"
+// memory is an L2-class cache hit, not DRAM traffic. The actual, real saving from fusion is
+// removing kernel_rms_norm_mul_f32's device-memory WRITE of the normed vector (and the
+// unfused mul_mv's corresponding first read of it) -- one dispatch instead of two, zero
+// extra threadgroup memory. v2: compute the norm SCALE once per threadgroup (tiny reduction,
+// unchanged from v1) but never materialize the normed vector anywhere -- apply
+// x[i]*scale*norm_w[i] inline at the same point kernel_mul_mv_{q1_0,q2_0}_f32_impl reads y[i],
+// reading x/norm_w straight from device memory exactly like that kernel does. Threadgroup
+// memory drops from ~20KB to 128 bytes (the reduction scratch only) -- occupancy should now
+// match the baseline kernel's. NSG/NR0 also switched from an arbitrary 4/8 to match upstream's
+// proven-tuned N_SG_Q1_0/N_SG_Q2_0=2, N_R0_Q1_0/N_R0_Q2_0=8 for this exact quant format.
+#define NSG_RMSNORM_QMV 2
 #define NR0_RMSNORM_QMV 8
 
-template<typename block_t, int QK, int nr0>
-void kernel_rmsnorm_qmv_impl(
-        constant ggml_metal_kargs_rmsnorm_qmv & args,
-        device const char  * src0,   // quantized weight [ne00, ne01]
-        device const float * x,      // [ne00]
-        device const float * norm_w, // [ne00]
-        device       float * dst,    // [ne01]
-        threadgroup  float * xn,     // ne00 floats
-        threadgroup  float * red,    // >= 32 floats
+// Shared norm-scale reduction: collaboratively computes 1/sqrt(mean(x^2)+eps) across the whole
+// threadgroup. Reads x straight from device memory (cache-resident after first touch, see
+// comment above) -- writes nothing, returns the scalar in every thread.
+inline float rmsnorm_scale(
+        device const float * x,
+        int32_t ne00,
+        float eps,
+        threadgroup float * red, // >= 32 floats
         ushort3 tpitg,
         ushort3 ntg,
         ushort  tiisg,
-        ushort  sgitg,
-        ushort  sgpg,   // simdgroups per threadgroup (== NSG_RMSNORM_QMV at dispatch)
-        uint    tgx) {
+        ushort  sgitg) {
     if (sgitg == 0) {
         red[tiisg] = 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float sumsq = 0.0f;
-    for (int i = tpitg.x; i < args.ne00; i += ntg.x) {
+    for (int i = tpitg.x; i < ne00; i += ntg.x) {
         const float v = x[i];
         sumsq += v * v;
     }
@@ -3818,12 +3831,24 @@ void kernel_rmsnorm_qmv_impl(
     float total = red[tiisg];
     total = simd_sum(total);
 
-    const float scale = 1.0f / sqrt(total / (float) args.ne00 + args.eps);
+    return 1.0f / sqrt(total / (float) ne00 + eps);
+}
 
-    for (int i = tpitg.x; i < args.ne00; i += ntg.x) {
-        xn[i] = x[i] * scale * norm_w[i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+template<typename block_t, int QK, int nr0>
+void kernel_rmsnorm_qmv_impl(
+        constant ggml_metal_kargs_rmsnorm_qmv & args,
+        device const char  * src0,   // quantized weight [ne00, ne01]
+        device const float * x,      // [ne00]
+        device const float * norm_w, // [ne00]
+        device       float * dst,    // [ne01]
+        threadgroup  float * red,    // >= 32 floats
+        ushort3 tpitg,
+        ushort3 ntg,
+        ushort  tiisg,
+        ushort  sgitg,
+        ushort  sgpg,   // simdgroups per threadgroup (== NSG_RMSNORM_QMV at dispatch)
+        uint    tgx) {
+    const float scale = rmsnorm_scale(x, args.ne00, args.eps, red, tpitg, ntg, tiisg, sgitg);
 
     const int nb = args.ne00 / QK;
     const int first_row = (int(tgx) * sgpg + sgitg) * nr0;
@@ -3840,18 +3865,20 @@ void kernel_rmsnorm_qmv_impl(
     const short ix = tiisg / 8;
     const short il = (tiisg % 8) * 16;
 
-    threadgroup const float * yb = xn + ix * QK + il;
+    device const float * xb = x      + ix * QK + il;
+    device const float * wb = norm_w + ix * QK + il;
 
     for (int ib = ix; ib < nb; ib += N_SIMDWIDTH / 8) {
         float sumy = 0.0f;
         FOR_UNROLL (short i = 0; i < 16; i++) {
-            yl[i] = yb[i];
-            sumy += yb[i];
+            yl[i] = xb[i] * scale * wb[i];
+            sumy += yl[i];
         }
         FOR_UNROLL (short row = 0; row < nr0; row++) {
             sumf[row] += block_q_n_dot_y(ax[row] + ib, sumy, yl, il);
         }
-        yb += QK * (N_SIMDWIDTH / 8);
+        xb += QK * (N_SIMDWIDTH / 8);
+        wb += QK * (N_SIMDWIDTH / 8);
     }
 
     for (int row = 0; row < nr0; ++row) {
@@ -3869,15 +3896,14 @@ kernel void kernel_rmsnorm_mv_q1_0_f32(
         device const float * x                            [[buffer(2)]],
         device const float * norm_w                       [[buffer(3)]],
         device       float * dst                          [[buffer(4)]],
-        threadgroup  float * xn                            [[threadgroup(0)]],
-        threadgroup  float * red                           [[threadgroup(1)]],
+        threadgroup  float * red                           [[threadgroup(0)]],
         uint3   tgpig [[threadgroup_position_in_grid]],
         ushort3 tpitg [[thread_position_in_threadgroup]],
         ushort3 ntg   [[threads_per_threadgroup]],
         ushort  tiisg [[thread_index_in_simdgroup]],
         ushort  sgitg [[simdgroup_index_in_threadgroup]]) {
     kernel_rmsnorm_qmv_impl<block_q1_0, QK1_0, NR0_RMSNORM_QMV>(
-        args, src0, x, norm_w, dst, xn, red, tpitg, ntg, tiisg, sgitg, NSG_RMSNORM_QMV, tgpig.x);
+        args, src0, x, norm_w, dst, red, tpitg, ntg, tiisg, sgitg, NSG_RMSNORM_QMV, tgpig.x);
 }
 
 [[host_name("kernel_rmsnorm_mv_q2_0_f32")]]
@@ -3887,24 +3913,26 @@ kernel void kernel_rmsnorm_mv_q2_0_f32(
         device const float * x                            [[buffer(2)]],
         device const float * norm_w                       [[buffer(3)]],
         device       float * dst                          [[buffer(4)]],
-        threadgroup  float * xn                            [[threadgroup(0)]],
-        threadgroup  float * red                           [[threadgroup(1)]],
+        threadgroup  float * red                           [[threadgroup(0)]],
         uint3   tgpig [[threadgroup_position_in_grid]],
         ushort3 tpitg [[thread_position_in_threadgroup]],
         ushort3 ntg   [[threads_per_threadgroup]],
         ushort  tiisg [[thread_index_in_simdgroup]],
         ushort  sgitg [[simdgroup_index_in_threadgroup]]) {
     kernel_rmsnorm_qmv_impl<block_q2_0, QK2_0, NR0_RMSNORM_QMV>(
-        args, src0, x, norm_w, dst, xn, red, tpitg, ntg, tiisg, sgitg, NSG_RMSNORM_QMV, tgpig.x);
+        args, src0, x, norm_w, dst, red, tpitg, ntg, tiisg, sgitg, NSG_RMSNORM_QMV, tgpig.x);
 }
 
 // Multi-consumer generalization: ONE shared RMSNorm(x)*norm_w feeds N independently-shaped
 // quantized mat-vecs (gate+up MLP N=2, wqkv+wqkv_gate GDN input N=2, attention QKV-family
 // N=3/4 -- exact fan-outs measured live on Bonsai-27B, see bonsai-27b-megakernel-repo memory).
 // Grid: tgpig.y selects which of the N (weight, dst) pairs this threadgroup serves; tgpig.x
-// tiles that matrix's output rows. The norm is recomputed redundantly per y-slot (cheap --
-// O(ne00) vs the O(ne00*ne01) matvec it feeds) in exchange for N-1 fewer kernel dispatches and
-// N-1 fewer device-memory round-trips of the shared normed vector.
+// tiles that matrix's output rows. `args.which` selects the sibling THIS dispatch serves --
+// dispatched once per sibling with a grid sized to that sibling's own ne01 (see host-side
+// comment: a uniform (max_tg, N) grid wasted >99% of threadgroups when siblings are wildly
+// imbalanced, e.g. observed ne01=[10240,48,48,6144] on one real fusion site). Norm SCALE only
+// (no threadgroup-staged vector), x/norm_w read straight from device memory, recomputed
+// redundantly per dispatch (cheap scalar reduction vs the O(ne00*ne01) matvec it feeds).
 template<typename block_t, int QK, int nr0, int N>
 void kernel_rmsnorm_qmv_multi_impl(
         constant ggml_metal_kargs_rmsnorm_qmv_multi & args,
@@ -3912,7 +3940,6 @@ void kernel_rmsnorm_qmv_multi_impl(
         device const float * x,
         device const float * norm_w,
         device       float * dsts[N],
-        threadgroup  float * xn,
         threadgroup  float * red,
         ushort3 tpitg,
         ushort3 ntg,
@@ -3920,34 +3947,9 @@ void kernel_rmsnorm_qmv_multi_impl(
         ushort  sgitg,
         ushort  sgpg,
         uint3   tgpig) {
-    if (sgitg == 0) {
-        red[tiisg] = 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float scale = rmsnorm_scale(x, args.ne00, args.eps, red, tpitg, ntg, tiisg, sgitg);
 
-    float sumsq = 0.0f;
-    for (int i = tpitg.x; i < args.ne00; i += ntg.x) {
-        const float v = x[i];
-        sumsq += v * v;
-    }
-    sumsq = simd_sum(sumsq);
-
-    if (tiisg == 0) {
-        red[sgitg] = sumsq;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float total = red[tiisg];
-    total = simd_sum(total);
-
-    const float scale = 1.0f / sqrt(total / (float) args.ne00 + args.eps);
-
-    for (int i = tpitg.x; i < args.ne00; i += ntg.x) {
-        xn[i] = x[i] * scale * norm_w[i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint n = tgpig.y; // which (weight, dst) pair, 0..N-1
+    const uint n = (uint) args.which;
     if (n >= (uint) N || args.ne01[n] <= 0) {
         return;
     }
@@ -3970,18 +3972,20 @@ void kernel_rmsnorm_qmv_multi_impl(
     const short ix = tiisg / 8;
     const short il = (tiisg % 8) * 16;
 
-    threadgroup const float * yb = xn + ix * QK + il;
+    device const float * xb = x      + ix * QK + il;
+    device const float * wb = norm_w + ix * QK + il;
 
     for (int ib = ix; ib < nb; ib += N_SIMDWIDTH / 8) {
         float sumy = 0.0f;
         FOR_UNROLL (short i = 0; i < 16; i++) {
-            yl[i] = yb[i];
-            sumy += yb[i];
+            yl[i] = xb[i] * scale * wb[i];
+            sumy += yl[i];
         }
         FOR_UNROLL (short row = 0; row < nr0; row++) {
             sumf[row] += block_q_n_dot_y(ax[row] + ib, sumy, yl, il);
         }
-        yb += QK * (N_SIMDWIDTH / 8);
+        xb += QK * (N_SIMDWIDTH / 8);
+        wb += QK * (N_SIMDWIDTH / 8);
     }
 
     for (int row = 0; row < nr0; ++row) {
@@ -4006,8 +4010,7 @@ kernel void NAME( \
         device       float * dst_1  [[buffer(8)]], \
         device       float * dst_2  [[buffer(9)]], \
         device       float * dst_3  [[buffer(10)]], \
-        threadgroup  float * xn     [[threadgroup(0)]], \
-        threadgroup  float * red    [[threadgroup(1)]], \
+        threadgroup  float * red    [[threadgroup(0)]], \
         uint3   tgpig [[threadgroup_position_in_grid]], \
         ushort3 tpitg [[thread_position_in_threadgroup]], \
         ushort3 ntg   [[threads_per_threadgroup]], \
@@ -4016,7 +4019,7 @@ kernel void NAME( \
     device const char * srcs[4] = { src0_0, src0_1, src0_2, src0_3 }; \
     device float * dsts[4] = { dst_0, dst_1, dst_2, dst_3 }; \
     kernel_rmsnorm_qmv_multi_impl<BLOCK_T, QK, NR0_RMSNORM_QMV, N>( \
-        args, srcs, x, norm_w, dsts, xn, red, tpitg, ntg, tiisg, sgitg, NSG_RMSNORM_QMV, tgpig); \
+        args, srcs, x, norm_w, dsts, red, tpitg, ntg, tiisg, sgitg, NSG_RMSNORM_QMV, tgpig); \
 }
 
 QMV_MULTI_KERNEL(kernel_rmsnorm_mv2_q1_0_f32, block_q1_0, QK1_0, 2)

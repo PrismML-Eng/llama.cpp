@@ -3628,11 +3628,12 @@ int ggml_metal_op_rmsnorm_qmv_try(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, bid_normw,  3);
     ggml_metal_encoder_set_buffer  (enc, bid_dst,    4);
 
-    ggml_metal_encoder_set_threadgroup_memory_size(enc, args.ne00 * sizeof(float), 0);
-    ggml_metal_encoder_set_threadgroup_memory_size(enc, 32 * sizeof(float), 1);
+    // v2: no threadgroup-staged normed vector (see ggml-metal.metal comment) -- only the small
+    // reduction scratch remains, at threadgroup(0) now that xn is gone.
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, 32 * sizeof(float), 0);
 
-    const int NSG_HOST = 4; // must match NSG_RMSNORM_QMV in ggml-metal.metal
-    const int NR0_HOST = 8; // must match NR0_RMSNORM_QMV in ggml-metal.metal
+    const int NSG_HOST = 2; // must match NSG_RMSNORM_QMV in ggml-metal.metal (== N_SG_Q1_0/Q2_0)
+    const int NR0_HOST = 8; // must match NR0_RMSNORM_QMV in ggml-metal.metal (== N_R0_Q1_0/Q2_0)
 
     const int rows_per_tg = NSG_HOST * NR0_HOST;
     const int num_tg      = (args.ne01 + rows_per_tg - 1) / rows_per_tg;
@@ -3735,7 +3736,13 @@ int ggml_metal_op_rmsnorm_qmv_multi_try(ggml_metal_op_t ctx, int idx) {
     }
 
     if (trace) {
-        GGML_LOG_DEBUG("%s: idx=%d MATCHED n=%d qtype=%s\n", __func__, idx, n, ggml_type_name(qtype));
+        char ne01buf[128] = {};
+        for (int32_t k = 0; k < n; ++k) {
+            char tmp[32];
+            snprintf(tmp, sizeof(tmp), "%s%lld", k ? "," : "", (long long) mms[k]->src[0]->ne[1]);
+            strncat(ne01buf, tmp, sizeof(ne01buf) - strlen(ne01buf) - 1);
+        }
+        GGML_LOG_DEBUG("%s: idx=%d MATCHED n=%d qtype=%s ne01=[%s]\n", __func__, idx, n, ggml_type_name(qtype), ne01buf);
     }
 
     float eps;
@@ -3781,19 +3788,25 @@ int ggml_metal_op_rmsnorm_qmv_multi_try(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, bid_dst[2],  9);
     ggml_metal_encoder_set_buffer  (enc, bid_dst[3], 10);
 
-    ggml_metal_encoder_set_threadgroup_memory_size(enc, args.ne00 * sizeof(float), 0);
-    ggml_metal_encoder_set_threadgroup_memory_size(enc, 32 * sizeof(float), 1);
+    // v2: no threadgroup-staged normed vector -- only the small reduction scratch remains.
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, 32 * sizeof(float), 0);
 
-    const int NSG_HOST = 4; // must match NSG_RMSNORM_QMV in ggml-metal.metal
-    const int NR0_HOST = 8; // must match NR0_RMSNORM_QMV in ggml-metal.metal
+    const int NSG_HOST = 2; // must match NSG_RMSNORM_QMV in ggml-metal.metal (== N_SG_Q1_0/Q2_0)
+    const int NR0_HOST = 8; // must match NR0_RMSNORM_QMV in ggml-metal.metal (== N_R0_Q1_0/Q2_0)
     const int rows_per_tg = NSG_HOST * NR0_HOST;
 
-    int max_tg = 0;
+    // Dispatch once per sibling, each with a grid sized to THAT sibling's own ne01 -- a
+    // uniform (max_tg, n) grid wastes threadgroups (up to >99% observed) whenever siblings are
+    // imbalanced, since every dispatched threadgroup pays a full norm reduction regardless of
+    // whether it's in-bounds. Same pipeline/bind state reused across the n calls (cheap --
+    // no PSO rebind, just a bytes update + dispatch).
     for (int32_t k = 0; k < n; ++k) {
-        max_tg = std::max(max_tg, (args.ne01[k] + rows_per_tg - 1) / rows_per_tg);
-    }
+        args.which = k;
+        ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, max_tg, n, 1, NSG_HOST * 32, 1, 1);
+        const int tg_k = (args.ne01[k] + rows_per_tg - 1) / rows_per_tg;
+        ggml_metal_encoder_dispatch_threadgroups(enc, tg_k, 1, 1, NSG_HOST * 32, 1, 1);
+    }
 
     for (int32_t i = 1; i < 2 + n; ++i) {
         if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {

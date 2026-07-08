@@ -580,11 +580,16 @@ typedef struct {
 // weight_n [ne00, ne01[n]] -> dst_n [ne01[n]]. Real fan-outs observed on Bonsai-27B
 // (Qwen3-Next hybrid): gate+up MLP (N=2), wqkv+wqkv_gate GDN input (N=2),
 // q/k/v-family attention input (N=3,4) -- see bonsai-27b-megakernel-repo memory.
+// v2: dispatched ONCE per sibling (`which` selects it) with a grid sized to THAT sibling's
+// own ne01, not a uniform (max_tg, N) grid -- real fan-outs are wildly imbalanced (observed
+// [10240,48,48,6144] on one site), and a uniform grid wasted >99% of threadgroups on the small
+// siblings (each still paying a full norm reduction before exiting on the row-bounds check).
 typedef struct {
     int32_t  ne00;
     int32_t  ne01[4];
     uint64_t nb01[4];
     float    eps;
+    int32_t  which; // which sibling this dispatch serves, 0..n-1
 } ggml_metal_kargs_rmsnorm_qmv_multi;
 
 typedef struct {
