@@ -8,6 +8,7 @@
 #include "llama-io.h"
 #include "llama-kv-cache.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -324,8 +325,16 @@ llama_context::llama_context(
         if (params.path_kv_mean_center != nullptr) {
             auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
             if (!kv) {
+                // hybrid (recurrent + attention) models keep a standard KV cache for their
+                // attention sublayers; center that one. bias tensors are matched by model
+                // layer id, so layers absent from the attention cache are simply skipped.
+                if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+                    kv = hyb->get_mem_attn();
+                }
+            }
+            if (!kv) {
                 throw std::runtime_error("path_kv_mean_center is only supported for the standard KV cache "
-                        "(not recurrent, hybrid or MLA/DSA memory types)");
+                        "(not recurrent or MLA/DSA memory types)");
             }
             if (!kv->load_kv_mean_center(params.path_kv_mean_center)) {
                 throw std::runtime_error("failed to load K-cache mean-centering bias file");
