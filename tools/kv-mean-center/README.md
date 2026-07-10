@@ -41,16 +41,35 @@ at inference time with:
 `--kv-mean-center` requires `--cache-type-k q4_0`; loading fails with a clear error otherwise
 (centering is currently only implemented/validated for `GGML_TYPE_Q4_0`).
 
-**Warning: do not combine centering with the Hadamard K-cache rotation.** If the K cache also has
-this fork's optional Hadamard rotation feature active (automatic for `GGML_TYPE_Q4_0` caches whose
-head dimension is a multiple of 64, unless `LLAMA_ATTN_ROT_DISABLE=1`), the bias measured here is
-taken in the pre-rotation basis, since that is where the model's `Kcur` tensor naturally sits
-before the rotation is applied, while the centering subtraction happens in whatever basis
-`cpy_k()` sees (post-rotation, if active). That stays exactly safe for attention logits (see
-docs/kv-mean-center.md), but measured end-to-end it is worse than either feature alone: after
-rotation the true per-channel means are near zero, so subtracting the pre-rotation bias injects a
-spurious offset instead of removing one. On a hybrid-attention model with a Q4_0 K cache the
-logit KL divergence vs an F16 cache was 0.00144 with rotation alone, 0.00149 with centering alone
-(rotation disabled), and 0.0020-0.0021 with both. Use centering only where the rotation is not
-active; recalibrating directly against the post-rotation representation is the natural follow-up
-that would let the two compose.
+## Interaction with the Hadamard K-cache rotation: calibrate with matching cache settings
+
+This fork's optional Hadamard rotation is active for quantized K caches whose head dimension is a
+multiple of 64 (unless `LLAMA_ATTN_ROT_DISABLE=1`). The bias measured by this tool lives in
+whatever basis the calibration run's K cache used: the collector taps the exact tensor `cpy_k()`
+writes, after any rotation. Since the rotation is gated on the K cache being quantized, a
+calibration run with the default F16 cache measures the unrotated basis, and that bias must not be
+applied to a rotated (quantized) cache: measured end to end the mismatch is worse than either
+feature alone, because the subtracted vector no longer matches the channel means of the basis
+being quantized.
+
+**Rule: calibrate with the same `--cache-type-k` (and `LLAMA_ATTN_ROT_DISABLE`, if any) that you
+will serve with.** For the common case that is:
+
+```
+./llama-kv-mean-center -m model.gguf -f calib.txt -o kv-mean-center.gguf -ctk q4_0 [-fa on]
+```
+
+The tool records the calibration basis in the output file (`kv_mean_center.k_rot`) and the loader
+refuses a bias whose basis does not match the inference-time rotation state, so a mismatch fails
+fast instead of silently degrading quality. Measured on a hybrid-attention model, Q4_0 K cache,
+logit KL divergence vs an F16-cache baseline over 12x512-token held-out chunks:
+
+| configuration | mean KLD |
+| --- | --- |
+| rotation alone (uncentered) | 0.00144 |
+| centering alone (rotation disabled, matched basis) | 0.00149 |
+| rotation + pre-rotation bias (the mismatch, now rejected) | 0.0020-0.0021 |
+| rotation + rotated-basis bias (calibrated with `-ctk q4_0`) | **0.00111** |
+
+The two features compose once the basis matches, and the composed configuration is the best of
+the four.

@@ -1411,6 +1411,32 @@ bool llama_kv_cache::load_kv_mean_center(const char * path, bool require_q4_0) {
         return false;
     }
 
+    // the bias is only valid in the basis it was measured in: a bias calibrated with the
+    // Hadamard K-cache rotation active must be applied with the rotation active, and vice
+    // versa. a mismatched basis measurably degrades quantization quality instead of
+    // improving it (see tools/kv-mean-center/README.md), so refuse it outright.
+    {
+        const int64_t idx_k_rot = gguf_find_key(ctx_gguf, "kv_mean_center.k_rot");
+        if (idx_k_rot >= 0) {
+            const bool bias_k_rot = gguf_get_val_bool(ctx_gguf, idx_k_rot);
+            if (bias_k_rot != attn_rot_k) {
+                LLAMA_LOG_ERROR("%s: bias file %s was calibrated with the K-cache rotation %s, but it is %s "
+                        "for this context - recalibrate with matching cache settings "
+                        "(or set LLAMA_ATTN_ROT_DISABLE=1 consistently in both)\n",
+                        __func__, path,
+                        bias_k_rot  ? "active" : "inactive",
+                        attn_rot_k ? "active" : "inactive");
+                gguf_free(ctx_gguf);
+                ggml_free(ctx_data);
+                return false;
+            }
+        } else {
+            LLAMA_LOG_WARN("%s: bias file %s does not record its calibration basis (kv_mean_center.k_rot); "
+                    "K-cache rotation is %s for this context - a basis mismatch degrades quality\n",
+                    __func__, path, attn_rot_k ? "active" : "inactive");
+        }
+    }
+
     k_bar.resize(layers.size(), nullptr);
 
     // one ggml context (+ backend buffer) per unique buffer type, so each bias tensor ends up
