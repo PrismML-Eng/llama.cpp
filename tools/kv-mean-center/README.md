@@ -41,11 +41,16 @@ at inference time with:
 `--kv-mean-center` requires `--cache-type-k q4_0`; loading fails with a clear error otherwise
 (centering is currently only implemented/validated for `GGML_TYPE_Q4_0`).
 
-Note: if the K cache also has this fork's optional Hadamard rotation feature active (automatic for
-`GGML_TYPE_Q4_0` caches whose head dimension is a multiple of 64, unless `LLAMA_ATTN_ROT_DISABLE=1`),
-the bias measured here is taken in the pre-rotation basis, since that is where the model's `Kcur`
-tensor naturally sits before the rotation is applied. The centering subtraction still happens in
-whatever basis `cpy_k()` sees (post-rotation, if active), which remains exactly safe (see
-docs/kv-mean-center.md), but a mismatched basis means the calibrated bias is a less accurate
-estimate of that channel's true post-rotation mean. Recalibrating directly against the
-post-rotation representation is a natural follow-up.
+**Warning: do not combine centering with the Hadamard K-cache rotation.** If the K cache also has
+this fork's optional Hadamard rotation feature active (automatic for `GGML_TYPE_Q4_0` caches whose
+head dimension is a multiple of 64, unless `LLAMA_ATTN_ROT_DISABLE=1`), the bias measured here is
+taken in the pre-rotation basis, since that is where the model's `Kcur` tensor naturally sits
+before the rotation is applied, while the centering subtraction happens in whatever basis
+`cpy_k()` sees (post-rotation, if active). That stays exactly safe for attention logits (see
+docs/kv-mean-center.md), but measured end-to-end it is worse than either feature alone: after
+rotation the true per-channel means are near zero, so subtracting the pre-rotation bias injects a
+spurious offset instead of removing one. On a hybrid-attention model with a Q4_0 K cache the
+logit KL divergence vs an F16 cache was 0.00144 with rotation alone, 0.00149 with centering alone
+(rotation disabled), and 0.0020-0.0021 with both. Use centering only where the rotation is not
+active; recalibrating directly against the post-rotation representation is the natural follow-up
+that would let the two compose.
