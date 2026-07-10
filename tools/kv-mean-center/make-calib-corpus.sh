@@ -5,26 +5,35 @@
 # Usage:
 #   make-calib-corpus.sh -s <llama-server binary> -m <model.gguf> -o <corpus.txt>
 #                        [-n <tokens per prompt, default 600>] [-p <port, default 8901>]
+#                        [-g <n-gpu-layers, passed through to llama-server>]
 #
-# Requires: curl, jq. Starts a temporary llama-server on the given port, generates
-# one response per built-in seed prompt with thinking disabled, concatenates the
-# responses, and checks the result is not degenerate (gzip compression ratio).
+# Requires: curl, jq, gzip. Starts a temporary llama-server on the given port,
+# generates one response per built-in seed prompt with thinking disabled,
+# concatenates the responses, and checks the result is not degenerate (gzip
+# compression ratio).
 set -euo pipefail
+
+# Print the header comment block (everything between the shebang and the first
+# non-comment line) as the help text.
+usage() { awk 'NR == 1 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "$0"; }
 
 NTOK=600
 PORT=8901
 SERVER_BIN=""
 MODEL=""
 OUT=""
+NGL=""
 
-while getopts "s:m:o:n:p:h" opt; do
+while getopts "s:m:o:n:p:g:h" opt; do
   case $opt in
     s) SERVER_BIN=$OPTARG ;;
     m) MODEL=$OPTARG ;;
     o) OUT=$OPTARG ;;
     n) NTOK=$OPTARG ;;
     p) PORT=$OPTARG ;;
-    h|*) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    g) NGL=$OPTARG ;;
+    h) usage; exit 0 ;;
+    *) usage >&2; exit 1 ;;
   esac
 done
 
@@ -34,6 +43,7 @@ if [ -z "$SERVER_BIN" ] || [ -z "$MODEL" ] || [ -z "$OUT" ]; then
 fi
 command -v curl >/dev/null || { echo "error: curl not found" >&2; exit 1; }
 command -v jq   >/dev/null || { echo "error: jq not found" >&2; exit 1; }
+command -v gzip >/dev/null || { echo "error: gzip not found" >&2; exit 1; }
 
 # Diverse seed prompts: expository, narrative, technical, code, dialogue, instructional.
 PROMPTS=(
@@ -73,7 +83,8 @@ cleanup() {
 trap cleanup EXIT
 
 echo "starting llama-server on port $PORT ..." >&2
-"$SERVER_BIN" -m "$MODEL" -ngl 99 --port "$PORT" >/dev/null 2>&1 &
+# NGL is optional; when unset the server's own --n-gpu-layers default applies.
+"$SERVER_BIN" -m "$MODEL" ${NGL:+-ngl "$NGL"} --port "$PORT" >/dev/null 2>&1 &
 SERVER_PID=$!
 
 for _ in $(seq 1 120); do
