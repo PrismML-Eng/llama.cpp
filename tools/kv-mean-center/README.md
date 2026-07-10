@@ -31,6 +31,22 @@ values right before they would be written into the cache.
 * `--chunks` maximum number of chunks to process (default: all available).
 * `-ngl | --n-gpu-layers` offload layers to GPU for faster calibration.
 
+If you do not have a calibration corpus at hand, `make-calib-corpus.sh` generates one from the
+model itself, so no external data file is needed:
+
+```
+./tools/kv-mean-center/make-calib-corpus.sh \
+    -s ./llama-server -m model.gguf -o calib-corpus.txt
+```
+
+It starts a temporary `llama-server`, generates one response per built-in seed prompt (a mix of
+expository, narrative, technical, code and dialogue prompts) with thinking disabled, and refuses
+to write a corpus that looks degenerate (checked via gzip compression ratio). The per-channel K
+mean is dominated by model-intrinsic channel structure rather than corpus content, so
+self-generated text measures the same bias as an external corpus: in an A/B test, a self-generated
+corpus and a standard multi-domain calibration set produced biases agreeing to within the
+calibration sampling noise (cosine similarity above 0.95 on every layer).
+
 The output is a small GGUF file with one F32 tensor per layer, named `kv_bar.blk.<il>.k`. Load it
 at inference time with:
 
