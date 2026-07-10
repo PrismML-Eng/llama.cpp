@@ -236,14 +236,16 @@ static void test_q4_0_gate() {
 
     // F16 K cache + --kv-mean-center must be rejected outright (llama_init_from_model returns
     // nullptr), matching this codebase's convention for other cache-type-gated mismatches (e.g.
-    // "V cache quantization requires flash_attn")
-    llama_context_ptr ctx_bad = build_context(model.get(), GGML_TYPE_F16, tmp_path.c_str());
+    // "V cache quantization requires flash_attn"). use a basis-matching file (F16 cache means
+    // the rotation is off, so k_rot=false matches) so this exercises the cache-type gate
+    // specifically, not the basis check
+    const std::string tmp_path_unrot = "test-kv-mean-center-gate-unrot.gguf";
+    TEST_ASSERT(common_kv_mean_center_write(tmp_path_unrot, layers, /*k_rot=*/false));
+    llama_context_ptr ctx_bad = build_context(model.get(), GGML_TYPE_F16, tmp_path_unrot.c_str());
     TEST_ASSERT(ctx_bad == nullptr);
 
     // a bias measured in the unrotated basis must be rejected by a rotated (Q4_0) K cache:
     // a basis mismatch degrades quantization quality instead of improving it
-    const std::string tmp_path_unrot = "test-kv-mean-center-gate-unrot.gguf";
-    TEST_ASSERT(common_kv_mean_center_write(tmp_path_unrot, layers, /*k_rot=*/false));
     llama_context_ptr ctx_mismatch = build_context(model.get(), GGML_TYPE_Q4_0, tmp_path_unrot.c_str());
     TEST_ASSERT(ctx_mismatch == nullptr);
     remove(tmp_path_unrot.c_str());

@@ -1411,6 +1411,20 @@ bool llama_kv_cache::load_kv_mean_center(const char * path, bool require_q4_0) {
         return false;
     }
 
+    // validate the cache type first, so an unsupported cache type gets its actionable error
+    // even when the bias file's basis would also mismatch
+    if (require_q4_0) {
+        for (const auto & layer : layers) {
+            if (layer.k->type != GGML_TYPE_Q4_0) {
+                LLAMA_LOG_ERROR("%s: K-cache mean-centering requires K cache type %s, but layer %d has type %s\n",
+                        __func__, ggml_type_name(GGML_TYPE_Q4_0), layer.il, ggml_type_name(layer.k->type));
+                gguf_free(ctx_gguf);
+                ggml_free(ctx_data);
+                return false;
+            }
+        }
+    }
+
     // the bias is only valid in the basis it was measured in: a bias calibrated with the
     // Hadamard K-cache rotation active must be applied with the rotation active, and vice
     // versa. a mismatched basis measurably degrades quantization quality instead of
@@ -1418,6 +1432,13 @@ bool llama_kv_cache::load_kv_mean_center(const char * path, bool require_q4_0) {
     {
         const int64_t idx_k_rot = gguf_find_key(ctx_gguf, "kv_mean_center.k_rot");
         if (idx_k_rot >= 0) {
+            if (gguf_get_kv_type(ctx_gguf, idx_k_rot) != GGUF_TYPE_BOOL) {
+                LLAMA_LOG_ERROR("%s: bias file %s has a non-boolean kv_mean_center.k_rot key - malformed file\n",
+                        __func__, path);
+                gguf_free(ctx_gguf);
+                ggml_free(ctx_data);
+                return false;
+            }
             const bool bias_k_rot = gguf_get_val_bool(ctx_gguf, idx_k_rot);
             if (bias_k_rot != attn_rot_k) {
                 LLAMA_LOG_ERROR("%s: bias file %s was calibrated with the K-cache rotation %s, but it is %s "
@@ -1476,13 +1497,6 @@ bool llama_kv_cache::load_kv_mean_center(const char * path, bool require_q4_0) {
         if (!src) {
             // no bias provided for this layer - leave it uncentered
             continue;
-        }
-
-        if (require_q4_0 && layers[ikv].k->type != GGML_TYPE_Q4_0) {
-            LLAMA_LOG_ERROR("%s: K-cache mean-centering requires K cache type %s, but layer %d has type %s\n",
-                    __func__, ggml_type_name(GGML_TYPE_Q4_0), il, ggml_type_name(layers[ikv].k->type));
-            ok = false;
-            break;
         }
 
         if (src->type != GGML_TYPE_F32) {

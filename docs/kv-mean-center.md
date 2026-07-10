@@ -84,8 +84,9 @@ scheduler eval-callback mechanism `llama-imatrix` uses to capture activations). 
 
 - Only `GGML_TYPE_Q4_0` is supported; other K cache types are rejected. Generalizing the mechanism
   to other quantization types is future work.
-- The plain KV cache and the attention sub-cache of hybrid (recurrent + attention) models are
-  supported. Recurrent-only and MLA/DSA memory types are not.
+- Every standard-attention KV cache layout is supported: the plain cache, the base/SWA pair of
+  sliding-window models, and the attention sub-cache of hybrid (recurrent + attention) models,
+  with or without SWA. Recurrent-only and MLA/DSA memory types are not.
 - The calibration hook (`k_cache_in`) is currently only wired into the standard
   dense/GQA attention path (`llm_graph_context::build_attn(llm_graph_input_attn_kv *, ...)`),
   which covers the large majority of architectures. MLA and other specialized attention variants
