@@ -254,6 +254,15 @@ struct llama_hparams {
     bool     dspark_confidence_head              = false;
     bool     dspark_confidence_head_with_markov  = false;
 
+    // GIDD log-SNR / noise-level conditioning (LogSnrEmbed): sinusoidal
+    // featurization of a per-position log-SNR value, run through a 2-layer
+    // SiLU MLP (dspark.log_snr_fc1/fc2), added to the draft noise embedding
+    // before the backbone. Absent on drafters not trained with it --
+    // dspark_log_snr_conditioning gates whether the loader/graph touch it.
+    bool     dspark_log_snr_conditioning         = false;
+    float    dspark_min_log_snr                  = 0.0f;
+    float    dspark_max_log_snr                  = 0.0f;
+
     // ordered set of target-model layer indices this drafter taps; n_dspark_target_layers
     // is also the concatenation width multiplier (n_capture) for dspark.fc's input.
     uint32_t n_dspark_target_layers = 0;

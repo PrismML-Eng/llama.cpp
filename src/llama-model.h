@@ -588,6 +588,12 @@ struct llama_model {
     struct ggml_tensor * dspark_confidence_head    = nullptr; // accept-rate predictor
     struct ggml_tensor * dspark_confidence_head_b  = nullptr;
 
+    // GIDD log-SNR conditioning (present only when hparams.dspark_log_snr_conditioning).
+    struct ggml_tensor * dspark_log_snr_fc1_w      = nullptr; // [n_freq -> hidden]
+    struct ggml_tensor * dspark_log_snr_fc1_b      = nullptr;
+    struct ggml_tensor * dspark_log_snr_fc2_w      = nullptr; // [hidden -> hidden]
+    struct ggml_tensor * dspark_log_snr_fc2_b      = nullptr;
+
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 

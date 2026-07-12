@@ -208,6 +208,12 @@ enum llm_kv {
     LLM_KV_DSPARK_MARKOV_RANK,
     LLM_KV_DSPARK_CONFIDENCE_HEAD,
     LLM_KV_DSPARK_CONFIDENCE_WITH_MARKOV,
+    // GIDD log-SNR / noise-level conditioning (present on some drafters).
+    // Optional: absent on drafters not trained with it, which must keep
+    // loading unchanged.
+    LLM_KV_DSPARK_LOG_SNR_CONDITIONING,
+    LLM_KV_DSPARK_MIN_LOG_SNR,
+    LLM_KV_DSPARK_MAX_LOG_SNR,
     LLM_KV_NUM_DEEPSTACK_LAYERS,
     LLM_KV_DEEPSTACK_MAPPING,
     LLM_KV_HIDDEN_ACT,
@@ -583,6 +589,8 @@ enum llm_tensor {
     LLM_TENSOR_DSPARK_MARKOV_HEAD_A,  // low-rank logit-bias factor A
     LLM_TENSOR_DSPARK_MARKOV_HEAD_B,  // low-rank logit-bias factor B
     LLM_TENSOR_DSPARK_CONFIDENCE_HEAD, // accept-rate predictor
+    LLM_TENSOR_DSPARK_LOG_SNR_FC1,     // GIDD log-SNR embed: [n_freq -> hidden]
+    LLM_TENSOR_DSPARK_LOG_SNR_FC2,     // GIDD log-SNR embed: [hidden -> hidden]
 };
 
 enum llm_tensor_layer {

@@ -203,6 +203,9 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DSPARK_MARKOV_RANK,                "%s.dspark.markov_rank"                },
     { LLM_KV_DSPARK_CONFIDENCE_HEAD,            "%s.dspark.confidence_head"            },
     { LLM_KV_DSPARK_CONFIDENCE_WITH_MARKOV,     "%s.dspark.confidence_head_with_markov"},
+    { LLM_KV_DSPARK_LOG_SNR_CONDITIONING,       "%s.dspark.log_snr_conditioning"       },
+    { LLM_KV_DSPARK_MIN_LOG_SNR,                "%s.dspark.min_log_snr"                },
+    { LLM_KV_DSPARK_MAX_LOG_SNR,                "%s.dspark.max_log_snr"                },
     { LLM_KV_NUM_DEEPSTACK_LAYERS,              "%s.n_deepstack_layers"                },
     { LLM_KV_DEEPSTACK_MAPPING,                 "%s.deepstack_mapping"                 },
     { LLM_KV_HIDDEN_ACT,                        "%s.hidden_activation"                 },
@@ -474,6 +477,8 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_DSPARK_MARKOV_HEAD_A,                   "dspark.markov_head_a" },
     { LLM_TENSOR_DSPARK_MARKOV_HEAD_B,                   "dspark.markov_head_b" },
     { LLM_TENSOR_DSPARK_CONFIDENCE_HEAD,                 "dspark.confidence_head" },
+    { LLM_TENSOR_DSPARK_LOG_SNR_FC1,                     "dspark.log_snr_fc1" },
+    { LLM_TENSOR_DSPARK_LOG_SNR_FC2,                     "dspark.log_snr_fc2" },
     { LLM_TENSOR_ATTN_SUB_NORM,                          "blk.%d.attn_sub_norm" },
     { LLM_TENSOR_FFN_SUB_NORM,                           "blk.%d.ffn_sub_norm" },
     { LLM_TENSOR_DEC_OUTPUT_NORM,                        "dec.output_norm" },
@@ -799,6 +804,8 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_DSPARK_MARKOV_HEAD_A,       {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_DSPARK_MARKOV_HEAD_B,       {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_DSPARK_CONFIDENCE_HEAD,     {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DSPARK_LOG_SNR_FC1,         {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DSPARK_LOG_SNR_FC2,         {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
     // Nemotron 3 Super
     // latent projections feed ggml_mul_mat, the buft probe must use MUL_MAT to keep them on GPU
     {LLM_TENSOR_FFN_LATENT_DOWN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},

@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <cmath>
+
 // dspark: EAGLE-style block-diffusion speculative-decoding drafter.
 //
 // The trunk is a small, plain dense Qwen3-style stack (standard llama_layer
@@ -57,6 +59,23 @@ void llama_model_dspark::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_DSPARK_CONFIDENCE_HEAD,             hparams.dspark_confidence_head,             false);
     ml.get_key(LLM_KV_DSPARK_CONFIDENCE_WITH_MARKOV,      hparams.dspark_confidence_head_with_markov,  false);
 
+    // GIDD log-SNR conditioning: optional metadata, absent (and defaulted off)
+    // on drafters not trained with it, which must keep loading unchanged. When
+    // it is enabled the bounds are required and drive a divide in the
+    // featurization (t = (log_snr - min) / (max - min)), so they must be present,
+    // finite, and strictly ordered -- otherwise the embedding is silently NaN.
+    ml.get_key(LLM_KV_DSPARK_LOG_SNR_CONDITIONING, hparams.dspark_log_snr_conditioning, false);
+    if (hparams.dspark_log_snr_conditioning) {
+        ml.get_key(LLM_KV_DSPARK_MIN_LOG_SNR, hparams.dspark_min_log_snr, true);
+        ml.get_key(LLM_KV_DSPARK_MAX_LOG_SNR, hparams.dspark_max_log_snr, true);
+        if (!std::isfinite(hparams.dspark_min_log_snr) || !std::isfinite(hparams.dspark_max_log_snr)) {
+            throw std::runtime_error("dspark log-SNR conditioning: min/max_log_snr must be finite");
+        }
+        if (!(hparams.dspark_max_log_snr > hparams.dspark_min_log_snr)) {
+            throw std::runtime_error("dspark log-SNR conditioning: max_log_snr must be greater than min_log_snr");
+        }
+    }
+
     // ordered set of TARGET-model layer indices this drafter taps. note this
     // indexes into the target's (large) layer count, not this drafter's own
     // (tiny) n_layer -- get_arr_n first to learn the count, then get_arr to
@@ -112,6 +131,21 @@ void llama_model_dspark::load_arch_tensors(llama_model_loader & ml) {
         const int64_t conf_in = n_embd + (hparams.dspark_confidence_head_with_markov ? markov_rank : 0);
         dspark_confidence_head   = create_tensor(tn(LLM_TENSOR_DSPARK_CONFIDENCE_HEAD, "weight"), { conf_in, 1 }, TENSOR_NOT_REQUIRED);
         dspark_confidence_head_b = create_tensor(tn(LLM_TENSOR_DSPARK_CONFIDENCE_HEAD, "bias"),   { 1 },         TENSOR_NOT_REQUIRED);
+    }
+
+    // GIDD log-SNR conditioning (LogSnrEmbed): unlike markov_head/confidence_head
+    // above, this IS built into the forward graph (graph::graph() below) -- it
+    // changes the draft embedding every forward pass, not a deferred host-side
+    // adjustment -- so if the GGUF says log_snr_conditioning is on, the weights
+    // are REQUIRED. A missing tensor here is a broken conversion, not something
+    // to silently degrade past (a drafter trained with conditioning that runs
+    // without it produces wrong drafts).
+    if (hparams.dspark_log_snr_conditioning) {
+        const int64_t n_freq = 128; // sinusoidal feature count (LogSnrEmbed)
+        dspark_log_snr_fc1_w = create_tensor(tn(LLM_TENSOR_DSPARK_LOG_SNR_FC1, "weight"), { n_freq, n_embd }, 0);
+        dspark_log_snr_fc1_b = create_tensor(tn(LLM_TENSOR_DSPARK_LOG_SNR_FC1, "bias"),   { n_embd },         0);
+        dspark_log_snr_fc2_w = create_tensor(tn(LLM_TENSOR_DSPARK_LOG_SNR_FC2, "weight"), { n_embd, n_embd }, 0);
+        dspark_log_snr_fc2_b = create_tensor(tn(LLM_TENSOR_DSPARK_LOG_SNR_FC2, "bias"),   { n_embd },         0);
     }
 
     for (int i = 0; i < n_layer; ++i) {
@@ -207,6 +241,58 @@ llama_model_dspark::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * inpL = build_inp_embd(model.tok_embd);
     inpL = ggml_view_2d(ctx0, inpL, n_embd, n_draft, inpL->nb[1], inpL->nb[1] * n_ctx_rows);
     cb(inpL, "dspark_draft_embd", -1);
+
+    // --- GIDD log-SNR conditioning (LogSnrEmbed) ----------------------------
+    // added to the draft noise embedding BEFORE the layer loop. The per-position
+    // log-SNR pattern is the fixed round-1 inference convention: the anchor
+    // position of each block (every block_size-th draft row, starting at 0) is
+    // set to max_log_snr, every other (masked) position to min_log_snr -- this
+    // drafter always operates on a full block_size-aligned draft block (see the
+    // file header), so n_draft is a multiple of block_size in every real decode.
+    if (hparams.dspark_log_snr_conditioning) {
+        const int64_t n_freq   = 128;
+        const int64_t half     = n_freq / 2;
+        const float   min_snr  = hparams.dspark_min_log_snr;
+        const float   max_snr  = hparams.dspark_max_log_snr;
+        const int64_t bsz      = hparams.dspark_block_size > 0 ? hparams.dspark_block_size : n_draft;
+
+        // host-side: the sinusoidal featurization fused with the anchor/mask
+        // pattern above. Both are pure functions of n_draft/block_size/min/max
+        // log-SNR -- no runtime/ubatch data -- so precomputing on the host
+        // (rather than chaining ggml_arange/sin/cos in-graph) keeps this
+        // directly auditable against the reference implementation. The loader
+        // guarantees max_snr > min_snr (both finite), so the divide is safe.
+        std::vector<float> feat((size_t) (n_freq * n_draft));
+        for (int64_t pos = 0; pos < n_draft; ++pos) {
+            const float log_snr = (pos % bsz == 0) ? max_snr : min_snr;
+            const float t       = (log_snr - min_snr) / (max_snr - min_snr) * 1000.0f;
+            for (int64_t i = 0; i < half; ++i) {
+                const float freq  = expf(-logf(10000.0f) * (float) i / (float) half);
+                const float angle = t * freq;
+                feat[(size_t) (pos * n_freq + i)]        = sinf(angle);
+                feat[(size_t) (pos * n_freq + half + i)] = cosf(angle);
+            }
+        }
+
+        auto logsnr_input = std::make_unique<llm_graph_input_dspark_logsnr>(std::move(feat));
+        logsnr_input->feat = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_freq, n_draft);
+        ggml_set_input(logsnr_input->feat);
+        ggml_set_name(logsnr_input->feat, "dspark_log_snr_feat");
+        ggml_tensor * snr_feat = logsnr_input->feat;
+        res->add_input(std::move(logsnr_input));
+
+        ggml_tensor * snr_hidden = build_lora_mm(model.dspark_log_snr_fc1_w, snr_feat);
+        snr_hidden = ggml_add(ctx0, snr_hidden, model.dspark_log_snr_fc1_b);
+        snr_hidden = ggml_silu(ctx0, snr_hidden);
+        cb(snr_hidden, "dspark_log_snr_fc1", -1);
+
+        ggml_tensor * snr_embed = build_lora_mm(model.dspark_log_snr_fc2_w, snr_hidden);
+        snr_embed = ggml_add(ctx0, snr_embed, model.dspark_log_snr_fc2_b);
+        cb(snr_embed, "dspark_log_snr_fc2", -1);
+
+        inpL = ggml_add(ctx0, inpL, snr_embed);
+        cb(inpL, "dspark_draft_embd_snr", -1);
+    }
 
     ggml_tensor * inp_pos = build_inp_pos();
     auto * inp_attn = build_attn_inp_kv();

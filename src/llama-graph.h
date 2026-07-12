@@ -179,6 +179,27 @@ public:
     const llama_dspark_ctx * dctx;
 };
 
+// dspark GIDD log-SNR conditioning (LogSnrEmbed): the sinusoidal feature matrix
+// fed into dspark.log_snr_fc1/fc2. Unlike llm_graph_input_dspark_ctx, this
+// carries no external staged state -- the per-position log-SNR pattern (anchor
+// position of each block at max_log_snr, mask positions at min_log_snr) and its
+// sinusoidal featurization are a pure function of n_draft/block_size/min_log_snr/
+// max_log_snr, all known at graph-build time, so the caller precomputes the full
+// [n_freq, n_draft] feature matrix once (graph::graph()) and this class just
+// stages it as an input (ggml's no_alloc graph context means even build-time-
+// constant data has to go through set_input(), same as everything else here).
+class llm_graph_input_dspark_logsnr : public llm_graph_input_i {
+public:
+    llm_graph_input_dspark_logsnr(std::vector<float> feat) : v_feat(std::move(feat)) {}
+    virtual ~llm_graph_input_dspark_logsnr() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * feat = nullptr; // F32 [n_freq, n_draft]
+
+    std::vector<float> v_feat;
+};
+
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
     llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
