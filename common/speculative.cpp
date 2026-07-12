@@ -923,6 +923,33 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         mask_token_id = meta.mask_token_id;
         markov_rank   = meta.markov_rank;
 
+        // Contract with the target model. The drafter consumes the target's
+        // hidden states directly -- each captured layer row is exactly
+        // target_hidden wide, and n_embd_cap == n_capture * n_embd is copied
+        // verbatim out of llama_get_embeddings_capture_ith() in stage_ctx_feat()
+        // -- and it resamples/argmaxes over the target's vocabulary. A drafter
+        // trained against a differently-sized target would silently over-read the
+        // capture rows or index the wrong vocab. Validate both here so an
+        // incompatible pairing fails loudly at construction instead of corrupting
+        // every round (mirrors draft-mtp's n_embd assert).
+        {
+            const llama_model * model_tgt = llama_get_model(ctx_tgt);
+            const int64_t n_embd_tgt  = llama_model_n_embd(model_tgt);
+            const int64_t n_vocab_tgt = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+            if (n_embd != n_embd_tgt) {
+                LOG_ERR("%s: drafter tap width n_embd=%lld != target hidden size %lld\n",
+                        __func__, (long long) n_embd, (long long) n_embd_tgt);
+                throw std::runtime_error("dspark: drafter/target hidden-size mismatch "
+                        "(the drafter was trained against a different target model)");
+            }
+            if (n_vocab != n_vocab_tgt) {
+                LOG_ERR("%s: drafter vocab=%lld != target vocab=%lld\n",
+                        __func__, (long long) n_vocab, (long long) n_vocab_tgt);
+                throw std::runtime_error("dspark: drafter/target vocabulary mismatch "
+                        "(the drafter must share the target's tokenizer)");
+            }
+        }
+
         has_markov = markov_rank > 0 && llama_model_dspark_get_markov(model_dft, markov_w1, markov_w2);
         if (n_vocab > std::numeric_limits<int>::max()) {
             throw std::runtime_error("dspark: vocab size exceeds cblas integer range");
@@ -1152,7 +1179,24 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             // The speculative tail is discarded every round regardless of
             // what the target ultimately accepts; only accept()/process()
             // decide what becomes real context for the NEXT round.
-            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, (llama_pos) start, -1);
+            if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, (llama_pos) start, -1)) {
+                // Could not crop just the speculative tail (e.g. the backend
+                // rejected the partial removal): the physical drafter cache still
+                // contains the draft rows, so advancing n_cache to `start` would
+                // desync bookkeeping from the cache and corrupt every later round.
+                // Recover deterministically by wiping the whole drafter sequence
+                // and resetting bookkeeping so the next round rebuilds its context
+                // from scratch (a full-sequence removal always succeeds).
+                LOG_ERR("%s: failed to crop drafter cache tail for seq %d at start=%lld -- "
+                        "resetting the drafter sequence to recover\n",
+                        __func__, (int) seq_id, (long long) start);
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1);
+                n_cache[seq_id] = 0;
+                feat.clear();
+                pos.clear();
+                rows_since_accept[seq_id] = 0;
+                continue;
+            }
             n_cache[seq_id] = start;
 
             feat.clear();
@@ -1199,13 +1243,21 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                 result.resize((size_t) block_size);
                 if (dspark_markov_cuda_resample(markov_cuda, logits_base, (int32_t) dp.id_last,
                                                 block_size, (int32_t *) result.data())) {
-                    // Host-side mirror of the sequential-chaining assert: any
-                    // token that feeds a later position's prev must not be the
-                    // mask token -- same invariant the host loop enforces.
-                    for (int32_t k = 1; k < block_size; ++k) {
-                        GGML_ASSERT(result[(size_t) (k - 1)] != mask_token_id &&
-                                "dspark: cuda markov resample chained a mask_token_id prev -- "
-                                "sequential invariant violated");
+                    // The sequential chaining is guaranteed structurally on the
+                    // device (position k reads position k-1's argmax from device
+                    // memory, never a host-precomputed id). mask_token_id is a
+                    // real vocabulary id, so a device-sampled token can legitimately
+                    // equal it -- that only yields a low-quality draft the target
+                    // will reject, not a violated invariant. Warn once instead of
+                    // aborting a valid run.
+                    static bool warned_cuda_mask = false;
+                    for (int32_t k = 1; k < block_size && !warned_cuda_mask; ++k) {
+                        if (result[(size_t) (k - 1)] == mask_token_id) {
+                            LOG_WRN("%s: dspark cuda markov resample produced mask_token_id at a "
+                                    "chained draft position -- drafter emitted the mask sentinel; "
+                                    "the target verify will reject it\n", __func__);
+                            warned_cuda_mask = true;
+                        }
                     }
                     did_cuda = true;
                 } else {
@@ -1221,10 +1273,20 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
 
             if (!did_cuda)
             for (int32_t k = 0; k < block_size; ++k) {
-                if (k > 0) {
-                    GGML_ASSERT(prev_token != mask_token_id &&
-                            "dspark: markov resample must chain the previous step's SAMPLED "
-                            "token, never mask_token_id -- do not batch this over the block");
+                // prev_token is the token SAMPLED at step k-1 (assigned from best_id
+                // at the end of this loop), never a draft input id -- that is the
+                // real structural guarantee that this resample chains forward rather
+                // than being batched over the block. A sampled token can legitimately
+                // equal mask_token_id (a real vocab id), which merely makes a poor
+                // draft the target rejects, so warn once instead of aborting.
+                if (k > 0 && prev_token == mask_token_id) {
+                    static bool warned_host_mask = false;
+                    if (!warned_host_mask) {
+                        LOG_WRN("%s: dspark markov resample chained a mask_token_id prev at k=%d -- "
+                                "drafter emitted the mask sentinel; the target verify will reject it\n",
+                                __func__, k);
+                        warned_host_mask = true;
+                    }
                 }
 
                 const float * base_logits = logits_base + (size_t) k * n_vocab;
