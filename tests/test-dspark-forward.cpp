@@ -32,7 +32,7 @@
 #include <algorithm>
 #include <fstream>
 
-static void fail(const std::string & msg) {
+[[noreturn]] static void fail(const std::string & msg) {
     fprintf(stderr, "FAIL: %s\n", msg.c_str());
     exit(1);
 }
@@ -42,9 +42,15 @@ static void fail(const std::string & msg) {
 // exists as token_embd.weight's own shape (see src/models/dspark.cpp's
 // load_arch_tensors for the mirror-image fix on the loader side).
 static int64_t n_vocab_from_model(const llama_model * model) {
-    const struct ggml_tensor * t = model->get_tensor("token_embd.weight");
-    if (!t) fail("token_embd.weight not found in loaded model");
-    return t->ne[1];
+    // Use the exported free-function tensor map rather than the
+    // llama_model::get_tensor member: member functions aren't reliably exported
+    // across the Windows DLL boundary (undefined symbol at link on x64-windows-llvm).
+    for (const auto & [name, t] : llama_internal_get_tensor_map(model)) {
+        if (name == "token_embd.weight") {
+            return t->ne[1];
+        }
+    }
+    fail("token_embd.weight not found in loaded model");
 }
 
 struct dspark_meta {

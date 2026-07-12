@@ -79,7 +79,7 @@
 #include <string>
 #include <vector>
 
-static void fail(const std::string & msg) {
+[[noreturn]] static void fail(const std::string & msg) {
     fprintf(stderr, "FAIL: %s\n", msg.c_str());
     exit(1);
 }
