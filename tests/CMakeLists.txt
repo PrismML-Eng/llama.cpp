@@ -287,7 +287,11 @@ if (Python3_Interpreter_FOUND)
 else()
     message(STATUS "test-rs-ring-rotation: Python3 not found; test self-skips on the non-recurrent stories model")
 endif()
-llama_build_and_test(test-rs-ring-rotation.cpp LABEL "model" ARGS -m "${RS_RING_MODEL}")
+# Force CPU (-ngl 0): the ring bit-identity check requires the ring and no-ring
+# contexts to run the identical GDN compute path. On GPU backends without a fused
+# GDN op it falls back per context and diverges; the invariant (and this test) is
+# defined on CPU, per the test header.
+llama_build_and_test(test-rs-ring-rotation.cpp LABEL "model" ARGS -m "${RS_RING_MODEL}" -ngl 0)
 set_tests_properties(test-rs-ring-rotation PROPERTIES FIXTURES_REQUIRED "${RS_RING_FIXTURE}")
 
 # Test state save/load functionality
