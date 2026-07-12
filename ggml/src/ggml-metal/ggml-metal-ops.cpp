@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <unordered_set>
 
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     if (!t) {
@@ -73,6 +74,14 @@ struct ggml_metal_op {
         return idxs.size();
     }
 
+    bool is_fused_set_rows(const ggml_tensor * node) const {
+        return fused_set_rows.find(node) != fused_set_rows.end();
+    }
+
+    void mark_fused_set_rows(const ggml_tensor * node) {
+        fused_set_rows.insert(node);
+    }
+
     ggml_tensor * node(int i) const {
         assert(i >= 0 && i < (int) idxs.size());
         return ggml_graph_node(gf, idxs[i]);
@@ -109,6 +118,7 @@ private:
 
     // non-empty node indices
     std::vector<int> idxs;
+    std::unordered_set<const ggml_tensor *> fused_set_rows;
 };
 
 ggml_metal_op_t ggml_metal_op_init(
@@ -179,6 +189,13 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     //GGML_LOG_INFO("%s: encoding node %3d, op = %8s\n", __func__, idx, ggml_op_name(node->op));
 
     if (ggml_is_empty(node)) {
+        return 1;
+    }
+
+    // A rows scatter may be consumed by the preceding fused GDN epilogue.
+    // Keep the graph node for dependency construction, but do not encode a
+    // second copy/scatter kernel.
+    if (node->op == GGML_OP_SET_ROWS && ctx->is_fused_set_rows(node)) {
         return 1;
     }
 
@@ -1591,6 +1608,55 @@ int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// The rows-mode GDN op produces attention output plus a trailing snapshot
+// region.  In the recurrent ring graph that region is viewed and later
+// scattered back into the state cache by SET_ROWS.  Keep the graph nodes (and
+// therefore the dependency) but let the GDN epilogue perform that scatter so
+// the 786K-element SET_ROWS dispatch disappears from the Metal command stream.
+static int ggml_metal_gdn_write_rows(
+        ggml_metal_op_t ctx,
+        int             idx,
+        ggml_tensor **   write_rows,
+        ggml_tensor **   state_dst,
+        ggml_tensor **   fused_set_rows) {
+    *write_rows = nullptr;
+    *state_dst  = nullptr;
+    *fused_set_rows = nullptr;
+
+    const ggml_tensor * gdn = ctx->node(idx);
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->src[6] == nullptr ||
+        getenv("GGML_GDN_WRITE_FOLD_DISABLE") != nullptr) {
+        return 1;
+    }
+
+    for (int j = idx + 1; j < ctx->n_nodes(); ++j) {
+        ggml_tensor * set_rows = ctx->node(j);
+        if (set_rows->op != GGML_OP_SET_ROWS || set_rows->src[0] == nullptr) {
+            continue;
+        }
+
+        // SET_ROWS receives a view into the GDN result. Follow the view chain
+        // because attention normalization and cache maintenance nodes may be
+        // ordered between the producer and this scatter in the graph.
+        const ggml_tensor * src = set_rows->src[0];
+        while (src != nullptr && (src->op == GGML_OP_VIEW || src->op == GGML_OP_RESHAPE)) {
+            src = src->src[0];
+        }
+        if (src != gdn || set_rows->src[1] == nullptr || set_rows->src[2] == nullptr ||
+            set_rows->src[1]->type != GGML_TYPE_I64 || set_rows->src[2]->type != GGML_TYPE_F32 ||
+            set_rows->src[2]->buffer == nullptr || set_rows->src[2]->data == nullptr) {
+            continue;
+        }
+
+        *write_rows = set_rows->src[1];
+        *state_dst  = set_rows->src[2];
+        *fused_set_rows = set_rows;
+        return 1;
+    }
+
+    return 1;
+}
+
 int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -1607,7 +1673,22 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
-    auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net(lib, op);
+    ggml_tensor * write_rows = nullptr;
+    ggml_tensor * state_dst  = nullptr;
+    ggml_tensor * fused_set_rows = nullptr;
+    const int n_fuse = ggml_metal_gdn_write_rows(ctx, idx, &write_rows, &state_dst, &fused_set_rows);
+    const bool has_write_rows = write_rows != nullptr;
+
+    if (has_write_rows) {
+        ctx->mark_fused_set_rows(fused_set_rows);
+        // The future SET_ROWS is an explicit write dependency. Register its
+        // destination now and force a barrier before the in-kernel write so
+        // earlier cache maintenance cannot overlap it.
+        ggml_metal_op_concurrency_reset(ctx);
+        ggml_metal_op_concurrency_add(ctx, fused_set_rows);
+    }
+
+    auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net(lib, op, has_write_rows);
 
     int ida = 0;
 
@@ -1660,13 +1741,17 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     // rows (rows mode; bind state as a never-read placeholder otherwise --
     // the function constant compiles the rows path out entirely)
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[6] ? op->src[6] : op->src[5]), ida++);
+    // write rows and destination are only consumed by the fused ring path;
+    // bind valid placeholders for the ordinary/scratch variants.
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(has_write_rows ? write_rows : (op->src[6] ? op->src[6] : op->src[5])), ida++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(has_write_rows ? state_dst : op->src[5]), ida++);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst
 
     const int nsg = pipeline.nsg;
 
     ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
 
-    return 1;
+    return n_fuse;
 }
 
 int ggml_metal_op_solve_tri(ggml_metal_op_t ctx, int idx) {

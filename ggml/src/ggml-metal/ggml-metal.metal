@@ -2623,6 +2623,7 @@ constant short FC_gated_delta_net_ne20 [[function_constant(FC_GATED_DELTA_NET + 
 constant short FC_gated_delta_net_ne30 [[function_constant(FC_GATED_DELTA_NET + 1)]];
 constant short FC_gated_delta_net_K    [[function_constant(FC_GATED_DELTA_NET + 2)]];
 constant bool  FC_gated_delta_net_rows [[function_constant(FC_GATED_DELTA_NET + 3)]];
+constant bool  FC_gated_delta_net_write_rows [[function_constant(FC_GATED_DELTA_NET + 4)]];
 
 #if 1
 template<short NSG>
@@ -2635,6 +2636,8 @@ kernel void kernel_gated_delta_net_impl(
         device const char * b,
         device const char * s,
         device const char * rows,
+        device const char * write_rows,
+        device       char * state_dst,
         device       char * dst,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
@@ -2643,6 +2646,7 @@ kernel void kernel_gated_delta_net_impl(
 #define G        FC_gated_delta_net_ne30
 #define K        FC_gated_delta_net_K
 #define HAS_ROWS FC_gated_delta_net_rows
+#define WRITE_ROWS FC_gated_delta_net_write_rows
 
     const uint tx = tpitg.x;
     const uint ty = tpitg.y;
@@ -2744,7 +2748,18 @@ kernel void kernel_gated_delta_net_impl(
         if (K > 1) {
             const int target_slot = (int)t - shift;
             if (target_slot >= 0 && target_slot < (int)K) {
-                device float * dst_state = (device float *) (dst) + attn_size + (uint)target_slot * state_size_per_snap + state_out_base;
+                device float * dst_state;
+                if (WRITE_ROWS) {
+                    // SET_ROWS receives only the trailing n_write snapshots
+                    // when T < K; convert the absolute output slot back to
+                    // the compact row-index input's slot-major coordinate.
+                    const int write_slot = target_slot - max(0, (int)K - (int)args.ne22);
+                    const uint64_t row = ((device const int64_t *) write_rows)[(uint)write_slot * args.ne23 + i23];
+                    dst_state = (device float *) state_dst + row * (uint64_t)(S_v * S_v * args.ne21)
+                        + (uint) i21 * S_v * S_v + i20 * S_v;
+                } else {
+                    dst_state = (device float *) (dst) + attn_size + (uint)target_slot * state_size_per_snap + state_out_base;
+                }
                 FOR_UNROLL (short j = 0; j < NSG; j++) {
                     const short is = tx*NSG + j;
                     dst_state[is] = ls[j];
@@ -2764,6 +2779,7 @@ kernel void kernel_gated_delta_net_impl(
 #undef S_v
 #undef G
 #undef K
+#undef WRITE_ROWS
 }
 
 typedef decltype(kernel_gated_delta_net_impl<4>) kernel_gated_delta_net_t;
