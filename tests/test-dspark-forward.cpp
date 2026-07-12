@@ -37,20 +37,14 @@
     exit(1);
 }
 
-// dspark ships no tokenizer of its own (tied to the TARGET's vocab), so
-// llama_vocab_n_tokens() is 0 for a dspark GGUF -- the real vocab width only
-// exists as token_embd.weight's own shape (see src/models/dspark.cpp's
-// load_arch_tensors for the mirror-image fix on the loader side).
+// dspark ships no real tokenizer, but the converter's set_vocab() calls
+// add_vocab_size() to fill the "none" tokenizer with dummy entries sized to the
+// target's real vocab width (so batch validation passes) -- so
+// llama_vocab_n_tokens() reports that width. Use the public/exported vocab API
+// rather than the internal llama_model tensor map, which is not exported across
+// the Windows DLL boundary.
 static int64_t n_vocab_from_model(const llama_model * model) {
-    // Use the exported free-function tensor map rather than the
-    // llama_model::get_tensor member: member functions aren't reliably exported
-    // across the Windows DLL boundary (undefined symbol at link on x64-windows-llvm).
-    for (const auto & [name, t] : llama_internal_get_tensor_map(model)) {
-        if (name == "token_embd.weight") {
-            return t->ne[1];
-        }
-    }
-    fail("token_embd.weight not found in loaded model");
+    return llama_vocab_n_tokens(llama_model_get_vocab(model));
 }
 
 struct dspark_meta {
