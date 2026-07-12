@@ -219,7 +219,8 @@ static int run_tier1(const std::string & model_path) {
     return 0;
 }
 
-static int run_tier2(const std::string & model_path, const std::string & ref_path) {
+static int run_tier2(const std::string & model_path, const std::string & ref_path,
+                     double min_argmax_match_rate, double min_top5_overlap) {
     printf("=== Tier 2: real drafter weights, deterministic tap features, diff vs Python reference implementation ===\n");
 
     std::ifstream f(ref_path, std::ios::binary);
@@ -282,8 +283,10 @@ static int run_tier2(const std::string & model_path, const std::string & ref_pat
         const float * a = logits.data()     + (size_t) p * n_vocab; // C++
         const float * b = ref_logits.data() + (size_t) p * n_vocab; // python
 
+        // scan from v=0 so a NaN or discrepancy at token 0 is counted in the diff
+        // and non-finite metrics (argmax stays correct: it is seeded at index 0).
         int64_t argmax_a = 0, argmax_b = 0;
-        for (int64_t v = 1; v < n_vocab; ++v) {
+        for (int64_t v = 0; v < n_vocab; ++v) {
             if (a[v] > a[argmax_a]) argmax_a = v;
             if (b[v] > b[argmax_b]) argmax_b = v;
             const double d = std::fabs((double) a[v] - (double) b[v]);
@@ -322,12 +325,33 @@ static int run_tier2(const std::string & model_path, const std::string & ref_pat
         fail("Tier 2 FAILED: non-finite logits");
     }
 
+    // Gate on agreement with the Python reference. Both metrics are scale-invariant
+    // rates in [0,1]: a correct C++ drafter matches the reference argmax on nearly
+    // every position and shares nearly all of its top-5, while a broken one does
+    // not -- without this the test passed on any finite output (even zero matches).
+    // Thresholds default high and are overridable from the CLI for calibration.
+    if (argmax_match_rate < min_argmax_match_rate) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "Tier 2 FAILED: argmax_match_rate %.3f < %.3f",
+                 argmax_match_rate, min_argmax_match_rate);
+        fail(buf);
+    }
+    if (mean_top5_overlap < min_top5_overlap) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "Tier 2 FAILED: mean_top5_overlap %.3f < %.3f",
+                 mean_top5_overlap, min_top5_overlap);
+        fail(buf);
+    }
+    printf("Tier 2 PASSED: argmax_match_rate=%.3f (>= %.3f), mean_top5_overlap=%.3f (>= %.3f)\n",
+           argmax_match_rate, min_argmax_match_rate, mean_top5_overlap, min_top5_overlap);
+
     return 0;
 }
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <model.gguf> --tier1 | --tier2 <ref.bin>\n", argv[0]);
+        fprintf(stderr, "usage: %s <model.gguf> --tier1 | "
+                "--tier2 <ref.bin> [min_argmax_match_rate] [min_top5_overlap]\n", argv[0]);
         return 1;
     }
 
@@ -341,7 +365,11 @@ int main(int argc, char ** argv) {
         rc = run_tier1(model_path);
     } else if (mode == "--tier2") {
         if (argc < 4) fail("--tier2 requires a ref.bin path");
-        rc = run_tier2(model_path, argv[3]);
+        // greedy argmax should match the reference on essentially every position;
+        // default the gate high and allow calibration from the CLI.
+        double min_argmax_match_rate = argc > 4 ? atof(argv[4]) : 0.90;
+        double min_top5_overlap      = argc > 5 ? atof(argv[5]) : 0.90;
+        rc = run_tier2(model_path, argv[3], min_argmax_match_rate, min_top5_overlap);
     } else {
         fail("unknown mode: " + mode);
         rc = 1;
