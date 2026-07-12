@@ -69,6 +69,8 @@ class DSparkModel(TextModel):
         "markov_head.down":      gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DSPARK_MARKOV_HEAD_A],
         "markov_head.up":        gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DSPARK_MARKOV_HEAD_B],
         "confidence_head":       gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DSPARK_CONFIDENCE_HEAD],
+        "log_snr_embed.fc1":     gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DSPARK_LOG_SNR_FC1],
+        "log_snr_embed.fc2":     gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DSPARK_LOG_SNR_FC2],
     }
 
     def set_gguf_parameters(self):
@@ -102,6 +104,18 @@ class DSparkModel(TextModel):
         conf_with_markov = hp.get("confidence_head_with_markov")
         if conf_with_markov is not None:
             self.gguf_writer.add_dspark_confidence_head_with_markov(bool(conf_with_markov))
+
+        log_snr_cond = hp.get("log_snr_conditioning")
+        if log_snr_cond is not None:
+            self.gguf_writer.add_dspark_log_snr_conditioning(bool(log_snr_cond))
+
+        min_log_snr = hp.get("min_log_snr")
+        if min_log_snr is not None:
+            self.gguf_writer.add_dspark_min_log_snr(float(min_log_snr))
+
+        max_log_snr = hp.get("max_log_snr")
+        if max_log_snr is not None:
+            self.gguf_writer.add_dspark_max_log_snr(float(max_log_snr))
 
         logger.info(
             "dspark: exported drafter (block_size=%d, target_layers=%s); "

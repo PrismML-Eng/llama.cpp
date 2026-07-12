@@ -134,6 +134,9 @@ class Keys:
         DSPARK_MARKOV_RANK                = "{arch}.dspark.markov_rank"
         DSPARK_CONFIDENCE_HEAD            = "{arch}.dspark.confidence_head"
         DSPARK_CONFIDENCE_WITH_MARKOV     = "{arch}.dspark.confidence_head_with_markov"
+        DSPARK_LOG_SNR_CONDITIONING       = "{arch}.dspark.log_snr_conditioning"
+        DSPARK_MIN_LOG_SNR                = "{arch}.dspark.min_log_snr"
+        DSPARK_MAX_LOG_SNR                = "{arch}.dspark.max_log_snr"
         NUM_DEEPSTACK_LAYERS              = "{arch}.n_deepstack_layers"
         DEEPSTACK_MAPPING                 = "{arch}.deepstack_mapping"
         POOLING_TYPE                      = "{arch}.pooling_type"
@@ -920,6 +923,8 @@ class MODEL_TENSOR(IntEnum):
     DSPARK_MARKOV_HEAD_A   = auto()
     DSPARK_MARKOV_HEAD_B   = auto()
     DSPARK_CONFIDENCE_HEAD = auto()
+    DSPARK_LOG_SNR_FC1     = auto()
+    DSPARK_LOG_SNR_FC2     = auto()
     # lfm2 audio
     A_ENC_NORM_CONV        = auto()
     A_ENC_LINEAR_POS       = auto()
@@ -1504,6 +1509,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DSPARK_MARKOV_HEAD_A:      "dspark.markov_head_a",
     MODEL_TENSOR.DSPARK_MARKOV_HEAD_B:      "dspark.markov_head_b",
     MODEL_TENSOR.DSPARK_CONFIDENCE_HEAD:    "dspark.confidence_head",
+    MODEL_TENSOR.DSPARK_LOG_SNR_FC1:        "dspark.log_snr_fc1",
+    MODEL_TENSOR.DSPARK_LOG_SNR_FC2:        "dspark.log_snr_fc2",
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
@@ -2270,6 +2277,8 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.DSPARK_MARKOV_HEAD_A,
         MODEL_TENSOR.DSPARK_MARKOV_HEAD_B,
         MODEL_TENSOR.DSPARK_CONFIDENCE_HEAD,
+        MODEL_TENSOR.DSPARK_LOG_SNR_FC1,
+        MODEL_TENSOR.DSPARK_LOG_SNR_FC2,
     ],
     MODEL_ARCH.QWEN35MOE: [
         MODEL_TENSOR.TOKEN_EMBD,

@@ -889,6 +889,15 @@ class GGUFWriter:
     def add_dspark_confidence_head_with_markov(self, value: bool) -> None:
         self.add_bool(Keys.LLM.DSPARK_CONFIDENCE_WITH_MARKOV.format(arch=self.arch), value)
 
+    def add_dspark_log_snr_conditioning(self, value: bool) -> None:
+        self.add_bool(Keys.LLM.DSPARK_LOG_SNR_CONDITIONING.format(arch=self.arch), value)
+
+    def add_dspark_min_log_snr(self, value: float) -> None:
+        self.add_float32(Keys.LLM.DSPARK_MIN_LOG_SNR.format(arch=self.arch), value)
+
+    def add_dspark_max_log_snr(self, value: float) -> None:
+        self.add_float32(Keys.LLM.DSPARK_MAX_LOG_SNR.format(arch=self.arch), value)
+
     def add_swin_norm(self, value: bool) -> None:
         self.add_bool(Keys.LLM.SWIN_NORM.format(arch=self.arch), value)
 
