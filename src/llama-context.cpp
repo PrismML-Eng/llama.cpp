@@ -1222,6 +1222,15 @@ void llama_context::set_capture_layers(const std::vector<int32_t> & layer_ids) {
             LLAMA_LOG_ERROR("%s: capture layer %d out of range [0, %d)\n", __func__, il, n_layer);
             continue;
         }
+        if (n >= (uint32_t) cparams.capture_layer_idx.size()) {
+            // capture_layer_idx is a fixed-size (LLAMA_MAX_LAYERS) array. A caller
+            // that repeats layer ids can drive n past its capacity even though
+            // every individual id passed the range check above; without this bound
+            // the next write corrupts adjacent cparams fields. Stop once full.
+            LLAMA_LOG_ERROR("%s: too many capture layers (limit %zu); ignoring the remainder\n",
+                    __func__, cparams.capture_layer_idx.size());
+            break;
+        }
         cparams.capture_layer_idx[n++] = il;
     }
 
@@ -1634,12 +1643,23 @@ int llama_context::encode(const llama_batch & batch_inp) {
     // single bulk copy: t_h_capture is already [n_capture * n_embd, n_tokens].
     if (embd_capture.data && cparams.n_capture_layers > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
         ggml_tensor * t_cap = res->get_h_capture();
+        const size_t row = (size_t) cparams.n_capture_layers * hparams.n_embd;
+        GGML_ASSERT(n_tokens*(int64_t) row <= (int64_t) embd_capture.size);
         if (t_cap) {
             ggml_backend_t backend_c = ggml_backend_sched_get_tensor_backend(sched.get(), t_cap);
             GGML_ASSERT(backend_c != nullptr);
-            const size_t row = (size_t) cparams.n_capture_layers * hparams.n_embd;
-            GGML_ASSERT(n_tokens*(int64_t) row <= (int64_t) embd_capture.size);
             ggml_backend_tensor_get_async(backend_c, t_cap, embd_capture.data, 0, n_tokens*row*sizeof(float));
+        } else {
+            // see the masked-path counterpart above: capture requested on an arch
+            // whose graph has no capture tensor -- zero rather than return
+            // uninitialized memory through the public getters.
+            static bool warned_no_capture = false;
+            if (!warned_no_capture) {
+                LLAMA_LOG_WARN("%s: capture layers were requested but this architecture does not "
+                        "produce capture embeddings; returning zeros\n", __func__);
+                warned_no_capture = true;
+            }
+            memset(embd_capture.data, 0, n_tokens*row*sizeof(float));
         }
     }
 
@@ -2103,13 +2123,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (embd_capture.data && cparams.n_capture_layers > 0 && n_outputs > 0 &&
                 cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
             ggml_tensor * t_cap = res->get_h_capture();
+            const size_t row = (size_t) cparams.n_capture_layers * hparams.n_embd;
+            float * embd_capture_out = embd_capture.data + (size_t) n_outputs_prev * row;
+            GGML_ASSERT((n_outputs_prev + n_outputs)*(int64_t) row <= (int64_t) embd_capture.size);
             if (t_cap) {
                 ggml_backend_t backend_c = ggml_backend_sched_get_tensor_backend(sched.get(), t_cap);
                 GGML_ASSERT(backend_c != nullptr);
-                const size_t row = (size_t) cparams.n_capture_layers * hparams.n_embd;
-                float * embd_capture_out = embd_capture.data + (size_t) n_outputs_prev * row;
-                GGML_ASSERT((n_outputs_prev + n_outputs)*(int64_t) row <= (int64_t) embd_capture.size);
                 ggml_backend_tensor_get_async(backend_c, t_cap, embd_capture_out, 0, n_outputs*row*sizeof(float));
+            } else {
+                // capture was requested (n_capture_layers > 0) but this model's
+                // graph never produced a capture tensor -- only qwen35 builds it.
+                // output_reserve() already allocated embd_capture, so zero the
+                // rows for this ubatch rather than leave uninitialized memory that
+                // llama_get_embeddings_capture*() would hand back. Warn once so the
+                // misconfiguration (capture on an unsupported arch) is visible.
+                static bool warned_no_capture = false;
+                if (!warned_no_capture) {
+                    LLAMA_LOG_WARN("%s: capture layers were requested but this architecture does not "
+                            "produce capture embeddings; returning zeros\n", __func__);
+                    warned_no_capture = true;
+                }
+                memset(embd_capture_out, 0, n_outputs*row*sizeof(float));
             }
         }
 
