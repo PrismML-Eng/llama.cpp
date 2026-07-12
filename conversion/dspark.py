@@ -10,14 +10,13 @@ if TYPE_CHECKING:
 
 @ModelBase.register("Qwen3DSparkModel", "DSparkForCausalLM", "DsparkSpeculator")
 class DSparkModel(TextModel):
-    """Converter stub for the dspark speculative-decoding drafter.
+    """Converter for the dspark speculative-decoding drafter.
 
     dspark is an EAGLE-style block-diffusion drafter. This converter maps an
-    EasyDeL dspark export onto the dspark GGUF tensor names so the artifact can be
-    produced and inspected. The drafter forward graph is NOT implemented yet (see
-    docs/dspark-scope.md): loading the resulting GGUF for inference fails with a
-    clear "dspark draft loop not implemented yet" error from the C++ side. This is
-    intentional and gated on dspark beating MTP accept rate at convergence.
+    EasyDeL dspark export onto the dspark GGUF tensor names. The drafter forward
+    graph and block-diffusion draft loop are implemented (src/models/dspark.cpp,
+    common/speculative.cpp), so the produced GGUF loads and runs as a draft-dspark
+    speculator. See docs/dspark-scope.md for the drafter shape and the capture API.
 
     Tensor name mapping (HF Qwen3DSparkModel export -> gguf):
         fc                          -> dspark.fc
@@ -105,8 +104,8 @@ class DSparkModel(TextModel):
             self.gguf_writer.add_dspark_confidence_head_with_markov(bool(conf_with_markov))
 
         logger.info(
-            "dspark: scaffolding export only (block_size=%d, target_layers=%s); "
-            "drafter forward graph is not implemented, see docs/dspark-scope.md",
+            "dspark: exported drafter (block_size=%d, target_layers=%s); "
+            "see docs/dspark-scope.md",
             block_size, target_layers,
         )
 

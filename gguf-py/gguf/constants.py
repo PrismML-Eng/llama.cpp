@@ -2249,7 +2249,8 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
     MODEL_ARCH.DSPARK: [
         # dspark drafter: feature-reuse projection + small transformer trunk +
         # lm head + two aux heads. Decoder blocks reuse the standard ATTN_*/FFN_*
-        # names. The forward graph is NOT built yet (scaffolding only).
+        # names. The forward graph and block-diffusion draft loop are implemented
+        # in src/models/dspark.cpp and common/speculative.cpp.
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.DSPARK_FC,
         MODEL_TENSOR.DSPARK_HIDDEN_NORM,

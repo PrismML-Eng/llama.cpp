@@ -17,15 +17,21 @@ work below is gated on that result.
    position into a single `[n_capture * n_embd]` row. This is the piece that both
    EAGLE3-proper and dspark need, and it is independent of any draft loop. See the
    API summary below.
-2. dspark GGUF architecture scaffolding. The architecture enum, its tensor names,
-   and a converter stub that maps an EasyDeL dspark export onto those names. No
-   forward graph is built: the model-build path errors with a clear message.
+2. dspark GGUF architecture and converter. The architecture enum, its tensor
+   names, and a converter that maps an EasyDeL dspark export onto those names
+   (`conversion/dspark.py`).
+3. dspark forward graph and block-diffusion draft loop. The model build path
+   (`src/models/dspark.cpp`) implements the feature-reuse projection and the
+   masked block forward, and the `draft-dspark` speculative impl
+   (`common/speculative.cpp`) runs the block-diffusion propose plus the
+   sequential Markov resample (host BLAS/scalar, with an optional CUDA path).
 
-## Deferred (scoped only, not built)
+## Open / deferred
 
-The block-diffusion `draft()` inner loop and the dspark forward graph. The reason
-is the gate in the last section: there is no point spending runtime engineering on
-a drafter that does not yet win on accept rate.
+The remaining question is not runtime engineering but the accept-rate gate below:
+whether the trained drafter beats MTP at convergence. The `confidence_head`
+adaptive commit-count policy is exported but its use for choosing how many drafted
+tokens to keep is left to the driver.
 
 ## dspark drafter shape
 

@@ -2,12 +2,14 @@
 
 // Device-side (CUDA) implementation of the dspark vanilla Markov resample.
 //
-// This is an opt-in acceleration of the sequential per-position resample that
+// This is an acceleration of the sequential per-position resample that
 // common/speculative.cpp otherwise runs host-side (scalar or BLAS). It is
-// compiled only when the build has CUDA (LLAMA_DSPARK_MARKOV_CUDA) and is
-// enabled at runtime via the LLAMA_DSPARK_MARKOV_CUDA=1 environment variable.
+// compiled whenever the build has CUDA (LLAMA_DSPARK_MARKOV_CUDA) and, when the
+// drafter carries a Markov head, is the DEFAULT resample path at runtime; set
+// the environment variable LLAMA_DSPARK_MARKOV_CUDA=0 to fall back to the host
+// path.
 //
-// The math is identical to the host paths: for a drafted position k,
+// The math mirrors the host paths: for a drafted position k,
 //     correction[v] = sum_r w1[prev * R + r] * w2[v * R + r]
 //     step_logit[v] = base_logits[k][v] + correction[v]
 //     out[k]        = argmax_v step_logit[v]   (lowest v wins ties)
@@ -15,6 +17,14 @@
 // k-1 for k > 0. The sequential chaining is preserved structurally on the
 // device: position k's kernel reads the argmax that position k-1's kernel
 // wrote into device memory -- it is never precomputed on the host.
+//
+// The device reduces `correction` with a warp tree-reduction, so its
+// floating-point accumulation order differs from the host scalar loop (and from
+// BLAS, which uses yet another order). The result is therefore functionally
+// equivalent, not bit-identical: at an exact argmax tie the rounding can select
+// a different token. That only changes which speculative draft is proposed --
+// the target verify still arbitrates the committed output -- so it never affects
+// correctness, only (rarely) the accept rate.
 
 #include <cstdint>
 

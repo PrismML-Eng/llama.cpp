@@ -120,9 +120,10 @@ option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
 option(LLAMA_DSPARK_MARKOV_BLAS "llama-common: use BLAS for dspark Markov resample" OFF)
 
-# Device-side dspark Markov resample (opt-in at runtime via
-# LLAMA_DSPARK_MARKOV_CUDA=1). Compiled by default whenever the CUDA backend is
-# built; the BLAS/scalar host paths remain the default at runtime.
+# Device-side dspark Markov resample. Compiled by default whenever the CUDA
+# backend is built and -- when the drafter actually carries a Markov head -- it
+# is the DEFAULT resample path at runtime. Set LLAMA_DSPARK_MARKOV_CUDA=0 in the
+# environment to fall back to the BLAS/scalar host paths.
 if (GGML_CUDA)
     set(LLAMA_DSPARK_MARKOV_CUDA_DEFAULT ON)
 else()

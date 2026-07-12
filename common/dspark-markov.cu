@@ -88,6 +88,11 @@ __global__ void dspark_gemv_argmax_partial(
         for (int r = lane; r < rank; r += DSPARK_WARP) {
             acc += w1s[r] * w2row[r];
         }
+        // warp tree-reduction: its floating-point accumulation order differs from
+        // the host scalar loop (and from BLAS), so the correction -- and thus a
+        // near-tie argmax -- is functionally equivalent, not bit-identical, to the
+        // host paths. This only changes which speculative draft is proposed; the
+        // target verify arbitrates the committed output. See dspark-markov.h.
         #pragma unroll
         for (int o = DSPARK_WARP / 2; o > 0; o >>= 1) {
             acc += __shfl_xor_sync(0xffffffffu, acc, o);
