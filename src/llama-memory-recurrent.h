@@ -76,6 +76,13 @@ public:
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
+    // per-seq ring head: the snapshot group that holds the current (newest) state.
+    // the state j tokens back lives in group (rs_ring[seq] + j) % (1 + n_rs_seq).
+    // the head rotates backwards on every write, so pre-existing snapshots keep
+    // their age in place and only the fresh per-token snapshots are copied
+    // (instead of re-copying all (1 + n_rs_seq) groups on every decode)
+    std::vector<uint32_t> rs_ring;
+
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
     // computed before each graph build
@@ -167,11 +174,19 @@ public:
     uint32_t get_head() const;
     int32_t  get_rs_z() const;
     uint32_t get_size() const;
+    uint32_t get_n_rs_seq() const;
 
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // fill the I64 destination-row indices for the per-token snapshot writes of
+    // the current ubatch (see llm_graph_input_rs::s_write_rows, slot-major, and
+    // s_write_rows_conv, seq-major) and advance the per-seq ring heads. must be
+    // called after the s_copy input has been filled (s_copy folds any pending
+    // rollback into the ring head). dst_conv may be null
+    void set_input_s_write_rows(ggml_tensor * dst, ggml_tensor * dst_conv) const;
 
 private:
     const llama_memory_status status;

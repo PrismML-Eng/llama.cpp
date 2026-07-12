@@ -871,6 +871,24 @@ class GGUFWriter:
     def add_nextn_predict_layers(self, count: int) -> None:
         self.add_uint32(Keys.LLM.NEXTN_PREDICT_LAYERS.format(arch=self.arch), count)
 
+    def add_dspark_block_size(self, size: int) -> None:
+        self.add_uint32(Keys.LLM.DSPARK_BLOCK_SIZE.format(arch=self.arch), size)
+
+    def add_dspark_mask_token_id(self, tid: int) -> None:
+        self.add_uint32(Keys.LLM.DSPARK_MASK_TOKEN_ID.format(arch=self.arch), tid)
+
+    def add_dspark_target_layers(self, layers: Sequence[int]) -> None:
+        self.add_array(Keys.LLM.DSPARK_TARGET_LAYERS.format(arch=self.arch), list(layers))
+
+    def add_dspark_markov_rank(self, rank: int) -> None:
+        self.add_uint32(Keys.LLM.DSPARK_MARKOV_RANK.format(arch=self.arch), rank)
+
+    def add_dspark_confidence_head(self, value: bool) -> None:
+        self.add_bool(Keys.LLM.DSPARK_CONFIDENCE_HEAD.format(arch=self.arch), value)
+
+    def add_dspark_confidence_head_with_markov(self, value: bool) -> None:
+        self.add_bool(Keys.LLM.DSPARK_CONFIDENCE_WITH_MARKOV.format(arch=self.arch), value)
+
     def add_swin_norm(self, value: bool) -> None:
         self.add_bool(Keys.LLM.SWIN_NORM.format(arch=self.arch), value)
 

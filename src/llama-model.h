@@ -578,6 +578,16 @@ struct llama_model {
     struct ggml_tensor * dense_2_out_layers_b = nullptr;
     struct ggml_tensor * dense_3_out_layers   = nullptr;
 
+    // dspark drafter: target-feature projection + auxiliary heads (output-level,
+    // not per-layer -- the trunk decoder layers reuse the standard llama_layer
+    // attn_*/ffn_* fields above like any dense Qwen3-style stack).
+    struct ggml_tensor * dspark_fc                 = nullptr; // [n_capture*n_embd -> n_embd]
+    struct ggml_tensor * dspark_hidden_norm        = nullptr; // RMSNorm after fc
+    struct ggml_tensor * dspark_markov_head_a      = nullptr; // low-rank logit-bias factor A
+    struct ggml_tensor * dspark_markov_head_b      = nullptr; // low-rank logit-bias factor B
+    struct ggml_tensor * dspark_confidence_head    = nullptr; // accept-rate predictor
+    struct ggml_tensor * dspark_confidence_head_b  = nullptr;
+
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 

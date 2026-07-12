@@ -173,4 +173,45 @@ if (LLAMA_LLGUIDANCE)
     endif()
 endif()
 
+if (LLAMA_DSPARK_MARKOV_BLAS)
+    find_package(BLAS REQUIRED)
+
+    if ("${BLAS_INCLUDE_DIRS}" STREQUAL "")
+        find_path(LLAMA_DSPARK_MARKOV_CBLAS_INCLUDE_DIR
+            NAMES cblas.h
+            HINTS
+                /usr/include
+                /usr/local/include
+                /usr/include/openblas
+                /opt/homebrew/opt/openblas/include
+                /usr/local/opt/openblas/include
+                /usr/include/x86_64-linux-gnu/openblas/include
+        )
+        set(BLAS_INCLUDE_DIRS ${LLAMA_DSPARK_MARKOV_CBLAS_INCLUDE_DIR})
+    endif()
+
+    if ("${BLAS_INCLUDE_DIRS}" STREQUAL "")
+        message(FATAL_ERROR "LLAMA_DSPARK_MARKOV_BLAS was enabled but cblas.h could not be found")
+    endif()
+
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_DSPARK_MARKOV_BLAS)
+    target_include_directories(${TARGET} SYSTEM PRIVATE ${BLAS_INCLUDE_DIRS})
+    target_link_libraries(${TARGET} PUBLIC ${BLAS_LIBRARIES})
+endif()
+
+if (LLAMA_DSPARK_MARKOV_CUDA)
+    # The CUDA language and CMAKE_CUDA_ARCHITECTURES are already established by
+    # ggml's CUDA backend build; reuse them for the self-contained resample TU.
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+
+    target_sources(${TARGET} PRIVATE dspark-markov.cu)
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_DSPARK_MARKOV_CUDA)
+    target_link_libraries(${TARGET} PRIVATE CUDA::cudart)
+
+    if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set_target_properties(${TARGET} PROPERTIES CUDA_ARCHITECTURES "80")
+    endif()
+endif()
+
 target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)

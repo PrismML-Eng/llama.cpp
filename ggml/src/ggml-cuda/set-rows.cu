@@ -217,6 +217,46 @@ static void set_rows_cuda(
     }
 }
 
+// Wide-row f32 -> f32 fast path: the generic kernel is scalar (one element per
+// thread, per-element index math and idx load). For wide contiguous rows (e.g.
+// recurrent-state snapshots, D = S_v*S_v*H elements per row) resolve the
+// destination row once per block and stream the row with float4 accesses.
+template <typename idx_t>
+static __global__ void k_set_rows_wide_f32(const char * __restrict__ src0,
+                                           const idx_t * __restrict__ src1,
+                                           char * __restrict__ dst,
+                                           const int64_t nv00, // row size in float4
+                                           const int64_t ne02,
+                                           const size_t  nb01,
+                                           const size_t  nb02,
+                                           const size_t  nb03,
+                                           const int64_t s10,
+                                           const int64_t s11,
+                                           const int64_t s12,
+                                           const size_t  nb1,
+                                           const size_t  nb2,
+                                           const size_t  nb3,
+                                           const uint3   ne11_fd,
+                                           const uint3   ne12_fd) {
+    const int64_t i01 = blockIdx.y;
+    const int64_t i02 = blockIdx.z % ne02;
+    const int64_t i03 = blockIdx.z / ne02;
+
+    const int64_t i11 = fastmodulo((uint32_t) i02, ne11_fd);
+    const int64_t i12 = fastmodulo((uint32_t) i03, ne12_fd);
+
+    ggml_cuda_pdl_sync();
+    const int64_t dst_row = *(src1 + i01*s10 + i11*s11 + i12*s12);
+    ggml_cuda_pdl_lc();
+
+    const float4 * src_row     = (const float4 *) (src0 + i01*nb01 + i02*nb02 + i03*nb03);
+    float4       * dst_row_ptr = (float4 *)       (dst  + dst_row*nb1 + i02*nb2 + i03*nb3);
+
+    for (int64_t i00 = blockIdx.x*blockDim.x + threadIdx.x; i00 < nv00; i00 += (int64_t) gridDim.x*blockDim.x) {
+        dst_row_ptr[i00] = src_row[i00];
+    }
+}
+
 template<typename src_t, typename idx_t>
 static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const src_t * src0_d = (const src_t *)src0->data;
@@ -226,6 +266,32 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
     cudaStream_t stream = ctx.stream();
 
+    if (dst->type == GGML_TYPE_F32 &&
+        ne00 % 4 == 0 && ne00 >= 1024 &&
+        ne01 <= 65535 && ne02*ne03 <= 65535 &&
+        nb00 == sizeof(float) &&
+        ((uintptr_t) src0->data) % 16 == 0 && nb01 % 16 == 0 && nb02 % 16 == 0 && nb03 % 16 == 0 &&
+        ((uintptr_t)  dst->data) % 16 == 0 && nb1  % 16 == 0 && nb2  % 16 == 0 && nb3  % 16 == 0) {
+        if (ggml_nelements(src0) > 0 && ne11 > 0 && ne12 > 0) {
+            const int64_t nv00 = ne00/4;
+
+            const dim3 block_size(CUDA_SET_ROWS_BLOCK_SIZE);
+            const dim3 grid_size((unsigned) ((nv00 + CUDA_SET_ROWS_BLOCK_SIZE - 1)/CUDA_SET_ROWS_BLOCK_SIZE),
+                                 (unsigned) ne01,
+                                 (unsigned) (ne02*ne03));
+
+            const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
+            const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
+
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_size, block_size, 0, stream);
+            ggml_cuda_kernel_launch(k_set_rows_wide_f32<idx_t>, launch_params,
+                (const char *) src0->data, src1_d, (char *) dst->data,
+                nv00, ne02, nb01, nb02, nb03,
+                (int64_t) (nb10/sizeof(idx_t)), (int64_t) (nb11/sizeof(idx_t)), (int64_t) (nb12/sizeof(idx_t)),
+                nb1, nb2, nb3, ne11_fd, ne12_fd);
+        }
+        return;
+    }
 
     if (dst->type == GGML_TYPE_F32) {
         set_rows_cuda(

@@ -41,6 +41,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_QWEN3VLMOE,       "qwen3vlmoe"       },
     { LLM_ARCH_QWEN35,           "qwen35"           },
     { LLM_ARCH_QWEN35MOE,        "qwen35moe"        },
+    { LLM_ARCH_DSPARK,           "dspark"           },
     { LLM_ARCH_PHI2,             "phi2"             },
     { LLM_ARCH_PHI3,             "phi3"             },
     { LLM_ARCH_PHIMOE,           "phimoe"           },
@@ -196,6 +197,12 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_MOE_EVERY_N_LAYERS,                "%s.moe_every_n_layers"                },
     { LLM_KV_MOE_LATENT_SIZE,                   "%s.moe_latent_size"                   },
     { LLM_KV_NEXTN_PREDICT_LAYERS,              "%s.nextn_predict_layers"              },
+    { LLM_KV_DSPARK_BLOCK_SIZE,                 "%s.dspark.block_size"                 },
+    { LLM_KV_DSPARK_MASK_TOKEN_ID,              "%s.dspark.mask_token_id"              },
+    { LLM_KV_DSPARK_TARGET_LAYERS,              "%s.dspark.target_layers"              },
+    { LLM_KV_DSPARK_MARKOV_RANK,                "%s.dspark.markov_rank"                },
+    { LLM_KV_DSPARK_CONFIDENCE_HEAD,            "%s.dspark.confidence_head"            },
+    { LLM_KV_DSPARK_CONFIDENCE_WITH_MARKOV,     "%s.dspark.confidence_head_with_markov"},
     { LLM_KV_NUM_DEEPSTACK_LAYERS,              "%s.n_deepstack_layers"                },
     { LLM_KV_DEEPSTACK_MAPPING,                 "%s.deepstack_mapping"                 },
     { LLM_KV_HIDDEN_ACT,                        "%s.hidden_activation"                 },
@@ -462,6 +469,11 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_NEXTN_HNORM,                            "blk.%d.nextn.hnorm" },
     { LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,                 "blk.%d.nextn.shared_head_head" },
     { LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,                 "blk.%d.nextn.shared_head_norm" },
+    { LLM_TENSOR_DSPARK_FC,                              "dspark.fc" },
+    { LLM_TENSOR_DSPARK_HIDDEN_NORM,                     "dspark.hidden_norm" },
+    { LLM_TENSOR_DSPARK_MARKOV_HEAD_A,                   "dspark.markov_head_a" },
+    { LLM_TENSOR_DSPARK_MARKOV_HEAD_B,                   "dspark.markov_head_b" },
+    { LLM_TENSOR_DSPARK_CONFIDENCE_HEAD,                 "dspark.confidence_head" },
     { LLM_TENSOR_ATTN_SUB_NORM,                          "blk.%d.attn_sub_norm" },
     { LLM_TENSOR_FFN_SUB_NORM,                           "blk.%d.ffn_sub_norm" },
     { LLM_TENSOR_DEC_OUTPUT_NORM,                        "dec.output_norm" },
@@ -779,6 +791,14 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_NEXTN_HNORM,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    // dspark drafter extras. fc / markov factors are matmuls; the two norms are
+    // elementwise muls. All output-side (non-repeating) so the loader does not
+    // require a per-block index.
+    {LLM_TENSOR_DSPARK_FC,                  {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DSPARK_HIDDEN_NORM,         {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL}},
+    {LLM_TENSOR_DSPARK_MARKOV_HEAD_A,       {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DSPARK_MARKOV_HEAD_B,       {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DSPARK_CONFIDENCE_HEAD,     {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
     // Nemotron 3 Super
     // latent projections feed ggml_mul_mat, the buft probe must use MUL_MAT to keep them on GPU
     {LLM_TENSOR_FFN_LATENT_DOWN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},

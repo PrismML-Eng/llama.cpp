@@ -9,6 +9,7 @@
 #include "ggml-metal-device.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <algorithm>
 #include <limits>
 #include <cmath>
@@ -2056,7 +2057,39 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
     // find the break-even point where the matrix-matrix kernel becomes more efficient compared
     // to the matrix-vector kernel
-    const int ne11_mm_min = 8;
+    // experiment knobs (verify-path investigation):
+    //   GGML_METAL_MM_MIN         - override ne11_mm_min (mul_mm used when ne11 > this)
+    //   GGML_METAL_EXT_MAX        - override max ne11 routed to the mul_mv_ext kernels
+    //   GGML_METAL_Q1_0_EXT_ENABLE - put Q1_0 back on the mul_mv_ext path (measured
+    //                                2.5-4x slower per weight pass than mul_mv for q1_0)
+    //   GGML_METAL_Q1_0_MV_MAX    - max ne11 kept on the (multi-column) mul_mv path for
+    //                               Q1_0 before switching to mul_mm
+    static const int  ne11_mm_min_env = getenv("GGML_METAL_MM_MIN")  ? atoi(getenv("GGML_METAL_MM_MIN"))  : 8;
+    static const int  ne11_ext_max    = getenv("GGML_METAL_EXT_MAX") ? atoi(getenv("GGML_METAL_EXT_MAX")) : 8;
+    static const bool q1_0_ext_enable = getenv("GGML_METAL_Q1_0_EXT_ENABLE") != NULL;
+    static const int  q1_0_mv_max     = getenv("GGML_METAL_Q1_0_MV_MAX") ? atoi(getenv("GGML_METAL_Q1_0_MV_MAX")) : 16;
+
+    // narrow-N tensor-path mul_mm for q1_0 mid-size batches (spec-decode verify):
+    //   GGML_METAL_Q1_0_NB_MIN/_NB_MAX - ne11 range routed to the nb kernels (min 0 disables)
+    //   GGML_METAL_Q1_0_NB             - force B-tile width (16/32; 0 = auto)
+    //   GGML_METAL_Q1_0_NB_K           - K-tile/16 (2, 4 or 8; default 2 - larger tiles measured slower)
+    static const int  q1_0_nb_min = getenv("GGML_METAL_Q1_0_NB_MIN") ? atoi(getenv("GGML_METAL_Q1_0_NB_MIN")) : 6;
+    static const int  q1_0_nb_max = getenv("GGML_METAL_Q1_0_NB_MAX") ? atoi(getenv("GGML_METAL_Q1_0_NB_MAX")) : 64;
+    static const int  q1_0_nb_w   = getenv("GGML_METAL_Q1_0_NB")     ? atoi(getenv("GGML_METAL_Q1_0_NB"))     : 0;
+    static const int  q1_0_nb_k   = getenv("GGML_METAL_Q1_0_NB_K")   ? atoi(getenv("GGML_METAL_Q1_0_NB_K"))   : 2;
+
+    // small weight matrices produce too few threadgroups for the nb path (dispatch
+    // goes latency-bound in the serialized decode graph) - keep them on mul_mv
+    static const int q1_0_nb_min_ne01 = getenv("GGML_METAL_Q1_0_NB_MIN_NE01") ? atoi(getenv("GGML_METAL_Q1_0_NB_MIN_NE01")) : 4096;
+
+    const bool use_mm_nb = props_dev->has_tensor &&
+        op->src[0]->type == GGML_TYPE_Q1_0 && op->src[1]->type == GGML_TYPE_F32 &&
+        q1_0_nb_min > 0 && ne11 >= q1_0_nb_min && ne11 <= q1_0_nb_max &&
+        ne01 >= q1_0_nb_min_ne01;
+
+    // for Q1_0 the multi-column mul_mv kernels (nr1 2/3/4) beat mul_mm well past the
+    // generic threshold: keep mid-size batches on mul_mv
+    const int ne11_mm_min = op->src[0]->type == GGML_TYPE_Q1_0 ? std::max(ne11_mm_min_env, q1_0_mv_max) : ne11_mm_min_env;
 
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
@@ -2067,7 +2100,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_F32  || // TODO: helper function
            op->src[0]->type == GGML_TYPE_F16  ||
            op->src[0]->type == GGML_TYPE_BF16 ||
-           op->src[0]->type == GGML_TYPE_Q1_0 ||
+           (op->src[0]->type == GGML_TYPE_Q1_0 && q1_0_ext_enable) ||
            op->src[0]->type == GGML_TYPE_Q2_0 ||
            op->src[0]->type == GGML_TYPE_Q4_0 ||
            op->src[0]->type == GGML_TYPE_Q4_1 ||
@@ -2076,7 +2109,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_Q8_0 ||
            op->src[0]->type == GGML_TYPE_MXFP4 ||
            op->src[0]->type == GGML_TYPE_IQ4_NL ||
-           false) && (ne11 >= 2 && ne11 <= 8)
+           false) && (ne11 >= 2 && ne11 <= ne11_ext_max)
          ) ||
          (
           (
@@ -2127,7 +2160,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             case 5:
                 r1ptg = 5; break;
             default:
-                GGML_ABORT("unsupported ne11");
+                // ne11 > 8 (reachable only via GGML_METAL_EXT_MAX override): tile with r1ptg=4/5
+                r1ptg = ne11 % 5 == 0 ? 5 : 4; break;
         };
 
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op, nsg, nxpsg, r1ptg);
@@ -2165,7 +2199,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         !ggml_is_transposed(op->src[1]) &&
         // for now the matrix-matrix multiplication kernel only works on A14+/M1+ SoCs
         // AMD GPU and older A-chips will reuse matrix-vector multiplication kernel
-        props_dev->has_simdgroup_mm && ne00 >= 64 && ne11 > ne11_mm_min) {
+        props_dev->has_simdgroup_mm && ne00 >= 64 && (ne11 > ne11_mm_min || use_mm_nb)) {
         //GGML_LOG_INFO("matrix: ne00 = %6d, ne01 = %6d, ne02 = %6d, ne11 = %6d, ne12 = %6d\n", ne00, ne01, ne02, ne11, ne12);
 
         // some Metal matrix data types require aligned pointers
@@ -2177,7 +2211,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         //    default: break;
         //}
 
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op);
+        const int nb_w = q1_0_nb_w ? q1_0_nb_w : (ne11 <= 16 ? 16 : 32);
+
+        auto pipeline = use_mm_nb ? ggml_metal_library_get_pipeline_mul_mm_nb(lib, op, nb_w, q1_0_nb_k)
+                                  : ggml_metal_library_get_pipeline_mul_mm(lib, op);
 
         ggml_metal_kargs_mul_mm args = {
             /*.ne00 =*/ ne00,

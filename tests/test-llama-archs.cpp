@@ -167,6 +167,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   uint32_t(192));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, uint32_t(128));
     }
+    // dspark drafter: required hparams (block size, mask token, target tap layers)
+    ms.add_kv(LLM_KV_DSPARK_BLOCK_SIZE,    uint32_t(7));
+    ms.add_kv(LLM_KV_DSPARK_MASK_TOKEN_ID, uint32_t(0));
+    ms.add_kv(LLM_KV_DSPARK_TARGET_LAYERS, std::vector<uint32_t>({1, 2}));
+
     ms.add_kv(LLM_KV_ATTENTION_CLAMP_KQV,              1.0f);
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_EPS,          1e-5f);
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,      1e-5f);
@@ -450,6 +455,12 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
         if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
         }
+        if (arch == LLM_ARCH_DSPARK) {
+            // the dspark drafter is not a generic LM: a decode without staged
+            // target-tap capture features produces no logits (see
+            // tests/test-dspark-forward.cpp for its dedicated gates)
+            continue;
+        }
         for (bool moe : {false, true}) {
             if (moe && !moe_implemented(arch)) {
                 continue;
@@ -552,6 +563,12 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         }
         if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
+        }
+        if (arch == LLM_ARCH_DSPARK) {
+            // the dspark drafter is not a generic LM: a decode without staged
+            // target-tap capture features produces no logits (see
+            // tests/test-dspark-forward.cpp for its dedicated gates)
+            continue;
         }
 
         const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;

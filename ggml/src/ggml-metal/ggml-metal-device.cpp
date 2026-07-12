@@ -5,6 +5,7 @@
 #include "ggml-impl.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -745,6 +746,58 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_nb(ggml_metal_library_t lib, const ggml_tensor * op, int nb, int nk) {
+    GGML_ASSERT(ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor);
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_Q1_0);
+    GGML_ASSERT(nb == 16 || nb == 32);
+    GGML_ASSERT(nk == 2  || nk == 4 || nk == 8);
+    if (nb == 32) {
+        nk = 2; // only nb16 has larger K-tile instantiations (k64/k128)
+    }
+
+    char base[256];
+    char name[256];
+
+    // A-tile height (GGML_METAL_Q1_0_NB_A: 32/64/128, nb16 only)
+    static const int nra_env = getenv("GGML_METAL_Q1_0_NB_A") ? atoi(getenv("GGML_METAL_Q1_0_NB_A")) : 64;
+    const int nra = nb == 16 ? nra_env : 64;
+    const int nsg = nra == 128 ? 4 : 2;
+
+    GGML_ASSERT(op->src[1]->ne[2] <= INT16_MAX && op->src[1]->ne[3] <= INT16_MAX);
+    const int16_t ne12 = (int16_t) op->src[1]->ne[2];
+    const int16_t ne13 = (int16_t) op->src[1]->ne[3];
+    const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
+    const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
+
+    if (nra == 64) {
+        snprintf(base, 256, "kernel_mul_mm_nb%d_k%d_%s_%s", nb, 16*nk, ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type));
+    } else {
+        snprintf(base, 256, "kernel_mul_mm_nb%da%d_k%d_%s_%s", nb, nra, 16*nk, ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type));
+    }
+    snprintf(name, 256, "%s_ne12=%d_ne13=%d_r2=%d_r3=%d", base, ne12, ne13, r2, r3);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_int16(cv, ne12,  FC_MUL_MM + 2);
+        ggml_metal_cv_set_int16(cv, ne13,  FC_MUL_MM + 3);
+        ggml_metal_cv_set_int16(cv, r2,    FC_MUL_MM + 4);
+        ggml_metal_cv_set_int16(cv, r3,    FC_MUL_MM + 5);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    res.nr0  = nra;
+    res.nr1  = nb;
+    res.nsg  = nsg;
+    res.smem = (size_t) nra * (16*nk) * sizeof(ggml_fp16_t);
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -786,6 +839,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_Q1_0;
                 nr0 = N_R0_Q1_0;
+
+                // multi-column variants: read the streamed weights once per nr1
+                // src1 columns (mid-size batch / spec-decode verify path).
+                // GGML_METAL_Q1_0_NR1 clamps the max variant (1 disables).
+                static const int nr1_max = getenv("GGML_METAL_Q1_0_NR1") ? atoi(getenv("GGML_METAL_Q1_0_NR1")) : 0;
+
+                // measured (M5 Pro): nr1=2 is the per-pass sweet spot; nr1=3 wins for
+                // exactly 3 columns; nr1=4 variants are latency/register limited and
+                // lose to ceil(ne11/2) passes of nr1=2. GGML_METAL_Q1_0_NR1=n forces nr1.
+                const int nr1_force = nr1_max <= 4 ? nr1_max : 0;
+                if (nr1_force > 1) {
+                    nr1 = nr1_force;
+                    suffix = nr1 == 2 ? "_nr1_2" : nr1 == 3 ? "_nr1_3" : "_nr1_4";
+                } else if (nr1_max != 1 && ne11 == 3) {
+                    nr1 = 3; suffix = "_nr1_3";
+                } else if (nr1_max != 1 && ne11 >= 2) {
+                    nr1 = 2; suffix = "_nr1_2";
+                }
             } break;
         case GGML_TYPE_Q2_0:
             {

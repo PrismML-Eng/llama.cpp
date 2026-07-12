@@ -3,6 +3,8 @@
 #include "common.h"
 #include "ggml.h"
 #include "llama.h"
+#include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP);
+                              // llama_dspark_meta / llama_model_dspark_get_meta / llama_model_dspark_get_markov (used by dspark)
 #include "log.h"
 #include "ngram-cache.h"
 #include "ngram-map.h"
@@ -15,8 +17,17 @@
 #include <cassert>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <cinttypes>
+
+#ifdef LLAMA_DSPARK_MARKOV_BLAS
+#include <cblas.h>
+#endif
+
+#ifdef LLAMA_DSPARK_MARKOV_CUDA
+#include "dspark-markov.h"
+#endif
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -26,6 +37,7 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
     {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
     {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+    {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
     {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
@@ -164,6 +176,23 @@ struct common_speculative_impl {
 
     // true if this implementation requires the target context to extract pre-norm embeddings
     virtual bool need_embd_nextn() const { return false; }
+
+    // true if this implementation requires the target's multi-layer tap capture
+    // (see llama_set_capture_layers / llama_get_embeddings_capture_ith)
+    virtual bool need_embd_capture() const { return false; }
+
+    // TEST/DEBUG ONLY hook: lets a test harness inject target-tap context rows
+    // directly (see common_speculative_dspark_stage_ctx_test in speculative.h),
+    // bypassing the normal process()-driven capture path. No-op for every
+    // implementation except dspark.
+    virtual bool stage_test_ctx_feat(
+            llama_seq_id /*seq_id*/,
+            const float * /*feat*/,
+            int64_t /*n_rows*/,
+            int64_t /*n_embd_cap*/,
+            const int32_t * /*pos*/) {
+        return false;
+    }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -786,6 +815,557 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 };
 
+// dspark: EAGLE-style block-diffusion drafter (Phase 2 of the dspark port --
+// see docs/dspark-scope.md). The forward graph itself
+// (src/models/dspark.cpp) is Phase 1 and is not touched here; this class only
+// drives the repeated draft/verify loop around it.
+//
+// Shape of one round, mirroring the Python reference implementation 1:1:
+//   - L      = n_cache[seq]  : rows currently resident in ctx_dft's persistent
+//                              KV cache for this seq (DynamicCache.get_seq_length()).
+//   - start  = dp.n_past     : absolute position of the last committed token
+//                              (dp.id_last) -- the reference's "start".
+//   - ctx_len = start - L    : number of NEW target-tap context rows to feed
+//                              this round (== previous round's n_accepted+1,
+//                              or the whole prompt for the very first round).
+//   - one llama_decode(ctx_dft) call over n_tokens = ctx_len + block_size:
+//     ctx_len dummy-token rows (their real content comes from
+//     llama_set_dspark_ctx, not batch.token) followed by the block_size draft
+//     rows (block position 0 seeded with the REAL anchor token dp.id_last,
+//     positions 1..block_size-1 seeded with mask_token_id).
+//   - crop ctx_dft's cache back to `start` (DynamicCache.crop(start)):
+//     the draft block's rows are always thrown away immediately regardless of
+//     what the target ultimately accepts -- only accept() decides what
+//     becomes real context for the NEXT round.
+//   - sequential, host-side Markov resample over the block_size base logits
+//     (see the class-level comment on the resample loop below).
+//
+// Context-row bookkeeping: llama_dspark_ctx (src/llama-graph.h) is a single
+// staging slot on llama_context, not per-sequence, so -- like the Python reference
+// reference itself (build_dspark_proposal asserts batch_size==1) -- this impl
+// drafts sequences one at a time within draft(), not batched together in one
+// llama_decode call. Fine for the single-stream case this Phase 2 gate
+// targets; batching multiple concurrently-drafting seqs into one dspark call
+// would need a per-seq-capable staging mechanism, out of scope here.
+struct common_speculative_impl_draft_dspark : public common_speculative_impl {
+    common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
+
+    int64_t n_embd        = 0;
+    int64_t n_vocab       = 0; // from token_embd's own shape; dspark has no tokenizer/vocab of its own
+    int64_t n_capture     = 0; // target_layer_ids count
+    int64_t n_embd_cap    = 0; // n_capture * n_embd (raw pre-fc tap width)
+    int32_t block_size    = 0;
+    int32_t mask_token_id = 0;
+
+    // vanilla Markov head weights, host-resident (loaded once at construction
+    // via llama_model_dspark_get_markov): [n_vocab * n_rank] row-major, rank
+    // fastest-varying. See the resample loop in draft() for how these are used.
+    std::vector<float> markov_w1;
+    std::vector<float> markov_w2;
+    std::vector<float> markov_bias;
+    int64_t markov_rank = 0;
+    bool    has_markov  = false;
+#ifdef LLAMA_DSPARK_MARKOV_CUDA
+    bool                        markov_use_cuda = false; // device-side resample (default when built with CUDA; LLAMA_DSPARK_MARKOV_CUDA=0 to disable)
+    struct dspark_markov_cuda * markov_cuda     = nullptr;
+#endif
+
+    llama_batch batch; // ctx_dft batch; no embd channel -- context features are
+                        // staged out-of-band via llama_set_dspark_ctx, not batch.embd
+
+    // --- per-seq persistent state --------------------------------------
+    // drafter KV-cache length ("L" above / DynamicCache.get_seq_length()):
+    // number of context rows currently resident in ctx_dft's cache.
+    std::vector<int64_t> n_cache;
+
+    // growing buffer of not-yet-consumed target-tap context rows, accumulated
+    // across process() calls since the last draft() call drained them. Rows
+    // are contiguous and strictly increasing in position (asserted in draft()).
+    std::vector<std::vector<float>>   ctx_feat; // [n_seq][rows * n_embd_cap]
+    std::vector<std::vector<int32_t>> ctx_pos;  // [n_seq][rows]
+
+    // how many of the currently-buffered rows were appended since the last
+    // accept() call. accept() trims exactly this many down to n_accepted+1,
+    // discarding the rejected tail, leaving any earlier
+    // (already-accepted-but-not-yet-drained) rows untouched. This is what
+    // lets dspark's context stay correct even on rounds where a DIFFERENT
+    // implementation's draft is the one that gets verified: process() runs
+    // (and accumulates) unconditionally for every registered impl, and
+    // accept() runs on every impl too (is_other=true for the ones that didn't
+    // draft), so dspark's own bookkeeping tracks the real generation stream
+    // regardless of who proposed a given round's tokens.
+    std::vector<int64_t> rows_since_accept;
+
+    // process()'s per-seq contiguous-range bookkeeping (mirrors draft-mtp).
+    std::vector<int32_t> i_batch_beg;
+    std::vector<int32_t> i_batch_end;
+
+    common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, n_seq)
+        , params(params.draft)
+    {
+        auto * ctx_dft = this->params.ctx_dft;
+        auto * ctx_tgt = this->params.ctx_tgt;
+        GGML_ASSERT(ctx_dft && ctx_tgt && "dspark requires ctx_tgt and ctx_dft to be set");
+
+        const llama_model * model_dft = llama_get_model(ctx_dft);
+
+        llama_dspark_meta meta;
+        if (!llama_model_dspark_get_meta(model_dft, &meta)) {
+            throw std::runtime_error("dspark: ctx_dft's model does not look like a dspark drafter (missing dspark.*.block_size KV)");
+        }
+
+        n_embd        = meta.n_embd;
+        n_vocab       = meta.n_vocab;
+        n_capture     = meta.n_capture;
+        n_embd_cap    = meta.n_embd_cap;
+        block_size    = meta.block_size;
+        mask_token_id = meta.mask_token_id;
+        markov_rank   = meta.markov_rank;
+
+        has_markov = markov_rank > 0 && llama_model_dspark_get_markov(model_dft, markov_w1, markov_w2);
+        if (n_vocab > std::numeric_limits<int>::max()) {
+            throw std::runtime_error("dspark: vocab size exceeds cblas integer range");
+        }
+        markov_bias.resize((size_t) n_vocab);
+
+#ifdef LLAMA_DSPARK_MARKOV_CUDA
+        // Device path is the DEFAULT when built with CUDA and a real markov head:
+        // upload the Markov factors once and run the whole sequential resample on
+        // the GPU (token-identical to the host scalar/BLAS path). Opt out with
+        // LLAMA_DSPARK_MARKOV_CUDA=0 to fall back to the host path.
+        bool want_cuda_markov = has_markov;
+        if (const char * e = getenv("LLAMA_DSPARK_MARKOV_CUDA")) {
+            const char c     = e[0];
+            want_cuda_markov = want_cuda_markov && !(c == '0' || c == 'n' || c == 'N' || c == 'f' || c == 'F');
+        }
+        if (want_cuda_markov) {
+            markov_cuda     = dspark_markov_cuda_init(markov_w1.data(), markov_w2.data(), n_vocab, markov_rank);
+            markov_use_cuda = markov_cuda != nullptr;
+            LOG_INF("%s: - device markov resample (CUDA) %s\n", __func__,
+                    markov_use_cuda ? "ENABLED (default; LLAMA_DSPARK_MARKOV_CUDA=0 to disable)" :
+                                      "FAILED TO INIT (falling back to host path)");
+        }
+#endif
+
+        LOG_INF("%s: adding speculative implementation 'draft-dspark'\n", __func__);
+        LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_capture=%lld, n_embd=%lld, n_vocab=%lld, markov_rank=%lld, has_markov=%d\n",
+                __func__, block_size, mask_token_id, (long long) n_capture, (long long) n_embd, (long long) n_vocab,
+                (long long) markov_rank, (int) has_markov);
+        if (markov_rank > 0 && !has_markov) {
+            LOG_WRN("%s: dspark model reports markov_rank=%lld but its markov head weights could not be read "
+                    "(gated/rnn markov head type? only 'vanilla' is supported) -- "
+                    "block logits will NOT be markov-corrected\n", __func__, (long long) markov_rank);
+        }
+
+        // dspark attention is fully non-causal within a call: the draft block
+        // attends over the WHOLE persistent cache plus itself, with no
+        // position-based masking (attention_mask=None, is_causal=False in the
+        // reference) -- see src/models/dspark.cpp's header comment.
+        llama_set_causal_attn(ctx_dft, false);
+
+        const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
+        batch = llama_batch_init(/* n_tokens = */ n_b, /* embd = */ 0, /* n_seq_max = */ 1);
+
+        n_cache.assign(n_seq, 0);
+        ctx_feat.assign(n_seq, {});
+        ctx_pos.assign(n_seq, {});
+        rows_since_accept.assign(n_seq, 0);
+        i_batch_beg.assign(n_seq, -1);
+        i_batch_end.assign(n_seq, -1);
+    }
+
+    ~common_speculative_impl_draft_dspark() override {
+        llama_batch_free(batch);
+#ifdef LLAMA_DSPARK_MARKOV_CUDA
+        if (markov_cuda != nullptr) {
+            dspark_markov_cuda_free(markov_cuda);
+            markov_cuda = nullptr;
+        }
+#endif
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        // fresh generation: drop any leftover state from a prior generation
+        // that reused this seq slot, and make sure ctx_dft's own cache for
+        // this seq starts empty.
+        n_cache[seq_id] = 0;
+        ctx_feat[seq_id].clear();
+        ctx_pos[seq_id].clear();
+        rows_since_accept[seq_id] = 0;
+
+        llama_memory_seq_rm(llama_get_memory(params.ctx_dft), seq_id, 0, -1);
+    }
+
+    bool process(const llama_batch & batch_in) override {
+        if (batch_in.n_tokens <= 0) {
+            return true;
+        }
+
+        // TODO: how to make it work with vision tokens? (mirrors draft-mtp)
+        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+            return true;
+        }
+
+        const int32_t n_tokens = batch_in.n_tokens;
+
+        std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
+        std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
+
+        for (int k = 0; k < n_tokens; ++k) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                GGML_ASSERT(batch_in.n_seq_id[k] == 1);
+
+                if (batch_in.seq_id[k][0] == seq_id) {
+                    i_batch_end[seq_id] = k;
+                    if (i_batch_beg[seq_id] < 0) {
+                        i_batch_beg[seq_id] = k;
+                    }
+                }
+            }
+        }
+
+        auto * ctx_tgt = params.ctx_tgt;
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_batch_beg[seq_id] < 0) {
+                continue;
+            }
+
+            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+
+            auto & feat = ctx_feat[seq_id];
+            auto & pos  = ctx_pos[seq_id];
+
+            const size_t row0 = pos.size();
+            feat.resize((row0 + (size_t) n_rows) * (size_t) n_embd_cap);
+            pos.resize(row0 + (size_t) n_rows);
+
+            for (int32_t i = 0; i < n_rows; ++i) {
+                const int32_t k = i_batch_beg[seq_id] + i;
+
+                // NOTE: capture rows always use the masked (output-row) layout
+                // (see src/llama-context.cpp's get_embeddings_capture_ith) --
+                // this requires the caller to have requested logits/output on
+                // EVERY row it wants a capture row for (unlike the pre-norm
+                // path MTP uses, which can force unmasked extraction). For a
+                // long prompt this means every prefill row, not just the
+                // last -- a caller-side (main/server driver loop) requirement
+                // when a registered impl reports need_embd_capture(), exactly
+                // analogous to draft-mtp's own begin()-time warning about
+                // need_embd_nextn.
+                const float * cap = llama_get_embeddings_capture_ith(ctx_tgt, k);
+                if (cap == nullptr) {
+                    LOG_ERR("%s: llama_get_embeddings_capture_ith(%d) returned null -- was "
+                            "llama_set_capture_layers() engaged and logits requested for every "
+                            "row this impl needs?\n", __func__, k);
+                    return false;
+                }
+
+                std::memcpy(feat.data() + (row0 + (size_t) i) * (size_t) n_embd_cap, cap,
+                        (size_t) n_embd_cap * sizeof(float));
+                pos[row0 + i] = batch_in.pos[k];
+            }
+
+            rows_since_accept[seq_id] += n_rows;
+        }
+
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        auto * ctx_dft = params.ctx_dft;
+        const int64_t n_batch_max = (int64_t) llama_n_batch(ctx_dft);
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            auto & feat = ctx_feat[seq_id];
+            auto & pos  = ctx_pos[seq_id];
+
+            const int64_t L       = n_cache[seq_id];
+            const int64_t start   = dp.n_past;
+            const int64_t ctx_len = start - L;
+
+            if (ctx_len <= 0) {
+                LOG_WRN("%s: seq %d has no new context rows staged (n_past=%lld, cache=%lld) -- "
+                        "skipping this round\n", __func__, (int) seq_id, (long long) start, (long long) L);
+                continue;
+            }
+            if ((int64_t) pos.size() != ctx_len) {
+                LOG_ERR("%s: seq %d staged context rows (%zu) != expected ctx_len (%lld) -- "
+                        "n_past bookkeeping is out of sync with process()/accept(); "
+                        "aborting draft for this seq this round\n",
+                        __func__, (int) seq_id, pos.size(), (long long) ctx_len);
+                continue;
+            }
+            GGML_ASSERT(pos.front() == (int32_t) L        && "dspark: staged rows do not start at the drafter's cache position");
+            GGML_ASSERT(pos.back()  == (int32_t) start - 1 && "dspark: staged rows do not end just before the anchor position");
+
+            const int64_t n_tokens = ctx_len + block_size;
+            if (n_tokens > n_batch_max) {
+                LOG_ERR("%s: seq %d round needs %lld tokens > n_batch=%lld -- skipping\n",
+                        __func__, (int) seq_id, (long long) n_tokens, (long long) n_batch_max);
+                continue;
+            }
+
+            llama_set_dspark_ctx(ctx_dft, feat.data(), ctx_len, n_embd_cap, pos.data());
+
+            common_batch_clear(batch);
+            for (int64_t i = 0; i < ctx_len; ++i) {
+                // dummy token id: this row's real content comes from the
+                // staged dspark ctx feature above, not the token embedding
+                // (see src/models/dspark.cpp -- these columns are sliced away
+                // before the residual stream even forms). logits=false: this
+                // impl never reads output for context rows.
+                common_batch_add(batch, /* token = */ 0, (llama_pos)(L + i), { seq_id }, /* logits = */ false);
+            }
+            // block position 0 is seeded with the REAL last-accepted token
+            // (the "anchor"), NOT mask_token_id -- matches the Python reference
+            // reference's evaluator._propose (draft_input_ids[:,0] =
+            // output_ids[:,start]). Positions 1..block_size-1 are masked.
+            common_batch_add(batch, dp.id_last, (llama_pos) start, { seq_id }, /* logits = */ true);
+            for (int32_t k = 1; k < block_size; ++k) {
+                common_batch_add(batch, mask_token_id, (llama_pos)(start + k), { seq_id }, /* logits = */ true);
+            }
+
+            const int32_t rc = llama_decode(ctx_dft, batch);
+
+            // always clear the staged ctx immediately after use, success or not.
+            llama_set_dspark_ctx(ctx_dft, nullptr, 0, 0, nullptr);
+
+            if (rc != 0) {
+                LOG_WRN("%s: llama_decode(ctx_dft) failed rc=%d for seq %d\n", __func__, rc, (int) seq_id);
+                continue;
+            }
+
+            // crop away the just-written draft block, keeping only the
+            // (now-committed) context rows -- mirrors
+            // past_key_values_draft.crop(start) in the Python reference implementation.
+            // The speculative tail is discarded every round regardless of
+            // what the target ultimately accepts; only accept()/process()
+            // decide what becomes real context for the NEXT round.
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, (llama_pos) start, -1);
+            n_cache[seq_id] = start;
+
+            feat.clear();
+            pos.clear();
+            rows_since_accept[seq_id] = 0; // this round's rows were just consumed
+
+            // --- sequential Markov resample -------------------------------
+            // step_logits[k] = base_logits[k] + markov_w2(markov_w1(prev_token)),
+            // where prev_token is the block's own anchor token for k==0 and the
+            // ACTUALLY SAMPLED token from step k-1 for k>0. This must never be
+            // batched over mask_token_id for all block positions at once --
+            // that exact bug class already hit the on-device (MLX/Swift) port.
+            // The assert below makes the sequential dependency structural
+            // rather than just a comment: it is unsatisfiable if this loop is
+            // ever refactored to precompute prev_token_ids up front from
+            // draft_input_ids instead of chaining the sampled result forward.
+            llama_tokens result;
+            result.reserve(block_size);
+
+            // dense output buffer: only the block_size draft rows requested
+            // logits this call, so llama_get_logits() is already exactly
+            // block_size*n_vocab floats in row order -- no per-row index
+            // resolution needed (mirrors tests/test-dspark-forward.cpp's
+            // llama_get_logits(ctx) usage). llama_get_logits_ith(ctx, i)
+            // would need i to be the RAW ubatch row (ctx_len + k here), since
+            // it resolves through output_resolve_row() same as the
+            // pre-norm/capture accessors -- the bulk buffer sidesteps that.
+            const float * logits_base = llama_get_logits(ctx_dft);
+            if (logits_base == nullptr) {
+                LOG_ERR("%s: llama_get_logits(ctx_dft) returned null for seq %d\n", __func__, (int) seq_id);
+                continue;
+            }
+
+            bool did_cuda = false;
+#ifdef LLAMA_DSPARK_MARKOV_CUDA
+            // Device path: one H2D of this round's base logits, then a
+            // sequential per-position fused GEMV + add-base + argmax that
+            // chains through a device-resident prev token. The chaining
+            // invariant is structural -- position k's kernel reads the argmax
+            // position k-1's kernel wrote to device memory, never a host id.
+            if (markov_use_cuda && has_markov) {
+                static_assert(sizeof(llama_token) == sizeof(int32_t),
+                        "dspark cuda markov path assumes llama_token == int32_t");
+                result.resize((size_t) block_size);
+                if (dspark_markov_cuda_resample(markov_cuda, logits_base, (int32_t) dp.id_last,
+                                                block_size, (int32_t *) result.data())) {
+                    // Host-side mirror of the sequential-chaining assert: any
+                    // token that feeds a later position's prev must not be the
+                    // mask token -- same invariant the host loop enforces.
+                    for (int32_t k = 1; k < block_size; ++k) {
+                        GGML_ASSERT(result[(size_t) (k - 1)] != mask_token_id &&
+                                "dspark: cuda markov resample chained a mask_token_id prev -- "
+                                "sequential invariant violated");
+                    }
+                    did_cuda = true;
+                } else {
+                    LOG_WRN("%s: cuda markov resample failed for seq %d -- falling back to the host path\n",
+                            __func__, (int) seq_id);
+                    markov_use_cuda = false;
+                    result.clear();
+                }
+            }
+#endif
+
+            llama_token prev_token = dp.id_last;
+
+            if (!did_cuda)
+            for (int32_t k = 0; k < block_size; ++k) {
+                if (k > 0) {
+                    GGML_ASSERT(prev_token != mask_token_id &&
+                            "dspark: markov resample must chain the previous step's SAMPLED "
+                            "token, never mask_token_id -- do not batch this over the block");
+                }
+
+                const float * base_logits = logits_base + (size_t) k * n_vocab;
+
+                llama_token best_id = 0;
+                float       best_v  = -std::numeric_limits<float>::infinity();
+
+                if (has_markov) {
+                    const float * emb = markov_w1.data() + (size_t) prev_token * (size_t) markov_rank;
+#ifdef LLAMA_DSPARK_MARKOV_BLAS
+                    cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                                (int) n_vocab, (int) markov_rank,
+                                1.0f,
+                                markov_w2.data(), (int) markov_rank,
+                                emb, 1,
+                                0.0f,
+                                markov_bias.data(), 1);
+
+                    for (int64_t v = 0; v < n_vocab; ++v) {
+                        const float logit = base_logits[v] + markov_bias[(size_t) v];
+                        if (logit > best_v) {
+                            best_v  = logit;
+                            best_id = (llama_token) v;
+                        }
+                    }
+#else
+                    for (int64_t v = 0; v < n_vocab; ++v) {
+                        const float * w2row = markov_w2.data() + (size_t) v * (size_t) markov_rank;
+                        float bias = 0.0f;
+                        for (int64_t r = 0; r < markov_rank; ++r) {
+                            bias += emb[r] * w2row[r];
+                        }
+                        const float logit = base_logits[v] + bias;
+                        if (logit > best_v) {
+                            best_v  = logit;
+                            best_id = (llama_token) v;
+                        }
+                    }
+#endif
+                } else {
+                    for (int64_t v = 0; v < n_vocab; ++v) {
+                        if (base_logits[v] > best_v) {
+                            best_v  = base_logits[v];
+                            best_id = (llama_token) v;
+                        }
+                    }
+                }
+
+                result.push_back(best_id);
+                prev_token = best_id; // chain the SAMPLED token, never mask_token_id
+            }
+
+            if (result.size() < (size_t) params.n_min) {
+                continue; // dp.result stays empty: treated as a failed draft this round
+            }
+
+            *dp.result = std::move(result);
+        }
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        const int64_t n_round_rows = rows_since_accept[seq_id];
+        rows_since_accept[seq_id] = 0;
+        if (n_round_rows <= 0) {
+            return;
+        }
+
+        // process() (or the test-only injection hook) unconditionally
+        // captured tap features for the WHOLE verify batch, including any
+        // positions past the accepted prefix; trim this round's
+        // freshly-appended tail down to n_accepted+1 rows (the actually
+        // committed context), discarding the rejected continuation. This
+        // mirrors the Python reference implementation's evaluator._update():
+        //   context.target_hidden_states = verified_target_hidden[:, :accepted_draft_tokens+1, :]
+        // Runs the same way regardless of is_other: dspark's own context must
+        // stay correct even on rounds where a different implementation's
+        // draft is the one that gets verified.
+        const int64_t keep = std::min<int64_t>(n_round_rows, (int64_t) n_accepted + 1);
+        const int64_t drop = n_round_rows - keep;
+
+        if (drop > 0) {
+            auto & feat = ctx_feat[seq_id];
+            auto & pos  = ctx_pos[seq_id];
+
+            const size_t total_rows = pos.size();
+            GGML_ASSERT((int64_t) total_rows >= drop);
+
+            feat.resize((total_rows - (size_t) drop) * (size_t) n_embd_cap);
+            pos.resize(total_rows - (size_t) drop);
+        }
+    }
+
+    bool need_embd() const override {
+        return false;
+    }
+
+    bool need_embd_nextn() const override {
+        return false;
+    }
+
+    bool need_embd_capture() const override {
+        return true;
+    }
+
+    bool stage_test_ctx_feat(
+            llama_seq_id seq_id,
+            const float * feat_in,
+            int64_t n_rows,
+            int64_t n_embd_cap_in,
+            const int32_t * pos_in) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+        if (n_embd_cap_in != n_embd_cap) {
+            LOG_ERR("%s: n_embd_cap mismatch: got %lld, expected %lld\n",
+                    __func__, (long long) n_embd_cap_in, (long long) n_embd_cap);
+            return false;
+        }
+        if (n_rows <= 0) {
+            return true;
+        }
+
+        auto & feat = ctx_feat[seq_id];
+        auto & pos  = ctx_pos[seq_id];
+
+        const size_t row0 = pos.size();
+        feat.resize((row0 + (size_t) n_rows) * (size_t) n_embd_cap);
+        pos.resize(row0 + (size_t) n_rows);
+
+        std::memcpy(feat.data() + row0 * (size_t) n_embd_cap, feat_in, (size_t) n_rows * (size_t) n_embd_cap * sizeof(float));
+        std::memcpy(pos.data() + row0, pos_in, (size_t) n_rows * sizeof(int32_t));
+
+        rows_since_accept[seq_id] += n_rows;
+        return true;
+    }
+};
+
 // state of self-speculation (simple implementation, not ngram-map)
 struct common_speculative_impl_ngram_simple : public common_speculative_impl {
     common_params_speculative_ngram_map params;
@@ -1282,6 +1862,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
         case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
         case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return "ngram-map-k";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
@@ -1336,6 +1917,15 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
                 break;
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+                // dspark's real upper bound is the checkpoint's block_size
+                // (typically 7), which isn't known until the GGUF is loaded --
+                // this function only sees CLI params. Reuse the same
+                // user-configurable draft.n_max bound the other draft-model
+                // types use; callers enabling dspark should set --draft-max
+                // to at least the checkpoint's block_size.
+                n_max = std::max(n_max, std::max(0, spec->draft.n_max));
+                break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
                 n_max = std::max(n_max, (int32_t) spec->ngram_simple.size_m);
                 break;
@@ -1371,6 +1961,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_draft_simple = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE));
         bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
         bool has_mtp = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) && params.draft.ctx_dft != nullptr;
+        bool has_dspark = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) && params.draft.ctx_dft != nullptr;
 
         bool has_ngram_cache   = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_CACHE));
         bool has_ngram_simple  = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE));
@@ -1379,7 +1970,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_ngram_mod     = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MOD));
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 9);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 10);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -1409,6 +2000,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         if (has_mtp) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, params));
         }
+        if (has_dspark) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params));
+        }
     }
 
     std::vector<std::unique_ptr<common_speculative_impl>> impls = {};
@@ -1427,6 +2021,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
                 impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK: {
+                impls.push_back(std::make_unique<common_speculative_impl_draft_dspark>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {
@@ -1555,6 +2153,20 @@ bool common_speculative_need_embd_nextn(common_speculative * spec) {
 
     for (auto & impl : spec->impls) {
         if (impl->need_embd_nextn()) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool common_speculative_need_embd_capture(common_speculative * spec) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    for (auto & impl : spec->impls) {
+        if (impl->need_embd_capture()) {
             return true;
         }
     }
@@ -1693,4 +2305,25 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_acc_tokens,
                 str_perf.c_str());
     }
+}
+
+bool common_speculative_dspark_stage_ctx_test(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        const float * feat,
+        int64_t n_rows,
+        int64_t n_embd_cap,
+        const int32_t * pos) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    bool any = false;
+    for (auto & impl : spec->impls) {
+        if (impl->stage_test_ctx_feat(seq_id, feat, n_rows, n_embd_cap, pos)) {
+            any = true;
+        }
+    }
+
+    return any;
 }

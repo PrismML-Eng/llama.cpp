@@ -320,8 +320,14 @@ int main(int argc, char ** argv) {
         {
             LOG_DBG("clear kv cache from any extra tokens, n_past = %d\n", n_past);
 
-            llama_memory_seq_rm(llama_get_memory(ctx_tgt),       seq_id, n_past, -1);
-            llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq_id, n_past, -1);
+            // must not ignore failure here: on a hybrid GDN/attention target
+            // this is a bounded partial rollback of the recurrent state (see
+            // common_params_speculative::need_n_rs_seq()), and a silently
+            // ignored no-op would leave every round's rejected draft tail
+            // permanently baked into the recurrent state instead of failing
+            // loudly.
+            common_context_seq_rm(ctx_tgt,       seq_id, n_past, -1);
+            common_context_seq_rm(ctx_dft.get(), seq_id, n_past, -1);
         }
 
         if ((params.n_predict >= 0 && n_predict > params.n_predict) || has_eos) {

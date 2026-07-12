@@ -257,6 +257,13 @@ set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED 
 llama_build_and_test(test-recurrent-state-rollback.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-recurrent-state-rollback PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# Rotating recurrent-state snapshot ring (n_rs_seq). Skips unless the model arch
+# supports recurrent rollback -- run manually against a hybrid GDN model, e.g.:
+#   python3 tests/gen-tiny-qwen35.py /tmp/tiny-qwen35.gguf
+#   test-rs-ring-rotation -m /tmp/tiny-qwen35.gguf
+llama_build_and_test(test-rs-ring-rotation.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-rs-ring-rotation PROPERTIES FIXTURES_REQUIRED test-download-model)
+
 # Test state save/load functionality
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
@@ -310,3 +317,23 @@ if (TARGET gguf-model-data)
     target_link_libraries(export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# dspark Phase 1 forward-graph gate (Tier 1: synthetic tap features / Tier 2:
+# diff vs the Python reference implementation). Not wired into `ctest` since both
+# tiers need a real dspark GGUF passed on the command line; run manually.
+llama_build(test-dspark-forward.cpp)
+
+# dspark Phase 2 block-draft-loop gate (common_speculative_impl_draft_dspark):
+# diffs several rounds of the real draft loop against a Python
+# reference (scratchpad/dspark_phase2_py_ref.py) driven over an identical
+# synthetic target-feature stand-in. Not wired into `ctest`: needs a tiny
+# synthetic dspark GGUF + the reference JSON passed on the command line (see
+# scratchpad/dspark_build_tiny.py); run manually.
+llama_build(test-dspark-loop.cpp)
+
+# dspark Phase 3 real-target eval harness: drives the real draft/verify/accept
+# loop against a real target + real drafter GGUF to measure accept-rate/
+# tau (there is no CLI/server integration for draft-dspark yet -- see the
+# file's header comment). Not wired into `ctest`: needs real multi-GB GGUFs
+# passed on the command line; run manually on a GPU host.
+llama_build(test-dspark-real-eval.cpp)

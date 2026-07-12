@@ -1,8 +1,10 @@
 #pragma once
 
 #include "llama.h"
+#include "llama-hparams.h" // LLAMA_MAX_LAYERS
 
 #include <cstdint>
+#include <array>
 
 #define LLAMA_MAX_SEQ 256
 
@@ -31,6 +33,16 @@ struct llama_cparams {
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
+
+    // multi-layer hidden-state tap (EAGLE3 / dspark target-feature reuse)
+    // when n_capture_layers > 0 the model graph concatenates the per-layer output
+    // of each layer in capture_layer_idx[0..n_capture_layers) along dim0 and the
+    // context exposes it per position as a row of width [n_capture_layers * n_embd].
+    // the order of capture_layer_idx defines the concatenation order.
+    bool     embeddings_capture = false;
+    uint32_t n_capture_layers   = 0;
+    std::array<int32_t, LLAMA_MAX_LAYERS> capture_layer_idx = {};
+
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;
