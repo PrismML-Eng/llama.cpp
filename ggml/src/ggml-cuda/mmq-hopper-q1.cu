@@ -8,6 +8,10 @@
 #include <mutex>
 #include <unordered_map>
 
+// Public entry point, defined below and called from ggml-cuda.cu. Declared here
+// so the definition has a prior declaration (satisfies -Werror=missing-declarations).
+bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
 #if defined(GGML_USE_HOPPER_Q1)  // built only when CUTLASS include dir is provided
 #    include <cuda_pipeline.h>
 
