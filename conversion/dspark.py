@@ -134,5 +134,15 @@ class DSparkModel(TextModel):
             return [(gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.TOKEN_EMBD] + ".weight", data_torch)]
 
         # per-layer decoder tensors fall through to the standard mapping. The base
-        # class resolves layers.{bid}.<attn/mlp...> to blk.{bid}.<gguf name>.
-        return [(self.map_tensor_name(name), data_torch)]
+        # class resolves (model.)layers.{bid}.<attn/mlp...> to blk.{bid}.<gguf name>.
+        # Strip only the dspark-specific wrapper (drafter./dspark.) here -- the head
+        # loop above matched against the fully stripped `n`, but this fallthrough
+        # must not pass an unsupported drafter./dspark. prefix to map_tensor_name or
+        # the per-layer tensor fails to map. Keep any standard model. prefix, which
+        # map_tensor_name already understands.
+        fallthrough_name = name
+        for prefix in ("drafter.", "dspark."):
+            if fallthrough_name.startswith(prefix):
+                fallthrough_name = fallthrough_name[len(prefix):]
+                break
+        return [(self.map_tensor_name(fallthrough_name), data_torch)]
