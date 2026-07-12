@@ -37,6 +37,13 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
     {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
     {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+    // draft-dspark requires the driver to engage multi-layer capture on the
+    // target context (llama_set_capture_layers with the drafter's target layer
+    // ids, plus logits requested on every row) before drafting -- see
+    // need_embd_capture()/process(). The reference driver that does this is
+    // tests/test-dspark-real-eval.cpp; the generic CLI (--spec-type) and server
+    // paths do NOT yet engage capture, so selecting draft-dspark there currently
+    // fails at the first draft round with a clear error rather than running.
     {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
     {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
@@ -1143,7 +1150,7 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                 continue;
             }
 
-            llama_set_dspark_ctx(ctx_dft, feat.data(), ctx_len, n_embd_cap, pos.data());
+            llama_set_dspark_ctx(ctx_dft, feat.data(), ctx_len, n_embd_cap);
 
             common_batch_clear(batch);
             for (int64_t i = 0; i < ctx_len; ++i) {
@@ -1166,7 +1173,7 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             const int32_t rc = llama_decode(ctx_dft, batch);
 
             // always clear the staged ctx immediately after use, success or not.
-            llama_set_dspark_ctx(ctx_dft, nullptr, 0, 0, nullptr);
+            llama_set_dspark_ctx(ctx_dft, nullptr, 0, 0);
 
             if (rc != 0) {
                 LOG_WRN("%s: llama_decode(ctx_dft) failed rc=%d for seq %d\n", __func__, rc, (int) seq_id);

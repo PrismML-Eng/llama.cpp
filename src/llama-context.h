@@ -128,7 +128,7 @@ struct llama_context {
     // decode() call. feat is [n_ctx_rows * n_embd_cap] row-major (row i is
     // position pos[i]'s raw concatenated multi-layer tap feature, pre dspark.fc).
     // pass n_ctx_rows <= 0 (or feat == nullptr) to clear the staged context.
-    void set_dspark_ctx(const float * feat, int64_t n_ctx_rows, int64_t n_embd_cap, const int32_t * pos);
+    void set_dspark_ctx(const float * feat, int64_t n_ctx_rows, int64_t n_embd_cap);
 
     void set_causal_attn(bool value);
     void set_warmup(bool value);

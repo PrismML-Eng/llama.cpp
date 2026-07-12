@@ -115,7 +115,7 @@ static std::vector<float> run_forward(
     if ((int64_t) draft_tokens.size() != block_size)          fail("draft_tokens size mismatch");
     if ((int64_t) draft_pos.size()    != block_size)          fail("draft_pos size mismatch");
 
-    llama_set_dspark_ctx(ctx, ctx_feat.data(), n_ctx_rows, n_embd_cap, ctx_pos.data());
+    llama_set_dspark_ctx(ctx, ctx_feat.data(), n_ctx_rows, n_embd_cap);
 
     const int32_t n_tokens = (int32_t) n_ctx_rows + block_size;
     llama_batch batch = llama_batch_init(n_tokens, 0, 1);
@@ -143,7 +143,7 @@ static std::vector<float> run_forward(
         fail("llama_decode returned " + std::to_string(rc));
     }
 
-    llama_set_dspark_ctx(ctx, nullptr, 0, 0, nullptr); // clear staged context
+    llama_set_dspark_ctx(ctx, nullptr, 0, 0); // clear staged context
 
     float * logits = llama_get_logits(ctx);
     if (!logits) fail("llama_get_logits returned null");

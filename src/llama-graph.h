@@ -88,11 +88,12 @@ struct llama_dspark_ctx {
     int64_t n_embd_cap = 0; // n_capture_layers * n_embd (raw tap width, pre dspark.fc)
     int64_t n_ctx_rows = 0; // number of staged context rows for the next decode call
 
-    // [n_ctx_rows * n_embd_cap], row-major: row i is position ctx_pos[i]'s
-    // concatenated multi-layer tap feature (e.g. from llama_get_embeddings_capture_ith
-    // on the target's context, one row per accepted-since-last-round token).
+    // [n_ctx_rows * n_embd_cap], row-major: row i is the concatenated multi-layer
+    // tap feature for the i-th staged context row (e.g. from
+    // llama_get_embeddings_capture_ith on the target's context, one row per
+    // accepted-since-last-round token). Row positions come from the decode batch,
+    // not from this staged data.
     std::vector<float>   v_ctx_feat;
-    std::vector<int32_t> v_ctx_pos; // [n_ctx_rows], absolute position id per context row
 };
 
 struct llm_graph_params;

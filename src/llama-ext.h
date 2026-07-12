@@ -130,17 +130,16 @@ LLAMA_API float *  llama_get_embeddings_capture_ith(struct llama_context * ctx, 
 // concatenation) and a different row count than the draft block, so it is
 // staged out of band, consumed by the drafter's graph on its next decode() call.
 //
-// feat is [n_ctx_rows * n_embd_cap] row-major (row i = position pos[i]'s
-// concatenated tap feature). pos may be null, in which case rows are assumed
-// to be contiguous positions starting at 0 (only useful for one-shot testing;
-// real multi-round callers should always pass explicit positions). Pass
-// n_ctx_rows <= 0 or feat == nullptr to clear the staged context.
+// feat is [n_ctx_rows * n_embd_cap] row-major (row i is the concatenated
+// multi-layer tap feature for the i-th staged context row). The decode position
+// of each context row is taken from the batch the drafter decodes next, not from
+// this staged data, so no positions are passed here. Pass n_ctx_rows <= 0 or
+// feat == nullptr to clear the staged context.
 LLAMA_API void llama_set_dspark_ctx(
         struct llama_context * ctx,
         const float           * feat,
               int64_t           n_ctx_rows,
-              int64_t           n_embd_cap,
-        const int32_t         * pos);
+              int64_t           n_embd_cap);
 //
 // dspark drafter: model-level metadata + auxiliary-head weights
 //

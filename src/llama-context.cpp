@@ -1243,8 +1243,7 @@ void llama_context::set_capture_layers(const std::vector<int32_t> & layer_ids) {
 void llama_context::set_dspark_ctx(
         const float   * feat,
               int64_t   n_ctx_rows,
-              int64_t   n_embd_cap,
-        const int32_t * pos) {
+              int64_t   n_embd_cap) {
     if (n_ctx_rows <= 0 || n_embd_cap <= 0 || feat == nullptr) {
         // reset: no staged context (e.g. before the very first drafter round,
         // where the whole prompt still needs to go through as context on the
@@ -1252,7 +1251,6 @@ void llama_context::set_dspark_ctx(
         dspark_ctx.n_ctx_rows = 0;
         dspark_ctx.n_embd_cap = 0;
         dspark_ctx.v_ctx_feat.clear();
-        dspark_ctx.v_ctx_pos.clear();
         return;
     }
 
@@ -1260,18 +1258,6 @@ void llama_context::set_dspark_ctx(
     dspark_ctx.n_embd_cap = n_embd_cap;
 
     dspark_ctx.v_ctx_feat.assign(feat, feat + (size_t) n_ctx_rows * (size_t) n_embd_cap);
-
-    dspark_ctx.v_ctx_pos.resize((size_t) n_ctx_rows);
-    if (pos != nullptr) {
-        std::copy(pos, pos + n_ctx_rows, dspark_ctx.v_ctx_pos.begin());
-    } else {
-        // caller didn't supply explicit positions: assume a contiguous run
-        // ending just before the current staged sequence length. this is a
-        // convenience default; callers doing real multi-round decoding should
-        // pass explicit positions since the growing-cache bookkeeping (Phase 2)
-        // owns the authoritative position numbering.
-        std::iota(dspark_ctx.v_ctx_pos.begin(), dspark_ctx.v_ctx_pos.end(), 0);
-    }
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -3879,9 +3865,8 @@ void llama_set_dspark_ctx(
         llama_context * ctx,
         const float   * feat,
               int64_t   n_ctx_rows,
-              int64_t   n_embd_cap,
-        const int32_t * pos) {
-    ctx->set_dspark_ctx(feat, n_ctx_rows, n_embd_cap, pos);
+              int64_t   n_embd_cap) {
+    ctx->set_dspark_ctx(feat, n_ctx_rows, n_embd_cap);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
