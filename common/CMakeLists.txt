@@ -210,7 +210,22 @@ if (LLAMA_DSPARK_MARKOV_CUDA)
     target_link_libraries(${TARGET} PRIVATE CUDA::cudart)
 
     if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set_target_properties(${TARGET} PROPERTIES CUDA_ARCHITECTURES "80")
+        # CMAKE_CUDA_ARCHITECTURES is resolved inside ggml's CUDA backend
+        # subdirectory (auto-detect / GGML_CUDA_ARCHITECTURES) with a plain set(),
+        # so it does not propagate up to this scope. Pinning "80" would build the
+        # resample TU for SM80 only -- forcing a PTX JIT on Hopper/H100 (sm_90) and
+        # failing outright on the pre-Ampere GPUs the rest of ggml still supports.
+        # Inherit the exact architecture list the ggml CUDA backend was built for.
+        if (TARGET ggml-cuda)
+            get_target_property(_dspark_markov_cuda_archs ggml-cuda CUDA_ARCHITECTURES)
+        endif()
+        if (_dspark_markov_cuda_archs)
+            set_target_properties(${TARGET} PROPERTIES CUDA_ARCHITECTURES "${_dspark_markov_cuda_archs}")
+        else()
+            # ggml-cuda target/property unavailable: detect the build machine's GPU
+            # (e.g. sm_90 on H100) rather than defaulting to SM80 only.
+            set_target_properties(${TARGET} PROPERTIES CUDA_ARCHITECTURES "native")
+        endif()
     endif()
 endif()
 
