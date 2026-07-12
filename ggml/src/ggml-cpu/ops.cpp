@@ -10559,11 +10559,16 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     const bool kda = (neg0 == S_v);
 
-    // state is 3D (S_v*S_v*H, K, n_seqs); K is the snapshot slot count.
-    const int64_t K = src_state->ne[1];
+    // K is the snapshot slot count (op_params, shared by both op variants).
+    const int64_t K = ggml_get_op_params_i32(dst, 0);
     GGML_ASSERT(K >= 1);
-    // per-seq stride in floats (slot 0 of seq s lives at state + s * seq_stride)
-    const int64_t state_seq_stride = src_state->nb[2] / sizeof(float);
+    // rows mode (src[6] set): state is a 2D cache view (D, n_rows) and each
+    // sequence's live state is read at row rows[seq] -- no gathered scratch.
+    const ggml_tensor * src_rows = dst->src[6];
+    const int32_t * state_rows_idx = src_rows ? (const int32_t *) src_rows->data : nullptr;
+    // scratch mode: per-seq stride in floats (slot 0 of seq s at s * seq_stride)
+    const int64_t state_seq_stride = src_rows ? 0 : (int64_t) (src_state->nb[2] / sizeof(float));
+    const int64_t state_row_size   = src_rows ? (int64_t) (src_state->nb[1] / sizeof(float)) : 0;
 
     const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
     const int ith = params->ith;
@@ -10608,9 +10613,12 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             ? state_work
             : state_out_base + (iv3 * H + iv1) * S_v * S_v;
 
-        // copy input state into the working buffer and operate in-place
-        // state layout (D, K, n_seqs): slot 0 of seq iv3 starts at iv3 * state_seq_stride.
-        const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+        // copy input state into the working buffer and operate in-place.
+        // scratch mode: state layout (D, K, n_seqs), slot 0 of seq iv3 at
+        // iv3 * state_seq_stride. rows mode: cache row state_rows_idx[iv3].
+        const float * s_in = state_rows_idx
+            ? state_in_base + (int64_t) state_rows_idx[iv3] * state_row_size + iv1 * S_v * S_v
+            : state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
         memcpy(s_out, s_in, S_v * S_v * sizeof(float));
 
         // attn output pointer for first token of this (head, seq)

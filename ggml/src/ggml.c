@@ -6236,6 +6236,69 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[4] = beta;
     result->src[5] = state;
 
+    // K for the output snapshot slots; kept in op_params so both op variants
+    // (scratch-state and rows-indexed) share one code path in the backends
+    ggml_set_op_params_i32(result, 0, (int32_t) K);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * states,
+        struct ggml_tensor  * rows,
+        int                   n_snap_slots) {
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(states));
+    GGML_ASSERT(ggml_is_contiguous(rows));
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(states->type == GGML_TYPE_F32);
+    GGML_ASSERT(rows->type == GGML_TYPE_I32);
+
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+
+    GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
+    GGML_ASSERT(beta->ne[0] == 1);
+
+    // states is a 2D cache view (D, n_rows); each row is one sequence's state
+    GGML_ASSERT(states->ne[0] == S_v * S_v * H);
+    GGML_ASSERT(rows->ne[0] == n_seqs);
+
+    const int64_t K = n_snap_slots;
+    GGML_ASSERT(K >= 1);
+
+    const int64_t state_rows = K * S_v * n_seqs;
+    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = states;
+    result->src[6] = rows;
+
+    ggml_set_op_params_i32(result, 0, (int32_t) K);
+
     return result;
 }
 

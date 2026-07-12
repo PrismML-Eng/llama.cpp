@@ -545,16 +545,21 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor *        g,
         ggml_tensor *        b,
         ggml_tensor *        s,
-        int                  il) {
+        int                  il,
+        ggml_tensor *        state_rows) {
     const auto * mctx_cur = inp->mctx;
     const auto   kv_head  = mctx_cur->get_head();
 
-    const int64_t S_v          = s->ne[0];
-    const int64_t H_v          = s->ne[2];
-    const int64_t n_seqs       = s->ne[3];
+    // dims from v (always (S_v, H_v, T, B)): in rows mode `s` is the 2D cache
+    // view, so its shape no longer carries them
+    const int64_t S_v          = v->ne[0];
+    const int64_t H_v          = v->ne[1];
+    const int64_t n_seqs       = v->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
     const bool keep = cparams.n_rs_seq > 0;
+
+    GGML_ASSERT(state_rows == nullptr || keep); // rows mode is a ring-path optimization
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
@@ -578,12 +583,23 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     // snapshot slot 0 of each sequence (all backends -- see ggml_gated_delta_net);
     // slots 1..K-1 exist only to size the K-slot output. copy the current state
     // into slot 0 and leave the rest uninitialized instead of zero-padding,
-    // which would write D*K elements per layer on every decode
-    ggml_tensor * s_in  = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, K, n_seqs);
-    ggml_tensor * s_in0 = ggml_view_3d(ctx0, s_in, D, 1, n_seqs, s_in->nb[1], s_in->nb[2], 0);
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_reshape_3d(ctx0, s, D, 1, n_seqs), s_in0));
+    // which would write D*K elements per layer on every decode.
+    // Keep a private scratch tensor per recurrent layer. Reusing one scratch
+    // across layers creates overlapping live ranges in the Metal scheduler;
+    // that splits the ring-enabled graph at every recurrent boundary. The
+    // extra memory is preferable to serializing all 48 GDN layers.
+    ggml_tensor * gdn_out;
+    if (state_rows) {
+        // rows mode: the fused op reads each seq's live state directly from the
+        // cache view at row state_rows[seq] -- no gather, no slot-0 cpy
+        gdn_out = ggml_gated_delta_net_rows(ctx0, q, k, v, g, b, s, state_rows, (int) K);
+    } else {
+        ggml_tensor * s_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, K, n_seqs);
+        ggml_tensor * s_in0 = ggml_view_3d(ctx0, s_in, D, 1, n_seqs, s_in->nb[1], s_in->nb[2], 0);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_reshape_3d(ctx0, s, D, 1, n_seqs), s_in0));
 
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s_in);
+        gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s_in);
+    }
     if (n_seq_tokens > 1) {
         cb(gdn_out, LLAMA_TENSOR_NAME_FGDN_CH, il);
     } else {

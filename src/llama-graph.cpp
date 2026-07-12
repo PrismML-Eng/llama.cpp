@@ -2885,6 +2885,33 @@ ggml_tensor * llm_graph_context::build_rs(
                     get_state_rows);
 }
 
+ggml_tensor * llm_graph_context::build_rs_cache_view(
+        llm_graph_input_rs * inp,
+        ggml_tensor * s,
+            int32_t   state_size,
+            int32_t   n_seqs) const {
+    const auto * kv_state = inp->mctx;
+
+    const uint32_t n_rs     = kv_state->get_n_rs();
+    const uint32_t rs_head  = kv_state->get_head();
+    const  int32_t rs_zero  = kv_state->get_rs_z();
+
+    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
+
+    // same cache hygiene as build_rs, minus the main gather (the consumer reads
+    // per-seq rows via inp->s_copy_main directly)
+    ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+
+    ggml_tensor * states_extra = ggml_get_rows(ctx0, states, inp->s_copy_extra);
+    ggml_build_forward_expand(gf,
+        ggml_cpy(ctx0,
+            states_extra,
+            ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
+
+    return states;
+}
+
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
     llm_graph_input_rs * inp,
     const llama_ubatch & ubatch,

@@ -4329,6 +4329,10 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             break;
         case GGML_OP_GATED_DELTA_NET:
             {
+                if (op->src[6] != nullptr) {
+                    supports_op = false; // rows-indexed state read not implemented here
+                    break;
+                }
                 const uint32_t s_v = (uint32_t) src2->ne[0];
                 supports_op = op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
                               src2->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&

@@ -1174,6 +1174,17 @@ struct llm_graph_context {
                 int32_t   n_seqs,
             const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
 
+    // like build_rs, but WITHOUT the main per-seq state gather: performs the
+    // rs_zero clear and the extra-states relocation, then returns the 2D
+    // (state_size, n_rs_total) cache view. For consumers that read per-seq
+    // state rows directly via inp->s_copy_main (e.g. ggml_gated_delta_net_rows),
+    // saving a get_rows + a downstream slot-0 cpy per layer per decode.
+    ggml_tensor * build_rs_cache_view(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+                int32_t   state_size,
+                int32_t   n_seqs) const;
+
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,
         const llama_ubatch & ubatch,
