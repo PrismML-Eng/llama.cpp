@@ -966,8 +966,10 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
 #ifdef LLAMA_DSPARK_MARKOV_CUDA
         // Device path is the DEFAULT when built with CUDA and a real markov head:
         // upload the Markov factors once and run the whole sequential resample on
-        // the GPU (token-identical to the host scalar/BLAS path). Opt out with
-        // LLAMA_DSPARK_MARKOV_CUDA=0 to fall back to the host path.
+        // the GPU (functionally equivalent to the host scalar/BLAS path; not
+        // bit-identical -- the warp reduction's accumulation order differs, see
+        // common/dspark-markov.h). Opt out with LLAMA_DSPARK_MARKOV_CUDA=0 to
+        // fall back to the host path.
         bool want_cuda_markov = has_markov;
         if (const char * e = getenv("LLAMA_DSPARK_MARKOV_CUDA")) {
             const char c     = e[0];
@@ -1064,6 +1066,25 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         }
 
         auto * ctx_tgt = params.ctx_tgt;
+
+        // The row copy below reads n_embd_cap floats from each target capture
+        // row, whose real width is n_capture_configured * n_embd. The ctor
+        // validated n_embd/n_vocab against the target model, but capture layers
+        // are engaged by the DRIVER after construction (llama_set_capture_layers),
+        // so the configured layer count can only be checked here: a driver that
+        // engaged fewer layers than the drafter was trained on would otherwise
+        // over-read past the end of the capture row (and more layers would feed
+        // misaligned features).
+        {
+            const uint32_t n_cap_cfg = llama_get_n_capture(ctx_tgt);
+            if ((int64_t) n_cap_cfg != n_capture) {
+                LOG_ERR("%s: target context has %u capture layers configured but the drafter "
+                        "expects %lld -- the driver must pass the drafter's target layer list "
+                        "to llama_set_capture_layers()\n",
+                        __func__, n_cap_cfg, (long long) n_capture);
+                return false;
+            }
+        }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
