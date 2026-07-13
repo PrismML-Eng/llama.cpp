@@ -2068,6 +2068,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     static const int  ne11_ext_max    = getenv("GGML_METAL_EXT_MAX") ? atoi(getenv("GGML_METAL_EXT_MAX")) : 8;
     static const bool q1_0_ext_enable = getenv("GGML_METAL_Q1_0_EXT_ENABLE") != NULL;
     static const int  q1_0_mv_max     = getenv("GGML_METAL_Q1_0_MV_MAX") ? atoi(getenv("GGML_METAL_Q1_0_MV_MAX")) : 16;
+    //   GGML_METAL_Q2_0_NR1 >= 2 routes Q2_0 ne11 2..8 off the ext path and onto the
+    //   experimental multi-column mul_mv variants (see ggml-metal-device.cpp); the
+    //   default keeps Q2_0 on the ext path
+    static const int  q2_0_nr1        = getenv("GGML_METAL_Q2_0_NR1") ? atoi(getenv("GGML_METAL_Q2_0_NR1")) : 0;
 
     // narrow-N tensor-path mul_mm for q1_0 mid-size batches (spec-decode verify):
     //   GGML_METAL_Q1_0_NB_MIN/_NB_MAX - ne11 range routed to the nb kernels (min 0 disables)
@@ -2101,7 +2105,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_F16  ||
            op->src[0]->type == GGML_TYPE_BF16 ||
            (op->src[0]->type == GGML_TYPE_Q1_0 && q1_0_ext_enable) ||
-           op->src[0]->type == GGML_TYPE_Q2_0 ||
+           (op->src[0]->type == GGML_TYPE_Q2_0 && q2_0_nr1 < 2) ||
            op->src[0]->type == GGML_TYPE_Q4_0 ||
            op->src[0]->type == GGML_TYPE_Q4_1 ||
            op->src[0]->type == GGML_TYPE_Q5_0 ||

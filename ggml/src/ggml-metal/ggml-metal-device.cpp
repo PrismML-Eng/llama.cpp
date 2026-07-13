@@ -862,6 +862,22 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_Q2_0;
                 nr0 = N_R0_Q2_0;
+
+                // multi-column variants, same scheme as Q1_0 above: read the
+                // streamed q2_0 weights once per nr1 src1 columns.
+                // EXPERIMENTAL, opt-in via GGML_METAL_Q2_0_NR1 (0/absent keeps
+                // the default routing, i.e. the mul_mv_ext path for ne11 2..8).
+                // Measured (M5 Pro, [4096,14336]): nr1_2 = 93.2 us at ne11=2
+                // vs 122 for the ext route (+31%); ne11=4 via 2 passes = 171
+                // vs 183. But nr1_3 = 195 vs 152 ext at ne11=3 (occupancy
+                // cliff at tpb=16) -- routing is NOT settled yet, hence opt-in.
+                static const int nr1_max = getenv("GGML_METAL_Q2_0_NR1") ? atoi(getenv("GGML_METAL_Q2_0_NR1")) : 0;
+
+                const int nr1_force = nr1_max >= 2 && nr1_max <= 4 ? nr1_max : 0;
+                if (nr1_force > 1 && ne11 >= 2) {
+                    nr1 = std::min(nr1_force, 4);
+                    suffix = nr1 == 2 ? "_nr1_2" : nr1 == 3 ? "_nr1_3" : "_nr1_4";
+                }
             } break;
         case GGML_TYPE_Q4_0:
             {
