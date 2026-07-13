@@ -2748,21 +2748,29 @@ kernel void kernel_gated_delta_net_impl(
         if (K > 1) {
             const int target_slot = (int)t - shift;
             if (target_slot >= 0 && target_slot < (int)K) {
-                device float * dst_state;
-                if (WRITE_ROWS) {
-                    // SET_ROWS receives only the trailing n_write snapshots
-                    // when T < K; convert the absolute output slot back to
-                    // the compact row-index input's slot-major coordinate.
-                    const int write_slot = target_slot - max(0, (int)K - (int)args.ne22);
-                    const uint64_t row = ((device const int64_t *) write_rows)[(uint)write_slot * args.ne23 + i23];
-                    dst_state = (device float *) state_dst + row * (uint64_t)(S_v * S_v * args.ne21)
-                        + (uint) i21 * S_v * S_v + i20 * S_v;
-                } else {
-                    dst_state = (device float *) (dst) + attn_size + (uint)target_slot * state_size_per_snap + state_out_base;
-                }
+                // always populate the op's own snapshot tail: the fold must
+                // not leave the documented output region uninitialized for
+                // other consumers (or output/eval callbacks)
+                device float * dst_state = (device float *) (dst) + attn_size + (uint)target_slot * state_size_per_snap + state_out_base;
                 FOR_UNROLL (short j = 0; j < NSG; j++) {
                     const short is = tx*NSG + j;
                     dst_state[is] = ls[j];
+                }
+
+                if (WRITE_ROWS) {
+                    // additionally scatter into the state cache in place of
+                    // the folded SET_ROWS. SET_ROWS receives only the trailing
+                    // n_write snapshots when T < K; convert the absolute
+                    // output slot back to the compact row-index input's
+                    // slot-major coordinate.
+                    const int write_slot = target_slot - max(0, (int)K - (int)args.ne22);
+                    const uint64_t row = ((device const int64_t *) write_rows)[(uint)write_slot * args.ne23 + i23];
+                    device float * dst_rows = (device float *) state_dst + row * (uint64_t)(S_v * S_v * args.ne21)
+                        + (uint) i21 * S_v * S_v + i20 * S_v;
+                    FOR_UNROLL (short j = 0; j < NSG; j++) {
+                        const short is = tx*NSG + j;
+                        dst_rows[is] = ls[j];
+                    }
                 }
             }
         }
@@ -2773,6 +2781,18 @@ kernel void kernel_gated_delta_net_impl(
         FOR_UNROLL (short j = 0; j < NSG; j++) {
             const short is = tx*NSG + j;
             dst_state[is] = ls[j];
+        }
+
+        if (WRITE_ROWS) {
+            // single snapshot slot: scatter it to the cache row in place of
+            // the folded SET_ROWS, same as the K > 1 branch above
+            const uint64_t row = ((device const int64_t *) write_rows)[i23];
+            device float * dst_rows = (device float *) state_dst + row * (uint64_t)(S_v * S_v * args.ne21)
+                + (uint) i21 * S_v * S_v + i20 * S_v;
+            FOR_UNROLL (short j = 0; j < NSG; j++) {
+                const short is = tx*NSG + j;
+                dst_rows[is] = ls[j];
+            }
         }
     }
 
