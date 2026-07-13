@@ -2727,9 +2727,23 @@ bool llama_model_dspark_get_markov(
                 return true;
             }
             default:
-                LLAMA_LOG_ERROR("%s: unsupported markov head tensor type %s (only f32/f16/bf16 supported)\n",
-                        __func__, ggml_type_name(t->type));
-                return false;
+                if (!ggml_is_quantized(t->type)) {
+                    LLAMA_LOG_ERROR("%s: unsupported markov head tensor type %s\n",
+                            __func__, ggml_type_name(t->type));
+                    return false;
+                }
+
+                const auto * qtype = ggml_get_type_traits(t->type);
+                if (qtype == nullptr || qtype->to_float == nullptr) {
+                    LLAMA_LOG_ERROR("%s: quantized markov head tensor type %s has no dequantizer\n",
+                            __func__, ggml_type_name(t->type));
+                    return false;
+                }
+
+                std::vector<uint8_t> raw(ggml_nbytes(t));
+                ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+                qtype->to_float(raw.data(), out.data(), n);
+                return true;
         }
     };
 

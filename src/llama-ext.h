@@ -186,3 +186,14 @@ LLAMA_API bool llama_model_dspark_get_markov(
         const struct llama_model * model,
         std::vector<float>       & w1,
         std::vector<float>       & w2);
+
+// Run the sequential vanilla Markov resample on the drafter backend. The
+// latest decode graph's logits remain device-resident; this helper gathers the
+// previous-token row from markov_head_a, multiplies by markov_head_b, adds the
+// corresponding logits row, and returns one argmax per block position. Returns
+// false when the head/backend is unsupported so callers can use the host path.
+LLAMA_API bool llama_dspark_markov_resample(
+        struct llama_context * ctx,
+        int32_t               n_rows,
+        llama_token           prev_token,
+        llama_token         * result);

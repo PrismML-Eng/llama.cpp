@@ -1297,9 +1297,31 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             }
 #endif
 
+            // Metal path, same contract as the CUDA block above: one
+            // dependency-chain graph for the whole block (each step's GPU
+            // argmax feeds the next step's get_rows), reading the drafter's
+            // still-device-resident logits. Returns false when the head or
+            // backend is unsupported (or DSPARK_MARKOV_CPU=1) -> host path.
+            bool did_metal = false;
+            if (!did_cuda && has_markov) {
+                result.resize((size_t) block_size);
+                if (llama_dspark_markov_resample(ctx_dft, block_size, dp.id_last, result.data())) {
+                    static bool warned_metal_mask = false;
+                    for (int32_t k = 1; k < block_size && !warned_metal_mask; ++k) {
+                        if (result[(size_t) (k - 1)] == mask_token_id) {
+                            LOG_WRN("%s: metal markov resample sampled mask_token_id at a chained position\n", __func__);
+                            warned_metal_mask = true;
+                        }
+                    }
+                    did_metal = true;
+                } else {
+                    result.clear();
+                }
+            }
+
             llama_token prev_token = dp.id_last;
 
-            if (!did_cuda)
+            if (!did_cuda && !did_metal)
             for (int32_t k = 0; k < block_size; ++k) {
                 // prev_token is the token SAMPLED at step k-1 (assigned from best_id
                 // at the end of this loop), never a draft input id -- that is the

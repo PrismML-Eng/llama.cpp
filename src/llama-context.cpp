@@ -2555,6 +2555,159 @@ ggml_status llama_context::graph_compute(
     return status;
 }
 
+bool llama_context::dspark_markov_resample(
+        uint32_t     n_rows,
+        llama_token  prev_token,
+        llama_token * result) {
+    if (n_rows == 0 || result == nullptr || getenv("DSPARK_MARKOV_CPU") != nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * head_a = model.dspark_markov_head_a;
+    const ggml_tensor * head_b = model.dspark_markov_head_b;
+    if (head_a == nullptr || head_b == nullptr || gf_res_prev == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * t_logits = gf_res_prev->get_logits();
+    const int64_t n_vocab = model.vocab.n_tokens();
+    if (t_logits == nullptr || t_logits->type != GGML_TYPE_F32 || t_logits->data == nullptr ||
+            t_logits->ne[0] != n_vocab || t_logits->ne[1] < (int64_t) n_rows ||
+            head_a->ne[0] != head_b->ne[0] || head_a->ne[1] != head_b->ne[1] ||
+            head_a->ne[1] != n_vocab) {
+        return false;
+    }
+
+    const auto supported_head_type = [](ggml_type type) {
+        return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 ||
+               type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q8_0;
+    };
+    if (!supported_head_type(head_a->type) || !supported_head_type(head_b->type)) {
+        return false;
+    }
+
+    const ggml_backend_dev_t dev = model.dev_output();
+    if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return false;
+    }
+
+    if (!dspark_markov_sched) {
+        if (backend_ptrs.empty() || backend_buft.size() != backend_ptrs.size()) {
+            return false;
+        }
+
+        dspark_markov_sched.reset(ggml_backend_sched_new(
+                backend_ptrs.data(), backend_buft.data(), (int) backend_ptrs.size(),
+                /* graph_size = */ 64, /* parallel = */ false, cparams.op_offload));
+        if (!dspark_markov_sched) {
+            return false;
+        }
+    }
+
+    // The decode graph is asynchronous. Synchronize it once before the
+    // dedicated scheduler reads its logits output tensor.
+    synchronize();
+
+    // Build one graph covering rows [k0, k0 + n_chain). Each step consumes the
+    // previous step's GPU argmax tensor as the row id for head_a, so the
+    // sequential Markov dependency remains exact while Metal executes the
+    // whole chain in one scheduler submission.
+    const auto resample_chain = [&](uint32_t k0, uint32_t n_chain, llama_token tok0) -> bool {
+        ggml_init_params params = {
+            /*.mem_size   =*/ 128*ggml_tensor_overhead() + ggml_graph_overhead_custom(64, false),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx { ggml_init(params) };
+        if (!ctx) {
+            return false;
+        }
+
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
+        ggml_set_input(ids);
+
+        // Do not use ggml_view_1d on t_logits: its parent edge would recursively
+        // pull the completed decode graph into this tiny graph. Each base tensor
+        // is a detached, read-only alias of one already-computed logits row.
+        std::vector<ggml_tensor *> sampled_rows;
+        sampled_rows.reserve(n_chain);
+
+        ggml_tensor * prev_ids = ids;
+        for (uint32_t k = k0; k < k0 + n_chain; ++k) {
+            ggml_tensor * base = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n_vocab);
+            base->buffer = t_logits->buffer;
+            base->data = (char *) t_logits->data + (size_t) k * (size_t) n_vocab * sizeof(float);
+
+            ggml_tensor * emb = ggml_get_rows(ctx.get(), const_cast<ggml_tensor *>(head_a), prev_ids);
+            ggml_tensor * bias = ggml_mul_mat(ctx.get(), const_cast<ggml_tensor *>(head_b), emb);
+            ggml_tensor * logits = ggml_add(ctx.get(), base, bias);
+            ggml_tensor * sampled = ggml_argmax(ctx.get(), logits);
+
+            ggml_set_output(sampled);
+            sampled_rows.push_back(sampled);
+            prev_ids = sampled;
+        }
+
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), 64, false);
+        ggml_build_forward_expand(gf, sampled_rows.back());
+
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            if (!ggml_backend_dev_supports_op(dev, ggml_graph_node(gf, i))) {
+                return false;
+            }
+        }
+
+        ggml_backend_sched_reset(dspark_markov_sched.get());
+        if (!ggml_backend_sched_alloc_graph(dspark_markov_sched.get(), gf)) {
+            return false;
+        }
+
+        ggml_backend_t ids_backend = ggml_backend_sched_get_tensor_backend(dspark_markov_sched.get(), ids);
+        ggml_backend_t out_backend = ggml_backend_sched_get_tensor_backend(dspark_markov_sched.get(), sampled_rows.back());
+        if (ids_backend == nullptr || out_backend == nullptr ||
+                ggml_backend_get_device(out_backend) != dev) {
+            return false;
+        }
+
+        const int32_t id = (int32_t) tok0;
+        ggml_backend_tensor_set(ids, &id, 0, sizeof(id));
+
+        const ggml_status status = ggml_backend_sched_graph_compute(dspark_markov_sched.get(), gf);
+        if (status != GGML_STATUS_SUCCESS) {
+            return false;
+        }
+
+        // One scheduler synchronization covers the entire sequential chain.
+        for (uint32_t k = 0; k < n_chain; ++k) {
+            int32_t sampled_id = -1;
+            ggml_backend_tensor_get(sampled_rows[k], &sampled_id, 0, sizeof(sampled_id));
+            if (sampled_id < 0 || sampled_id >= n_vocab) {
+                return false;
+            }
+
+            result[k0 + k] = (llama_token) sampled_id;
+        }
+
+        return true;
+    };
+
+    // A/B toggle: emulate the pre-fusion behavior — one graph build, scheduler
+    // submission, synchronization, and host readback per draft step, with the
+    // sampled token fed back through the host between steps.
+    if (getenv("DSPARK_MARKOV_PER_STEP") != nullptr) {
+        llama_token tok = prev_token;
+        for (uint32_t k = 0; k < n_rows; ++k) {
+            if (!resample_chain(k, 1, tok)) {
+                return false;
+            }
+            tok = result[k];
+        }
+        return true;
+    }
+
+    return resample_chain(0, n_rows, prev_token);
+}
+
 llm_graph_cb llama_context::graph_get_cb() const {
     return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
@@ -4273,4 +4426,12 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+bool llama_dspark_markov_resample(
+        struct llama_context * ctx,
+        int32_t               n_rows,
+        llama_token           prev_token,
+        llama_token         * result) {
+    return ctx != nullptr && ctx->dspark_markov_resample((uint32_t) n_rows, prev_token, result);
 }

@@ -257,6 +257,10 @@ public:
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
+    // Run the DSpark vanilla Markov resample on a dedicated backend scheduler,
+    // leaving the main decode scheduler and its graph allocations untouched.
+    bool dspark_markov_resample(uint32_t n_rows, llama_token prev_token, llama_token * result);
+
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
@@ -377,6 +381,9 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     llm_graph_result_ptr gf_res_prev;
+
+    // dedicated scheduler for the DSpark Metal Markov resample (see dspark_markov_resample)
+    ggml_backend_sched_ptr dspark_markov_sched;
     llm_graph_result_ptr gf_res_reserve;
 
     // host buffer for the model output (logits and embeddings)
