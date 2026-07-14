@@ -1624,10 +1624,24 @@ static int ggml_metal_gdn_write_rows(
     *fused_set_rows = nullptr;
 
     const ggml_tensor * gdn = ctx->node(idx);
-    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->src[6] == nullptr ||
+    // honor the backend-wide fusion switch, like every other Metal fusion
+    if (!ctx->use_fusion ||
+        gdn->op != GGML_OP_GATED_DELTA_NET || gdn->src[6] == nullptr ||
         getenv("GGML_GDN_WRITE_FOLD_DISABLE") != nullptr) {
         return 1;
     }
+
+    // expected geometry of the recurrent-ring snapshot the kernel will scatter:
+    // the GDN output is [attn scores | K state snapshots]; the fold only applies
+    // to a SET_ROWS of the snapshot tail, whose per-row width is the full state
+    // D = S_v*S_v*H_v and whose row count is min(T, K)*n_seqs.
+    const int64_t S_v      = gdn->src[2]->ne[0];     // value head dim
+    const int64_t H_v      = gdn->src[2]->ne[2];     // value heads
+    const int64_t n_seqs   = gdn->src[2]->ne[3];
+    const int64_t T        = gdn->src[0]->ne[2];     // tokens this step
+    const int64_t K        = (int64_t) ggml_get_op_params_i32(gdn, 0);
+    const int64_t D        = S_v * S_v * H_v;
+    const int64_t n_write  = (T < K ? T : K) * n_seqs;
 
     for (int j = idx + 1; j < ctx->n_nodes(); ++j) {
         ggml_tensor * set_rows = ctx->node(j);
@@ -1645,6 +1659,18 @@ static int ggml_metal_gdn_write_rows(
         if (src != gdn || set_rows->src[1] == nullptr || set_rows->src[2] == nullptr ||
             set_rows->src[1]->type != GGML_TYPE_I64 || set_rows->src[2]->type != GGML_TYPE_F32 ||
             set_rows->src[2]->buffer == nullptr || set_rows->src[2]->data == nullptr) {
+            continue;
+        }
+
+        // Descent from the GDN output is necessary but NOT sufficient: a caller
+        // could scatter a differently-shaped view (e.g. an attention-output
+        // slice). Verify the fold target is exactly the snapshot tail --
+        // matching per-row state width, index count and destination row width --
+        // before suppressing the SET_ROWS and letting the kernel write it.
+        const ggml_tensor * view = set_rows->src[0];
+        if (ggml_nelements(view) != D * n_write ||
+            set_rows->src[1]->ne[0] != n_write ||
+            set_rows->src[2]->ne[0] != D) {
             continue;
         }
 
