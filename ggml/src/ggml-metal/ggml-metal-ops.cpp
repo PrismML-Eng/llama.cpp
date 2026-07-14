@@ -1675,8 +1675,15 @@ static int ggml_metal_gdn_write_rows(
         // count, destination row width, AND that the view begins at the
         // snapshot-tail byte offset within the GDN output (tensors are
         // allocated at encode time, so the data pointers are valid here).
+        // The fused epilogue scatters the CONTIGUOUS snapshot tail, but
+        // ggml_set_rows only requires contiguous rows (nb[0]); it permits an
+        // arbitrary row stride nb[1] that its own kernel would honor. Require
+        // the compact [D, n_write] layout (row width D, unit element stride,
+        // row stride == D) so a strided view is left to the real SET_ROWS.
         const ggml_tensor * view = set_rows->src[0];
+        const size_t ts = ggml_type_size(view->type);
         if (ggml_nelements(view) != D * n_write ||
+            view->ne[0] != D || view->nb[0] != ts || view->nb[1] != (size_t) D * ts ||
             set_rows->src[1]->ne[0] != n_write ||
             set_rows->src[2]->ne[0] != D) {
             continue;
