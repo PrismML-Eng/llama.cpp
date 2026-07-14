@@ -882,6 +882,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 if (nr1_force > 1 && ne11 >= 2) {
                     nr1 = std::min(nr1_force, 4);
                     suffix = nr1 == 2 ? "_nr1_2" : nr1 == 3 ? "_nr1_3" : "_nr1_4";
+                } else if (nr1_max != 1 && ne11 >= 2 && ne11 != 3) {
+                    // Default-on nr1=2 multi-column (mirrors the Q1_0 path above):
+                    // measured +31% at ne11=2 (93.2 vs 122 us) and a win at ne11=4
+                    // (2 passes, 171 vs 183). ne11==3 is carved out -- that is the
+                    // occupancy cliff (nr1_3 loses to ext) that kept this opt-in;
+                    // for 3 columns we stay on ext. GGML_METAL_Q2_0_NR1=1 disables.
+                    nr1 = 2; suffix = "_nr1_2";
                 }
             } break;
         case GGML_TYPE_Q4_0:
