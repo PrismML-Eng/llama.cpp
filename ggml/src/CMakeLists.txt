@@ -222,6 +222,15 @@ if (GGML_SCHED_NO_REALLOC)
     target_compile_definitions(ggml-base PUBLIC GGML_SCHED_NO_REALLOC)
 endif()
 
+if (GGML_OPENMP AND EMSCRIPTEN)
+    # Emscripten/WASM cannot emit the common symbols that libomp's reduction
+    # helpers generate (e.g. .gomp_critical_user_.reduction.var), so an OpenMP
+    # build of ggml-quants.c fails to link. WASM has no host threads to gain
+    # from OpenMP anyway -- disable it rather than fail the build.
+    message(STATUS "ggml: disabling OpenMP for Emscripten/WASM target")
+    set(GGML_OPENMP OFF)
+endif()
+
 if (GGML_OPENMP)
     find_package(OpenMP)
     if (OpenMP_FOUND)
