@@ -146,6 +146,11 @@ struct server_slot {
     // speculative decoding
     common_speculative * spec;
 
+    // capture-type drafters (dspark) build per-sequence state during prompt
+    // processing; cloned n_cmpl children copy the llama contexts but not that
+    // state, so speculation is disabled for them (see launch_slot_with_task).
+    bool spec_disabled = false;
+
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
@@ -371,7 +376,7 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        return spec != nullptr && !spec_disabled;
     }
 
     void add_token(const completion_token_output & token) {
@@ -1034,16 +1039,17 @@ private:
                     }
                 }
 
-                // dspark stages all context rows since its cache position in ONE
-                // batch -- worst case the whole window right after begin() (e.g.
-                // a follow-up request with >n_batch tokens of history). If the
-                // drafter's batch is smaller than its context, every round is
-                // skipped ("round needs N tokens > n_batch") and speculation
-                // silently degrades to plain AR.
-                if (cparams.n_batch < cparams.n_ctx) {
-                    SRV_INF("draft-dspark: raising draft ctx n_batch %u -> %u (full-context staging)\n",
-                            cparams.n_batch, cparams.n_ctx);
-                    cparams.n_batch = cparams.n_ctx;
+                // dspark stages all context rows since its cache position PLUS a
+                // full block in ONE batch -- worst case ctx_len == n_ctx right
+                // after begin() (e.g. a follow-up request with a long history).
+                // If the drafter's batch cannot fit ctx_len + block_size, the
+                // round is skipped ("round needs N tokens > n_batch") and
+                // speculation silently degrades to plain AR.
+                const uint32_t n_batch_dspark = cparams.n_ctx + (block_size > 0 ? block_size : 64);
+                if (cparams.n_batch < n_batch_dspark) {
+                    SRV_INF("draft-dspark: raising draft ctx n_batch %u -> %u (full-context staging + block)\n",
+                            cparams.n_batch, n_batch_dspark);
+                    cparams.n_batch = n_batch_dspark;
                 }
                 if (cparams.n_ubatch < cparams.n_batch) {
                     cparams.n_ubatch = cparams.n_batch;
@@ -1171,6 +1177,16 @@ private:
         if (spec && common_speculative_need_embd_capture(spec.get())) {
             const std::string & drafter_path = params_base.speculative.draft.mparams.path;
 
+            // the generic wrapper truncates drafts to n_max while dspark always
+            // produces (and the target verify batch is sized for) a full block --
+            // a mismatched value silently changes behavior, so require equality.
+            const uint32_t block_size = server_read_dspark_block_size(drafter_path);
+            if (block_size > 0 && (uint32_t) std::max(0, params_base.speculative.draft.n_max) != block_size) {
+                SRV_ERR("draft-dspark: --spec-draft-n-max (%d) must equal the drafter's block_size (%u)\n",
+                        params_base.speculative.draft.n_max, block_size);
+                return false;
+            }
+
             const std::vector<int32_t> capture_layers = server_read_dspark_target_layers(drafter_path);
             if (capture_layers.empty()) {
                 SRV_ERR("draft-dspark: failed to read dspark.target_layers from '%s' -- disabling speculative decoding\n", drafter_path.c_str());
@@ -1178,6 +1194,15 @@ private:
             } else {
                 llama_set_capture_layers(ctx_tgt, capture_layers.data(), capture_layers.size(), /* masked = */ false);
                 SRV_INF("draft-dspark: target tap capture engaged on %zu layers\n", capture_layers.size());
+
+                // a context shift moves cache positions and shrinks slot.prompt,
+                // but the speculator's staged capture window is not shifted or
+                // rebuilt -- drafting would silently stop for the rest of the
+                // request. Disable shifting, same as the mtmd/context checks above.
+                if (params_base.ctx_shift) {
+                    params_base.ctx_shift = false;
+                    SRV_WRN("%s\n", "ctx_shift is not supported with draft-dspark capture, it will be disabled");
+                }
             }
         }
 
@@ -1653,6 +1678,14 @@ private:
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+
+        // capture-type drafters: child slots clone the llama contexts from the
+        // parent, but the speculator's per-sequence capture state (staged
+        // features/positions, cache pos) is not cloned -- every draft round
+        // would fail the staged-row check. Run children without speculation.
+        slot.spec_disabled = slot.task->is_child() &&
+                             slot.spec != nullptr &&
+                             common_speculative_need_embd_capture(slot.spec);
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt

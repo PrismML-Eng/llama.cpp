@@ -53,6 +53,29 @@ static std::vector<int32_t> read_dspark_target_layers(const std::string & drafte
     return out;
 }
 
+// the drafter's block size (draft tokens per round); 0 on failure.
+static uint32_t read_dspark_block_size(const std::string & drafter_path) {
+    struct gguf_init_params gp = { /* .no_alloc = */ true, /* .ctx = */ nullptr };
+    gguf_context * gctx = gguf_init_from_file(drafter_path.c_str(), gp);
+    if (gctx == nullptr) {
+        return 0;
+    }
+
+    uint32_t out = 0;
+
+    const int64_t arch_kid = gguf_find_key(gctx, "general.architecture");
+    if (arch_kid >= 0) {
+        const std::string key = std::string(gguf_get_val_str(gctx, arch_kid)) + ".dspark.block_size";
+        const int64_t kid = gguf_find_key(gctx, key.c_str());
+        if (kid >= 0 && gguf_get_kv_type(gctx, kid) == GGUF_TYPE_UINT32) {
+            out = gguf_get_val_u32(gctx, kid);
+        }
+    }
+
+    gguf_free(gctx);
+    return out;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -116,14 +139,16 @@ int main(int argc, char ** argv) {
 
         auto cparams = common_context_params_to_llama(params_dft);
 
-        // dspark stages all context rows since its cache position in one batch
-        // (worst case the full window), so its batch must cover the context --
-        // otherwise every draft round is skipped and speculation degrades to AR.
+        // dspark stages all context rows since its cache position PLUS a full
+        // block in one batch (worst case ctx_len == n_ctx), so its batch must
+        // cover n_ctx + block_size -- otherwise draft rounds near the context
+        // limit are skipped and speculation silently degrades to AR.
         const bool spec_dspark = std::find(params.speculative.types.begin(),
                                            params.speculative.types.end(),
                                            COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
         if (spec_dspark) {
-            cparams.n_batch  = std::max(cparams.n_batch,  cparams.n_ctx);
+            const uint32_t block_size = read_dspark_block_size(params.speculative.draft.mparams.path);
+            cparams.n_batch  = std::max(cparams.n_batch,  cparams.n_ctx + (block_size > 0 ? block_size : 64));
             cparams.n_ubatch = std::max(cparams.n_ubatch, cparams.n_batch);
         }
 
