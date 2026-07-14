@@ -16,6 +16,7 @@
 #include "mtmd-helper.h"
 
 #include "ggml-cpp.h"
+#include "gguf.h"
 
 // TODO: tmp until the mtmd draft processing is refactored [TAG_MTMD_DRAFT_PROCESSING]
 #include "../../src/llama-ext.h"
@@ -54,6 +55,68 @@ static uint32_t server_n_outputs_max(const common_params & params) {
     const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
 
     return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
+}
+
+// dspark drafters carry the target layer-id list to capture as an array-typed
+// GGUF KV, which llama_model's string-KV cache skips (array KVs are not
+// exposed via llama_model_meta_val_str) -- read it from the drafter file
+// directly, same as tests/test-dspark-real-eval.cpp. Returns empty on failure.
+static std::vector<int32_t> server_read_dspark_target_layers(const std::string & drafter_path) {
+    struct gguf_init_params gp = { /* .no_alloc = */ true, /* .ctx = */ nullptr };
+    gguf_context * gctx = gguf_init_from_file(drafter_path.c_str(), gp);
+    if (gctx == nullptr) {
+        return {};
+    }
+
+    std::vector<int32_t> out;
+
+    const int64_t arch_kid = gguf_find_key(gctx, "general.architecture");
+    if (arch_kid >= 0) {
+        const std::string key = std::string(gguf_get_val_str(gctx, arch_kid)) + ".dspark.target_layers";
+        const int64_t kid = gguf_find_key(gctx, key.c_str());
+        if (kid >= 0 && gguf_get_kv_type(gctx, kid) == GGUF_TYPE_ARRAY) {
+            const enum gguf_type arr_type = gguf_get_arr_type(gctx, kid);
+            const size_t         n        = gguf_get_arr_n(gctx, kid);
+            const void *         data     = gguf_get_arr_data(gctx, kid);
+            out.reserve(n);
+            for (size_t i = 0; i < n; i++) {
+                switch (arr_type) {
+                    case GGUF_TYPE_INT32:  out.push_back(((const int32_t  *) data)[i]); break;
+                    case GGUF_TYPE_UINT32: out.push_back((int32_t) ((const uint32_t *) data)[i]); break;
+                    case GGUF_TYPE_INT64:  out.push_back((int32_t) ((const int64_t  *) data)[i]); break;
+                    case GGUF_TYPE_UINT64: out.push_back((int32_t) ((const uint64_t *) data)[i]); break;
+                    default: out.clear(); i = n; break;
+                }
+            }
+        }
+    }
+
+    gguf_free(gctx);
+    return out;
+}
+
+// read the dspark drafter's block size (draft tokens per round) from its GGUF.
+// Returns 0 on failure.
+static uint32_t server_read_dspark_block_size(const std::string & drafter_path) {
+    struct gguf_init_params gp = { /* .no_alloc = */ true, /* .ctx = */ nullptr };
+    gguf_context * gctx = gguf_init_from_file(drafter_path.c_str(), gp);
+    if (gctx == nullptr) {
+        return 0;
+    }
+
+    uint32_t out = 0;
+
+    const int64_t arch_kid = gguf_find_key(gctx, "general.architecture");
+    if (arch_kid >= 0) {
+        const std::string key = std::string(gguf_get_val_str(gctx, arch_kid)) + ".dspark.block_size";
+        const int64_t kid = gguf_find_key(gctx, key.c_str());
+        if (kid >= 0 && gguf_get_kv_type(gctx, kid) == GGUF_TYPE_UINT32) {
+            out = gguf_get_val_u32(gctx, kid);
+        }
+    }
+
+    gguf_free(gctx);
+    return out;
 }
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
@@ -954,6 +1017,39 @@ private:
             cparams.n_rs_seq  = 0;
             cparams.ctx_other = ctx_tgt;
 
+            // dspark drafts a full block per round regardless of the configured
+            // draft n_max: its drafter batch requests [anchor + block_size] output
+            // rows per sequence, which can exceed the generic (1 + n_max) sizing.
+            const bool spec_dspark = std::find(params_base.speculative.types.begin(),
+                                               params_base.speculative.types.end(),
+                                               COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params_base.speculative.types.end();
+            if (spec_dspark) {
+                const uint32_t block_size = server_read_dspark_block_size(params_spec.mparams.path);
+                if (block_size > 0) {
+                    const uint32_t n_out_dspark = params_base.n_parallel * (1 + block_size);
+                    if (cparams.n_outputs_max < n_out_dspark) {
+                        SRV_INF("draft-dspark: raising draft ctx n_outputs_max %u -> %u (block_size=%u)\n",
+                                cparams.n_outputs_max, n_out_dspark, block_size);
+                        cparams.n_outputs_max = n_out_dspark;
+                    }
+                }
+
+                // dspark stages all context rows since its cache position in ONE
+                // batch -- worst case the whole window right after begin() (e.g.
+                // a follow-up request with >n_batch tokens of history). If the
+                // drafter's batch is smaller than its context, every round is
+                // skipped ("round needs N tokens > n_batch") and speculation
+                // silently degrades to plain AR.
+                if (cparams.n_batch < cparams.n_ctx) {
+                    SRV_INF("draft-dspark: raising draft ctx n_batch %u -> %u (full-context staging)\n",
+                            cparams.n_batch, cparams.n_ctx);
+                    cparams.n_batch = cparams.n_ctx;
+                }
+                if (cparams.n_ubatch < cparams.n_batch) {
+                    cparams.n_ubatch = cparams.n_batch;
+                }
+            }
+
             ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
 
             params_base.speculative.draft.ctx_tgt = ctx_tgt;
@@ -1066,6 +1162,23 @@ private:
 
         if (ctx_dft) {
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
+        }
+
+        // dspark (draft-dspark) needs the target context to capture the drafter's
+        // tap layers on every decode -- without this the first draft round fails
+        // (capture rows come back null). masked=false keeps batch.logits narrow
+        // (no per-row full-vocab lm_head), see llama_set_capture_layers (#63).
+        if (spec && common_speculative_need_embd_capture(spec.get())) {
+            const std::string & drafter_path = params_base.speculative.draft.mparams.path;
+
+            const std::vector<int32_t> capture_layers = server_read_dspark_target_layers(drafter_path);
+            if (capture_layers.empty()) {
+                SRV_ERR("draft-dspark: failed to read dspark.target_layers from '%s' -- disabling speculative decoding\n", drafter_path.c_str());
+                spec.reset();
+            } else {
+                llama_set_capture_layers(ctx_tgt, capture_layers.data(), capture_layers.size(), /* masked = */ false);
+                SRV_INF("draft-dspark: target tap capture engaged on %zu layers\n", capture_layers.size());
+            }
         }
 
         if (spec) {
@@ -2639,6 +2752,16 @@ private:
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
+                        // capture-type drafters (dspark): begin() clears the per-seq staged
+                        // feature window, so it must run BEFORE the prompt is decoded --
+                        // the prompt chunks' capture rows are staged by the
+                        // common_speculative_process() call in the decode loop below.
+                        // (for other spec types begin() stays after prompt eval, see
+                        // SLOT_STATE_DONE_PROMPT.)
+                        if (slot.can_speculate() && common_speculative_need_embd_capture(spec.get())) {
+                            common_speculative_begin(spec.get(), slot.id, slot.task->tokens.get_text_tokens());
+                        }
+
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
 
@@ -2709,7 +2832,15 @@ private:
                                 continue;
                             }
 
-                            if (slot.task->params.cache_prompt) {
+                            // capture-type drafters (dspark) need a capture row staged for every
+                            // prompt position; KV-cache prefix reuse would skip decoding (and thus
+                            // capturing) the reused positions, so force a full reprocess.
+                            const bool spec_needs_full_prompt = slot.can_speculate() && common_speculative_need_embd_capture(spec.get());
+                            if (spec_needs_full_prompt && slot.task->params.cache_prompt) {
+                                SLT_DBG(slot, "%s", "draft-dspark: disabling prompt cache reuse (capture rows needed for every position)\n");
+                            }
+
+                            if (slot.task->params.cache_prompt && !spec_needs_full_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
@@ -3359,7 +3490,10 @@ private:
                     // prompt evaluated for next-token prediction
                     slot.state = SLOT_STATE_GENERATING;
 
-                    if (slot.can_speculate()) {
+                    // capture-type drafters already ran begin() before prompt decode (see
+                    // SLOT_STATE_STARTED) -- running it again here would wipe the prompt's
+                    // staged capture rows.
+                    if (slot.can_speculate() && !common_speculative_need_embd_capture(spec.get())) {
                         common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                     }
                 } else if (slot.state != SLOT_STATE_GENERATING) {
