@@ -428,8 +428,26 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // ring path: read per-seq live state directly from the cache inside the
     // fused GDN op (rows mode) instead of gather + slot-0 cpy per layer.
     // GGML_GDN_STATE_GATHER=1 restores the legacy gathered path (A/B).
+    // rows mode (the src[6] variant) is implemented on CPU and Metal only;
+    // other GPU backends reject it in supports_op, which would silently move
+    // the whole recurrent op to CPU -- keep the gathered form unless every
+    // GPU device in the model is Metal.
     static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
-    const bool gdn_state_rows = gdn_state_rows_env && cparams.n_rs_seq > 0;
+
+    bool gdn_state_rows_dev_ok = true;
+    for (const auto & ldev : model.devices) {
+        if (ldev.dev == nullptr || ggml_backend_dev_type(ldev.dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ldev.dev);
+        const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+        if (reg_name == nullptr || strcmp(reg_name, "Metal") != 0) {
+            gdn_state_rows_dev_ok = false;
+            break;
+        }
+    }
+
+    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0;
 
     ggml_tensor * state;
     if (gdn_state_rows) {
