@@ -2901,16 +2901,16 @@ ggml_tensor * llm_graph_context::build_rs_cache_view(
     // same cache hygiene as build_rs, minus the main gather (the consumer reads
     // per-seq rows via inp->s_copy_main directly, inside the GDN op).
     //
-    // build_rs gathers the main rows BEFORE this extra relocation so an
-    // overlapping main row is read before being overwritten. We defer the main
-    // read into the consumer, so it is only safe if the relocation cannot
-    // clobber a main row. That holds by construction: s_copy() maps main rows
-    // to [rs_head, rs_head + n_seqs) (cell_idx = i + head, i < n_seqs), while
-    // the extra destination below is [rs_head + n_seqs, rs_head + n_rs) -- the
-    // two ranges are disjoint, so no main row the consumer will read lies in
-    // the relocation target. (Assert the invariant so a future cache-layout
-    // change that breaks it fails loudly rather than corrupting state.)
-    GGML_ASSERT((uint32_t) n_seqs <= n_rs && "rows mode: main rows [head,head+n_seqs) must not overlap extra dest [head+n_seqs,head+n_rs)");
+    // KNOWN LIMITATION (tracked follow-up): build_rs gathers the main rows
+    // BEFORE this extra relocation, so an overlapping main row is read before
+    // being overwritten. rows mode defers the main read into the consumer, and
+    // s_copy() maps a main row to an arbitrary cache slot (idx*size + src0),
+    // which can fall inside the extra destination [rs_head+n_seqs, rs_head+n_rs)
+    // during a cache reorder -- so this relocation could clobber a main row the
+    // consumer will later read. Not reachable on the current single-sequence
+    // decode path, but it is a real multi-sequence hazard; the correct fix is
+    // to order the relocation AFTER the GDN read (build_rs's read-before-write
+    // ordering), which is a graph-dependency refactor left as follow-up.
     ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
     ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
 

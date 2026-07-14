@@ -1641,7 +1641,13 @@ static int ggml_metal_gdn_write_rows(
     const int64_t T        = gdn->src[0]->ne[2];     // tokens this step
     const int64_t K        = (int64_t) ggml_get_op_params_i32(gdn, 0);
     const int64_t D        = S_v * S_v * H_v;
-    const int64_t n_write  = (T < K ? T : K) * n_seqs;
+    const int64_t n_slots  = (T < K ? T : K);         // snapshot slots written
+    const int64_t n_write  = n_slots * n_seqs;
+    // byte offset of the snapshot tail within the GDN output, matching the
+    // kernel: dst = base + attn_size + (K - n_slots)*state_size_per_snap.
+    const int64_t attn_size            = T * H_v * S_v * n_seqs;
+    const int64_t state_size_per_snap  = D * n_seqs;
+    const int64_t snap_off_elems       = attn_size + (K - n_slots) * state_size_per_snap;
 
     for (int j = idx + 1; j < ctx->n_nodes(); ++j) {
         ggml_tensor * set_rows = ctx->node(j);
@@ -1663,14 +1669,21 @@ static int ggml_metal_gdn_write_rows(
         }
 
         // Descent from the GDN output is necessary but NOT sufficient: a caller
-        // could scatter a differently-shaped view (e.g. an attention-output
-        // slice). Verify the fold target is exactly the snapshot tail --
-        // matching per-row state width, index count and destination row width --
-        // before suppressing the SET_ROWS and letting the kernel write it.
+        // could scatter a differently-shaped view, or a same-sized view at a
+        // different offset (e.g. an attention-output slice). Verify the fold
+        // target is exactly the snapshot tail -- per-row state width, index
+        // count, destination row width, AND that the view begins at the
+        // snapshot-tail byte offset within the GDN output (tensors are
+        // allocated at encode time, so the data pointers are valid here).
         const ggml_tensor * view = set_rows->src[0];
         if (ggml_nelements(view) != D * n_write ||
             set_rows->src[1]->ne[0] != n_write ||
             set_rows->src[2]->ne[0] != D) {
+            continue;
+        }
+        if (view->data == nullptr || gdn->data == nullptr ||
+            (size_t) ((const char *) view->data - (const char *) gdn->data) !=
+                (size_t) snap_off_elems * sizeof(float)) {
             continue;
         }
 
