@@ -350,29 +350,23 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
         }
 
         const block_q1_0 * bxi = (const block_q1_0 *) x + kbx0 + i*stride + kbx;
-        const int qs_offset = 4*kqsx;
-        const int qs0 = bxi->qs[qs_offset + 0] | (bxi->qs[qs_offset + 1] << 8) |
-                        (bxi->qs[qs_offset + 2] << 16) | (bxi->qs[qs_offset + 3] << 24);
-
-        int unpacked_bytes[8];
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const int shift = j * 4;
-            const int bits4 = (qs0 >> shift) & 0x0F;
-            const int b0 = (bits4 & 0x01) ? 1 : -1;
-            const int b1 = (bits4 & 0x02) ? 1 : -1;
-            const int b2 = (bits4 & 0x04) ? 1 : -1;
-            const int b3 = (bits4 & 0x08) ? 1 : -1;
-            unpacked_bytes[j] = (b0 & 0xFF) | ((b1 & 0xFF) << 8) | ((b2 & 0xFF) << 16) | ((b3 & 0xFF) << 24);
-        }
+        const int16_t    * qxi = (const int16_t *) bxi->qs + kqsx * 2;
 
         const int dst_offset = kbx*(scale_entries_per_block*QI8_0) + kqsx*QI8_0;
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
+        for (int j = 0; j < 2; ++j) {
+            const int4 v = unpack_q1_0_bytes(qxi[j]);
+
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-            x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + dst_offset + j] = unpacked_bytes[j];
+            x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + dst_offset + j*4+0] = v.x;
+            x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + dst_offset + j*4+1] = v.y;
+            x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + dst_offset + j*4+2] = v.z;
+            x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + dst_offset + j*4+3] = v.w;
 #else
-            x_qs[i*(2*MMQ_TILE_NE_K + 1) + dst_offset + j] = unpacked_bytes[j];
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + dst_offset + j*4+0] = v.x;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + dst_offset + j*4+1] = v.y;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + dst_offset + j*4+2] = v.z;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + dst_offset + j*4+3] = v.w;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         }
     }
@@ -4279,4 +4273,3 @@ void ggml_cuda_op_mul_mat_q(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
-
