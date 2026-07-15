@@ -568,9 +568,17 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
     float sumf = 0.0f;
 
-#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
-    // AVX-512-VNNI: unpack 2-bit codes c in {0,1,2,3} (value = c-1), then
+#if (defined(__AVX512VNNI__) && defined(__AVX512VL__)) || defined(__AVXVNNI__)
+    // VNNI: unpack 2-bit codes c in {0,1,2,3} (value = c-1), then
     // dot((c-1), qy) = dpbusd(c, qy) - dpbusd(1, qy).
+    // The kernel only uses 256-bit registers, so it runs unchanged on
+    // AVX-VNNI-only CPUs (e.g. Intel Alder/Raptor Lake, where AVX512 is
+    // unavailable); the AVX-VNNI intrinsic differs only in name.
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#define GGML_Q2_0_DPBUSD(acc, a, b) _mm256_dpbusd_epi32(acc, a, b)
+#else
+#define GGML_Q2_0_DPBUSD(acc, a, b) _mm256_dpbusd_avx_epi32(acc, a, b)
+#endif
     const __m256i ones   = _mm256_set1_epi8(1);
     const __m128i idxlo  = _mm_setr_epi8(0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3);
     const __m128i idxhi  = _mm_setr_epi8(4,4,4,4,5,5,5,5,6,6,6,6,7,7,7,7);
@@ -591,12 +599,13 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
             r0 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r0, mul), 6), three);
             r1 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r1, mul), 6), three);
             __m256i codes = _mm256_permute4x64_epi64(_mm256_packus_epi16(r0, r1), 0xD8); // 32 codes in order
-            const int dp = hsum_i32_8(_mm256_dpbusd_epi32(_mm256_setzero_si256(), codes, qy));
-            const int sy = hsum_i32_8(_mm256_dpbusd_epi32(_mm256_setzero_si256(), ones,  qy));
+            const int dp = hsum_i32_8(GGML_Q2_0_DPBUSD(_mm256_setzero_si256(), codes, qy));
+            const int sy = hsum_i32_8(GGML_Q2_0_DPBUSD(_mm256_setzero_si256(), ones,  qy));
             sumi += d1 * (float)(dp - sy);
         }
         sumf += d0 * sumi;
     }
+#undef GGML_Q2_0_DPBUSD
 #else
     for (int i = 0; i < nb; i++) {
         const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
