@@ -552,6 +552,12 @@ static inline __m128i get_scale_shuffle(int i) {
 }
 #endif
 
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#  define GGML_DPBUSD_256 _mm256_dpbusd_epi32
+#elif defined(__AVXVNNI__)
+#  define GGML_DPBUSD_256 _mm256_dpbusd_avx_epi32
+#endif
+
 void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK2_0;
     const int nb = n / qk;
@@ -568,8 +574,8 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
     float sumf = 0.0f;
 
-#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
-    // AVX-512-VNNI: unpack 2-bit codes c in {0,1,2,3} (value = c-1), then
+#if (defined(__AVX512VNNI__) && defined(__AVX512VL__)) || defined(__AVXVNNI__)
+    // AVX-512-VNNI or AVX-VNNI: unpack 2-bit codes c in {0,1,2,3} (value = c-1), then
     // dot((c-1), qy) = dpbusd(c, qy) - dpbusd(1, qy).
     const __m256i ones   = _mm256_set1_epi8(1);
     const __m128i idxlo  = _mm_setr_epi8(0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3);
@@ -591,8 +597,8 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
             r0 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r0, mul), 6), three);
             r1 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r1, mul), 6), three);
             __m256i codes = _mm256_permute4x64_epi64(_mm256_packus_epi16(r0, r1), 0xD8); // 32 codes in order
-            const int dp = hsum_i32_8(_mm256_dpbusd_epi32(_mm256_setzero_si256(), codes, qy));
-            const int sy = hsum_i32_8(_mm256_dpbusd_epi32(_mm256_setzero_si256(), ones,  qy));
+            const int dp = hsum_i32_8(GGML_DPBUSD_256(_mm256_setzero_si256(), codes, qy));
+            const int sy = hsum_i32_8(GGML_DPBUSD_256(_mm256_setzero_si256(), ones,  qy));
             sumi += d1 * (float)(dp - sy);
         }
         sumf += d0 * sumi;
