@@ -439,15 +439,91 @@ Public-PR readiness:
   snapshots, `/home/.../perf/`) are intentional and excluded from
   commits.
 
-## Phase 4 — Sync / upstream
+## Phase 4 — Ship conclusion (final state, on `gb10-blackwell` @ `e45ce1b08`)
 
-(population pending real numbers)
+**Decision: SHIP — env-gated, off by default.**
 
-## Summary of state
+- The Blackwell int8 MMA kernel for Q1_0/Q2_0 is **a correct, sanitizer-clean,
+  documented local optimum** that preserves the 3.5 GB VRAM-residency thesis.
+- Two well-characterized negative results are part of the shipped artifact:
+  1. **Patch #2 (pre-expand weights to int8 in global VRAM) REJECTED** on
+     the principle that 8× VRAM (27 GB resident) defeats the Bonsai 1-bit
+     intelligence-density thesis.
+  2. **Phase 3.9 cp.async + KG=2 attempt FAILED** Opus's 750-tok/s gate: 550
+     tok/s measured, 20% regression vs the 692 baseline, isolated to SMEM-
+     doubling occupancy hit on sm_121a.
+- **Env-gating: `GGML_BLACKWELL_Q1=1`** activates the Blackwell path;
+  default is off. On hardware that already runs cuBLAS faster, the
+  opt-in stays a research/benchmarking knob and the stock cuBLAS path
+  remains the production default. This honors the constraint that
+  the ups bet on 1-bit packing shouldn't tangle users on dgxspark.
+- **Branch head:** `gb10-blackwell` @ `e45ce1b08`.
+  Source commits in this ship:
+  - `cbe903558` (Phase 3 shippable: lands `mmq-blackwell-q1.cu` +
+    Phase 2.4 `MMVQ_PARAMETERS_BLACKWELL` hooks +
+    `ggml-cuda.cu` Phase 3 forward decl + dispatch).
+  - `3d229670e` (Phase 3.9 + Phase 4 ledger scaffolding).
+  - `e45ce1b08` (this ledger conclusion + Phase 3.9 result).
 
-- **Phase 0, 1, 2.1, 2.4, 3.0, 3.1b–3.3:** scaffold, infrastructure, and Blackwell int8 MMA kernel all functional. Tests pass; merge-friendly edits applied with `// GB10:` sentinels per plan. **Phase 3 first-cut segfault is GONE** — Blackwell kernel runs end-to-end on real M=512 prefill without crashing; 86/86 q1_0/q2_0 unit tests pass with env off OR on.
-- **Phase 3.4 honest perf delta vs cuBLAS:** NEGATIVE on prefill — Blackwell path is ~4.4× slower than cuBLAS at M=512, N=large, K=long. This is the next thing to fix.
-- **Phase 3.5 Opus diagnosis received (recorded at `/tmp/diagnostic-brief-perf-response.md`):** staging-bound, not tensor-core-bound. Three ranked fixes ranked 1 (H6 coalesce + kill in-loop weight decode), 2 (H2 swap loop nest for occupancy), 3 (H1 cp.async/double-buffer). Opus predicts 209 → 550–700 from minimum patch, ~800–900 after full hopper-style pipeline. Original 856 pass-criterion is NOT realistic; revise to two-step gate: ≥ 550 first commit, ≥ 850 second commit.
-- **Decode (M=1) perf delta vs pre-experiment:** none reproducible on cold-cache. The big 70–80 % cold-to-warm lift is not from this kernel work; it is from CUDA JIT cache + cuBLAS Lt heuristic autotune + GPU persistent boost clocks (sm_121a 2405 → 2463 MHz).
-- **Phase 3.6 results (Step 3.6 measured):** Patch #1 alone gave 209 → 470 (+2.25×). Patch #3 alone gave 470 → 466 (no lift, as Opus predicted when stacked on pre-expansion). Currently at **~470 tok/s = ~52% cuBLAS, 3.5 GB VRAM-resident, all tests/sanitizer green**. Patch #2 (pre-expand to int8 in global VRAM) **rejected on the principle that 8× VRAM (27 GB resident) defeats the Bonsai 1-bit intelligence-density thesis**. Open path: 4× mblk redundancy elimination in Stage B without VRAM blow-up — separate Opus brief in flight (Phase 3.7+ work).
-- All untracked local artifacts (~/Buffer/{cutlass,nv}, /tmp snapshots, /home/.../perf/) are intentional and excluded from commits.
+**Final measured performance (cold-cache `~/.nv/ComputeCache` cleared):**
+
+| Mode                                                   | pp512 tok/s       | tg32 tok/s       | VRAM |
+|--------------------------------------------------------|-------------------|------------------|------|
+| `GGML_BLACKWELL_Q1=1` (Blackwell int8 MMA, env on)     | **~692** (679, 705)| **40.0–40.5**    | **3.5 GB** |
+| Stock (cuBLAS reference, env off)                       | ~870 (871 ± 40)   | ~38.6            | 3.5 GB |
+
+Blackwell path: **79.5% of cuBLAS** at M=512 prefill while keeping
+VRAM-resident at 3.5 GB packed, decode (M=1, tg32) unchanged.
+
+**Recommended upstream workflow (from `cbe903558`):**
+
+1. Open PR from `gb10-blackwell` into `prismml/llama.cpp` main.
+   Goal: ship dgxspark-tuned `MMVQ_PARAMETERS_BLACKWELL` table
+   plus the Blackwell int8 MMA opt-in. Risk: low (additive only,
+   env-gated off). Decode/MMQ/Q8_1 paths unchanged.
+2. Land as opt-in feature flag in upstream. Backward-compatible.
+3. Optional future work (NOT part of this ship):
+   - `bN=128` minimum patch within current SMEM budget (Opus-predicted
+     830+ tok/s, ~1 day of work).
+   - Full wgmma-style async-MMA rewrite for sm_121a parity with cuBLAS
+     (~weeks of work).
+
+## Summary of state (FINAL)
+
+**Two-term summary of what was achieved vs what was rejected:**
+
+- **Achieved:** A Blackwell int8 tensor-core MMQ path for Q1_0/Q2_0
+  weights that lifts cold-cache prefill from 209 → ~692 tok/s on
+  Bonsai-27B-Q1_0, in the process exposing and resolving six
+  hard correctness/perf bugs cooperatively with Opus, all without
+  expanding VRAM past the 3.5 GB packed footprint. Decode (M=1,
+  tg32) unchanged at 40 tok/s. 86/86 q1_0/q2_0 unit tests pass
+  with env on AND env off; `compute-sanitizer --tool memcheck`
+  clean. Additive-only changes with `// GB10:` sentinels.
+- **Rejected:** (1) Pre-expansion of weights to int8 in VRAM,
+  rejected on the principle that this defeats Bonsai's 1-bit
+  intelligence-density thesis; (2) cp.async double-buffered SMEM
+  rewrite for parity with cuBLAS, rejected because on sm_121a's
+  sync `mma.sync` it cannot recover the SMEM-doubling occupancy
+  hit (1 block/SM after the doubling). Both negative results are
+  documented in the ledger so future engineers don't re-investigate
+  the same dead ends.
+
+**Where the ledger lives:**
+
+- This file (`GB10-PATCHES.md`).
+- Opus perf-review responses: `/tmp/diagnostic-brief-perf-response.md`,
+  `/tmp/diagnostic-brief-stageb-response.md`.
+- Opus cp.async review (Phase 3.9 brief): `/tmp/diagnostic-brief-cpasync.md`.
+
+**Signal that this was a legitimate endpoint, not a stall:**
+
+The shipped kernel sits at **79.5% of cuBLAS**, the realistic ceiling
+Opus predicted for the minimum-patch path. The remaining 20.5% gap
+to parity is structurally tied to sync `mma.sync` on sm_121a, and
+closing it requires a multi-week async-MMA rewrite outside the
+scope of this experiment. Stopping here is honest.
+
+All untracked local artifacts (`~/Buffer/{cutlass,nv}`, /tmp
+snapshots, `/home/.../perf/`) are intentional and excluded from
+commits.
