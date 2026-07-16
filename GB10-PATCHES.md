@@ -372,14 +372,15 @@ head `cbe903558` is the Bonsai-thesis-respecting Blackwell path.
 
 ## Phase 4 — Sync / upstream
 
-HEAD on `gb10-blackwell` branch: `cbe903558` (ship commit, lands
-mmq-blackwell-q1.cu + supporting diffs + this ledger).
+HEAD on `gb10-blackwell` branch: `102e97b74` (Phase 4 SHIP conclusion;
+lands the final decision + ledger conclusion above the source-ship
+commit `cbe903558`).
 
 Public-PR readiness:
 
-| Branch             | HEAD       | Status                                  |
-|--------------------|------------|-----------------------------------------|
-| gb10-blackwell     | cbe903558  | 692 tok/s Blackwell, ship-ready locally |
+| Branch             | HEAD        | Status                                  |
+|--------------------|-------------|-----------------------------------------|
+| gb10-blackwell     | `102e97b74` | 692 tok/s Blackwell, shipped env-gated  |
 
 **Suggested upstream workflow:**
 
@@ -439,7 +440,7 @@ Public-PR readiness:
   snapshots, `/home/.../perf/`) are intentional and excluded from
   commits.
 
-## Phase 4 — Ship conclusion (final state, on `gb10-blackwell` @ `e45ce1b08`)
+## Phase 4 — Ship conclusion (final state, on `gb10-blackwell` @ `102e97b74`)
 
 **Decision: SHIP — env-gated, off by default.**
 
@@ -457,13 +458,14 @@ Public-PR readiness:
   opt-in stays a research/benchmarking knob and the stock cuBLAS path
   remains the production default. This honors the constraint that
   the ups bet on 1-bit packing shouldn't tangle users on dgxspark.
-- **Branch head:** `gb10-blackwell` @ `e45ce1b08`.
+- **Branch head:** `gb10-blackwell` @ `102e97b74`.
   Source commits in this ship:
   - `cbe903558` (Phase 3 shippable: lands `mmq-blackwell-q1.cu` +
     Phase 2.4 `MMVQ_PARAMETERS_BLACKWELL` hooks +
     `ggml-cuda.cu` Phase 3 forward decl + dispatch).
   - `3d229670e` (Phase 3.9 + Phase 4 ledger scaffolding).
-  - `e45ce1b08` (this ledger conclusion + Phase 3.9 result).
+  - `e45ce1b08` (ledger: Phase 3.9 cp.async attempt documented).
+  - `102e97b74` (this ledger: Phase 4 SHIP conclusion, env-gated).
 
 **Final measured performance (cold-cache `~/.nv/ComputeCache` cleared):**
 
