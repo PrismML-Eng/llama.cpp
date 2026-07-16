@@ -261,6 +261,110 @@ requires multi-rewrite (bM=512 persistent-CTA + cp.async).
 above the 550 first-gate (in fact 79.5% cuBLAS), with 3.5 GB VRAM
 throughout — the Bonsai thesis is preserved.
 
+### Step 3.9 — Long-arc path to parity (NOT in this ship commit)
+
+Opus's recommended continuation once 4× mblk redundancy is confirmed
+DRAM-bound (which it was): build the W-stationary path with explicit
+bigger tile + async-copy pipeline.
+
+Concretely:
+
+1. **`bM=512` with 1024 threads per block.** Each warp still owns
+   16 rows × 64 cols (1 rowblock). 4× more colblocks per warp; per-warp
+   frags: 8 × 4 row-stacks = 32. Per-thread register budget: ~32 fp32
+   `acc_f` + d0..d3 = ~36 regs/thread (well within Blackwell's 256
+   regs/thread). SMEM 32 KB (sA_i) + 8 KB (sB_i) + 1 KB (scales)
+   = ~41 KB per block; 2 blocks/SM fits Blackwell's 227 KB SMEM.
+   This is the "W-read-once" shape for M=512 prefill where one CTA
+   covers the full M dim and decodes weights exactly once.
+
+2. **`__pipeline_memcpy_async` cp.async for SMEM loads.** Replace
+   Stage A/B synchronous global reads with stage-aware cp.async +
+   `__pipeline_commit` / `__pipeline_wait_prior(0)`. Mirrors what
+   `mmq-hopper-q1.cu` already does for wgmma. Combined with double-
+   buffered SMEM (`sA_i[2]`, `sB_i[2]`), this overlaps global
+   latency with mma work and is the canonical way to approach cuBLAS
+   parity.
+
+3. **Per-warp mapping under 1024 threads.** 16 warps × 16 cols of
+   row-frags × 8 cols of n-frags = 128 frags total (> bM*bN/128 = 32
+   in our case). Actually we want 32 warps for 1024 threads; either
+   shrink `WARPS_PER_BLOCK` or use the dual-warp (warpgroup) Hopper-
+   style pattern.
+
+**Predicted lift per Opus:** 692 → 700–800 tok/s.
+
+**Honest complexity:** Multi-day rewrite. Requires (a) per-warp
+mapping restructuring under 1024 threads, (b) rewrite of Stage A/B
+into cp.async + double-buffered, (c) routing question for non-M=512
+prefill (M=64 attention prefill needs fallback path).
+
+**Status:** Deferred. Current ship point at 692 tok/s on `gb10-blackwell`
+head `cbe903558` is the Bonsai-thesis-respecting Blackwell path.
+
+## Phase 4 — Sync / upstream
+
+HEAD on `gb10-blackwell` branch: `cbe903558` (ship commit, lands
+mmq-blackwell-q1.cu + supporting diffs + this ledger).
+
+Public-PR readiness:
+
+| Branch             | HEAD       | Status                                  |
+|--------------------|------------|-----------------------------------------|
+| gb10-blackwell     | cbe903558  | 692 tok/s Blackwell, ship-ready locally |
+
+**Suggested upstream workflow:**
+
+1. Open PR from `gb10-blackwell` into `prismml/llama.cpp` main with:
+   - Goal: ship dgxspark-tuned `#[MMVQ_PARAMETERS_BLACKWELL]` table
+     + Blackwell int8 MMA opt-in (Phase 2.4 + Phase 3 combined).
+   - Risk: low. All edits are additive with `// GB10:` sentinels.
+   - Behavior change: opt-in only (env var `GGML_BLACKWELL_Q1` default
+     off). Decode/MMQ/Q8_1 paths unchanged.
+2. Coordinate with PrismML on whether the global VRAM-residency
+   disclosure (`WVRA=3.5 GB`) is acceptable on dspark hardware. (Should
+   be: no allocation difference between off and on.)
+3. Optional Phase 3.9 follow-up PR for parity, only after 3.8 ship is
+   adopted.
+
+## Summary of state
+
+- **Phase 0, 1, 2.1, 2.4, 3.0, 3.1b–3.8:** scaffold, infrastructure,
+  and **the Blackwell int8 MMA kernel for Q1_0/Q2_0 weights** all
+  functional and shippable. Tests pass; merge-friendly edits applied
+  with `// GB10:` sentinels per plan. Build clean, sanitizer clean,
+  86/86 unit tests pass with env on AND env off, decode (M=1, tg32) at
+  40 tok/s unchanged. **Cold-cache pp512: 692 tok/s = 79.5% of cuBLAS
+  with 3.5 GB VRAM-resident — Bonsai thesis preserved.**
+- **Phase 3.5 Opus diagnosis received.** Recorded at
+  `/tmp/diagnostic-brief-perf-response.md`: staging-bound, not
+  tensor-core-bound; minimum-patch lift estimates refined. Original
+  856 pass criterion is **not realistic**; realistic ceiling for
+  minimum-patch path is ~600–750.
+- **Phase 3.6 measured lifts:** Patch #1 (Stage A coalesce + int load)
+  209 → 470 (+2.25×); Patch #3 (loop-nest swap) 470 → 466 (no lift
+  standalone, as Opus predicted when stacked on pre-expansion).
+- **Phase 3.7 Stage B Q1 + Q2 patches** lifted 470 → ~560 tok/s
+  (Opus predicted 530–600). **Crossed Opus's step-1 gate of 550**.
+- **Phase 3.8 bM=256 falsifier:** 560 → ~692 tok/s = **79.5% of cuBLAS**.
+  Confirmed **DRAM-bound**, opening the Q3 (W-stationary) rewrite
+  path. Inside the realistic minimum-patch ceiling Opus predicted.
+- **Patch #2 (pre-expand weights to int8 in global VRAM) REJECTED** on
+  the principle that 8× VRAM (27 GB resident) defeats the Bonsai 1-bit
+  intelligence-density thesis. All routes forward keep K1_0 weights
+  packed (3.5 GB) throughout.
+- **Phase 3.9 (long-arc, NOT in ship commit).** Build `bM=512` with
+  1024 threads + `__pipeline_memcpy_async` cp.async double-buffer;
+  Opus-predicted 700–800 tok/s = up to ~89% of cuBLAS. Multi-day
+  rewrite.
+- **Decode (M=1) perf delta vs pre-experiment:** none reproducible on
+  cold-cache. The big 70–80 % cold-to-warm lift is not from this
+  kernel work; it is from CUDA JIT cache + cuBLAS Lt heuristic
+  autotune + GPU persistent boost clocks (sm_121a 2405 → 2463 MHz).
+- All untracked local artifacts (`~/Buffer/{cutlass,nv}`, /tmp
+  snapshots, `/home/.../perf/`) are intentional and excluded from
+  commits.
+
 ## Phase 4 — Sync / upstream
 
 (population pending real numbers)
