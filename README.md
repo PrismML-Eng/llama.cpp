@@ -1,5 +1,17 @@
 # llama.cpp
 
+> [!IMPORTANT]
+> **This is the PrismML fork of llama.cpp.** It adds the `Q2_0` / `PQ2_0` 2-bit quantization used by the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models.
+>
+> **New here? Start with the [Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo) repo** — it downloads the right model files and the correct prebuilt binaries for your hardware/backend automatically.
+>
+> If you use this fork directly, the main caveats:
+> - **Use a complete matching build** — download the full bundle for your OS+backend from our [Releases](https://github.com/PrismML-Eng/llama.cpp/releases), or build from source. Do **not** drop this fork's `ggml-*` libraries into a stock llama.cpp build (ABI mismatch — this will fail to load models).
+> - **Models:** use the `*-Q2_0_g64.gguf` files (official **group-64** `Q2_0`). The legacy `*-Q2_0.gguf` (group 128) won't load on group-64 builds; `*-PQ2_0.gguf` is this fork's group-128 variant.
+> - `Q2_0` is already upstream in mainline llama.cpp for **CPU and Metal** — those work without this fork. Vulkan/CUDA come from this fork for now.
+
+---
+
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
