@@ -675,14 +675,15 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
     return d6 * sumf_d;
 }
 
-static __device__ __forceinline__ int4 unpack_q1_0_bytes(const int16_t q) {
+static __device__ __forceinline__ int4 unpack_q1_0_bytes(const uint16_t q) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    const int n0 = __byte_perm(0x11100100, 0x11100100, q >> 0);
-    const int n1 = __byte_perm(0x11100100, 0x11100100, q >> 2);
-    const int s0 = __byte_perm(0x01FF, 0x01FF, n0 >> 0);
-    const int s1 = __byte_perm(0x01FF, 0x01FF, n1 >> 0);
-    const int s2 = __byte_perm(0x01FF, 0x01FF, n0 >> 16);
-    const int s3 = __byte_perm(0x01FF, 0x01FF, n1 >> 16);
+    const uint32_t q32 = q;
+    const int      n0  = __byte_perm(0x11100100, 0x11100100, q32 >> 0);
+    const int      n1  = __byte_perm(0x11100100, 0x11100100, q32 >> 2);
+    const int      s0  = __byte_perm(0x01FF, 0x01FF, n0 >> 0);
+    const int      s1  = __byte_perm(0x01FF, 0x01FF, n1 >> 0);
+    const int      s2  = __byte_perm(0x01FF, 0x01FF, n0 >> 16);
+    const int      s3  = __byte_perm(0x01FF, 0x01FF, n1 >> 16);
 
     return make_int4(__byte_perm(s0, s1, 0x5410), __byte_perm(s0, s1, 0x7632), __byte_perm(s2, s3, 0x5410),
                      __byte_perm(s2, s3, 0x7632));
@@ -711,7 +712,7 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     // iqs selects which of the 4 chunks of 32 elements to process (0-3)
 
     const float     d1 = bq1_0->d;
-    const int16_t * qs = (const int16_t *) bq1_0->qs + iqs * 2;
+    const uint16_t * qs = (const uint16_t *) bq1_0->qs + iqs * 2;
 
     // Process only the chunk specified by iqs
     const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;

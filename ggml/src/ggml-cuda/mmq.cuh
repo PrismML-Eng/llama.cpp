@@ -350,7 +350,7 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
         }
 
         const block_q1_0 * bxi = (const block_q1_0 *) x + kbx0 + i*stride + kbx;
-        const int16_t    * qxi = (const int16_t *) bxi->qs + kqsx * 2;
+        const uint16_t   * qxi = (const uint16_t *) bxi->qs + kqsx * 2;
 
         const int dst_offset = kbx*(scale_entries_per_block*QI8_0) + kqsx*QI8_0;
 #pragma unroll
