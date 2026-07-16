@@ -261,7 +261,75 @@ requires multi-rewrite (bM=512 persistent-CTA + cp.async).
 above the 550 first-gate (in fact 79.5% cuBLAS), with 3.5 GB VRAM
 throughout — the Bonsai thesis is preserved.
 
-### Step 3.9 — Long-arc path to parity (NOT in this ship commit)
+### Step 3.9 — cp.async + double-buffered SMEM attempt (FAILED gate)
+
+Opus's Phase 3.9 brief (`/tmp/diagnostic-brief-cpasync.md`) predicted
+**760–820 tok/s** from a minimum patch that mirrored the Hopper
+template's `load_stage` lambda pattern: `__pipeline_memcpy_async` for
+Stage A + KG=2 double-buffered SMEM + one `__syncthreads()` per kc.
+
+**Attempt 1 — cp.async + KG=2 (full pattern per Opus):**
+
+| Run | Cold pp512 tok/s |
+|-----|------------------|
+| Blackwell ON bM=256 + cp.async (run 1) | **574 ± 40** |
+| Blackwell ON bM=256 + cp.async (run 2) | **526 ± 64** |
+
+Avg ~**550 tok/s** — **a ~20% regression vs the bM=256 single-buffer
+baseline (692)**. **Below Opus's 750 decision-rule threshold.**
+
+**Diagnostic control — KG=2 doubled SMEM, sync Stage A reads
+(no cp.async):** Hopper-pattern pulled out, only the dynamic SMEM
+doubling kept, to isolate the regression source.
+
+| Run | Cold pp512 tok/s |
+|-----|------------------|
+| Blackwell ON bM=256 + KG=2 sync (run 1) | **592 ± 42** |
+| Blackwell ON bM=256 + KG=2 sync (run 2) | **591 ± 43** |
+
+Avg ~**591 tok/s** — also a regression (692 → 591, ~15%).
+
+**Conclusion:** the regression is **NOT from `cp.async`** itself; it's
+from the **2× dynamic SMEM footprint (41 KB → 82 KB) cutting
+occupancy 2 → 1 block/SM**. On Blackwell sm_121a SMEM/SM = ~227 KB,
+the single-block-per-SM constraint after KG=2 is the dominant cost.
+`__pipeline_memcpy_async` cannot hide that — its predicted benefit
+relies on Hopper-style async-wgmma compute overlapping cp.async retire,
+and Blackwell sm_121a's `mma.sync` is synchronous per-warp so the
+retire cost stalls the warp pipeline regardless of pipeline depth.
+
+**Reverted to bM=256 single-buffer kernel** at 692 tok/s head
+(`cbe903558`). Source-file cp.async edits were not committed.
+
+**Per Opus decision rule:**
+> "If pp512 < 750: cp.async did not deliver the predicted lift. … This
+> is a debugging-mode case; I'd want to see nsys memcpy_async_* events
+> before adding more code."
+
+Verified: cp.async retired with hardware events (no error spam, sanitizer
+passed in op-tests). The issue is one of *cost physics*, not cp.async
+semantics. Hopper sm_90a's wgmma-async hides cp.async retire behind
+compute; Blackwell sm_121a's mma.sync does not.
+
+**Routes forward to actually push past 692:**
+- Reduce per-block SMEM footprint instead of doubling (e.g., keep
+  stages bM=256 single-buffer and find other latency hides — Stage
+  B async-read of `Wbits` to *a third* SMEM buffer, etc).
+- Increase per-block compute density (bN=128 within current SMEM
+  budget — Opus predicted 830+ from this alone on a single-stage
+  kernel, no KG=2 needed).
+- Use Blackwell's actual async MMA path (cuda.async-copy + wgmma
+  pattern) — but that requires the wgmma-equivalent for sm_121a
+  which is `tcgen05` and requires PTX `wgmma.mma_async`-style
+  intrinsics (cuda::pipeline API family). Multi-week rewrite.
+
+**Concretely: STOP at 692 tok/s for ship.** This is the realistic
+ceiling for minimum-patch path; the bigger push requires multi-week
+work, not a 1-day patch.
+
+### Step 3.9 — Long-arc path to parity (DEFERRED after Phase 3.9 attempt)
+
+
 
 Opus's recommended continuation once 4× mblk redundancy is confirmed
 DRAM-bound (which it was): build the W-stationary path with explicit
@@ -353,10 +421,16 @@ Public-PR readiness:
   the principle that 8× VRAM (27 GB resident) defeats the Bonsai 1-bit
   intelligence-density thesis. All routes forward keep K1_0 weights
   packed (3.5 GB) throughout.
-- **Phase 3.9 (long-arc, NOT in ship commit).** Build `bM=512` with
-  1024 threads + `__pipeline_memcpy_async` cp.async double-buffer;
-  Opus-predicted 700–800 tok/s = up to ~89% of cuBLAS. Multi-day
-  rewrite.
+- **Phase 3.9 (cp.async + KG=2 attempt; FAILED gate).** Measured
+  cp.async + KG=2 at 574 → 526 (~550 tok/s avg) — a 20% regression
+  vs the bM=256 baseline at 692. SMEM-doubling alone (KG=2 sync, no
+  cp.async) gave 592 → 591 (~591 tok/s avg), confirming the
+  regression is occupancy-driven, not cp.async-driven. cp.async
+  cannot hide SMEM-stall on Blackwell sm_121a (sync mma). Reverted
+  to 692 tok/s baseline for ship. Routes forward that could push
+  past 692 are `bN=128` within current SMEM budget (Opus-predicted
+  830+) or full wgmma-style async-MMA rewrite (~weeks of work).
+
 - **Decode (M=1) perf delta vs pre-experiment:** none reproducible on
   cold-cache. The big 70–80 % cold-to-warm lift is not from this
   kernel work; it is from CUDA JIT cache + cuBLAS Lt heuristic
