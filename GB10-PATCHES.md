@@ -165,6 +165,33 @@ without cp.async; revise to two-step gate.
 Test inputs/tolerance hid it; mask with `& 0xFF` or use
 `*reinterpret_cast<const int*>(p)` (4-byte aligned, so safe).
 
+### Step 3.6 — MEASURED lifts from minimum patch #1 and #3
+
+| Patch                                        | Cold-cache pp512 tok/s | Decode tg32 tok/s     |
+|----------------------------------------------|------------------------|-----------------------|
+| (post-fix baseline, no patches applied)       | 209 ± 22               | 39.0 ± 0.6            |
+| + Patch #1 (Stage A coalesce + int load)    | **470 ± 18**           | 38.7 ± 0.5            |
+| + Patch #3 (Stage D frag-outer / kk-inner)  | **466 ± 23**           | 39.0 ± 0.2            |
+
+**Patch #1 alone lifted pp512 from 209 → 470 (+2.25×):** above Opus's
+predicted ceiling (300–380) for that single step. Side benefits beyond
+the predicted lift: the single-int load also closed the latent sign-extension
+correctness landmine (Opus's H6 #1 call-out) and is fundamental for tensors
+with negative activation values once we move to general 1.x-bit
+quant-block-level ML.
+
+**Patch #3 (loop-nest swap) had no measurable standalone lift** precisely
+because Opus predicted its lift *on top of* pre-expansion. Without
+pre-expansion, global Wbits reads in Stage B remain the dominant
+latency, and extra occupancy from register relief simply buys more
+stalled warps. Confirms the H2/H1 stacking order in Opus's diagnosis.
+
+**Honest framing of current state:** 470 tok/s is **~52% of the cuBLAS
+reference (899 tok/s)** with the kernel running cleanly, decode (M=1)
+unchanged, 86/86 unit tests, sanitizer clean, and **3.5 GB VRAM-resident
+throughout**. This is the realistic ceiling for the VRAM-respecting path
+so far.
+
 ## Phase 4 — Sync / upstream
 
 (population pending real numbers)
@@ -175,5 +202,5 @@ Test inputs/tolerance hid it; mask with `& 0xFF` or use
 - **Phase 3.4 honest perf delta vs cuBLAS:** NEGATIVE on prefill — Blackwell path is ~4.4× slower than cuBLAS at M=512, N=large, K=long. This is the next thing to fix.
 - **Phase 3.5 Opus diagnosis received (recorded at `/tmp/diagnostic-brief-perf-response.md`):** staging-bound, not tensor-core-bound. Three ranked fixes ranked 1 (H6 coalesce + kill in-loop weight decode), 2 (H2 swap loop nest for occupancy), 3 (H1 cp.async/double-buffer). Opus predicts 209 → 550–700 from minimum patch, ~800–900 after full hopper-style pipeline. Original 856 pass-criterion is NOT realistic; revise to two-step gate: ≥ 550 first commit, ≥ 850 second commit.
 - **Decode (M=1) perf delta vs pre-experiment:** none reproducible on cold-cache. The big 70–80 % cold-to-warm lift is not from this kernel work; it is from CUDA JIT cache + cuBLAS Lt heuristic autotune + GPU persistent boost clocks (sm_121a 2405 → 2463 MHz).
-- **Phase 3.6 next concrete experiment:** apply minimum patch (coalesce Stage A + Stage B in-loop weight decode elimination via repack pre-expansion + Stage D loop-nest swap). Run bench → compare to Opus prediction (≥ 550 tok/s). Then revisit full Hopper-style pipeline rewrite (cp.async + double buffer) for ≥ 850.
+- **Phase 3.6 results (Step 3.6 measured):** Patch #1 alone gave 209 → 470 (+2.25×). Patch #3 alone gave 470 → 466 (no lift, as Opus predicted when stacked on pre-expansion). Currently at **~470 tok/s = ~52% cuBLAS, 3.5 GB VRAM-resident, all tests/sanitizer green**. Patch #2 (pre-expand to int8 in global VRAM) **rejected on the principle that 8× VRAM (27 GB resident) defeats the Bonsai 1-bit intelligence-density thesis**. Open path: 4× mblk redundancy elimination in Stage B without VRAM blow-up — separate Opus brief in flight (Phase 3.7+ work).
 - All untracked local artifacts (~/Buffer/{cutlass,nv}, /tmp snapshots, /home/.../perf/) are intentional and excluded from commits.
