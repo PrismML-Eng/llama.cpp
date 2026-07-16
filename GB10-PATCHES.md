@@ -122,9 +122,48 @@ Decode (tg32) unchanged — confirms dispatch routing: M=1 falls through to the 
 
 **Honest framing:** Blackwell MMA path is now CORRECT but SLOWER than cuBLAS. The Opus diagnosis cured the segfault; it did not optimize the kernel for sm_121a's specific int8 tensor-core pipe. Diagnosis likely needed: missing `__pipeline_memcpy_async` (cp.async) for SMEM loads, possibly underweight register pressure with `__launch_bounds__(256)` causing spills, scale-in-loop serialization, and absent software pipelining. Optionally also: numerical correctness cross-check that the int8 multiplication sum even matches a CPU reference (we haven't proven this yet beyond "doesn't crash"; the published numbers may be fast-but-wrong or slow-but-right).
 
-### Step 3.5 — NEXT: route perf gap to Opus for second-pass review
+### Step 3.5 — OPUS PERF-GAP REVIEW received (Phases 3.5/3.6 ahead)
 
-Diagnostic brief `/tmp/diagnostic-brief-perf.md` (TODO this session) will package: a single-tile CPU-reference vs Blackwell-output diff (correctness first), a single-tile nvprof / ncu-friendly-flavored run with measurable factors (memory transactions per fma, smem bank conflicts, occupancy), and the canonical PTX-m16n8k32-thrifty idioms expected to be missing.
+Diagnostic brief `/tmp/diagnostic-brief-perf.md` sent; Opus response recorded at
+`/tmp/diagnostic-brief-perf-response.md`. Read-only; no code changes.
+
+**Top level:** SM-bound on prologue throughput, not tensor-core-bound. Actual
+matmul is small (32 m16n8k32 / warp / kc-chunk ≪ a few hundred cycles);
+Stage A/B/C and their serial `__syncthreads` eat the slack.
+
+**Ranked causes (Opus):**
+
+| Rank | Hypothesis | Concrete bug |
+|------|------------|--------------|
+| 1    | **H6 — uncoalesced + byte-granular loads + in-loop weight decode.** Stage A reads 4 int8 → OR (sign-extension poisoning latent correctness bug for negative activations). Thread↔data mapping is `threadIdx.x * INTS + i` (blocked) — should be `i * 256 + threadIdx.x` (interleaved/coalesced). Weight expansion runs in hot loop and is re-done 4× per chunk (no (mblk) decoupling from (nblk,kc) means cache reuse is null). |
+| 2    | **H2 — register pressure → low occupancy.** Outer kk loop / inner f loop keeps `acc_i[8][4] = 32 regs` + `acc_f[8][4] = 32 regs` simultaneously → ~1 block/SM, can't hide Stage-A latency. Swap loop nest (frag outer, kk inner) → only one acc_i active → halve regs → more resident warps. |
+| 3    | **H1 — no cp.async / double-buffering.** Real, but cure for the latency that Ranks 1–2 expose. "Last mile" to cuBLAS parity, not the first thing to fix. |
+
+**Not the cause:** H3 (scale recompute noise), H4 (grid non-starved), H5
+(bN=64 vs 128 minor setup knob).
+
+**Opus minimum-patch predictions:**
+
+| Patch step | Predicted pp512 |
+|------------|-----------------|
+| Stage A coalesce + single int load | 209 → **300–380** |
+| + Weight pre-expansion (kills in-loop decode + 4× redundancy) | → **450–600** |
+| + Loop-nest swap / occupancy | → **550–700** |
+| + cp.async double buffer + ldmatrix.b16 | → **800–900** |
+
+**Opus revised pass criterion (two-step gate):**
+
+1. ≥ **550** tok/s after minimum patch (#1+#2+#3) — first commit, source matches a usable kernel.
+2. ≥ **850** tok/s after full Hopper-style pipeline (cp.async + double buffer) — second commit.
+
+The 856 single-number criterion is **not realistic** for a hand kernel
+without cp.async; revise to two-step gate.
+
+**Latent correctness landmine (Opus call-out):** the Stage-A
+`v |= ((int32_t)((int)p[0]))` pattern sign-extends negative bytes
+(`p[0] = 0xFF → 0xFFFFFFFF`) and the OR poisons the high bytes of `v`.
+Test inputs/tolerance hid it; mask with `& 0xFF` or use
+`*reinterpret_cast<const int*>(p)` (4-byte aligned, so safe).
 
 ## Phase 4 — Sync / upstream
 
@@ -134,6 +173,7 @@ Diagnostic brief `/tmp/diagnostic-brief-perf.md` (TODO this session) will packag
 
 - **Phase 0, 1, 2.1, 2.4, 3.0, 3.1b–3.3:** scaffold, infrastructure, and Blackwell int8 MMA kernel all functional. Tests pass; merge-friendly edits applied with `// GB10:` sentinels per plan. **Phase 3 first-cut segfault is GONE** — Blackwell kernel runs end-to-end on real M=512 prefill without crashing; 86/86 q1_0/q2_0 unit tests pass with env off OR on.
 - **Phase 3.4 honest perf delta vs cuBLAS:** NEGATIVE on prefill — Blackwell path is ~4.4× slower than cuBLAS at M=512, N=large, K=long. This is the next thing to fix.
+- **Phase 3.5 Opus diagnosis received (recorded at `/tmp/diagnostic-brief-perf-response.md`):** staging-bound, not tensor-core-bound. Three ranked fixes ranked 1 (H6 coalesce + kill in-loop weight decode), 2 (H2 swap loop nest for occupancy), 3 (H1 cp.async/double-buffer). Opus predicts 209 → 550–700 from minimum patch, ~800–900 after full hopper-style pipeline. Original 856 pass-criterion is NOT realistic; revise to two-step gate: ≥ 550 first commit, ≥ 850 second commit.
 - **Decode (M=1) perf delta vs pre-experiment:** none reproducible on cold-cache. The big 70–80 % cold-to-warm lift is not from this kernel work; it is from CUDA JIT cache + cuBLAS Lt heuristic autotune + GPU persistent boost clocks (sm_121a 2405 → 2463 MHz).
-- **Phase 3 next concrete experiment:** Phase 3.5 perf-gap review via a fresh diagnostic brief to Opus (covering correctness cross-check + perf-gap hypotheses) before any further kernel edits.
+- **Phase 3.6 next concrete experiment:** apply minimum patch (coalesce Stage A + Stage B in-loop weight decode elimination via repack pre-expansion + Stage D loop-nest swap). Run bench → compare to Opus prediction (≥ 550 tok/s). Then revisit full Hopper-style pipeline rewrite (cp.async + double buffer) for ≥ 850.
 - All untracked local artifacts (~/Buffer/{cutlass,nv}, /tmp snapshots, /home/.../perf/) are intentional and excluded from commits.
