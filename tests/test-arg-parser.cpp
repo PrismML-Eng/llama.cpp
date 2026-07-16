@@ -196,7 +196,7 @@ int main(void) {
                 assert(str.find("llama.cpp") != std::string::npos);
                 network_ok = true;
             } else {
-                printf("  good URL returned %d, no usable network -- skipping download tests\n\n", res.first);
+                printf("  good URL returned %ld, no usable network -- skipping download tests\n\n", res.first);
             }
         } catch (const std::exception & e) {
             printf("  good URL unreachable (%s) -- skipping download tests\n\n", e.what());
