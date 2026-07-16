@@ -2538,6 +2538,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+// GB10: Blackwell (sm_121 / DGX Spark) int8 tensor-core MMQ path for Q1_0/Q2_0. Opt-in (env GGML_BLACKWELL_Q1).
+bool ggml_cuda_mul_mat_q1_blackwell(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
@@ -2617,6 +2619,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     } else if (!split && use_mul_mat_q && (src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_Q2_0) && src1->ne[1] >= 128
         && ggml_cuda_mul_mat_q1_hopper(ctx, src0, src1, dst)) {
         // handled by the opt-in Hopper wgmma path (returns false to fall through when unsupported)
+    } else if (!split && use_mul_mat_q && (src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_Q2_0) && src1->ne[1] >= 128
+        && ggml_cuda_mul_mat_q1_blackwell(ctx, src0, src1, dst)) {
+        // GB10: opt-in Blackwell int8 MMA path (returns false to fall through when unsupported / not on DGX_SPARK)
     } else if (!split && use_mul_mat_q) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
     } else if (!split && (use_batched_cublas_f16 || use_batched_cublas_bf16 || use_batched_cublas_f32)

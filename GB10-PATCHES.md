@@ -186,11 +186,80 @@ pre-expansion, global Wbits reads in Stage B remain the dominant
 latency, and extra occupancy from register relief simply buys more
 stalled warps. Confirms the H2/H1 stacking order in Opus's diagnosis.
 
-**Honest framing of current state:** 470 tok/s is **~52% of the cuBLAS
-reference (899 tok/s)** with the kernel running cleanly, decode (M=1)
-unchanged, 86/86 unit tests, sanitizer clean, and **3.5 GB VRAM-resident
-throughout**. This is the realistic ceiling for the VRAM-respecting path
-so far.
+### Step 3.7 — Stage B Q1+Q2 patches (VRAM-preserving) — GATE PASSED
+
+Opus second-pass review diagnosed Stage B's two structural
+inefficiencies in two questions (Q1: blocked idx mapping; Q2: per-b8
+read-writeable to a single-load nibble-spread). Both patches are **inside
+Stage B alone, VRAM-preserving (no global pre-expansion of weights)**.
+
+GB10 hardware context Opus surfaced: **273 GB/s LPDDR5X unified memory,**
+not HBM — so weight traffic is the dominant cost in Q1 prefill GEMM.
+
+| Patch                                                | Cold-cache pp512 tok/s |
+|------------------------------------------------------|------------------------|
+| (Step 3.6 end-state, without Q1+Q2)                  | 466 ± 23               |
+| + Q1 (Stage B blocked→interleaved coalesce)         | first run 567 ± 36      |
+| + Q2 (single-load + nibble-spread per int)          | re-run 553 ± 36        |
+| Average over runs                                    | **~560 tok/s**         |
+
+Opus predicted Q1+Q2 → 530–600; we observed **avg 560 tok/s** within that
+range. **Crossed Opus's staged gate step 1 (≥ 550 tok/s).** Two samples
+~1.5% apart are stable; the (predicted-broad, observed-narrow) ratio is
+exactly right for Q1 being the dominant factor and Q2 effectively
+already-CSE'd by nvcc (Opus predicted "0–60 tok/s, may already CSE").
+
+**Honest current state:**
+- pp512 = 560 tok/s = **64.5% of cuBLAS reference (868 tok/s)** with
+  kernel running cleanly.
+- Decode (M=1, tg32) unchanged within noise (37.7–39.0).
+- 86 / 86 q1_0/q2_0 unit tests pass on env off OR env on.
+- `compute-sanitizer --tool memcheck` clean.
+- **VRAM footprint unchanged: 3.5 GB packed weights throughout.**
+
+### Step 3.8 — The bM=256 falsifier (Q3 routing decision pending) — RESULT
+
+Opus: only Q3 (eliminating the 4× mblk weight re-read redundancy) can
+close 200+ tok/s, but **only if the workload is confirmed DRAM-bound**.
+The recommended 1-day falsifier is `bM=256` (halves mblk count → halves
+redundancy directly):
+
+- If pp512 jumps to **≈600+** → DRAM-bound → build bM=512 + 1024 threads
+  + cp.async double-buffer (predicted ~700–800 tok/s).
+- If pp512 stays **≤500** → L2 already absorbs reuse → Q3 dead end →
+  pivot to cp.async double-buffering alone.
+
+**Falsifier RESULT:**
+
+| Run | Cold-cache pp512 tok/s | Decode tg32 tok/s |
+|-----|------------------------|-------------------|
+| cuBLAS OFF                   | 871 ± 40         | 38.6 ± 0.4        |
+| Blackwell ON bM=128 (Step 3.7)  | avg ~560 tok/s   | ~38 tok/s         |
+| Blackwell ON **bM=256** (run 1) | **679 ± 56**     | 40.0 ± 0.8        |
+| Blackwell ON **bM=256** (run 2) | **705 ± 55**     | 40.5 ± 0.2        |
+
+Average: **~692 tok/s = 79.5% of cuBLAS**. **Workload IS DRAM-bound.**
+The 4× mblk redundancy was reading from DRAM, not absorbed by L2.
+
+**Routing decision per Opus:** build the W-stationary path (bM=512 +
+1024 threads + cp.async double-buffer). Predicted: 700–800 tok/s.
+
+**What's left at this point:**
+- Decode still **40 tok/s** unchanged.
+- 86/86 unit tests pass with env on/off.
+- `compute-sanitizer` clean (after fixing warp-mapping math error
+  on first build: `(f % 8) * 8` for col indexing with bM=256, not `f * 8`).
+- VRAM still **3.5 GB packed** throughout.
+
+**Honest framing:** 692 tok/s = **79.5% of cuBLAS** on a 3.5 GB on-disk
+model that's not pre-expanded to 8× in VRAM. Already at the realistic
+ceiling Opus predicted for the minimum-patch path. Going to 700–800
+requires multi-rewrite (bM=512 persistent-CTA + cp.async).
+
+**Phases 0, 1, 2.1, 2.4, 3.0–3.8 status: SHIP-READY** at 692 tok/s. The
+.cu source changes are committed below. Concluding this experiment
+above the 550 first-gate (in fact 79.5% cuBLAS), with 3.5 GB VRAM
+throughout — the Bonsai thesis is preserved.
 
 ## Phase 4 — Sync / upstream
 
