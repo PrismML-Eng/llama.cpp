@@ -1,5 +1,22 @@
 # llama.cpp
 
+> [!IMPORTANT]
+> **This is the PrismML fork of llama.cpp.** It adds the `Q2_0` 2-bit quantization used by the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models.
+>
+> **New here? Start with the [Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo) repo.** It downloads the right models and the correct prebuilt binaries for your hardware/backend automatically.
+>
+> Ternary (`Q2_0`) support is migrating into mainline llama.cpp backend-by-backend, so which build + model file to use depends on where you run:
+>
+> - `*-Q2_0.gguf` (group size 128): the format **this fork** uses. Run it with this fork's builds / [releases](https://github.com/PrismML-Eng/llama.cpp/releases). Does not load on mainline llama.cpp.
+> - `*-Q2_0_g64.gguf` (group size 64): the **official mainline** llama.cpp format (currently CPU and Metal). Use a recent `ggml-org/llama.cpp` build for these, not this fork.
+> - `*-PQ2_0.gguf`: planned future fork format, **not supported anywhere yet**.
+>
+> Use a complete matching build. Do NOT drop this fork's `ggml-*` libraries into a stock llama.cpp build (ABI/format mismatch, models fail to load).
+>
+> **For the latest backend-by-backend migration status, see [Upstream Status for Ternary](https://github.com/PrismML-Eng/Bonsai-demo#upstream-status-for-ternary) in the Bonsai-demo README.**
+
+---
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
