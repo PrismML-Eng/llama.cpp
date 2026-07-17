@@ -1,14 +1,19 @@
 # llama.cpp
 
 > [!IMPORTANT]
-> **This is the PrismML fork of llama.cpp.** It adds the `Q2_0` / `PQ2_0` 2-bit quantization used by the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models.
+> **This is the PrismML fork of llama.cpp.** It adds the `Q2_0` 2-bit quantization used by the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models.
 >
-> **New here? Start with the [Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo) repo** — it downloads the right model files and the correct prebuilt binaries for your hardware/backend automatically.
+> **New here? Start with the [Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo) repo.** It downloads the right models and the correct prebuilt binaries for your hardware/backend automatically.
 >
-> If you use this fork directly, the main caveats:
-> - **Use a complete matching build** — download the full bundle for your OS+backend from our [Releases](https://github.com/PrismML-Eng/llama.cpp/releases), or build from source. Do **not** drop this fork's `ggml-*` libraries into a stock llama.cpp build (ABI mismatch — this will fail to load models).
-> - **Models:** use the `*-Q2_0_g64.gguf` files (official **group-64** `Q2_0`). The legacy `*-Q2_0.gguf` (group 128) won't load on group-64 builds; `*-PQ2_0.gguf` is this fork's group-128 variant.
-> - `Q2_0` is already upstream in mainline llama.cpp for **CPU and Metal** — those work without this fork. Vulkan/CUDA come from this fork for now.
+> Ternary (`Q2_0`) support is migrating into mainline llama.cpp backend-by-backend, so which build + model file to use depends on where you run:
+>
+> - `*-Q2_0.gguf` (group size 128): the format **this fork** uses. Run it with this fork's builds / [releases](https://github.com/PrismML-Eng/llama.cpp/releases). Does not load on mainline llama.cpp.
+> - `*-Q2_0_g64.gguf` (group size 64): the **official mainline** llama.cpp format (currently CPU and Metal). Use a recent `ggml-org/llama.cpp` build for these, not this fork.
+> - `*-PQ2_0.gguf`: planned future fork format, **not supported anywhere yet**.
+>
+> Use a complete matching build. Do NOT drop this fork's `ggml-*` libraries into a stock llama.cpp build (ABI/format mismatch, models fail to load).
+>
+> **For the latest backend-by-backend migration status, see [Upstream Status for Ternary](https://github.com/PrismML-Eng/Bonsai-demo#upstream-status-for-ternary) in the Bonsai-demo README.**
 
 ---
 
