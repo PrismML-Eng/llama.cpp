@@ -412,12 +412,14 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S . -B build -DGGML_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_CPU=OFF -DGGML_BACKEND_DL=ON -DLLAMA_BUILD_BORINGSSL=ON
-          cmake --build build --config Release --target ggml-vulkan
+          # Full self-contained bundle (CPU backends + Vulkan), not just the ggml-vulkan.dll
+          # add-on, so users can download this one zip and run without merging with the CPU zip.
+          cmake -S . -B build -DGGML_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=OFF -DLLAMA_BUILD_BORINGSSL=ON
+          cmake --build build --config Release
 
       - name: Pack artifacts
         run: |
-          7z a -snl llama-bin-win-vulkan-x64.zip .\build\bin\Release\ggml-vulkan.dll
+          7z a -snl llama-bin-win-vulkan-x64.zip .\build\bin\Release\*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
@@ -581,12 +583,13 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release `
             -DGGML_BACKEND_DL=ON `
             -DGGML_NATIVE=OFF `
-            -DGGML_CPU=OFF `
+            -DGGML_OPENMP=OFF `
             -DGPU_TARGETS="${{ matrix.gpu_targets }}" `
             -DGGML_HIP_ROCWMMA_FATTN=ON `
             -DGGML_HIP=ON `
             -DLLAMA_BUILD_BORINGSSL=ON
-          cmake --build build --target ggml-hip -j ${env:NUMBER_OF_PROCESSORS}
+          # Full self-contained bundle (CPU backend + HIP), not just the ggml-hip.dll add-on.
+          cmake --build build -j ${env:NUMBER_OF_PROCESSORS}
           md "build\bin\rocblas\library\"
           md "build\bin\hipblaslt\library"
           cp "${env:HIP_PATH}\bin\libhipblas.dll" "build\bin\"
