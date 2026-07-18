@@ -4063,7 +4063,7 @@ static int repack_q2_0_to_q2_0_4_bl(struct ggml_tensor *       t,
     int                nrow    = ggml_nrows(t);
     int                nblocks = t->ne[0] / QK2_0;
 
-    GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_q2_0));
+    GGML_ASSERT(data_size == (size_t) nrow * nblocks * sizeof(block_q2_0));
 
     if (t->ne[1] % nrows_interleaved != 0) {
         return -1;
@@ -4072,7 +4072,7 @@ static int repack_q2_0_to_q2_0_4_bl(struct ggml_tensor *       t,
     for (int b = 0; b < nrow; b += nrows_interleaved) {
         for (int64_t x = 0; x < nblocks; x++) {
             for (int i = 0; i < nrows_interleaved; i++) {
-                dst_tmp[i] = src[x + i * nblocks];
+                dst_tmp[i] = src[x + (int64_t) i * nblocks];
             }
             *dst++ = make_block_q2_0x4(dst_tmp, interleave_block);
         }
