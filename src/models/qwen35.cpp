@@ -473,7 +473,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     bool gdn_state_rows_dev_ok = true;
     for (const auto & ldev : model.devices) {
-        if (ldev.dev == nullptr || ggml_backend_dev_type(ldev.dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        // integrated GPUs (e.g. unified-memory CUDA devices) report IGPU, not GPU
+        if (ldev.dev == nullptr || (ggml_backend_dev_type(ldev.dev) != GGML_BACKEND_DEVICE_TYPE_GPU &&
+                                    ggml_backend_dev_type(ldev.dev) != GGML_BACKEND_DEVICE_TYPE_IGPU)) {
             continue;
         }
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ldev.dev);
