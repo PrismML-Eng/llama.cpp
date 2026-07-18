@@ -6405,3 +6405,311 @@ void ggml_gemm_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
 #endif
 }
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VNNI__)
+// Helpers for the Q1_0/Q2_0 4-column interleaved kernels.
+//
+// Both kernels keep two 512-bit fp32 accumulators per output row: one for
+// columns {0,1} and one for columns {2,3}, each holding 8 per-lane partial
+// sums per column. The horizontal reduction happens once per output tile.
+
+// Reduce a pair of fp32 accumulators into [col0, col1, col2, col3].
+static inline __m128 __acc_pair_reduce_ps(__m512 acc01, __m512 acc23) {
+    const __m256 lo01 = _mm512_castps512_ps256(acc01);
+    const __m256 hi01 = _mm512_extractf32x8_ps(acc01, 1);
+    const __m256 lo23 = _mm512_castps512_ps256(acc23);
+    const __m256 hi23 = _mm512_extractf32x8_ps(acc23, 1);
+    const __m256 h0 = _mm256_hadd_ps(lo01, hi01);
+    const __m256 h1 = _mm256_hadd_ps(lo23, hi23);
+    const __m256 hh = _mm256_hadd_ps(h0, h1);
+    return _mm_add_ps(_mm256_castps256_ps128(hh), _mm256_extractf128_ps(hh, 1));
+}
+
+// Expand one 32-value sub-block of a block_q1_0x4 (16 bytes, byte 4*c + j =
+// bits of column j for values 8*c..8*c+7) to {0,1} bytes:
+// w01 = [col0 x32 | col1 x32], w23 = [col2 x32 | col3 x32].
+static inline void __q1_0_expand_x4(const uint8_t * qs, __m512i * w01, __m512i * w23) {
+    const __m128i gather = _mm_setr_epi8(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+    const __m128i w = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *) qs), gather);
+    *w01 = _mm512_maskz_set1_epi8((__mmask64) (uint64_t) _mm_extract_epi64(w, 0), 1);
+    *w23 = _mm512_maskz_set1_epi8((__mmask64) (uint64_t) _mm_extract_epi64(w, 1), 1);
+}
+
+// Expand one 32-value sub-block of a block_q2_0x4 (32 bytes, 8 packed bytes
+// per column) to {0..3} code bytes: w01 = [col0 x32 | col1 x32], w23 likewise.
+static inline void __q2_0_expand_x4(const uint8_t * qs, __m512i * w01, __m512i * w23) {
+    const __m512i m3 = _mm512_set1_epi32(0x03030303);
+    const __m256i packed = _mm256_loadu_si256((const __m256i *) qs);
+    // dword d = packed byte d; spread the four 2-bit fields to byte lanes
+    const __m512i v01 = _mm512_cvtepu8_epi32(_mm256_castsi256_si128(packed));
+    const __m512i v23 = _mm512_cvtepu8_epi32(_mm256_extracti128_si256(packed, 1));
+    const __m512i r01 = _mm512_or_si512(_mm512_or_si512(v01, _mm512_slli_epi32(v01, 6)),
+                                        _mm512_or_si512(_mm512_slli_epi32(v01, 12), _mm512_slli_epi32(v01, 18)));
+    const __m512i r23 = _mm512_or_si512(_mm512_or_si512(v23, _mm512_slli_epi32(v23, 6)),
+                                        _mm512_or_si512(_mm512_slli_epi32(v23, 12), _mm512_slli_epi32(v23, 18)));
+    *w01 = _mm512_and_si512(r01, m3);
+    *w23 = _mm512_and_si512(r23, m3);
+}
+#endif // AVX512 VNNI
+
+void ggml_gemv_q1_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VNNI__)
+    {
+        const int qk = QK1_0;
+        const int nb = n / qk;
+
+        assert(nr == 1);
+        assert(n % qk == 0);
+        assert(nc % 4 == 0);
+        UNUSED(bs);
+
+        const __m512i ones  = _mm512_set1_epi8(1);
+        const __m512i idx01 = _mm512_set_epi32(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+        const __m512i idx23 = _mm512_set_epi32(3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2);
+
+        const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
+        for (int x = 0; x < nc / 4; x++) {
+            const block_q1_0x4 * b_ptr = (const block_q1_0x4 *) vx + (x * nb);
+
+            __m512 accf01 = _mm512_setzero_ps();
+            __m512 accf23 = _mm512_setzero_ps();
+
+            for (int l = 0; l < nb; l++) {
+                const __m512 d0    = _mm512_castps128_ps512(_mm_cvtph_ps(_mm_loadl_epi64((const __m128i *) b_ptr[l].d)));
+                const __m512 d0v01 = _mm512_permutexvar_ps(idx01, d0);
+                const __m512 d0v23 = _mm512_permutexvar_ps(idx23, d0);
+
+                for (int k = 0; k < QK1_0 / QK8_0; ++k) {
+                    const block_q8_0 * GGML_RESTRICT a_blk = a_ptr + l * (QK1_0 / QK8_0) + k;
+
+                    __m512i w01, w23;
+                    __q1_0_expand_x4((const uint8_t *) b_ptr[l].qs + 16 * k, &w01, &w23);
+
+                    const __m512i qa  = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i *) a_blk->qs));
+                    const __m512i sq  = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, qa);
+                    const __m512i i01 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w01, qa);
+                    const __m512i i23 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w23, qa);
+
+                    // signed dot partials: 2*dot(bits, qy) - sum(qy)
+                    const __m512 f01 = _mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_add_epi32(i01, i01), sq));
+                    const __m512 f23 = _mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_add_epi32(i23, i23), sq));
+
+                    const __m512 d1 = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a_blk->d));
+                    accf01 = _mm512_fmadd_ps(f01, _mm512_mul_ps(d0v01, d1), accf01);
+                    accf23 = _mm512_fmadd_ps(f23, _mm512_mul_ps(d0v23, d1), accf23);
+                }
+            }
+
+            _mm_storeu_ps(s + x * 4, __acc_pair_reduce_ps(accf01, accf23));
+        }
+        return;
+    }
+#endif // AVX512 VNNI
+
+    ggml_gemv_q1_0_4x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemm_q1_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VNNI__)
+    {
+        const int qk = QK1_0;
+        const int nb = n / qk;
+
+        assert(n % qk == 0);
+        assert(nr % 4 == 0);
+        assert(nc % 4 == 0);
+
+        const __m512i ones  = _mm512_set1_epi8(1);
+        const __m512i idx01 = _mm512_set_epi32(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+        const __m512i idx23 = _mm512_set_epi32(3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2);
+
+        // qword gathers of row m from a block_q8_0x4 (row-interleaved in 8-byte chunks)
+        __m512i rowidx[4];
+        for (int m = 0; m < 4; ++m) {
+            rowidx[m] = _mm512_set_epi64(12 + m, 8 + m, 4 + m, m, 12 + m, 8 + m, 4 + m, m);
+        }
+
+        for (int y = 0; y < nr / 4; y++) {
+            const block_q8_0x4 * a_ptr = (const block_q8_0x4 *) vy + (4 * y * nb);
+            for (int x = 0; x < nc / 4; x++) {
+                const block_q1_0x4 * b_ptr = (const block_q1_0x4 *) vx + (x * nb);
+
+                __m512 accf01[4];
+                __m512 accf23[4];
+                for (int m = 0; m < 4; m++) {
+                    accf01[m] = _mm512_setzero_ps();
+                    accf23[m] = _mm512_setzero_ps();
+                }
+
+                for (int l = 0; l < nb; l++) {
+                    const __m512 d0    = _mm512_castps128_ps512(_mm_cvtph_ps(_mm_loadl_epi64((const __m128i *) b_ptr[l].d)));
+                    const __m512 d0v01 = _mm512_permutexvar_ps(idx01, d0);
+                    const __m512 d0v23 = _mm512_permutexvar_ps(idx23, d0);
+
+                    for (int k = 0; k < QK1_0 / QK8_0; ++k) {
+                        const block_q8_0x4 * GGML_RESTRICT a_blk = a_ptr + 4 * l + k;
+
+                        __m512i w01, w23;
+                        __q1_0_expand_x4((const uint8_t *) b_ptr[l].qs + 16 * k, &w01, &w23);
+
+                        const __m512i qa_lo = _mm512_loadu_si512((const void *) a_blk->qs);
+                        const __m512i qa_hi = _mm512_loadu_si512((const void *) (a_blk->qs + 64));
+
+                        for (int m = 0; m < 4; ++m) {
+                            const __m512i qa  = _mm512_permutex2var_epi64(qa_lo, rowidx[m], qa_hi);
+                            const __m512i sq  = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, qa);
+                            const __m512i i01 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w01, qa);
+                            const __m512i i23 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w23, qa);
+
+                            const __m512 f01 = _mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_add_epi32(i01, i01), sq));
+                            const __m512 f23 = _mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_add_epi32(i23, i23), sq));
+
+                            const __m512 dd = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a_blk->d[m]));
+                            accf01[m] = _mm512_fmadd_ps(f01, _mm512_mul_ps(d0v01, dd), accf01[m]);
+                            accf23[m] = _mm512_fmadd_ps(f23, _mm512_mul_ps(d0v23, dd), accf23[m]);
+                        }
+                    }
+                }
+
+                for (int m = 0; m < 4; m++) {
+                    _mm_storeu_ps(s + (y * 4 + m) * bs + x * 4, __acc_pair_reduce_ps(accf01[m], accf23[m]));
+                }
+            }
+        }
+        return;
+    }
+#endif // AVX512 VNNI
+
+    ggml_gemm_q1_0_4x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemv_q2_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VNNI__)
+    {
+        const int qk = QK2_0;
+        const int nb = n / qk;
+
+        assert(nr == 1);
+        assert(n % qk == 0);
+        assert(nc % 4 == 0);
+        UNUSED(bs);
+
+        const __m512i ones  = _mm512_set1_epi8(1);
+        const __m512i idx01 = _mm512_set_epi32(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+        const __m512i idx23 = _mm512_set_epi32(3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2);
+
+        const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
+        for (int x = 0; x < nc / 4; x++) {
+            const block_q2_0x4 * b_ptr = (const block_q2_0x4 *) vx + (x * nb);
+
+            __m512 accf01 = _mm512_setzero_ps();
+            __m512 accf23 = _mm512_setzero_ps();
+
+            for (int l = 0; l < nb; l++) {
+                const __m512 d0    = _mm512_castps128_ps512(_mm_cvtph_ps(_mm_loadl_epi64((const __m128i *) b_ptr[l].d)));
+                const __m512 d0v01 = _mm512_permutexvar_ps(idx01, d0);
+                const __m512 d0v23 = _mm512_permutexvar_ps(idx23, d0);
+
+                for (int k = 0; k < QK2_0 / QK8_0; ++k) {
+                    const block_q8_0 * GGML_RESTRICT a_blk = a_ptr + l * (QK2_0 / QK8_0) + k;
+
+                    __m512i w01, w23;
+                    __q2_0_expand_x4((const uint8_t *) b_ptr[l].qs + 32 * k, &w01, &w23);
+
+                    const __m512i qa  = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i *) a_blk->qs));
+                    const __m512i sq  = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, qa);
+                    const __m512i i01 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w01, qa);
+                    const __m512i i23 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w23, qa);
+
+                    // signed dot partials: dot(codes, qy) - sum(qy), codes-1 in {-1,0,1,2}
+                    const __m512 f01 = _mm512_cvtepi32_ps(_mm512_sub_epi32(i01, sq));
+                    const __m512 f23 = _mm512_cvtepi32_ps(_mm512_sub_epi32(i23, sq));
+
+                    const __m512 d1 = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a_blk->d));
+                    accf01 = _mm512_fmadd_ps(f01, _mm512_mul_ps(d0v01, d1), accf01);
+                    accf23 = _mm512_fmadd_ps(f23, _mm512_mul_ps(d0v23, d1), accf23);
+                }
+            }
+
+            _mm_storeu_ps(s + x * 4, __acc_pair_reduce_ps(accf01, accf23));
+        }
+        return;
+    }
+#endif // AVX512 VNNI
+
+    ggml_gemv_q2_0_4x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemm_q2_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VNNI__)
+    {
+        const int qk = QK2_0;
+        const int nb = n / qk;
+
+        assert(n % qk == 0);
+        assert(nr % 4 == 0);
+        assert(nc % 4 == 0);
+
+        const __m512i ones  = _mm512_set1_epi8(1);
+        const __m512i idx01 = _mm512_set_epi32(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+        const __m512i idx23 = _mm512_set_epi32(3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2);
+
+        // qword gathers of row m from a block_q8_0x4 (row-interleaved in 8-byte chunks)
+        __m512i rowidx[4];
+        for (int m = 0; m < 4; ++m) {
+            rowidx[m] = _mm512_set_epi64(12 + m, 8 + m, 4 + m, m, 12 + m, 8 + m, 4 + m, m);
+        }
+
+        for (int y = 0; y < nr / 4; y++) {
+            const block_q8_0x4 * a_ptr = (const block_q8_0x4 *) vy + (4 * y * nb);
+            for (int x = 0; x < nc / 4; x++) {
+                const block_q2_0x4 * b_ptr = (const block_q2_0x4 *) vx + (x * nb);
+
+                __m512 accf01[4];
+                __m512 accf23[4];
+                for (int m = 0; m < 4; m++) {
+                    accf01[m] = _mm512_setzero_ps();
+                    accf23[m] = _mm512_setzero_ps();
+                }
+
+                for (int l = 0; l < nb; l++) {
+                    const __m512 d0    = _mm512_castps128_ps512(_mm_cvtph_ps(_mm_loadl_epi64((const __m128i *) b_ptr[l].d)));
+                    const __m512 d0v01 = _mm512_permutexvar_ps(idx01, d0);
+                    const __m512 d0v23 = _mm512_permutexvar_ps(idx23, d0);
+
+                    for (int k = 0; k < QK2_0 / QK8_0; ++k) {
+                        const block_q8_0x4 * GGML_RESTRICT a_blk = a_ptr + 4 * l + k;
+
+                        __m512i w01, w23;
+                        __q2_0_expand_x4((const uint8_t *) b_ptr[l].qs + 32 * k, &w01, &w23);
+
+                        const __m512i qa_lo = _mm512_loadu_si512((const void *) a_blk->qs);
+                        const __m512i qa_hi = _mm512_loadu_si512((const void *) (a_blk->qs + 64));
+
+                        for (int m = 0; m < 4; ++m) {
+                            const __m512i qa  = _mm512_permutex2var_epi64(qa_lo, rowidx[m], qa_hi);
+                            const __m512i sq  = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, qa);
+                            const __m512i i01 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w01, qa);
+                            const __m512i i23 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w23, qa);
+
+                            const __m512 f01 = _mm512_cvtepi32_ps(_mm512_sub_epi32(i01, sq));
+                            const __m512 f23 = _mm512_cvtepi32_ps(_mm512_sub_epi32(i23, sq));
+
+                            const __m512 dd = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a_blk->d[m]));
+                            accf01[m] = _mm512_fmadd_ps(f01, _mm512_mul_ps(d0v01, dd), accf01[m]);
+                            accf23[m] = _mm512_fmadd_ps(f23, _mm512_mul_ps(d0v23, dd), accf23[m]);
+                        }
+                    }
+                }
+
+                for (int m = 0; m < 4; m++) {
+                    _mm_storeu_ps(s + (y * 4 + m) * bs + x * 4, __acc_pair_reduce_ps(accf01[m], accf23[m]));
+                }
+            }
+        }
+        return;
+    }
+#endif // AVX512 VNNI
+
+    ggml_gemm_q2_0_4x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
