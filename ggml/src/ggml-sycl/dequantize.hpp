@@ -296,6 +296,21 @@ static __dpct_inline__ void dequantize_q1_0(const void *vx, const int64_t ib,
     v.y() = (2 * bit_1 - 1) * d;
 }
 
+static __dpct_inline__ void dequantize_q2_0(const void *vx, const int64_t ib,
+                                            const int iqs, dfloat2 &v) {
+    const block_q2_0 * x = (const block_q2_0 *) vx;
+    const dfloat d = x[ib].d;
+
+    auto dequantize_one = [&](const int idx) -> dfloat {
+        const uint8_t packed = x[ib].qs[idx / 4];
+        const int code = (packed >> (2 * (idx % 4))) & 0x3;
+        return (code - 1) * d;
+    };
+
+    v.x() = dequantize_one(iqs + 0);
+    v.y() = dequantize_one(iqs + 1);
+}
+
 static __dpct_inline__ void dequantize_nvfp4(const void *vx, const int64_t ib,
                                              const int iqs, dfloat2 &v) {
     const block_nvfp4 & xb = ((const block_nvfp4 *) vx)[ib];
