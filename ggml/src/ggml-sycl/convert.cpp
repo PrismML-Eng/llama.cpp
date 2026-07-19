@@ -662,10 +662,36 @@ static void dequantize_row_q1_0_sycl(const void * vx, dst_t * y, const int64_t k
         });
 }
 
+// Q2_0 uses one FP16 scale for 128 values and four 2-bit codes per byte.
+// Stored code 0..3 maps to -1, 0, +1, +2 multiplied by the block scale.
+template <typename dst_t>
+static void dequantize_row_q2_0_sycl(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
+    GGML_ASSERT(k % QK2_0 == 0);
+    const int64_t num_threads = SYCL_DEQUANTIZE_BLOCK_SIZE;
+    const int64_t num_blocks  = (k + num_threads - 1) / num_threads;
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, num_threads),
+                          sycl::range<3>(1, 1, num_threads)),
+        [=](sycl::nd_item<3> item_ct1) {
+            const int64_t i = item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
+            if (i >= k) {
+                return;
+            }
+            const block_q2_0 * x = static_cast<const block_q2_0 *>(vx);
+            const int64_t ib     = i / QK2_0;
+            const int local      = static_cast<int>(i % QK2_0);
+            const int code       = (x[ib].qs[local / 4] >> ((local % 4) * 2)) & 0x3;
+            const float d        = static_cast<float>(x[ib].d);
+            y[i] = static_cast<dst_t>((code - 1) * d);
+        });
+}
+
 to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
     switch (type) {
         case GGML_TYPE_Q1_0:
             return dequantize_row_q1_0_sycl;
+        case GGML_TYPE_Q2_0:
+            return dequantize_row_q2_0_sycl;
         case GGML_TYPE_Q4_0:
             if (dst->src[0]->extra &&
                 ((ggml_tensor_extra_gpu*)dst->src[0]->extra)->optimized_feature.reorder) {
@@ -750,6 +776,8 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
     switch (type) {
         case GGML_TYPE_Q1_0:
             return dequantize_row_q1_0_sycl;
+        case GGML_TYPE_Q2_0:
+            return dequantize_row_q2_0_sycl;
         case GGML_TYPE_Q4_0:
             if (dst->src[0]->extra &&
                 ((ggml_tensor_extra_gpu*)dst->src[0]->extra)->optimized_feature.reorder) {
