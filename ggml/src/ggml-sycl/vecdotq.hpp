@@ -1533,4 +1533,29 @@ vec_dot_iq4_xs_q8_1(const void *__restrict__ vbq,
 #endif
 }
 
+#define VDR_Q1_0_Q8_1_MMVQ 1
+
+static __dpct_inline__ float vec_dot_q1_0_q8_1(
+        const void * __restrict__ vbq,
+        const block_q8_1 * __restrict__ bq8_1,
+        const int & iqs) {
+    // Official PrismML Q1_0: one 128-element weight block and four
+    // aligned 32-element Q8_1 activation blocks. iqs selects one chunk.
+    const block_q1_0 * bq = static_cast<const block_q1_0 *>(vbq);
+    const float d_q1 = static_cast<float>(bq->d);
+    const sycl::float2 ds8 = bq8_1[iqs].ds.convert<float, sycl::rounding_mode::automatic>();
+    const float d_q8 = ds8.x();
+    const int8_t * q8 = bq8_1[iqs].qs;
+    const int base_bit = iqs * QK8_1;
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int bit = 0; bit < QK8_1; ++bit) {
+        const int absolute_bit = base_bit + bit;
+        const float sign = ((bq->qs[absolute_bit / 8] >> (absolute_bit % 8)) & 1) ? 1.0f : -1.0f;
+        sum += sign * static_cast<float>(q8[bit]);
+    }
+    return d_q1 * d_q8 * sum;
+}
+
 #endif // GGML_SYCL_VECDOTQ_HPP
