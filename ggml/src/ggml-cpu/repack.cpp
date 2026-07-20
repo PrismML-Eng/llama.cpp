@@ -8,6 +8,7 @@
 #include "ggml-cpu-impl.h"
 #include "simd-mappings.h"
 #include "traits.h"
+#include "quants.h"
 
 #include "arch-fallback.h"
 
@@ -15,6 +16,11 @@
 #include <cstring>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
+#include <cstdlib>
+#if defined(__AVX2__) || defined(__AVX512F__) || defined(__AVX512VNNI__) || (defined(_MSC_VER) && (defined(GGML_AVX2) || defined(GGML_AVX512)))
+#include <immintrin.h>
+#endif
+#include "tbkern/q2_pack.h"
 
 #include "repack.h"
 
@@ -4762,7 +4768,395 @@ class tensor_traits_base : public ggml::cpu::tensor_traits {
   public:
     virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
 };
+static bool tbkern_q2_0_scalar_enabled() {
+    const char * v = std::getenv("GGML_TBKERN_Q2_0");
+    return v && (std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 || std::strcmp(v, "on") == 0);
+}
 
+static bool tbkern_q2_0_avx2_enabled() {
+#if defined(__AVX2__) || (defined(_MSC_VER) && defined(GGML_AVX2))
+    const char * v = std::getenv("GGML_TBKERN_Q2_0_AVX2");
+    return v && (std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 || std::strcmp(v, "on") == 0);
+#else
+    return false;
+#endif
+}
+
+static bool tbkern_q2_0_vnni_enabled() {
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    const char * v = std::getenv("GGML_TBKERN_Q2_0_VNNI");
+    return v && (std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 || std::strcmp(v, "on") == 0) && ggml_cpu_has_avx512_vnni();
+#else
+    return false;
+#endif
+}
+
+static bool tbkern_q2_0_vnni64_enabled() {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+    const char * v = std::getenv("GGML_TBKERN_Q2_0_VNNI64");
+    return v && (std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 || std::strcmp(v, "on") == 0) && ggml_cpu_has_avx512_vnni();
+#else
+    return false;
+#endif
+}
+
+static bool tbkern_q2_0_vnni64_4r_enabled() {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+    const char * v = std::getenv("GGML_TBKERN_Q2_0_VNNI64_4R");
+    return v && (std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 || std::strcmp(v, "on") == 0) && ggml_cpu_has_avx512_vnni();
+#else
+    return false;
+#endif
+}
+
+static bool tbkern_q2_0_enabled() {
+    return tbkern_q2_0_scalar_enabled() || tbkern_q2_0_avx2_enabled() || tbkern_q2_0_vnni_enabled() || tbkern_q2_0_vnni64_enabled() || tbkern_q2_0_vnni64_4r_enabled();
+}
+
+static bool tbkern_q2_0_repackable(const ggml_tensor * t) {
+    if (!t || t->type != GGML_TYPE_Q2_0 || !tbkern_q2_0_enabled()) {
+        return false;
+    }
+    // Token embeddings are consumed by GET_ROWS and must retain native Prism layout.
+    const char * name = t->name;
+    if (name && (std::strstr(name, "token_embd") || std::strstr(name, "embeddings"))) {
+        return false;
+    }
+    // Phase 1 calls the native Q8_0 quantizer on the source row.  Restrict
+    // cache ownership to complete, 2D Q2_0 blocks so Kp == K and it never
+    // reads past the logical activation row.
+    return t->ne[0] > 0 && t->ne[1] > 0 &&
+           t->ne[0] <= INT32_MAX && t->ne[1] <= INT32_MAX &&
+           t->ne[2] == 1 && t->ne[3] == 1 &&
+           t->ne[0] % QK2_0 == 0;
+}
+
+// The CPU backend owns temporary activations through params->wdata. Keeping
+// this format identical to Prism's native Q8_0 input preserves the fp16 scale
+// and int8 quantization semantics of the fallback vec-dot path.
+static inline size_t tbkern_q2_0_q8_bytes(int K) {
+    return (size_t) (K / QK8_0) * sizeof(block_q8_0);
+}
+
+static inline size_t tbkern_q2_0_sum_offset(int K) {
+    return GGML_PAD(tbkern_q2_0_q8_bytes(K), alignof(int32_t));
+}
+
+static inline size_t tbkern_q2_0_scratch_bytes(int K) {
+    return tbkern_q2_0_sum_offset(K) + (size_t) (K / QK8_0) * sizeof(int32_t);
+}
+
+// Native Q2_0 bytes remain at tensor->data for generic ggml fallback. The
+// opt-in decode cache follows that native payload in the repack allocation.
+static inline const uint8_t * tbkern_q2_0_cache_data(const ggml_tensor * t) {
+    return static_cast<const uint8_t *>(t->data) + ggml_nbytes(t);
+}
+
+static inline uint8_t * tbkern_q2_0_row_ptr(ggml_tensor * t, int64_t row) {
+    const int64_t i1 = row % t->ne[1];
+    row /= t->ne[1];
+    const int64_t i2 = row % t->ne[2];
+    const int64_t i3 = row / t->ne[2];
+    return reinterpret_cast<uint8_t *>(t->data) + i1*t->nb[1] + i2*t->nb[2] + i3*t->nb[3];
+}
+
+static inline const uint8_t * tbkern_q2_0_row_ptr(const ggml_tensor * t, int64_t row) {
+    return tbkern_q2_0_row_ptr(const_cast<ggml_tensor *>(t), row);
+}
+
+// Layout B packs each 64 weights into 16 bytes. Byte b holds k=b,b+16,b+32,
+// and b+48, respectively. Decode directly from the cache: no per-call row
+// expansion or heap allocation is needed.
+static inline int tbkern_q2_0_code_at(const uint8_t * row, int k) {
+    const int within_64 = k & 63;
+    const uint8_t packed = row[(size_t) (k / 64) * 16 + (within_64 & 15)];
+    return (packed >> (2 * (within_64 / 16))) & 0x3;
+}
+#if defined(__AVX2__) || (defined(_MSC_VER) && defined(GGML_AVX2))
+// Compute sum((code - 1) * q8) for one QK8_0 block.  The unsigned code
+// values allow maddubs to perform the code*q8 products; subtracting sum(q8)
+// applies Prism's signed code mapping without an unsigned/signed mismatch.
+static inline int32_t tbkern_q2_0_dot_avx2(const uint8_t * weight_row, int base, const int8_t * q8) {
+    alignas(32) uint8_t codes[QK8_0];
+    for (int j = 0; j < QK8_0; ++j) {
+        codes[j] = (uint8_t) tbkern_q2_0_code_at(weight_row, base + j);
+    }
+    const __m256i c = _mm256_load_si256(reinterpret_cast<const __m256i *>(codes));
+    const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q8));
+    const __m256i pairs = _mm256_maddubs_epi16(c, x);
+    const __m256i sums = _mm256_madd_epi16(pairs, _mm256_set1_epi16(1));
+    __m128i total = _mm_add_epi32(_mm256_castsi256_si128(sums), _mm256_extracti128_si256(sums, 1));
+    total = _mm_hadd_epi32(total, total);
+    total = _mm_hadd_epi32(total, total);
+    return _mm_cvtsi128_si32(total);
+}
+#endif
+
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+// Compute sum((code - 1) * q8) for one QK8_0 block with AVX-512 VNNI.
+// dpbusd consumes unsigned code bytes and signed q8 bytes in four-byte
+// groups. Subtracting a second dot with an all-ones vector applies Prism's
+// signed (code - 1) mapping without changing the native quantizer.
+static inline int32_t tbkern_q2_0_dot_vnni(const uint8_t * weight_row, int base, const int8_t * q8) {
+    // A Prism Q2_0 row stores four 2-bit planes per 64 weights. A Q8_0
+    // dot covers either the first or second half of that group, so one
+    // unaligned 16-byte load contains all 32 codes. Expand the two planes
+    // in registers rather than materializing one byte at a time.
+    const int within_64 = base & 63;
+    GGML_ASSERT(within_64 == 0 || within_64 == 32);
+    const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i *>(
+        weight_row + (size_t) (base / 64) * 16));
+    const int shift_lo = (within_64 >> 4) * 2;
+    const int shift_hi = shift_lo + 2;
+    const __m128i mask = _mm_set1_epi8(3);
+    // A 16-bit shift is safe here: after masking with 0x03 per byte, bits
+    // shifted in from the neighbouring byte are outside the two low bits.
+    const __m128i lo = _mm_and_si128(_mm_srl_epi16(packed, _mm_cvtsi32_si128(shift_lo)), mask);
+    const __m128i hi = _mm_and_si128(_mm_srl_epi16(packed, _mm_cvtsi32_si128(shift_hi)), mask);
+    const __m256i c = _mm256_set_m128i(hi, lo);
+    const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q8));
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i prod = _mm256_dpbusd_epi32(zero, c, x);
+    const __m256i diff = prod;
+    __m128i total = _mm_add_epi32(_mm256_castsi256_si128(diff),
+                                  _mm256_extracti128_si256(diff, 1));
+    total = _mm_hadd_epi32(total, total);
+    total = _mm_hadd_epi32(total, total);
+    return _mm_cvtsi128_si32(total);
+}
+#endif
+
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+// The Q8 pair is shared by every output row for a single-token decode.
+static inline __m512i tbkern_q2_0_q8_pair_vnni64(const int8_t * q8_lo, const int8_t * q8_hi) {
+    const __m256i xlo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q8_lo));
+    const __m256i xhi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q8_hi));
+    __m512i x = _mm512_castsi256_si512(xlo);
+    return _mm512_inserti64x4(x, xhi, 1);
+}
+
+// Decode one packed 64-weight subgroup and dot it against a prepared Q8 pair.
+static inline void tbkern_q2_0_dot2_vnni64_x(const uint8_t * weight_row, int base, __m512i x,
+                                              int32_t * part_lo, int32_t * part_hi) {
+    GGML_ASSERT((base & 63) == 0);
+    const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i *>(
+        weight_row + (size_t) (base / 64) * 16));
+    const __m128i mask = _mm_set1_epi8(3);
+    const __m128i c0 = _mm_and_si128(packed, mask);
+    const __m128i c1 = _mm_and_si128(_mm_srl_epi16(packed, _mm_cvtsi32_si128(2)), mask);
+    const __m128i c2 = _mm_and_si128(_mm_srl_epi16(packed, _mm_cvtsi32_si128(4)), mask);
+    const __m128i c3 = _mm_and_si128(_mm_srl_epi16(packed, _mm_cvtsi32_si128(6)), mask);
+    __m512i codes = _mm512_castsi128_si512(c0);
+    codes = _mm512_inserti32x4(codes, c1, 1);
+    codes = _mm512_inserti32x4(codes, c2, 2);
+    codes = _mm512_inserti32x4(codes, c3, 3);
+    const __m512i prod = _mm512_dpbusd_epi32(_mm512_setzero_si512(), codes, x);
+    const __m256i lo = _mm512_castsi512_si256(prod);
+    const __m256i hi = _mm512_extracti64x4_epi64(prod, 1);
+    auto reduce = [](__m256i v) {
+        __m128i total = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+        total = _mm_hadd_epi32(total, total);
+        total = _mm_hadd_epi32(total, total);
+        return _mm_cvtsi128_si32(total);
+    };
+    *part_lo = reduce(lo);
+    *part_hi = reduce(hi);
+}
+
+// Decode one packed 64-weight subgroup once, then compute its two Q8_0
+// products together. The cache byte layout is four 16-byte 2-bit planes.
+static inline void tbkern_q2_0_dot2_vnni64(const uint8_t * weight_row, int base,
+                                            const int8_t * q8_lo, const int8_t * q8_hi,
+                                            int32_t * part_lo, int32_t * part_hi) {
+    tbkern_q2_0_dot2_vnni64_x(weight_row, base, tbkern_q2_0_q8_pair_vnni64(q8_lo, q8_hi), part_lo, part_hi);
+}
+#endif
+
+class tbkern_q2_0_traits : public tensor_traits_base {
+  public:
+    bool work_size(int, const ggml_tensor * op, size_t & size) override {
+        if (!op || op->op != GGML_OP_MUL_MAT || !op->src[0] || !op->src[1] ||
+            op->src[0]->type != GGML_TYPE_Q2_0 || op->src[1]->type != GGML_TYPE_F32 ||
+            ggml_nrows(op->src[1]) != 1) {
+            return false;
+        }
+        const int64_t K = op->src[0]->ne[0];
+        if (K <= 0 || K > INT32_MAX || K % QK2_0 != 0) {
+            return false;
+        }
+        size = GGML_PAD(tbkern_q2_0_scratch_bytes((int) K), GGML_MEM_ALIGN);
+        return true;
+    }
+
+    bool compute_forward(ggml_compute_params * params, ggml_tensor * op) override {
+        if (!op || op->op != GGML_OP_MUL_MAT) {
+            return false;
+        }
+        const ggml_tensor * src0 = op->src[0];
+        const ggml_tensor * src1 = op->src[1];
+        ggml_tensor * dst = op;
+        if (!src0 || !src1 || src0->type != GGML_TYPE_Q2_0 || src1->type != GGML_TYPE_F32 ||
+            ggml_nrows(src1) != 1 || src0->ne[2] != 1 || src0->ne[3] != 1) {
+            return false;
+        }
+        const int K = (int) src0->ne[0];
+        const int M = (int) src0->ne[1];
+        if (K <= 0 || M <= 0 || K % QK2_0 != 0 || src1->ne[0] != K || dst->ne[0] != M) {
+            return false;
+        }
+        GGML_ASSERT(src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+
+        const int G = QK2_0;
+        const int NG = K / G;
+        const int n_q8 = K / QK8_0;
+        const size_t sum_offset = tbkern_q2_0_sum_offset(K);
+        const size_t scratch_bytes = tbkern_q2_0_scratch_bytes(K);
+        GGML_ASSERT(params->wdata && params->wsize >= scratch_bytes);
+        const uint8_t * cache = tbkern_q2_0_cache_data(src0);
+        const auto * native = reinterpret_cast<const block_q2_0 *>(src0->data);
+        const size_t row_stride = tbk_row_stride_bytes(K);
+
+        auto * xq = reinterpret_cast<block_q8_0 *>(params->wdata);
+        auto * q8_sums = reinterpret_cast<int32_t *>(static_cast<uint8_t *>(params->wdata) + sum_offset);
+        if (params->ith == 0) {
+            const float * x = reinterpret_cast<const float *>(tbkern_q2_0_row_ptr(src1, 0));
+            quantize_row_q8_0(x, xq, K);
+            for (int ib = 0; ib < n_q8; ++ib) {
+                int32_t sum = 0;
+                for (int j = 0; j < QK8_0; ++j) {
+                    sum += (int32_t) xq[ib].qs[j];
+                }
+                q8_sums[ib] = sum;
+            }
+        }
+        ggml_barrier(params->threadpool);
+
+#if defined(__AVX2__) || (defined(_MSC_VER) && defined(GGML_AVX2))
+        const bool use_avx2 = tbkern_q2_0_avx2_enabled();
+#endif
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+        const bool use_vnni = tbkern_q2_0_vnni_enabled();
+#endif
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+        const bool use_vnni64_4r = tbkern_q2_0_vnni64_4r_enabled();
+        // A four-row tile's final 1--3 rows retain the Phase 8 VNNI64 route.
+        const bool use_vnni64 = tbkern_q2_0_vnni64_enabled() || use_vnni64_4r;
+#endif
+        const int row_begin = M * params->ith / params->nth;
+        const int row_end   = M * (params->ith + 1) / params->nth;
+        float * y = reinterpret_cast<float *>(tbkern_q2_0_row_ptr(dst, 0));
+        int tiled_row = row_begin;
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+        if (use_vnni64_4r) {
+            for (; tiled_row + 3 < row_end; tiled_row += 4) {
+                const uint8_t * weight_rows[4] = {
+                    cache + (size_t) (tiled_row + 0) * row_stride,
+                    cache + (size_t) (tiled_row + 1) * row_stride,
+                    cache + (size_t) (tiled_row + 2) * row_stride,
+                    cache + (size_t) (tiled_row + 3) * row_stride,
+                };
+                float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                for (int g = 0; g < NG; ++g) {
+                    const int base = g * G;
+                    float gacc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                    for (int b = 0; b < G / 64; ++b) {
+                        const int base_b = base + b * 64;
+                        const int ib = base_b / QK8_0;
+                        const __m512i xpair = tbkern_q2_0_q8_pair_vnni64(xq[ib].qs, xq[ib + 1].qs);
+                        for (int r = 0; r < 4; ++r) {
+                            int32_t part_lo;
+                            int32_t part_hi;
+                            tbkern_q2_0_dot2_vnni64_x(weight_rows[r], base_b, xpair, &part_lo, &part_hi);
+                            gacc[r] += GGML_CPU_FP16_TO_FP32(xq[ib].d) * (float) (part_lo - q8_sums[ib]);
+                            gacc[r] += GGML_CPU_FP16_TO_FP32(xq[ib + 1].d) * (float) (part_hi - q8_sums[ib + 1]);
+                        }
+                    }
+                    for (int r = 0; r < 4; ++r) {
+                        acc[r] += GGML_CPU_FP16_TO_FP32(native[(size_t) (tiled_row + r) * NG + g].d) * gacc[r];
+                    }
+                }
+                y[tiled_row + 0] = acc[0];
+                y[tiled_row + 1] = acc[1];
+                y[tiled_row + 2] = acc[2];
+                y[tiled_row + 3] = acc[3];
+            }
+        }
+#endif
+        for (int row = tiled_row; row < row_end; ++row) {
+            const uint8_t * weight_row = cache + (size_t) row * row_stride;
+            float acc = 0.0f;
+            for (int g = 0; g < NG; ++g) {
+                const int base = g * G;
+                float gacc = 0.0f;
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+                if (use_vnni64) {
+                    // Keep Q8_0 scales and floating-point accumulation in the
+                    // native 32-element order even though code expansion is 64-wide.
+                    for (int b = 0; b < G / 64; ++b) {
+                        const int base_b = base + b * 64;
+                        const int ib = base_b / QK8_0;
+                        int32_t part_lo;
+                        int32_t part_hi;
+                        tbkern_q2_0_dot2_vnni64(weight_row, base_b, xq[ib].qs, xq[ib + 1].qs, &part_lo, &part_hi);
+                        gacc += GGML_CPU_FP16_TO_FP32(xq[ib].d) * (float) (part_lo - q8_sums[ib]);
+                        gacc += GGML_CPU_FP16_TO_FP32(xq[ib + 1].d) * (float) (part_hi - q8_sums[ib + 1]);
+                    }
+                } else
+#endif
+                {
+                    for (int b = 0; b < G / QK8_0; ++b) {
+                        const int base_b = base + b * QK8_0;
+                        const int ib = base_b / QK8_0;
+                        int32_t part;
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+                        if (use_vnni) {
+                            part = tbkern_q2_0_dot_vnni(weight_row, base_b, xq[ib].qs);
+                        } else
+#endif
+#if defined(__AVX2__) || (defined(_MSC_VER) && defined(GGML_AVX2))
+                        if (use_avx2) {
+                            part = tbkern_q2_0_dot_avx2(weight_row, base_b, xq[ib].qs);
+                        } else
+#endif
+                        {
+                            part = 0;
+                            for (int j = 0; j < QK8_0; ++j) {
+                                part += tbkern_q2_0_code_at(weight_row, base_b + j) * (int32_t) xq[ib].qs[j];
+                            }
+                        }
+                        gacc += GGML_CPU_FP16_TO_FP32(xq[ib].d) * (float) (part - q8_sums[ib]);
+                    }
+                }
+                acc += GGML_CPU_FP16_TO_FP32(native[(size_t) row * NG + g].d) * gacc;
+            }
+            y[row] = acc;
+        }
+        return true;
+    }
+
+    int repack(ggml_tensor * t, const void * data, size_t data_size) override {
+        if (!t || !data || !tbkern_q2_0_repackable(t)) {
+            return TBK_EINVAL;
+        }
+        const int K = (int) t->ne[0];
+        const int M = (int) t->ne[1];
+        const size_t native_bytes = ggml_nbytes(t);
+        if (data_size != native_bytes || K % QK2_0 != 0) {
+            return TBK_EINVAL;
+        }
+        std::memmove(t->data, data, native_bytes);
+        tbk_mat packed{};
+        const int rc = tbk_pack_from_q2(reinterpret_cast<const uint8_t *>(t->data), M, K, QK2_0, TBK_LAYOUT_CODES, &packed);
+        if (rc != TBK_OK) {
+            return rc;
+        }
+        GGML_ASSERT(packed.Kp == K && packed.row_stride_bytes == tbk_row_stride_bytes(K));
+        const size_t cache_bytes = (size_t) M * packed.row_stride_bytes;
+        std::memcpy(static_cast<uint8_t *>(t->data) + native_bytes, packed.data, cache_bytes);
+        tbk_mat_free(&packed);
+        return TBK_OK;
+    }
+};
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
 
     bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
@@ -5134,6 +5528,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 }  // namespace ggml::cpu::repack
 
 static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(const struct ggml_tensor * cur) {
+    static const ggml::cpu::repack::tbkern_q2_0_traits tbkern_q2_0;
     // instance for Q4
     static const ggml::cpu::repack::tensor_traits<block_q4_0, 4, 4, GGML_TYPE_Q8_0> q4_0_4x4_q8_0;
     static const ggml::cpu::repack::tensor_traits<block_q4_0, 8, 4, GGML_TYPE_Q8_0> q4_0_4x8_q8_0;
@@ -5185,7 +5580,9 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
     static const ggml::cpu::repack::tensor_traits<block_q2_K, 1, 16, GGML_TYPE_Q8_K> q2_K_16x1_q8_K;
 #endif
 
-    if (cur->type == GGML_TYPE_Q4_0) {
+    if (ggml::cpu::repack::tbkern_q2_0_repackable(cur)) {
+        return &tbkern_q2_0;
+    } else if (cur->type == GGML_TYPE_Q4_0) {
         if (ggml_cpu_has_avx2() || (ggml_cpu_has_sve() && ggml_cpu_has_matmul_int8() && ggml_cpu_get_sve_cnt() == QK8_0)) {
             if (cur->ne[1] % 8 == 0) {
                 return &q4_0_8x8_q8_0;
@@ -5385,6 +5782,17 @@ static const char * ggml_backend_cpu_repack_buffer_type_get_name(ggml_backend_bu
     GGML_UNUSED(buft);
 }
 
+static size_t ggml_backend_cpu_repack_buffer_type_get_alloc_size(ggml_backend_buffer_type_t, const ggml_tensor * tensor) {
+    const size_t native_bytes = ggml_nbytes(tensor);
+    if (ggml::cpu::repack::tbkern_q2_0_repackable(tensor)) {
+        const size_t K = (size_t) tensor->ne[0];
+        const size_t M = (size_t) tensor->ne[1];
+        const size_t row_stride = tbk_row_stride_bytes((int) K);
+        GGML_ASSERT(M <= (SIZE_MAX - native_bytes) / row_stride);
+        return native_bytes + M * row_stride;
+    }
+    return native_bytes;
+}
 static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
 
@@ -5462,7 +5870,7 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void) {
                            /* .alloc_buffer     = */ ggml_backend_cpu_repack_buffer_type_alloc_buffer,
                            /* .get_alignment    = */ ggml_backend_cpu_repack_buffer_type_get_alignment,
                            /* .get_max_size     = */ nullptr,  // defaults to SIZE_MAX
-                           /* .get_alloc_size   = */ nullptr,  // defaults to ggml_nbytes
+                           /* .get_alloc_size   = */ ggml_backend_cpu_repack_buffer_type_get_alloc_size,
                            /* .is_host          = */ nullptr,
                            },
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),

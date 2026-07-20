@@ -1,3 +1,7 @@
+# Keep this at directory scope: CMAKE_CURRENT_FUNCTION_LIST_DIR was added
+# after the project's CMake 3.14 minimum and is not available there.
+set(TBKERN_ROOT "${CMAKE_SOURCE_DIR}/third_party/tbkern")
+
 function(ggml_add_cpu_backend_features cpu_name arch)
     # The feature detection code is compiled as a separate target so that
     # it can be built without the architecture flags
@@ -56,7 +60,14 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
-
+    # Resolve from the project root inside this function to avoid caller-scope shadowing.
+    set(TBKERN_ROOT "${CMAKE_SOURCE_DIR}/third_party/tbkern")
+    # Q2_0 cache packing is opt-in. Scalar and AVX2 routes are selected by env;
+    # Prism's native Q2_0 vec-dot remains the fallback.
+    target_sources(${GGML_CPU_NAME} PRIVATE
+        "${TBKERN_ROOT}/src/q2_pack.c"
+    )
+    target_include_directories(${GGML_CPU_NAME} PRIVATE "${TBKERN_ROOT}/include")
     if (APPLE AND GGML_ACCELERATE)
         find_library(ACCELERATE_FRAMEWORK Accelerate)
         if (ACCELERATE_FRAMEWORK)
