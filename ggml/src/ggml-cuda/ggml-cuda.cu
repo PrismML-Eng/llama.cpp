@@ -3317,6 +3317,48 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         return false;
     }
 
+    // If uid changed but node count matches, do a structural comparison
+    // (op + shapes of non-noop nodes only) skipping data pointers which
+    // differ between decode steps. Noop nodes (VIEW/PERMUTE/RESHAPE/TRANSPOSE)
+    // have shapes that vary per step (e.g. KV cache views grow with context).
+    if (graph->uid != 0 && cgraph->uid != graph->uid &&
+        (int)graph->node_props.size() == cgraph->n_nodes) {
+        bool structural_match = true;
+        for (int i = 0; i < cgraph->n_nodes && structural_match; i++) {
+            const ggml_tensor * n = cgraph->nodes[i];
+            if (ggml_is_empty(n) || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_TRANSPOSE ||
+                n->op == GGML_OP_VIEW || n->op == GGML_OP_PERMUTE || n->op == GGML_OP_NONE) {
+                continue;
+            }
+            const ggml_tensor * p = &graph->node_props[i].node;
+            if (n->op != p->op || n->type != p->type ||
+                memcmp(n->ne, p->ne, sizeof(n->ne)) != 0 ||
+                memcmp(n->nb, p->nb, sizeof(n->nb)) != 0) {
+                structural_match = false;
+                break;
+            }
+            for (int j = 0; j < GGML_MAX_SRC && structural_match; j++) {
+                if ((n->src[j] == nullptr) != (graph->node_props[i].node_src_data_ptrs[j] == nullptr)) {
+                    structural_match = false;
+                    break;
+                }
+                if (n->src[j]) {
+                    if (memcmp(n->src[j]->ne, graph->node_props[i].node_src_ne[j],
+                               sizeof(n->src[j]->ne)) != 0 ||
+                        memcmp(n->src[j]->nb, graph->node_props[i].node_src_nb[j],
+                               sizeof(n->src[j]->nb)) != 0) {
+                        structural_match = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if (structural_match) {
+            graph->uid = cgraph->uid;
+            return false;
+        }
+    }
+
     graph->uid = cgraph->uid;
 
     // Check if the graph size has changed
