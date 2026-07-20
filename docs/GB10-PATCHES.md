@@ -124,8 +124,7 @@ Decode (tg32) unchanged — confirms dispatch routing: M=1 falls through to the 
 
 ### Step 3.5 — OPUS PERF-GAP REVIEW received (Phases 3.5/3.6 ahead)
 
-Diagnostic brief `/tmp/diagnostic-brief-perf.md` sent; Opus response recorded at
-`/tmp/diagnostic-brief-perf-response.md`. Read-only; no code changes.
+Diagnostic brief sent; Opus response received (read-only; no code changes).
 
 **Top level:** SM-bound on prologue throughput, not tensor-core-bound. Actual
 matmul is small (32 m16n8k32 / warp / kc-chunk ≪ a few hundred cycles);
@@ -263,7 +262,7 @@ throughout — the Bonsai thesis is preserved.
 
 ### Step 3.9 — cp.async + double-buffered SMEM attempt (FAILED gate)
 
-Opus's Phase 3.9 brief (`/tmp/diagnostic-brief-cpasync.md`) predicted
+Opus's Phase 3.9 brief predicted
 **760–820 tok/s** from a minimum patch that mirrored the Hopper
 template's `load_stage` lambda pattern: `__pipeline_memcpy_async` for
 Stage A + KG=2 double-buffered SMEM + one `__syncthreads()` per kc.
@@ -405,8 +404,7 @@ Public-PR readiness:
   86/86 unit tests pass with env on AND env off, decode (M=1, tg32) at
   40 tok/s unchanged. **Cold-cache pp512: 692 tok/s = 79.5% of cuBLAS
   with 3.5 GB VRAM-resident — Bonsai thesis preserved.**
-- **Phase 3.5 Opus diagnosis received.** Recorded at
-  `/tmp/diagnostic-brief-perf-response.md`: staging-bound, not
+- **Phase 3.5 Opus diagnosis received** (read-only review): staging-bound, not
   tensor-core-bound; minimum-patch lift estimates refined. Original
   856 pass criterion is **not realistic**; realistic ceiling for
   minimum-patch path is ~600–750.
@@ -513,10 +511,11 @@ VRAM-resident at 3.5 GB packed, decode (M=1, tg32) unchanged.
 
 **Where the ledger lives:**
 
-- This file (`GB10-PATCHES.md`).
-- Opus perf-review responses: `/tmp/diagnostic-brief-perf-response.md`,
-  `/tmp/diagnostic-brief-stageb-response.md`.
-- Opus cp.async review (Phase 3.9 brief): `/tmp/diagnostic-brief-cpasync.md`.
+- This file (`docs/GB10-PATCHES.md`).
+- Opus perf-review responses: received as read-only reviews during the
+  investigation; not committed into the repo since they are session-local.
+- Opus cp.async review (Phase 3.9 brief): likewise received locally and
+  not committed.
 
 **Signal that this was a legitimate endpoint, not a stall:**
 

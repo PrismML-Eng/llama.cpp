@@ -446,6 +446,10 @@ bool ggml_cuda_mul_mat_q1_blackwell(ggml_backend_cuda_context & ctx,
     const int64_t K = src0->ne[0], N = src0->ne[1], M = src1->ne[1];
     const bool    is_q1 = src0->type == GGML_TYPE_Q1_0;
     const bool    is_q2 = src0->type == GGML_TYPE_Q2_0;
+    // Shape-guard fallthrough: M not divisible by bM (256), or N/K misalignment, returns false
+    // so the upstream dispatcher falls back to the stock MMQ path. This is intentional: the
+    // kernel only opts in on GGML_BLACKWELL_Q1, so unaligned shapes silently use the generic
+    // path without surfacing an error to the user.
     if (cc != GGML_CUDA_CC_DGX_SPARK ||
         (!is_q1 && !is_q2) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
         src1->ne[2] * src1->ne[3] != 1 || src0->ne[2] * src0->ne[3] != 1 || (M % blackwell_q1::bM) ||

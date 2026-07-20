@@ -787,6 +787,108 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     return d2 * (sumi * ds8f.x - ds8f.y);
 }
 
+// GB10: Blackwell (sm_121 / DGX Spark) MMVQ variants for Q1_0/Q2_0 with
+// 2-byte aligned weight loads. The stock variants above assemble each int
+// from N separate LDG.E.U8 byte reads (4 for Q1_0, 8 for Q2_0 per vec_dot
+// call), which SASS-confirmed via cuobjdump does NOT get fused by nvcc into
+// wider loads on sm_121a. These cc-gated variants replace the byte OR-shift
+// ladder with get_int_b2 (2-byte aligned uint16 reads), reducing global memory
+// transactions per vec_dot call: Q1_0 4 -> 2, Q2_0 8 -> 4. Math is bit-identical
+// (same byte streams into the same bit-unpack).
+//
+// SAFETY: block_q1_0 is 18 bytes (qs at offset 2), block_q2_0 is 34 bytes
+// (qs at offset 2). qs[] base address parity alternates mod 4 with block
+// index N, but qs[] base address is ALWAYS 2-byte aligned (mod 2 == 0 by
+// construction), so get_int_b2 is safe across all block indices. Using
+// get_int_b4 (4-byte aligned) would be UNSAFE because qs[] offset cycles
+// between 2 mod 4 (N even) and 0 mod 4 (N odd) -- a 4-byte load would alias
+// across block boundaries on alternating blocks.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+
+static __device__ __forceinline__ float vec_dot_q1_0_q8_1_blackwell(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q1_0 * bq1_0 = (const block_q1_0 *) vbq + kbx;
+
+    const float        d1      = bq1_0->d;
+    const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
+
+    // GB10: 4-byte coalesced weight load (one LDG.32 over 2 uint16 reads via
+    // get_int_b2). Mathematically equivalent to the 4 byte OR-shifts in the
+    // stock variant above.
+    const int v = get_int_b2(bq1_0->qs, iqs);
+
+    int vi_bytes[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int shift = j * 4;
+        const int bits4 = (v >> shift) & 0x0F;
+        const int b0    = (bits4 >> 0) & 1;
+        const int b1    = (bits4 >> 1) & 1;
+        const int b2    = (bits4 >> 2) & 1;
+        const int b3    = (bits4 >> 3) & 1;
+        vi_bytes[j]     = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    }
+
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int u = get_int_b4(bq8_1_chunk->qs, j);
+        sumi = ggml_cuda_dp4a(vi_bytes[j], u, sumi);
+    }
+
+    const float2 ds8f = __half22float2(bq8_1_chunk->ds);
+    return d1 * (2.0f * sumi * ds8f.x - ds8f.y);
+}
+
+static __device__ __forceinline__ float vec_dot_q2_0_q8_1_blackwell(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q2_0 * bq2_0 = (const block_q2_0 *) vbq + kbx;
+
+    const float        d2         = bq2_0->d;
+    const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
+
+    // GB10: two 4-byte coalesced weight loads (each over 2 uint16 reads via
+    // get_int_b2), replacing the 8 byte OR-shifts in the stock variant above.
+    const int v0 = get_int_b2(bq2_0->qs, iqs * 2 + 0);
+    const int v1 = get_int_b2(bq2_0->qs, iqs * 2 + 1);
+
+    int vi_bytes[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int shift = j * 8;
+        const int codes = (v0 >> shift) & 0xFF;
+        const int c0    = (codes >> 0) & 3;
+        const int c1    = (codes >> 2) & 3;
+        const int c2    = (codes >> 4) & 3;
+        const int c3    = (codes >> 6) & 3;
+        vi_bytes[j]     = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24);
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int shift = j * 8;
+        const int codes = (v1 >> shift) & 0xFF;
+        const int c0    = (codes >> 0) & 3;
+        const int c1    = (codes >> 2) & 3;
+        const int c2    = (codes >> 4) & 3;
+        const int c3    = (codes >> 6) & 3;
+        vi_bytes[4 + j] = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24);
+    }
+
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int u = get_int_b4(bq8_1_chunk->qs, j);
+        sumi = ggml_cuda_dp4a(vi_bytes[j], u, sumi);
+    }
+
+    const float2 ds8f = __half22float2(bq8_1_chunk->ds);
+    return d2 * (sumi * ds8f.x - ds8f.y);
+}
+
+#endif // GB10: sm_121a MMVQ coalesce variants
+
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 

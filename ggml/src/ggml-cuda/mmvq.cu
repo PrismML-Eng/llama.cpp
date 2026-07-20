@@ -8,6 +8,16 @@
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
+    // GB10: Blackwell (sm_121 / DGX Spark) routes Q1_0/Q2_0 to the
+    // 2-byte aligned-weight-load variants for fewer global mem transactions.
+    // Stock path is preserved exactly (compiled out on non-sm_121a targets).
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+    switch (type) {
+        case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1_blackwell;
+        case GGML_TYPE_Q2_0:    return vec_dot_q2_0_q8_1_blackwell;
+        default:                break; // fall through to stock
+    }
+#endif
     switch (type) {
         case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
         case GGML_TYPE_Q2_0:    return vec_dot_q2_0_q8_1;
@@ -70,10 +80,6 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_RDNA2,
     MMVQ_PARAMETERS_RDNA3_0,
     MMVQ_PARAMETERS_RDNA4,
-    // GB10: Blackwell (sm_121) tuning table for Q1_0/Q2_0 mmvq decode and multi-column mmvq.
-    // Initially mirrors GENERIC for ncols_dst=1 (nwarps=4, rows_per_block=1) so we get a clean
-    // perf-neutral baseline to iterate against; widen later based on per-type benchmark results.
-    MMVQ_PARAMETERS_BLACKWELL
 };
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
@@ -87,8 +93,6 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_GCN;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
     return MMVQ_PARAMETERS_TURING;
-#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK  // GB10: route sm_121a (DGX Spark) to Blackwell tuning table.
-    return MMVQ_PARAMETERS_BLACKWELL;
 #else
     return MMVQ_PARAMETERS_GENERIC;
 #endif
@@ -109,9 +113,6 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
         return MMVQ_PARAMETERS_TURING;
-    }
-    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK) {  // GB10: DGX Spark gets the Blackwell tuning table; other Blackwell parts keep GENERIC until we generalize.
-        return MMVQ_PARAMETERS_BLACKWELL;
     }
     return MMVQ_PARAMETERS_GENERIC;
 }
@@ -461,28 +462,6 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 return 1;
         }
     }
-    // GB10: Blackwell (sm_121) Blackwell tuning table. ncols_dst==1 keeps the GENERIC shape
-    // (4 warps cooperatively processing a single row) so the FIRST pass acts as a perf-neutral
-    // smoke test. For ncols_dst=2..4 we widen parallelism for Q1_0/Q2_0 specifically; non-Q1_0/Q2_0
-    // types fall through to values that match GENERIC.
-    if (table_id == MMVQ_PARAMETERS_BLACKWELL) {
-        if (ncols_dst == 1) {
-            return 4;
-        }
-        if (ncols_dst <= 4) {
-            switch (type) {
-                case GGML_TYPE_Q1_0:
-                case GGML_TYPE_Q2_0:
-                    return 8;
-                default:
-                    return 4;
-            }
-        }
-        if (ncols_dst <= 8) {
-            return 2;
-        }
-        return 1;
-    }
     return 1;
 }
 
@@ -502,17 +481,6 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
             default:
                 return 1;
         }
-    }
-    // GB10: Blackwell rows-per-block tuned to mirror GENERIC for ncols_dst==1 (per-row small_k
-    // heuristic unchanged) and to allow wider parallelism fan-out (nwarps=8) at ncols_dst<=4.
-    if (table_id == MMVQ_PARAMETERS_BLACKWELL) {
-        if (ncols_dst == 1) {
-            return small_k ? nwarps : 1;
-        }
-        if (ncols_dst <= 8) {
-            return 2;
-        }
-        return 1;
     }
     return 1;
 }
