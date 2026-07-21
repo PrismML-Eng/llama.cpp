@@ -404,51 +404,54 @@ export class MCPService {
 		}
 
 		const url = useProxy ? buildProxiedUrl(config.url) : new URL(config.url);
-		const { fetch: diagnosticFetch, disable: stopPhaseLogging } = this.createDiagnosticFetch(
-			serverName,
-			config,
-			requestInit,
-			url,
-			useProxy,
-			onLog
-		);
+
+		const { fetch: diagnosticFetch, disable: stopPhaseLogging } =
+			this.createDiagnosticFetch(
+				serverName,
+				config,
+				requestInit,
+				url,
+				useProxy,
+				onLog
+			);
 
 		if (useProxy && import.meta.env.DEV && import.meta.env.VITE_DEBUG) {
 			console.log(`[MCPService] Using CORS proxy for ${config.url} -> ${url.href}`);
 		}
 
-		try {
-			if (import.meta.env.DEV && import.meta.env.VITE_DEBUG) {
-				console.log(`[MCPService] Creating StreamableHTTP transport for ${url.href}`);
-			}
+		// Respect the configured transport instead of always defaulting to Streamable HTTP.
+		switch (config.transport) {
+			case MCPTransportType.SSE:
+				if (import.meta.env.DEV && import.meta.env.VITE_DEBUG) {
+					console.log(`[MCPService] Creating SSE transport for ${url.href}`);
+				}
 
-			return {
-				transport: new StreamableHTTPClientTransport(url, {
-					requestInit,
-					fetch: diagnosticFetch
-				}),
-				type: MCPTransportType.STREAMABLE_HTTP,
-				stopPhaseLogging
-			};
-		} catch (httpError) {
-			console.warn(`[MCPService] StreamableHTTP failed, trying SSE transport...`, httpError);
-
-			try {
 				return {
 					transport: new SSEClientTransport(url, {
 						requestInit,
 						fetch: diagnosticFetch,
-						eventSourceInit: { fetch: diagnosticFetch }
+						eventSourceInit: {
+							fetch: diagnosticFetch
+						}
 					}),
 					type: MCPTransportType.SSE,
 					stopPhaseLogging
 				};
-			} catch (sseError) {
-				const httpMsg = httpError instanceof Error ? httpError.message : String(httpError);
-				const sseMsg = sseError instanceof Error ? sseError.message : String(sseError);
 
-				throw new Error(`Failed to create transport. StreamableHTTP: ${httpMsg}; SSE: ${sseMsg}`);
-			}
+			case MCPTransportType.STREAMABLE_HTTP:
+			default:
+				if (import.meta.env.DEV && import.meta.env.VITE_DEBUG) {
+					console.log(`[MCPService] Creating StreamableHTTP transport for ${url.href}`);
+				}
+
+				return {
+					transport: new StreamableHTTPClientTransport(url, {
+						requestInit,
+						fetch: diagnosticFetch
+					}),
+					type: MCPTransportType.STREAMABLE_HTTP,
+					stopPhaseLogging
+				};
 		}
 	}
 

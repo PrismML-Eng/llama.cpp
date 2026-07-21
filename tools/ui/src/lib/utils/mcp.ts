@@ -36,15 +36,26 @@ import type { MimeTypeUnion } from '$lib/types/common';
 
 /**
  * Detects the MCP transport type from a URL.
- * WebSocket URLs (ws:// or wss://) use 'websocket', others use 'streamable_http'.
  */
 export function detectMcpTransportFromUrl(url: string): MCPTransportType {
-	const normalized = url.trim().toLowerCase();
+    const normalized = url.trim().toLowerCase();
 
-	return normalized.startsWith(UrlProtocol.WEBSOCKET) ||
-		normalized.startsWith(UrlProtocol.WEBSOCKET_SECURE)
-		? MCPTransportType.WEBSOCKET
-		: MCPTransportType.STREAMABLE_HTTP;
+    if (
+        normalized.startsWith(UrlProtocol.WEBSOCKET) ||
+        normalized.startsWith(UrlProtocol.WEBSOCKET_SECURE)
+    ) {
+        return MCPTransportType.WEBSOCKET;
+    }
+
+    // Legacy MCP SSE transport
+    if (
+        normalized.endsWith("/sse") ||
+        normalized.includes("/sse?")
+    ) {
+        return MCPTransportType.SSE;
+    }
+
+    return MCPTransportType.STREAMABLE_HTTP;
 }
 
 /**
