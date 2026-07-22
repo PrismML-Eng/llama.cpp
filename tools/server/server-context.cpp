@@ -1039,15 +1039,19 @@ private:
                     }
                 }
 
-                // dspark stages all context rows since its cache position PLUS a
-                // full block in ONE batch -- worst case ctx_len == n_ctx right
-                // after begin() (e.g. a follow-up request with a long history).
-                // If the drafter's batch cannot fit ctx_len + block_size, the
-                // round is skipped ("round needs N tokens > n_batch") and
-                // speculation silently degrades to plain AR.
-                const uint32_t n_batch_dspark = cparams.n_ctx + (block_size > 0 ? block_size : 64);
+                // dspark stages context rows PLUS a full block in ONE batch, but
+                // the impl windows its staging to the drafter's trained position
+                // range (common/speculative.cpp draft-dspark), so the batch only
+                // needs to cover that window -- NOT the full target n_ctx.
+                // (Sizing it to n_ctx forced a full-context micro-batch on the
+                // draft context, which stalled context creation at large -c.)
+                const int32_t n_ctx_train_dft = llama_model_n_ctx_train(model_dft.get());
+                uint32_t n_batch_dspark = cparams.n_ctx + (block_size > 0 ? block_size : 64);
+                if (n_ctx_train_dft > 0) {
+                    n_batch_dspark = std::min<uint32_t>(n_batch_dspark, (uint32_t) n_ctx_train_dft);
+                }
                 if (cparams.n_batch < n_batch_dspark) {
-                    SRV_INF("draft-dspark: raising draft ctx n_batch %u -> %u (full-context staging + block)\n",
+                    SRV_INF("draft-dspark: raising draft ctx n_batch %u -> %u (windowed staging + block)\n",
                             cparams.n_batch, n_batch_dspark);
                     cparams.n_batch = n_batch_dspark;
                 }

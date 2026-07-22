@@ -903,6 +903,26 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     // regardless of who proposed a given round's tokens.
     std::vector<int64_t> rows_since_accept;
 
+    // Windowed staging: the drafter's own attention/RoPE is only ever run at
+    // positions [0, window), window = min(drafter n_ctx_train, drafter n_batch).
+    // Positions the drafter sees are REBASED: drafter_pos = abs_pos - pos_base.
+    // When the next block would cross `window`, the drafter cache is wiped and
+    // the last `w_keep` buffered rows are restaged at positions 0..w_keep-1
+    // (pos_base slides forward). The tap features already encode the target's
+    // full-context state at each row, so long-range information still reaches
+    // the drafter through them; what the window preserves is the drafter
+    // staying inside its trained position range at ANY target n_ctx (measured
+    // on Ternary-Bonsai-27B: acceptance decays 59% -> 4.6% between short and
+    // 28k-token prompts when staged at absolute positions).
+    int64_t window = 0;
+    int64_t w_keep = 0;
+    std::vector<int64_t> pos_base;
+
+    // rows at the head of ctx_feat/ctx_pos that were already consumed by a
+    // past draft() round but are retained for the next rebase restage.
+    // Buffer layout: [n_retained consumed rows][pending rows].
+    std::vector<int64_t> n_retained;
+
     // process()'s per-seq contiguous-range bookkeeping (mirrors draft-mtp).
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
@@ -1003,10 +1023,23 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
         batch = llama_batch_init(/* n_tokens = */ n_b, /* embd = */ 0, /* n_seq_max = */ 1);
 
+        // windowed staging bounds (see the member comment on `window`): keep
+        // the drafter's positions inside its trained context regardless of the
+        // target's n_ctx. A drafter GGUF without context_length metadata
+        // falls back to the batch size (i.e. the old behavior's ceiling).
+        const int32_t n_ctx_train_dft = llama_model_n_ctx_train(model_dft);
+        window = std::min<int64_t>(n_ctx_train_dft > 0 ? n_ctx_train_dft : n_b, n_b);
+        GGML_ASSERT(window > 2 * (int64_t) block_size && "dspark: staging window too small for a draft block");
+        w_keep = std::min<int64_t>(window / 2, window - block_size);
+        LOG_INF("%s: - staging window=%lld (drafter n_ctx_train=%d, n_batch=%d), w_keep=%lld\n",
+                __func__, (long long) window, n_ctx_train_dft, n_b, (long long) w_keep);
+
         n_cache.assign(n_seq, 0);
         ctx_feat.assign(n_seq, {});
         ctx_pos.assign(n_seq, {});
         rows_since_accept.assign(n_seq, 0);
+        pos_base.assign(n_seq, 0);
+        n_retained.assign(n_seq, 0);
         i_batch_beg.assign(n_seq, -1);
         i_batch_end.assign(n_seq, -1);
     }
@@ -1033,6 +1066,8 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         ctx_feat[seq_id].clear();
         ctx_pos[seq_id].clear();
         rows_since_accept[seq_id] = 0;
+        pos_base[seq_id]   = 0;
+        n_retained[seq_id] = 0;
 
         llama_memory_seq_rm(llama_get_memory(params.ctx_dft), seq_id, 0, -1);
     }
@@ -1154,41 +1189,64 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                         "skipping this round\n", __func__, (int) seq_id, (long long) start, (long long) L);
                 continue;
             }
-            if ((int64_t) pos.size() != ctx_len) {
-                LOG_ERR("%s: seq %d staged context rows (%zu) != expected ctx_len (%lld) -- "
+            const int64_t n_ret = n_retained[seq_id];
+            const int64_t n_buf = (int64_t) pos.size();
+            if (n_buf - n_ret != ctx_len) {
+                LOG_ERR("%s: seq %d staged context rows (%lld) != expected ctx_len (%lld) -- "
                         "n_past bookkeeping is out of sync with process()/accept(); "
                         "aborting draft for this seq this round\n",
-                        __func__, (int) seq_id, pos.size(), (long long) ctx_len);
+                        __func__, (int) seq_id, (long long)(n_buf - n_ret), (long long) ctx_len);
                 continue;
             }
-            GGML_ASSERT(pos.front() == (int32_t) L        && "dspark: staged rows do not start at the drafter's cache position");
-            GGML_ASSERT(pos.back()  == (int32_t) start - 1 && "dspark: staged rows do not end just before the anchor position");
+            GGML_ASSERT(pos[n_ret] == (int32_t) L         && "dspark: staged rows do not start at the drafter's cache position");
+            GGML_ASSERT(pos.back() == (int32_t) start - 1 && "dspark: staged rows do not end just before the anchor position");
 
-            const int64_t n_tokens = ctx_len + block_size;
+            // windowed staging (see the member comment on `window`): append the
+            // pending rows incrementally at rebased positions, or -- when the
+            // block would cross the window -- slide it: wipe the drafter seq and
+            // restage the last `keep` buffered rows at positions 0..keep-1.
+            int64_t base   = pos_base[seq_id];
+            int64_t stage0 = n_ret;
+            const bool rebase = start - base + (int64_t) block_size > window;
+            if (rebase) {
+                const int64_t keep = std::min<int64_t>(n_buf, w_keep);
+                stage0 = n_buf - keep;
+                base   = start - keep;
+            }
+
+            const int64_t n_stage  = n_buf - stage0;
+            const int64_t n_tokens = n_stage + block_size;
             if (n_tokens > n_batch_max) {
+                // structurally unreachable (n_stage + block_size <= window <= n_batch
+                // on both paths above); kept as a guard so a bookkeeping bug skips
+                // the round instead of overflowing the batch.
                 LOG_ERR("%s: seq %d round needs %lld tokens > n_batch=%lld -- skipping\n",
                         __func__, (int) seq_id, (long long) n_tokens, (long long) n_batch_max);
                 continue;
             }
 
-            llama_set_dspark_ctx(ctx_dft, feat.data(), ctx_len, n_embd_cap);
+            if (rebase) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1);
+            }
+
+            llama_set_dspark_ctx(ctx_dft, feat.data() + (size_t) stage0 * (size_t) n_embd_cap, n_stage, n_embd_cap);
 
             common_batch_clear(batch);
-            for (int64_t i = 0; i < ctx_len; ++i) {
+            for (int64_t i = 0; i < n_stage; ++i) {
                 // dummy token id: this row's real content comes from the
                 // staged dspark ctx feature above, not the token embedding
                 // (see src/models/dspark.cpp -- these columns are sliced away
                 // before the residual stream even forms). logits=false: this
                 // impl never reads output for context rows.
-                common_batch_add(batch, /* token = */ 0, (llama_pos)(L + i), { seq_id }, /* logits = */ false);
+                common_batch_add(batch, /* token = */ 0, (llama_pos)(pos[stage0 + i] - base), { seq_id }, /* logits = */ false);
             }
             // block position 0 is seeded with the REAL last-accepted token
             // (the "anchor"), NOT mask_token_id -- matches the Python reference
             // reference's evaluator._propose (draft_input_ids[:,0] =
             // output_ids[:,start]). Positions 1..block_size-1 are masked.
-            common_batch_add(batch, dp.id_last, (llama_pos) start, { seq_id }, /* logits = */ true);
+            common_batch_add(batch, dp.id_last, (llama_pos)(start - base), { seq_id }, /* logits = */ true);
             for (int32_t k = 1; k < block_size; ++k) {
-                common_batch_add(batch, mask_token_id, (llama_pos)(start + k), { seq_id }, /* logits = */ true);
+                common_batch_add(batch, mask_token_id, (llama_pos)(start - base + k), { seq_id }, /* logits = */ true);
             }
 
             const int32_t rc = llama_decode(ctx_dft, batch);
@@ -1198,6 +1256,16 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
 
             if (rc != 0) {
                 LOG_WRN("%s: llama_decode(ctx_dft) failed rc=%d for seq %d\n", __func__, rc, (int) seq_id);
+                if (rebase) {
+                    // the cache was already wiped for the rebase: bookkeeping must
+                    // not pretend the pre-rebase rows are still resident.
+                    n_cache[seq_id]    = 0;
+                    pos_base[seq_id]   = 0;
+                    n_retained[seq_id] = 0;
+                    feat.clear();
+                    pos.clear();
+                    rows_since_accept[seq_id] = 0;
+                }
                 continue;
             }
 
@@ -1207,7 +1275,8 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             // The speculative tail is discarded every round regardless of
             // what the target ultimately accepts; only accept()/process()
             // decide what becomes real context for the NEXT round.
-            if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, (llama_pos) start, -1)) {
+            // NOTE: cache positions are drafter-rebased, hence `start - base`.
+            if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, (llama_pos)(start - base), -1)) {
                 // Could not crop just the speculative tail (e.g. the backend
                 // rejected the partial removal): the physical drafter cache still
                 // contains the draft rows, so advancing n_cache to `start` would
@@ -1219,16 +1288,26 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                         "resetting the drafter sequence to recover\n",
                         __func__, (int) seq_id, (long long) start);
                 llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1);
-                n_cache[seq_id] = 0;
+                n_cache[seq_id]    = 0;
+                pos_base[seq_id]   = 0;
+                n_retained[seq_id] = 0;
                 feat.clear();
                 pos.clear();
                 rows_since_accept[seq_id] = 0;
                 continue;
             }
-            n_cache[seq_id] = start;
+            n_cache[seq_id]  = start;
+            pos_base[seq_id] = base;
 
-            feat.clear();
-            pos.clear();
+            // this round's pending rows are consumed; retain the buffer tail for
+            // future rebase restaging. Trim the head lazily (in 512-row chunks)
+            // to keep the O(w_keep) erase off the per-round path.
+            if (n_buf > w_keep + 512) {
+                const int64_t cut = n_buf - w_keep;
+                feat.erase(feat.begin(), feat.begin() + (size_t) cut * (size_t) n_embd_cap);
+                pos.erase(pos.begin(), pos.begin() + cut);
+            }
+            n_retained[seq_id] = (int64_t) pos.size();
             rows_since_accept[seq_id] = 0; // this round's rows were just consumed
 
             // --- sequential Markov resample -------------------------------
