@@ -84,6 +84,8 @@ void * ppc_apack_cache_acquire_par(const void * key, int64_t m, int64_t k,
                                    int variant, size_t bytes, int nth, int * fresh);
 void ppc_apack_cache_slice_done(const void * key, int64_t m, int64_t k, int variant);
 void ppc_apack_slice(int64_t m, int mr, int ith, int nth, int64_t * i0, int64_t * rows);
+void gemv2_q4_K_q8_K_ppc(int64_t m, int64_t k, const void * Av, int64_t lda,
+                         const void * Bv, float * C, int ith, int nth);
 void ppc_apack_cache_clear(void);
 #ifdef __cplusplus
 }
