@@ -3627,7 +3627,11 @@ class tinyBLAS_PPC {
         } else if constexpr(RM == 8 && RN == 8) {
             KERNEL_8x8(ii, jj);
         } else {
-            static_assert(false, "RN/RM values not supported");
+            // dependent form: GCC < 13 evaluates a non-dependent
+            // static_assert(false) eagerly even in a discarded
+            // constexpr branch (pre-P2593); RM != RM defers it to
+            // instantiation, which never occurs for supported tiles.
+            static_assert(RM != RM, "RN/RM values not supported");
         }
     }
 
