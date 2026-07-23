@@ -4060,6 +4060,78 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
 #endif
     }
 
+    case GGML_TYPE_TQ2_0: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        gemm_tq2_0_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_TQ1_0: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        gemm_tq1_0_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_IQ2_XXS: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        gemm_iq2_xxs_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_IQ3_XXS: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        gemm_iq3_xxs_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_IQ3_S: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        gemm_iq3_s_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_IQ1_S: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        gemm_iq1_s_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
     case GGML_TYPE_Q1_0: {
         if (Btype != GGML_TYPE_Q8_0)
             return false;
