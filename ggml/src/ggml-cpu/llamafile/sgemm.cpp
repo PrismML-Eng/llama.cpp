@@ -4115,10 +4115,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_K)
             return false;
 #if defined(__MMA__)
-        if (n < 8)
-            return false;   // packed path reads int8-expanded weights;
-                            // below one column tile vec_dot wins the
-                            // bandwidth race on silicon (patch 0015)
+        // 0015 guard deliberately absent for this format: its ggml
+        // vec_dot is compute-starved on Power (2-3%% of the memory
+        // wall, VALIDATION-POWER10.md #9), so the cached packed path
+        // wins generation despite the int8 expansion (patch 0017).
         gemm_tq1_0_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
@@ -4243,10 +4243,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_K)
             return false;
 #if defined(__MMA__)
-        if (n < 8)
-            return false;   // packed path reads int8-expanded weights;
-                            // below one column tile vec_dot wins the
-                            // bandwidth race on silicon (patch 0015)
+        // 0015 guard deliberately absent for this format: its ggml
+        // vec_dot is compute-starved on Power (2-3%% of the memory
+        // wall, VALIDATION-POWER10.md #9), so the cached packed path
+        // wins generation despite the int8 expansion (patch 0017).
         gemm_iq1_m_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
