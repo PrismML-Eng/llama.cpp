@@ -833,7 +833,192 @@ extern "C" void grid16_gemm_packed(int64_t m, int64_t n, int64_t k,
 }
 
 
-#define GRID_ONESHOT_C(NAME, BLKA, REPACK, GEMM, ASZ, BSZ, PACKB, VARIANT)     \
+// ---- packed GEMV, n = 1: GER over the cached tiles --------------------
+//
+// The two-row VSX GEMV lost to vec_dot because n = 1 on this machine
+// is issue-rate bound (VALIDATION-POWER10.md s9.2).  This kernel
+// attacks that constraint with the one unit that crushes instructions
+// per byte: each xvi8ger4pp retires 4 rows x 4 depth of dot product,
+// and the A-side tiles, per-chunk scales and 128-offset corrections
+// already sit decoded in the pack cache.  The activation group is
+// XOR-flipped and replicated across the GER's four columns (one perm
+// per depth group), so every accumulator lane holds the same answer;
+// the fixup gathers the four rows into lane form with two merges and
+// a permdi.  Roughly 62 instructions per 8-row x 32-deep chunk versus
+// ~190 for the same work through the per-format vec_dot.
+extern "C" void grid_gemv_packed(int64_t m, int64_t k, const void * PAv,
+                                 const block_q8_K_ppc * y, float * C,
+                                 int ith, int nth) {
+    const agrid_t * PA = (const agrid_t *)PAv;
+    const int64_t nt = rt(m), ns = sl(k), ncht = k/32;
+    const vuc flip = vec_splats((unsigned char)0x80);
+    const vuc zero = vec_splats((unsigned char)0);
+    static const vuc repl[4] = {
+        (vuc){ 0,1,2,3, 0,1,2,3, 0,1,2,3, 0,1,2,3 },
+        (vuc){ 4,5,6,7, 4,5,6,7, 4,5,6,7, 4,5,6,7 },
+        (vuc){ 8,9,10,11, 8,9,10,11, 8,9,10,11, 8,9,10,11 },
+        (vuc){ 12,13,14,15, 12,13,14,15, 12,13,14,15, 12,13,14,15 },
+    };
+    const int64_t tpt = (nt + nth - 1) / nth;
+    const int64_t t0 = (int64_t)ith * tpt;
+    const int64_t t1 = (t0 + tpt) < nt ? (t0 + tpt) : nt;
+
+    for (int64_t it = t0; it < t1; it++) {
+        vfl fin0 = vec_splats(0.0f);   // rows it*MR+0..3, lane-per-row
+        vfl fin1 = vec_splats(0.0f);   // rows it*MR+4..7
+        for (int64_t s = 0; s < ns; s++) {
+            const agrid_t * T = &PA[it*ns + s];
+            const int64_t c0 = s*KC_CH;
+            const int64_t nch = (ncht - c0) < KC_CH ? (ncht - c0) : KC_CH;
+            for (int64_t ch = 0; ch < nch; ch++) {
+                if (ch + 1 < nch) {
+                    __builtin_prefetch(T->v[ch + 1], 0, 3);
+                    __builtin_prefetch((const char *)T->v[ch + 1] + 128, 0, 3);
+                }
+                const int64_t gc = c0 + ch;
+                const int8_t * q8 = y[gc/8].qs + 32*(gc%8);
+                const vfl vdB = vec_splats(y[gc/8].d);
+                const vuc ylo = vec_xor(load16u(q8),      flip);
+                const vuc yhi = vec_xor(load16u(q8 + 16), flip);
+                __vector_quad acc0, acc1;
+                __builtin_mma_xxsetaccz(&acc0);
+                __builtin_mma_xxsetaccz(&acc1);
+                const vuc * a = T->v[ch];
+                for (int x = 0; x < 8; x++) {
+                    const vuc yg = vec_perm(x < 4 ? ylo : yhi, zero, repl[x & 3]);
+                    __builtin_mma_xvi8ger4pp(&acc0, a[2*x],     yg);
+                    __builtin_mma_xvi8ger4pp(&acc1, a[2*x + 1], yg);
+                }
+                {
+                    vsi rp[4];
+                    __builtin_mma_disassemble_acc(rp, &acc0);
+                    vui m01 = vec_mergeh((vui)rp[0], (vui)rp[1]);
+                    vui m23 = vec_mergeh((vui)rp[2], (vui)rp[3]);
+                    vsi lanes = (vsi)vec_xxpermdi(m01, m23, 0);
+                    vfl t = vec_sub(vec_ctf(lanes, 0), T->C128[ch][0]);
+                    fin0 = vec_madd(t, vec_mul(T->sA[ch][0], vdB), fin0);
+                }
+                {
+                    vsi rp[4];
+                    __builtin_mma_disassemble_acc(rp, &acc1);
+                    vui m01 = vec_mergeh((vui)rp[0], (vui)rp[1]);
+                    vui m23 = vec_mergeh((vui)rp[2], (vui)rp[3]);
+                    vsi lanes = (vsi)vec_xxpermdi(m01, m23, 0);
+                    vfl t = vec_sub(vec_ctf(lanes, 0), T->C128[ch][1]);
+                    fin1 = vec_madd(t, vec_mul(T->sA[ch][1], vdB), fin1);
+                }
+            }
+        }
+        const int64_t r0 = it*MR;
+        for (int r = 0; r < 4; r++) {
+            if (r0 + r < m)     C[r0 + r]     = fin0[r];
+            if (r0 + 4 + r < m) C[r0 + 4 + r] = fin1[r];
+        }
+    }
+}
+
+
+
+// ---- packed GEMV for the 16-deep family (see grid_gemv_packed) --------
+//
+// The 16-deep chunks give each accumulator only FOUR GERs before the
+// fixup wants it drained, and xxmfacc serializes against that
+// accumulator's GER stream -- the engine never reaches a deep
+// pipeline (first cut measured 10 t/s where vec_dot does 33).  So
+// this kernel ping-pongs two accumulator sets across chunks: chunk
+// c+1's GERs issue on the idle set while chunk c drains and fixes up.
+// The same trade the 8x8 kernels measured at n = 8 is decisive here.
+static inline void grid16_gemv_issue(const agrid16_t * T, int64_t ch,
+                                     const block_q8_K_ppc * y, int64_t gc,
+                                     const vuc repl[4], vuc flip, vuc zero,
+                                     __vector_quad * a0, __vector_quad * a1) {
+    const int8_t * q8 = y[gc/16].qs + 16*(gc%16);
+    const vuc yv = vec_xor(load16u(q8), flip);
+    __builtin_mma_xxsetaccz(a0);
+    __builtin_mma_xxsetaccz(a1);
+    const vuc * a = T->v[ch];
+    for (int t = 0; t < 4; t++) {
+        const vuc yg = vec_perm(yv, zero, repl[t]);
+        __builtin_mma_xvi8ger4pp(a0, a[2*t],     yg);
+        __builtin_mma_xvi8ger4pp(a1, a[2*t + 1], yg);
+    }
+}
+
+static inline void grid16_gemv_fixup(const agrid16_t * T, int64_t ch,
+                                     const block_q8_K_ppc * y, int64_t gc,
+                                     __vector_quad * a0, __vector_quad * a1,
+                                     vfl * fin0, vfl * fin1) {
+    const vfl vdB = vec_splats(y[gc/16].d);
+    {
+        vsi rp[4];
+        __builtin_mma_disassemble_acc(rp, a0);
+        vui m01 = vec_mergeh((vui)rp[0], (vui)rp[1]);
+        vui m23 = vec_mergeh((vui)rp[2], (vui)rp[3]);
+        vsi lanes = (vsi)vec_xxpermdi(m01, m23, 0);
+        vfl t = vec_sub(vec_ctf(lanes, 0), T->C128[ch][0]);
+        *fin0 = vec_madd(t, vec_mul(T->sA[ch][0], vdB), *fin0);
+    }
+    {
+        vsi rp[4];
+        __builtin_mma_disassemble_acc(rp, a1);
+        vui m01 = vec_mergeh((vui)rp[0], (vui)rp[1]);
+        vui m23 = vec_mergeh((vui)rp[2], (vui)rp[3]);
+        vsi lanes = (vsi)vec_xxpermdi(m01, m23, 0);
+        vfl t = vec_sub(vec_ctf(lanes, 0), T->C128[ch][1]);
+        *fin1 = vec_madd(t, vec_mul(T->sA[ch][1], vdB), *fin1);
+    }
+}
+
+extern "C" void grid16_gemv_packed(int64_t m, int64_t k, const void * PAv,
+                                   const block_q8_K_ppc * y, float * C,
+                                   int ith, int nth) {
+    const agrid16_t * PA = (const agrid16_t *)PAv;
+    const int64_t nt = rt(m), ns = sl(k), ncht = k/16;
+    const vuc flip = vec_splats((unsigned char)0x80);
+    const vuc zero = vec_splats((unsigned char)0);
+    static const vuc repl[4] = {
+        (vuc){ 0,1,2,3, 0,1,2,3, 0,1,2,3, 0,1,2,3 },
+        (vuc){ 4,5,6,7, 4,5,6,7, 4,5,6,7, 4,5,6,7 },
+        (vuc){ 8,9,10,11, 8,9,10,11, 8,9,10,11, 8,9,10,11 },
+        (vuc){ 12,13,14,15, 12,13,14,15, 12,13,14,15, 12,13,14,15 },
+    };
+    const int64_t tpt = (nt + nth - 1) / nth;
+    const int64_t t0 = (int64_t)ith * tpt;
+    const int64_t t1 = (t0 + tpt) < nt ? (t0 + tpt) : nt;
+
+    for (int64_t it = t0; it < t1; it++) {
+        vfl fin0 = vec_splats(0.0f);
+        vfl fin1 = vec_splats(0.0f);
+        for (int64_t s = 0; s < ns; s++) {
+            const agrid16_t * T = &PA[it*ns + s];
+            const int64_t c0 = s*KC_CH16;
+            const int64_t nch = (ncht - c0) < KC_CH16 ? (ncht - c0) : KC_CH16;
+            if (nch <= 0) continue;
+            __vector_quad accP0, accP1, accQ0, accQ1;
+            grid16_gemv_issue(T, 0, y, c0, repl, flip, zero, &accP0, &accP1);
+            int p = 1;
+            for (int64_t ch = 0; ch < nch; ch++) {
+                if (ch + 2 < nch) __builtin_prefetch(T->v[ch + 2], 0, 3);
+                if (ch + 1 < nch) {
+                    if (p) grid16_gemv_issue(T, ch + 1, y, c0 + ch + 1, repl, flip, zero, &accQ0, &accQ1);
+                    else   grid16_gemv_issue(T, ch + 1, y, c0 + ch + 1, repl, flip, zero, &accP0, &accP1);
+                }
+                if (p) grid16_gemv_fixup(T, ch, y, c0 + ch, &accP0, &accP1, &fin0, &fin1);
+                else   grid16_gemv_fixup(T, ch, y, c0 + ch, &accQ0, &accQ1, &fin0, &fin1);
+                p ^= 1;
+            }
+        }
+        const int64_t r0 = it*MR;
+        for (int r = 0; r < 4; r++) {
+            if (r0 + r < m)     C[r0 + r]     = fin0[r];
+            if (r0 + 4 + r < m) C[r0 + 4 + r] = fin1[r];
+        }
+    }
+}
+
+
+
+#define GRID_ONESHOT_C(NAME, BLKA, REPACK, GEMM, GEMV, ASZ, BSZ, PACKB, VARIANT)     \
 extern "C" void NAME(int64_t m, int64_t n, int64_t k,                          \
         const void * Av, int64_t lda, const void * Bv, int64_t ldb,            \
         float * C, int64_t ldc, int ith, int nth) {                            \
@@ -857,11 +1042,15 @@ extern "C" void NAME(int64_t m, int64_t n, int64_t k,                          \
                while scalar row-partitions). Row-partition with the    \
                cached pack instead; the full activation pack is tiny   \
                at these n. Field regression, Q4_K tg32, 2026-07-21. */ \
+            if (n == 1) {                                              \
+                GEMV(m, k, PA, B, (float *)C, ith, nth);               \
+            } else {                                                   \
             void * PBs = aligned_alloc(64, BSZ(n, k));                 \
             if (!PBs) { GGML_ABORT("ppc-mma: pack alloc failed"); }    \
             PACKB(B, ldb, n, k, PBs);                                  \
             GEMM(m, n, k, PA, PBs, C, ldc, ith, nth);                  \
             free(PBs);                                                 \
+            }                                                          \
         } else {                                                       \
         const int64_t jpt = (njt + nth - 1) / nth;                             \
         const int64_t jt0 = (int64_t)ith*jpt;                                  \
@@ -895,15 +1084,15 @@ extern "C" void NAME(int64_t m, int64_t n, int64_t k,                          \
         free(PB);                                                              \
     }                                                                          \
 }
-GRID_ONESHOT_C(gemm_tq2_0_q8_K_ppc,   block_tq2_0_ppc,   grid_repack_tq2_0,   grid_gemm_packed,   grid_apack_size,   grid_bpack_size,   grid_pack_b_q8_K,   10)
-GRID_ONESHOT_C(gemm_tq1_0_q8_K_ppc,   block_tq1_0_ppc,   grid_repack_tq1_0,   grid_gemm_packed,   grid_apack_size,   grid_bpack_size,   grid_pack_b_q8_K,   11)
-GRID_ONESHOT_C(gemm_iq2_xxs_q8_K_ppc, block_iq2_xxs_ppc, grid_repack_iq2_xxs, grid_gemm_packed,   grid_apack_size,   grid_bpack_size,   grid_pack_b_q8_K,   12)
-GRID_ONESHOT_C(gemm_iq3_xxs_q8_K_ppc, block_iq3_xxs_ppc, grid_repack_iq3_xxs, grid_gemm_packed,   grid_apack_size,   grid_bpack_size,   grid_pack_b_q8_K,   13)
-GRID_ONESHOT_C(gemm_iq3_s_q8_K_ppc,   block_iq3_s_ppc,   grid_repack_iq3_s,   grid_gemm_packed,   grid_apack_size,   grid_bpack_size,   grid_pack_b_q8_K,   14)
-GRID_ONESHOT_C(gemm_iq1_s_q8_K_ppc,   block_iq1_s_ppc,   grid_repack_iq1_s,   grid_gemm_packed,   grid_apack_size,   grid_bpack_size,   grid_pack_b_q8_K,   15)
-GRID_ONESHOT_C(gemm_iq2_xs_q8_K_ppc,  block_iq2_xs_ppc,  grid16_repack_iq2_xs, grid16_gemm_packed, grid16_apack_size, grid16_bpack_size, grid16_pack_b_q8_K, 16)
-GRID_ONESHOT_C(gemm_iq2_s_q8_K_ppc,   block_iq2_s_ppc,   grid16_repack_iq2_s,  grid16_gemm_packed, grid16_apack_size, grid16_bpack_size, grid16_pack_b_q8_K, 17)
-GRID_ONESHOT_C(gemm_iq1_m_q8_K_ppc,   block_iq1_m_ppc,   grid16_repack_iq1_m,  grid16_gemm_packed, grid16_apack_size, grid16_bpack_size, grid16_pack_b_q8_K, 18)
+GRID_ONESHOT_C(gemm_tq2_0_q8_K_ppc,   block_tq2_0_ppc,   grid_repack_tq2_0,   grid_gemm_packed,   grid_gemv_packed,   grid_apack_size,   grid_bpack_size,   grid_pack_b_q8_K,   10)
+GRID_ONESHOT_C(gemm_tq1_0_q8_K_ppc,   block_tq1_0_ppc,   grid_repack_tq1_0,   grid_gemm_packed,   grid_gemv_packed,   grid_apack_size,   grid_bpack_size,   grid_pack_b_q8_K,   11)
+GRID_ONESHOT_C(gemm_iq2_xxs_q8_K_ppc, block_iq2_xxs_ppc, grid_repack_iq2_xxs, grid_gemm_packed,   grid_gemv_packed,   grid_apack_size,   grid_bpack_size,   grid_pack_b_q8_K,   12)
+GRID_ONESHOT_C(gemm_iq3_xxs_q8_K_ppc, block_iq3_xxs_ppc, grid_repack_iq3_xxs, grid_gemm_packed,   grid_gemv_packed,   grid_apack_size,   grid_bpack_size,   grid_pack_b_q8_K,   13)
+GRID_ONESHOT_C(gemm_iq3_s_q8_K_ppc,   block_iq3_s_ppc,   grid_repack_iq3_s,   grid_gemm_packed,   grid_gemv_packed,   grid_apack_size,   grid_bpack_size,   grid_pack_b_q8_K,   14)
+GRID_ONESHOT_C(gemm_iq1_s_q8_K_ppc,   block_iq1_s_ppc,   grid_repack_iq1_s,   grid_gemm_packed,   grid_gemv_packed,   grid_apack_size,   grid_bpack_size,   grid_pack_b_q8_K,   15)
+GRID_ONESHOT_C(gemm_iq2_xs_q8_K_ppc,  block_iq2_xs_ppc,  grid16_repack_iq2_xs, grid16_gemm_packed, grid16_gemv_packed, grid16_apack_size, grid16_bpack_size, grid16_pack_b_q8_K, 16)
+GRID_ONESHOT_C(gemm_iq2_s_q8_K_ppc,   block_iq2_s_ppc,   grid16_repack_iq2_s,  grid16_gemm_packed, grid16_gemv_packed, grid16_apack_size, grid16_bpack_size, grid16_pack_b_q8_K, 17)
+GRID_ONESHOT_C(gemm_iq1_m_q8_K_ppc,   block_iq1_m_ppc,   grid16_repack_iq1_m,  grid16_gemm_packed, grid16_gemv_packed, grid16_apack_size, grid16_bpack_size, grid16_pack_b_q8_K, 18)
 
 extern "C" void gemm_nvfp4_q8_0_ppc(int64_t m, int64_t n, int64_t k,
         const void * Av, int64_t lda, const void * Bv, int64_t ldb,

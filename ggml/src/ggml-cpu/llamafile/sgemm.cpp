@@ -4131,7 +4131,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_K)
             return false;
 #if defined(__MMA__)
-        if (n < 8)
+        if (n > 1 && n < 8)
             return false;   // packed path reads int8-expanded weights;
                             // below one column tile vec_dot wins the
                             // bandwidth race on silicon (patch 0015)
@@ -4147,7 +4147,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_K)
             return false;
 #if defined(__MMA__)
-        if (n < 8)
+        if (n > 1 && n < 8)
             return false;   // packed path reads int8-expanded weights;
                             // below one column tile vec_dot wins the
                             // bandwidth race on silicon (patch 0015)
@@ -4163,7 +4163,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_K)
             return false;
 #if defined(__MMA__)
-        if (n < 8)
+        if (n > 1 && n < 8)
             return false;   // packed path reads int8-expanded weights;
                             // below one column tile vec_dot wins the
                             // bandwidth race on silicon (patch 0015)
@@ -4179,7 +4179,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_K)
             return false;
 #if defined(__MMA__)
-        if (n < 8)
+        if (n > 1 && n < 8)
             return false;   // packed path reads int8-expanded weights;
                             // below one column tile vec_dot wins the
                             // bandwidth race on silicon (patch 0015)
