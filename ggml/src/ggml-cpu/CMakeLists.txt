@@ -89,6 +89,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                     ggml-cpu/llamafile/q2k_ppc_mma.cpp
                     ggml-cpu/llamafile/q3k_ppc_mma.cpp
                     ggml-cpu/llamafile/iq4_ppc_mma.cpp
+                    ggml-cpu/llamafile/legacy_ppc_mma.cpp
                     ggml-cpu/llamafile/kquants_ppc_mma.h
                     ggml-cpu/llamafile/qbit_ppc_mma.h
                     ggml-cpu/llamafile/sgemm.h)
