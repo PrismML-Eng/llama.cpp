@@ -132,11 +132,15 @@ static void repack_generic(const BLK * A, int64_t lda, int64_t m, int64_t k, ale
 }
 
 static void codes_q4_1(const block_q4_1 * bp, vuc v[2]) { nibbles32(bp->qs, v); }
+static void codes_q4_0(const block_q4_0 * bp, vuc v[2]) { nibbles32(bp->qs, v); }
 static void codes_q5_0(const block_q5_0 * bp, vuc v[2]) { nibbles32(bp->qs, v); qh_merge(bp->qh, v); }
 static void codes_q5_1(const block_q5_1 * bp, vuc v[2]) { nibbles32(bp->qs, v); qh_merge(bp->qh, v); }
 
 extern "C" void leg_repack_q4_1(const block_q4_1 * A, int64_t lda, int64_t m, int64_t k, void * p) {
     repack_generic<block_q4_1, codes_q4_1, true>(A, lda, m, k, (aleg_t *)p);
+}
+extern "C" void leg_repack_q4_0(const block_q4_0 * A, int64_t lda, int64_t m, int64_t k, void * p) {
+    repack_generic<block_q4_0, codes_q4_0, false>(A, lda, m, k, (aleg_t *)p);
 }
 extern "C" void leg_repack_q5_0(const block_q5_0 * A, int64_t lda, int64_t m, int64_t k, void * p) {
     repack_generic<block_q5_0, codes_q5_0, false>(A, lda, m, k, (aleg_t *)p);
@@ -187,6 +191,10 @@ static void pack_b_generic(const YBLK * B, int64_t ldb, int64_t n, int64_t k, bl
 
 extern "C" void leg_pack_b_q8_0(const block_q8_0 * B, int64_t ldb, int64_t n, int64_t k, void * p) {
     pack_b_generic<block_q8_0, false, 16>(B, ldb, n, k, (bleg_t *)p);
+}
+// SFACT 8 variant for Q4_0's offset (t = q - 8)
+extern "C" void leg_pack_b_q8_0_o8(const block_q8_0 * B, int64_t ldb, int64_t n, int64_t k, void * p) {
+    pack_b_generic<block_q8_0, false, 8>(B, ldb, n, k, (bleg_t *)p);
 }
 extern "C" void leg_pack_b_q8_1(const block_q8_1 * B, int64_t ldb, int64_t n, int64_t k, void * p) {
     pack_b_generic<block_q8_1, true, 1>(B, ldb, n, k, (bleg_t *)p);
@@ -339,6 +347,7 @@ extern "C" void NAME(int64_t m, int64_t n, int64_t k,                          \
 LEG_ONESHOT(gemm_q4_1_q8_1_ppc, block_q4_1, leg_repack_q4_1, block_q8_1, leg_pack_b_q8_1, leg_gemm_affine, 25)
 LEG_ONESHOT(gemm_q5_0_q8_0_ppc, block_q5_0, leg_repack_q5_0, block_q8_0, leg_pack_b_q8_0, leg_gemm_offset, 26)
 LEG_ONESHOT(gemm_q5_1_q8_1_ppc, block_q5_1, leg_repack_q5_1, block_q8_1, leg_pack_b_q8_1, leg_gemm_affine, 27)
+LEG_ONESHOT(gemm_q4_0_q8_0_ppc, block_q4_0, leg_repack_q4_0, block_q8_0, leg_pack_b_q8_0_o8, leg_gemm_offset, 28)
 
 #endif // __MMA__
 

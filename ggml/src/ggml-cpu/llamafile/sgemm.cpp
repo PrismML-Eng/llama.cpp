@@ -3952,12 +3952,11 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
            return false;
         if (m < 8 && m != 4)
            return false;
-        tinyBLAS_Q0_PPC<block_q8_0> tb{
-            k, (const block_q8_0 *)A, lda,
-            (const block_q8_0 *)B, ldb,
-            (float *)C, ldc,
-            params->ith, params->nth};
-        tb.matmul(m, n);
+        // routed through the pack-cached MMA kernels (patch 0011); replaces
+        // tinyBLAS_Q0_PPC, whose per-call weight repack, scalar comparray
+        // fixup and absent GEMV path made it the slow producer here.
+        gemm_q8_0_q8_0_ppc(m, n, k * QK8_0, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
         return true;
 #else
         return false;
@@ -4243,12 +4242,11 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
            return false;
         if (m < 8 && m != 4)
            return false;
-        tinyBLAS_Q0_PPC<block_q4_0> tb{
-            k, (const block_q4_0 *)A, lda,
-            (const block_q8_0 *)B, ldb,
-            (float *)C, ldc,
-            params->ith, params->nth};
-        tb.matmul(m, n);
+        // routed through the pack-cached MMA kernels (patch 0011); replaces
+        // tinyBLAS_Q0_PPC, whose per-call weight repack, scalar comparray
+        // fixup and absent GEMV path made it the slow producer here.
+        gemm_q4_0_q8_0_ppc(m, n, k * QK4_0, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
         return true;
 #else
         return false;

@@ -150,6 +150,30 @@ extern "C" void iq4nl_repack_a(const block_iq4_nl * A, int64_t lda,
     }
 }
 
+// ---- weight repack: Q8_0 (signed int8 weights, identity decode) ----
+extern "C" void q8_0_repack_a(const block_q8_0 * A, int64_t lda,
+                              int64_t m, int64_t k, void * packed) {
+    aiq4_t * P = (aiq4_t *)packed;
+    const int64_t kb = k/32, ns = sl32(k);
+    for (int64_t it = 0; it < rt8(m); it++)
+    for (int64_t s = 0; s < ns; s++) {
+        aiq4_t * T = &P[it*ns + s];
+        const int64_t b0 = s*KC_CH;
+        const int64_t nb = (kb - b0) < KC_CH ? (kb - b0) : KC_CH;
+        for (int64_t b = 0; b < nb; b++) {
+            vsc w[MR][2]; float sc[MR];
+            for (int r = 0; r < MR; r++) {
+                int64_t rr = it*MR + r; if (rr >= m) rr = m - 1;
+                const block_q8_0 * bp = &A[rr*lda + b0 + b];
+                sc[r] = GGML_FP16_TO_FP32(bp->d);
+                w[r][0] = (vsc)load16u(bp->qs);
+                w[r][1] = (vsc)load16u(bp->qs + 16);
+            }
+            iq4_place_chunk(T, b, w, sc);
+        }
+    }
+}
+
 // ---- weight repack: MXFP4 (same shape as IQ4_NL, different table+scale) ----
 extern "C" void mxfp4_repack_a(const block_mxfp4 * A, int64_t lda,
                                int64_t m, int64_t k, void * packed) {
@@ -395,6 +419,7 @@ extern "C" void NAME(int64_t m, int64_t n, int64_t k,                          \
 IQ4_ONESHOT(gemm_iq4_nl_q8_0_ppc, block_iq4_nl, iq4nl_repack_a, block_q8_0, iq4_pack_b_q8_0, 1)
 IQ4_ONESHOT(gemm_iq4_xs_q8_K_ppc, block_iq4_xs, iq4xs_repack_a, block_q8_K, iq4_pack_b_q8_K, 2)
 IQ4_ONESHOT(gemm_mxfp4_q8_0_ppc, block_mxfp4, mxfp4_repack_a, block_q8_0, iq4_pack_b_q8_0, 3)
+IQ4_ONESHOT(gemm_q8_0_q8_0_ppc, block_q8_0, q8_0_repack_a, block_q8_0, iq4_pack_b_q8_0, 4)
 
 #endif // __MMA__
 
