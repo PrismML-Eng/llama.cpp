@@ -339,18 +339,21 @@ export class MCPService {
 	}
 
 	/**
-	 * Create transport based on server configuration.
-	 * Supports WebSocket, StreamableHTTP (modern), and SSE (legacy) transports.
-	 * When `useProxy` is enabled, routes HTTP requests through llama-server's CORS proxy.
+	 * Creates an MCP transport based on the configured transport type.
+	 * Supports WebSocket, Streamable HTTP (modern), and legacy SSE transports.
 	 *
-	 * **Fallback Order:**
-	 * 1. WebSocket — if explicitly configured (no CORS proxy support)
-	 * 2. StreamableHTTP — default for HTTP connections
-	 * 3. SSE — automatic fallback if StreamableHTTP fails
+	 * When `useProxy` is enabled, HTTP-based transports are routed through
+	 * llama-server's CORS proxy. WebSocket connections are established directly.
 	 *
-	 * @param config - Server configuration with url, transport type, proxy, and auth settings
-	 * @returns Object containing the created transport and the transport type used
-	 * @throws {Error} If url is missing, WebSocket + proxy combination, or all transports fail
+	 * The configured transport is always respected. Streamable HTTP remains the
+	 * default when no transport is explicitly configured.
+	 *
+	 * @param config - Server configuration containing the URL, transport type,
+	 * proxy, and authentication settings.
+	 * @returns The created transport, the selected transport type, and a cleanup
+	 * function for connection logging.
+	 * @throws {Error} If the server URL is missing, an unsupported transport
+	 * configuration is requested, or the selected transport cannot be created.
 	 */
 	static createTransport(
 		serverName: string,
