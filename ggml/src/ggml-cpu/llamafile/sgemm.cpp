@@ -49,6 +49,7 @@
 #endif
 
 #include "sgemm.h"
+#include "qbit_ppc_mma.h"
 #include "ggml-impl.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-quants.h"
@@ -3956,6 +3957,32 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
             (float *)C, ldc,
             params->ith, params->nth};
         tb.matmul(m, n);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_Q1_0: {
+        if (Btype != GGML_TYPE_Q8_0)
+            return false;
+#if defined(__MMA__)
+        gemm_q1_0_q8_0_ppc_v3(m, n, k * QK1_0,
+            A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_Q2_0: {
+        if (Btype != GGML_TYPE_Q8_0)
+            return false;
+#if defined(__MMA__)
+        gemm_q2_0_q8_0_ppc_v3(m, n, k * QK2_0,
+            A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
         return true;
 #else
         return false;
