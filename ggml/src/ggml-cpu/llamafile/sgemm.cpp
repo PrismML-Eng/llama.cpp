@@ -50,6 +50,7 @@
 
 #include "sgemm.h"
 #include "qbit_ppc_mma.h"
+#include "kquants_ppc_mma.h"
 #include "ggml-impl.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-quants.h"
@@ -3957,6 +3958,54 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
             (float *)C, ldc,
             params->ith, params->nth};
         tb.matmul(m, n);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_Q4_K: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        gemm_q4_K_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_Q5_K: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        gemm_q5_K_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_Q6_K: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        gemm_q6_K_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_Q2_K: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        gemm_q2_K_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
         return true;
 #else
         return false;
