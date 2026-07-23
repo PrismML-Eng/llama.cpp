@@ -822,6 +822,18 @@ extern "C" void NAME(int64_t m, int64_t n, int64_t k,                          \
         if (fresh) { REPACK(A, lda, m, k, (void *)PA);                    \
                      ppc_apack_cache_publish(Av, m, k, VARIANT); }             \
         const int64_t njt = (n + NR - 1) / NR;                                 \
+        if (njt < nth) {                                               \
+            /* n too small to feed every thread by columns (worst      \
+               case n == 1 generation: one column, nth-1 idle threads  \
+               while scalar row-partitions). Row-partition with the    \
+               cached pack instead; the full activation pack is tiny   \
+               at these n. Field regression, Q4_K tg32, 2026-07-21. */ \
+            void * PBs = aligned_alloc(64, BSZ(n, k));                 \
+            if (!PBs) { GGML_ABORT("ppc-mma: pack alloc failed"); }    \
+            PACKB(B, ldb, n, k, PBs);                                  \
+            GEMM(m, n, k, PA, PBs, C, ldc, ith, nth);                  \
+            free(PBs);                                                 \
+        } else {                                                       \
         const int64_t jpt = (njt + nth - 1) / nth;                             \
         const int64_t jt0 = (int64_t)ith*jpt;                                  \
         const int64_t jt1 = (ith+1)*jpt < njt ? (ith+1)*jpt : njt;             \
@@ -835,6 +847,7 @@ extern "C" void NAME(int64_t m, int64_t n, int64_t k,                          \
             GEMM(m, nc, k, PA, PBl, C + j0*ldc, ldc, 0, 1);                                                         \
             free(PBl);                                                         \
         }                                                                      \
+        }                                                              \
     } else {                                                                   \
         void * PB = aligned_alloc(64, BSZ(n, k));                            \
         if (!PB) { GGML_ABORT("ppc-mma: pack alloc failed"); }                \
@@ -874,6 +887,18 @@ extern "C" void gemm_nvfp4_q8_0_ppc(int64_t m, int64_t n, int64_t k,
         if (fresh) { grid16_repack_nvfp4(A, lda, m, k, (void *)PA);
                      ppc_apack_cache_publish(Av, m, k, 19); }
         const int64_t njt = (n + NR - 1) / NR;
+        if (njt < nth) {
+            /* n too small to feed every thread by columns (worst
+               case n == 1 generation: one column, nth-1 idle threads
+               while scalar row-partitions). Row-partition with the
+               cached pack instead; the full activation pack is tiny
+               at these n. Field regression, Q4_K tg32, 2026-07-21. */
+            void * PBs = aligned_alloc(64, grid16_bpack_size(n, k));
+            if (!PBs) { GGML_ABORT("ppc-mma: pack alloc failed"); }
+            grid16_pack_b_q8_0(B, ldb, n, k, PBs);
+            grid16_gemm_packed(m, n, k, PA, PBs, C, ldc, ith, nth);
+            free(PBs);
+        } else {
         const int64_t jpt = (njt + nth - 1) / nth;
         const int64_t jt0 = (int64_t)ith*jpt;
         const int64_t jt1 = (ith+1)*jpt < njt ? (ith+1)*jpt : njt;
@@ -885,6 +910,7 @@ extern "C" void gemm_nvfp4_q8_0_ppc(int64_t m, int64_t n, int64_t k,
             grid16_pack_b_q8_0(B + j0*ldb, ldb, nc, k, PBl);
             grid16_gemm_packed(m, nc, k, PA, PBl, C + j0*ldc, ldc, 0, 1);
             free(PBl);
+        }
         }
     } else {
         void * PB = aligned_alloc(64, grid16_bpack_size(n, k));

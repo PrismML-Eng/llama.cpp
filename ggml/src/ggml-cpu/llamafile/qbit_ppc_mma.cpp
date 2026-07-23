@@ -421,6 +421,18 @@ extern "C" void NAME(int64_t m, int64_t n, int64_t k,                          \
         if (fresh) { REPACK(A, lda, m, k, PA);                                 \
                      ppc_apack_cache_publish(Av, m, k, VARIANT); }             \
         const int64_t njt = (n + NR - 1) / NR;                                 \
+        if (njt < nth) {                                               \
+            /* n too small to feed every thread by columns (worst      \
+               case n == 1 generation: one column, nth-1 idle threads  \
+               while scalar row-partitions). Row-partition with the    \
+               cached pack instead; the full activation pack is tiny   \
+               at these n. Field regression, Q4_K tg32, 2026-07-21. */ \
+            void * PBs = aligned_alloc(64, qbit_bpack_size(n, k));     \
+            if (!PBs) { GGML_ABORT("ppc-mma: pack alloc failed"); }    \
+            qbit_pack_b(B, ldb, n, k, PBs);                            \
+            qbit_gemm_packed(m, n, k, ALPHA, PA, PBs, C, ldc, ith, nth); \
+            free(PBs);                                                 \
+        } else {                                                       \
         const int64_t jpt = (njt + nth - 1) / nth;                             \
         const int64_t jt0 = (int64_t)ith*jpt;                                  \
         const int64_t jt1 = (ith+1)*jpt < njt ? (ith+1)*jpt : njt;             \
@@ -434,6 +446,7 @@ extern "C" void NAME(int64_t m, int64_t n, int64_t k,                          \
             qbit_gemm_packed(m, nc, k, ALPHA, PA, PBl, C + j0*ldc, ldc, 0, 1);                                                         \
             free(PBl);                                                         \
         }                                                                      \
+        }                                                              \
     } else {                                                                   \
         void * PB = aligned_alloc(64, qbit_bpack_size(n, k));                            \
         if (!PB) { GGML_ABORT("ppc-mma: pack alloc failed"); }                \
