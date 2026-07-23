@@ -18,6 +18,15 @@ void gemm_q6_K_q8_K_ppc(int64_t m, int64_t n, int64_t k,
 void gemm_q2_K_q8_K_ppc(int64_t m, int64_t n, int64_t k,
         const void * A, int64_t lda, const void * B, int64_t ldb,
         float * C, int64_t ldc, int ith, int nth);
+void gemm_q3_K_q8_K_ppc(int64_t m, int64_t n, int64_t k,
+        const void * A, int64_t lda, const void * B, int64_t ldb,
+        float * C, int64_t ldc, int ith, int nth);
+void gemm_iq4_nl_q8_0_ppc(int64_t m, int64_t n, int64_t k,
+        const void * A, int64_t lda, const void * B, int64_t ldb,
+        float * C, int64_t ldc, int ith, int nth);
+void gemm_iq4_xs_q8_K_ppc(int64_t m, int64_t n, int64_t k,
+        const void * A, int64_t lda, const void * B, int64_t ldb,
+        float * C, int64_t ldc, int ith, int nth);
 #ifdef __cplusplus
 }
 #endif
