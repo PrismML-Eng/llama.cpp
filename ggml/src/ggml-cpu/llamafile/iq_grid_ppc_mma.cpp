@@ -325,6 +325,13 @@ static inline void mma_transpose4(const vui rows[4], vuc * out, int stride) {
 
 static inline int hsum(vsi s) { return s[0] + s[1] + s[2] + s[3]; }
 
+#ifdef IQGRID_LXVP
+static inline void load_pair(const vuc * p, vuc out[2]) {
+    __vector_pair vp = *(const __vector_pair *)p;
+    __builtin_vsx_disassemble_pair((void *)out, &vp);
+}
+#endif
+
 static void grid_place_chunk(agrid_t * T, int64_t ch,
                              const vsc w[MR][2], const float scale[MR]) {
     for (int g = 0; g < 2; g++) {
@@ -449,8 +456,16 @@ __attribute__((unused)) static void kernel_grid_8x8(const agrid_t * PA, const bg
             for (int cgi = 0; cgi < 2; cgi++)
                 __builtin_mma_xxsetaccz(&acc[g][cgi]);
         for (int x = 0; x < 8; x++) {
+#ifdef IQGRID_LXVP
+            vuc wv[2], yv[2];
+            load_pair(a + 2*x, wv);
+            load_pair(y + 2*x, yv);
+            const vuc w0 = wv[0], w1 = wv[1];
+            const vuc y0 = yv[0], y1 = yv[1];
+#else
             const vuc w0 = a[2*x], w1 = a[2*x + 1];
             const vuc y0 = y[2*x], y1 = y[2*x + 1];
+#endif
             __builtin_mma_xvi8ger4pp(&acc[0][0], w0, y0);
             __builtin_mma_xvi8ger4pp(&acc[0][1], w0, y1);
             __builtin_mma_xvi8ger4pp(&acc[1][0], w1, y0);
@@ -494,8 +509,16 @@ static inline void grid_pp_compute(const vuc * a, const vuc * y,
         for (int cgi = 0; cgi < 2; cgi++)
             __builtin_mma_xxsetaccz(&acc[g][cgi]);
     for (int x = 0; x < 8; x++) {
+#ifdef IQGRID_LXVP
+        vuc wv[2], yv[2];
+        load_pair(a + 2*x, wv);
+        load_pair(y + 2*x, yv);
+        const vuc w0 = wv[0], w1 = wv[1];
+        const vuc y0 = yv[0], y1 = yv[1];
+#else
         const vuc w0 = a[2*x], w1 = a[2*x + 1];
         const vuc y0 = y[2*x], y1 = y[2*x + 1];
+#endif
         __builtin_mma_xvi8ger4pp(&acc[0][0], w0, y0);
         __builtin_mma_xvi8ger4pp(&acc[0][1], w0, y1);
         __builtin_mma_xvi8ger4pp(&acc[1][0], w1, y0);

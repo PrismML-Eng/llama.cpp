@@ -202,9 +202,14 @@ static void kernel4k_16x8(const a4k_t * PA, const b4k_t * PB,
             const vuc * a = PA->v[ch];
             const vuc * y = PB->v[ch];
             if (ch + 1 < 8*nsl) {
+#ifdef PPC_DCBT_STREAM
+                __asm__ volatile(\"dcbt 0,%0,8\" :: \"r\"(PA->v[ch + 1]));
+                __asm__ volatile(\"dcbt 0,%0,8\" :: \"r\"(PB->v[ch + 1]));
+#else
                 __builtin_prefetch(PA->v[ch + 1], 0, 3);
                 __builtin_prefetch((const char *)PA->v[ch + 1] + 256, 0, 3);
                 __builtin_prefetch(PB->v[ch + 1], 0, 3);
+#endif
             }
             __vector_quad acc[2][4];
             for (int i = 0; i < 2; i++)
