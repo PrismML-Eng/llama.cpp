@@ -840,10 +840,16 @@ extern "C" void NAME(int64_t m, int64_t n, int64_t k,                          \
     const BLKA * A = (const BLKA *)Av;                                         \
     const block_q8_K_ppc * B = (const block_q8_K_ppc *)Bv;                     \
     int fresh = 0;                                                             \
-    void * PA = ppc_apack_cache_acquire(Av, m, k, VARIANT, ASZ(m, k), &fresh); \
+    void * PA = ppc_apack_cache_acquire_par(Av, m, k, VARIANT,            \
+                                            ASZ(m, k), nth, &fresh);     \
     if (PA) {                                                                  \
-        if (fresh) { REPACK(A, lda, m, k, (void *)PA);                    \
-                     ppc_apack_cache_publish(Av, m, k, VARIANT); }             \
+        if (fresh) {                                                      \
+            int64_t i0_, rows_;                                           \
+            ppc_apack_slice(m, MR, ith, nth, &i0_, &rows_);               \
+            if (rows_ > 0) REPACK(A + i0_*lda, lda, rows_, k,             \
+                       (void *)((agrid_t *)PA + (i0_/MR)*sl(k)));         \
+            ppc_apack_cache_slice_done(Av, m, k, VARIANT);                \
+        }                                                                 \
         const int64_t njt = (n + NR - 1) / NR;                                 \
         if (njt < nth) {                                               \
             /* n too small to feed every thread by columns (worst      \
@@ -905,10 +911,16 @@ extern "C" void gemm_nvfp4_q8_0_ppc(int64_t m, int64_t n, int64_t k,
     const block_nvfp4_ppc * A = (const block_nvfp4_ppc *)Av;
     const block_q8_0_ppc * B = (const block_q8_0_ppc *)Bv;
     int fresh = 0;
-    void * PA = ppc_apack_cache_acquire(Av, m, k, 19, grid16_apack_size(m, k), &fresh);
+    void * PA = ppc_apack_cache_acquire_par(Av, m, k, 19,
+                                            grid16_apack_size(m, k), nth, &fresh);
     if (PA) {
-        if (fresh) { grid16_repack_nvfp4(A, lda, m, k, (void *)PA);
-                     ppc_apack_cache_publish(Av, m, k, 19); }
+        if (fresh) {
+            int64_t i0_, rows_;
+            ppc_apack_slice(m, MR, ith, nth, &i0_, &rows_);
+            if (rows_ > 0) grid16_repack_nvfp4(A + i0_*lda, lda, rows_, k,
+                       (void *)((agrid16_t *)PA + (i0_/MR)*sl(k)));
+            ppc_apack_cache_slice_done(Av, m, k, 19);
+        }
         const int64_t njt = (n + NR - 1) / NR;
         if (njt < nth) {
             /* n too small to feed every thread by columns (worst

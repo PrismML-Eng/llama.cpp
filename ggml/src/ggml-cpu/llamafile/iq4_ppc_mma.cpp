@@ -384,11 +384,16 @@ extern "C" void NAME(int64_t m, int64_t n, int64_t k,                          \
     const BLKA * A = (const BLKA *)Av;                                         \
     const YBLK * B = (const YBLK *)Bv;                                         \
     int fresh = 0;                                                             \
-    void * PA = ppc_apack_cache_acquire(Av, m, k, VARIANT,                     \
-                                        iq4_apack_size(m, k), &fresh);                  \
+    void * PA = ppc_apack_cache_acquire_par(Av, m, k, VARIANT,            \
+                                            iq4_apack_size(m, k), nth, &fresh); \
     if (PA) {                                                                  \
-        if (fresh) { REPACK(A, lda, m, k, PA);                                 \
-                     ppc_apack_cache_publish(Av, m, k, VARIANT); }             \
+        if (fresh) {                                                      \
+            int64_t i0_, rows_;                                           \
+            ppc_apack_slice(m, MR, ith, nth, &i0_, &rows_);               \
+            if (rows_ > 0) REPACK(A + i0_*lda, lda, rows_, k,             \
+                       (void *)((aiq4_t *)PA + (i0_/MR)*sl32(k)));        \
+            ppc_apack_cache_slice_done(Av, m, k, VARIANT);                \
+        }                                                                 \
         const int64_t njt = (n + NR - 1) / NR;                                 \
         if (njt < nth) {                                               \
             /* n too small to feed every thread by columns (worst      \

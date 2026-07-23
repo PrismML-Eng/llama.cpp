@@ -42,6 +42,7 @@ typedef struct {
     void  * buf;
     size_t  bytes;
     int     ready;      // 0 = packing in progress, 1 = usable
+    int     pending;    // outstanding parallel pack slices
     int     used;
 } slot_t;
 
@@ -169,6 +170,102 @@ extern "C" void ppc_apack_cache_clear(void) {
             memset(&g_slots[i], 0, sizeof(g_slots[i]));
         }
     pthread_mutex_unlock(&g_mu);
+}
+
+// Parallel first touch. All nth threads of one ggml op call
+// acquire_par with the same (key, m, k, variant, nth); the first
+// arrival creates the slot with pending = nth, and EVERY caller that
+// sees the slot unready gets the buffer with *fresh = 1: each packs
+// its disjoint row-tile slice, then calls slice_done, which counts
+// down and blocks until the pack is whole.  Later ops hit ready
+// slots and take the plain path (*fresh = 0).  Single-threaded cold
+// start was measured at ~0.5 GB/s for grid decode -- 3 s of one
+// thread working and seven waiting on a 1.5B model, worse for bigger
+// ones (VALIDATION-POWER10.md, remaining-work item 2).
+extern "C" void * ppc_apack_cache_acquire_par(const void * key, int64_t m, int64_t k,
+                                              int variant, size_t bytes, int nth,
+                                              int * fresh) {
+    *fresh = 0;
+    pthread_mutex_lock(&g_mu);
+    cap_init_locked();
+    if (g_cap == 0 || bytes > g_cap) {
+        if (g_cap != 0) refuse_locked(bytes);
+        pthread_mutex_unlock(&g_mu);
+        return NULL;
+    }
+    const uint64_t fp = fingerprint(key, m, k);
+    for (;;) {
+        slot_t * hit = NULL;
+        slot_t * stale = NULL;
+        for (int i = 0; i < g_nslots; i++)
+            if (g_slots[i].used && g_slots[i].key == key && g_slots[i].m == m &&
+                g_slots[i].k == k && g_slots[i].variant == variant) {
+                if (g_slots[i].fp == fp) { hit = &g_slots[i]; }
+                else { stale = &g_slots[i]; }
+                break;
+            }
+        if (stale && stale->ready) {
+            free(stale->buf);
+            g_total -= stale->bytes;
+            memset(stale, 0, sizeof(*stale));
+        } else if (stale) {
+            while (!stale->ready) pthread_cond_wait(&g_cv, &g_mu);
+            continue;
+        }
+        if (hit) {
+            void * b = hit->buf;
+            if (!hit->ready) *fresh = 1;   // join the parallel fill
+            pthread_mutex_unlock(&g_mu);
+            return b;
+        }
+        slot_t * dst = NULL;
+        for (int i = 0; i < g_nslots; i++)
+            if (!g_slots[i].used) { dst = &g_slots[i]; break; }
+        if (!dst) {
+            const int before = g_nslots;
+            if (!grow_locked()) { refuse_locked(bytes); pthread_mutex_unlock(&g_mu); return NULL; }
+            dst = &g_slots[before];
+        }
+        if (g_total + bytes > g_cap) { refuse_locked(bytes); pthread_mutex_unlock(&g_mu); return NULL; }
+        void * buf = aligned_alloc(64, bytes);
+        if (!buf) { refuse_locked(bytes); pthread_mutex_unlock(&g_mu); return NULL; }
+        dst->key = key; dst->fp = fp; dst->m = m; dst->k = k; dst->variant = variant;
+        dst->buf = buf; dst->bytes = bytes; dst->ready = 0; dst->pending = nth; dst->used = 1;
+        g_total += bytes;
+        g_admitted++;
+        *fresh = 1;
+        pthread_mutex_unlock(&g_mu);
+        return buf;
+    }
+}
+
+extern "C" void ppc_apack_cache_slice_done(const void * key, int64_t m, int64_t k, int variant) {
+    pthread_mutex_lock(&g_mu);
+    slot_t * s = NULL;
+    for (int i = 0; i < g_nslots; i++)
+        if (g_slots[i].used && g_slots[i].key == key && g_slots[i].m == m &&
+            g_slots[i].k == k && g_slots[i].variant == variant) { s = &g_slots[i]; break; }
+    if (s) {
+        if (s->pending > 0 && --s->pending == 0) {
+            s->ready = 1;
+            pthread_cond_broadcast(&g_cv);
+        }
+        while (!s->ready) pthread_cond_wait(&g_cv, &g_mu);
+    }
+    pthread_mutex_unlock(&g_mu);
+}
+
+// Row-tile slice assignment for the parallel fill: MR-aligned, evenly
+// spread, empty for surplus threads.
+extern "C" void ppc_apack_slice(int64_t m, int mr, int ith, int nth,
+                                int64_t * i0, int64_t * rows) {
+    const int64_t tiles = (m + mr - 1) / mr;
+    const int64_t tpt = (tiles + nth - 1) / nth;
+    int64_t t0 = (int64_t)ith * tpt, t1 = t0 + tpt;
+    if (t1 > tiles) t1 = tiles;
+    if (t0 >= t1) { *i0 = 0; *rows = 0; return; }
+    *i0 = t0 * mr;
+    *rows = (t1 * mr < m ? t1 * mr : m) - *i0;
 }
 
 // observability: totals since process start

@@ -80,6 +80,10 @@ void gemm_q4_0_q8_0_ppc(int64_t m, int64_t n, int64_t k,
 void * ppc_apack_cache_acquire(const void * key, int64_t m, int64_t k,
                                int variant, size_t bytes, int * fresh);
 void ppc_apack_cache_publish(const void * key, int64_t m, int64_t k, int variant);
+void * ppc_apack_cache_acquire_par(const void * key, int64_t m, int64_t k,
+                                   int variant, size_t bytes, int nth, int * fresh);
+void ppc_apack_cache_slice_done(const void * key, int64_t m, int64_t k, int variant);
+void ppc_apack_slice(int64_t m, int mr, int ith, int nth, int64_t * i0, int64_t * rows);
 void ppc_apack_cache_clear(void);
 #ifdef __cplusplus
 }
