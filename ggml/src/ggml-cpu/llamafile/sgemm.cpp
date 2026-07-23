@@ -3971,6 +3971,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_K)
             return false;
 #if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
         gemm_q4_K_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
@@ -3983,6 +3987,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_K)
             return false;
 #if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
         gemm_q5_K_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
@@ -3995,6 +4003,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_K)
             return false;
 #if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
         gemm_q6_K_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
@@ -4007,6 +4019,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_K)
             return false;
 #if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
         gemm_q2_K_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
@@ -4019,6 +4035,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_K)
             return false;
 #if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
         gemm_q3_K_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
@@ -4031,6 +4051,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_K)
             return false;
 #if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
         gemm_iq4_xs_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
@@ -4043,6 +4067,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_1)
             return false;
 #if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
         gemm_q4_1_q8_1_ppc(m, n, k * QK4_1, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
@@ -4055,6 +4083,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_1)
             return false;
 #if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
         gemm_q5_1_q8_1_ppc(m, n, k * QK5_1, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
@@ -4067,6 +4099,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_K)
             return false;
 #if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
         gemm_tq2_0_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
@@ -4079,6 +4115,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_K)
             return false;
 #if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
         gemm_tq1_0_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
@@ -4091,6 +4131,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_K)
             return false;
 #if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
         gemm_iq2_xxs_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
@@ -4103,6 +4147,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_K)
             return false;
 #if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
         gemm_iq3_xxs_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
@@ -4115,6 +4163,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_K)
             return false;
 #if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
         gemm_iq3_s_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
@@ -4127,6 +4179,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_K)
             return false;
 #if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
         gemm_iq1_s_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
@@ -4139,6 +4195,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_0)
             return false;
 #if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
         gemm_mxfp4_q8_0_ppc(m, n, k * QK_MXFP4, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
@@ -4151,6 +4211,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_K)
             return false;
 #if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
         gemm_iq2_xs_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
@@ -4163,6 +4227,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_K)
             return false;
 #if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
         gemm_iq2_s_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
@@ -4175,6 +4243,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_K)
             return false;
 #if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
         gemm_iq1_m_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
@@ -4187,6 +4259,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         if (Btype != GGML_TYPE_Q8_0)
             return false;
 #if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
         gemm_nvfp4_q8_0_ppc(m, n, k * QK_NVFP4, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
@@ -4269,6 +4345,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         tb.matmul(m, n);
         return true;
 #elif defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
         gemm_q5_0_q8_0_ppc(m, n, k * QK5_0, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;
@@ -4289,6 +4369,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         tb.matmul(m, n);
         return true;
 #elif defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
         gemm_iq4_nl_q8_0_ppc(m, n, k * QK4_NL, A, lda, B, ldb,
             (float *)C, ldc, params->ith, params->nth);
         return true;

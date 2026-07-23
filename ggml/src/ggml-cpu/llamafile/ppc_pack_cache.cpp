@@ -38,7 +38,7 @@
 #include <cstring>
 #include <pthread.h>
 
-#define PPC_PACK_CACHE_SLOTS 128
+#define PPC_PACK_CACHE_SLOTS 1024
 
 typedef struct {
     const void * key;
