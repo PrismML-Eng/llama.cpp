@@ -298,30 +298,43 @@ extern "C" void NAME(int64_t m, int64_t n, int64_t k,                          \
         float * C, int64_t ldc, int ith, int nth) {                            \
     const BLKA * A = (const BLKA *)Av;                                         \
     const YBLK * B = (const YBLK *)Bv;                                         \
-    void * PB = aligned_alloc(64, leg_bpack_size(n, k));                       \
-    if (!PB) { GGML_ABORT("ppc-mma: pack alloc failed"); }                     \
-    PACKB(B, ldb, n, k, PB);                                                   \
     int fresh = 0;                                                             \
     void * PA = ppc_apack_cache_acquire(Av, m, k, VARIANT,                     \
-                                        leg_apack_size(m, k), &fresh);         \
+                                        leg_apack_size(m, k), &fresh);                  \
     if (PA) {                                                                  \
         if (fresh) { REPACK(A, lda, m, k, PA);                                 \
                      ppc_apack_cache_publish(Av, m, k, VARIANT); }             \
-        GEMM(m, n, k, PA, PB, C, ldc, ith, nth);                               \
+        const int64_t njt = (n + NR - 1) / NR;                                 \
+        const int64_t jpt = (njt + nth - 1) / nth;                             \
+        const int64_t jt0 = (int64_t)ith*jpt;                                  \
+        const int64_t jt1 = (ith+1)*jpt < njt ? (ith+1)*jpt : njt;             \
+        if (jt0 < jt1) {                                                       \
+            const int64_t j0 = jt0*NR;                                         \
+            const int64_t nc = (n - j0) < (jt1 - jt0)*NR ? (n - j0)            \
+                                                         : (jt1 - jt0)*NR;    \
+            void * PBl = aligned_alloc(64, leg_bpack_size(nc, k));                      \
+            if (!PBl) { GGML_ABORT("ppc-mma: pack alloc failed"); }           \
+            PACKB(B + j0*ldb, ldb, nc, k, PBl);                                                 \
+            GEMM(m, nc, k, PA, PBl, C + j0*ldc, ldc, 0, 1);                                                         \
+            free(PBl);                                                         \
+        }                                                                      \
     } else {                                                                   \
-        void * PT = aligned_alloc(64, leg_apack_size(MR, k));                  \
-        if (!PT) { GGML_ABORT("ppc-mma: pack alloc failed"); }                 \
+        void * PB = aligned_alloc(64, leg_bpack_size(n, k));                            \
+        if (!PB) { GGML_ABORT("ppc-mma: pack alloc failed"); }                \
+        PACKB(B, ldb, n, k, PB);                                                      \
+        void * PT = aligned_alloc(64, leg_apack_size(MR, k));                           \
+        if (!PT) { GGML_ABORT("ppc-mma: pack alloc failed"); }                \
         const int64_t mt = (m + MR - 1) / MR;                                  \
         const int64_t tpt = (mt + nth - 1) / nth;                              \
         for (int64_t it = ith*tpt; it < (ith+1)*tpt && it < mt; it++) {        \
             const int64_t i = it*MR;                                           \
             const int64_t rows = (m - i) < MR ? (m - i) : MR;                  \
             REPACK(A + i*lda, lda, rows, k, PT);                               \
-            GEMM(rows, n, k, PT, PB, C + i, ldc, 0, 1);                        \
+            GEMM(rows, n, k, PT, PB, C + i, ldc, 0, 1);                                                          \
         }                                                                      \
         free(PT);                                                              \
+        free(PB);                                                              \
     }                                                                          \
-    free(PB);                                                                  \
 }
 LEG_ONESHOT(gemm_q4_1_q8_1_ppc, block_q4_1, leg_repack_q4_1, block_q8_1, leg_pack_b_q8_1, leg_gemm_affine, 25)
 LEG_ONESHOT(gemm_q5_0_q8_0_ppc, block_q5_0, leg_repack_q5_0, block_q8_0, leg_pack_b_q8_0, leg_gemm_offset, 26)

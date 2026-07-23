@@ -740,29 +740,42 @@ extern "C" void NAME(int64_t m, int64_t n, int64_t k,                          \
         float * C, int64_t ldc, int ith, int nth) {                            \
     const BLKA * A = (const BLKA *)Av;                                         \
     const block_q8_K_ppc * B = (const block_q8_K_ppc *)Bv;                     \
-    void * PB = aligned_alloc(64, BSZ(n, k));                                  \
-    if (!PB) { GGML_ABORT("ppc-mma: pack alloc failed"); }                     \
-    PACKB(B, ldb, n, k, PB);                                                   \
     int fresh = 0;                                                             \
     void * PA = ppc_apack_cache_acquire(Av, m, k, VARIANT, ASZ(m, k), &fresh); \
     if (PA) {                                                                  \
-        if (fresh) { REPACK(A, lda, m, k, (void *)PA);                         \
+        if (fresh) { REPACK(A, lda, m, k, (void *)PA);                    \
                      ppc_apack_cache_publish(Av, m, k, VARIANT); }             \
-        GEMM(m, n, k, PA, PB, C, ldc, ith, nth);                               \
+        const int64_t njt = (n + NR - 1) / NR;                                 \
+        const int64_t jpt = (njt + nth - 1) / nth;                             \
+        const int64_t jt0 = (int64_t)ith*jpt;                                  \
+        const int64_t jt1 = (ith+1)*jpt < njt ? (ith+1)*jpt : njt;             \
+        if (jt0 < jt1) {                                                       \
+            const int64_t j0 = jt0*NR;                                         \
+            const int64_t nc = (n - j0) < (jt1 - jt0)*NR ? (n - j0)            \
+                                                         : (jt1 - jt0)*NR;    \
+            void * PBl = aligned_alloc(64, BSZ(nc, k));                      \
+            if (!PBl) { GGML_ABORT("ppc-mma: pack alloc failed"); }           \
+            PACKB(B + j0*ldb, ldb, nc, k, PBl);                              \
+            GEMM(m, nc, k, PA, PBl, C + j0*ldc, ldc, 0, 1);                                                         \
+            free(PBl);                                                         \
+        }                                                                      \
     } else {                                                                   \
-        void * PT = aligned_alloc(64, ASZ(MR, k));                             \
-        if (!PT) { GGML_ABORT("ppc-mma: pack alloc failed"); }                 \
+        void * PB = aligned_alloc(64, BSZ(n, k));                            \
+        if (!PB) { GGML_ABORT("ppc-mma: pack alloc failed"); }                \
+        PACKB(B, ldb, n, k, PB);                                             \
+        void * PT = aligned_alloc(64, ASZ(MR, k));                           \
+        if (!PT) { GGML_ABORT("ppc-mma: pack alloc failed"); }                \
         const int64_t mt = (m + MR - 1) / MR;                                  \
         const int64_t tpt = (mt + nth - 1) / nth;                              \
         for (int64_t it = ith*tpt; it < (ith+1)*tpt && it < mt; it++) {        \
             const int64_t i = it*MR;                                           \
             const int64_t rows = (m - i) < MR ? (m - i) : MR;                  \
-            REPACK(A + i*lda, lda, rows, k, PT);                               \
-            GEMM(rows, n, k, PT, PB, C + i, ldc, 0, 1);                        \
+            REPACK(A + i*lda, lda, rows, k, PT);                          \
+            GEMM(rows, n, k, PT, PB, C + i, ldc, 0, 1);                                                          \
         }                                                                      \
         free(PT);                                                              \
+        free(PB);                                                              \
     }                                                                          \
-    free(PB);                                                                  \
 }
 GRID_ONESHOT_C(gemm_tq2_0_q8_K_ppc,   block_tq2_0_ppc,   grid_repack_tq2_0,   grid_gemm_packed,   grid_apack_size,   grid_bpack_size,   grid_pack_b_q8_K,   10)
 GRID_ONESHOT_C(gemm_tq1_0_q8_K_ppc,   block_tq1_0_ppc,   grid_repack_tq1_0,   grid_gemm_packed,   grid_apack_size,   grid_bpack_size,   grid_pack_b_q8_K,   11)
@@ -779,16 +792,28 @@ extern "C" void gemm_nvfp4_q8_0_ppc(int64_t m, int64_t n, int64_t k,
         float * C, int64_t ldc, int ith, int nth) {
     const block_nvfp4_ppc * A = (const block_nvfp4_ppc *)Av;
     const block_q8_0_ppc * B = (const block_q8_0_ppc *)Bv;
-    void * PB = aligned_alloc(64, grid16_bpack_size(n, k));
-    if (!PB) { GGML_ABORT("ppc-mma: pack alloc failed"); }
-    grid16_pack_b_q8_0(B, ldb, n, k, PB);
     int fresh = 0;
     void * PA = ppc_apack_cache_acquire(Av, m, k, 19, grid16_apack_size(m, k), &fresh);
     if (PA) {
         if (fresh) { grid16_repack_nvfp4(A, lda, m, k, (void *)PA);
                      ppc_apack_cache_publish(Av, m, k, 19); }
-        grid16_gemm_packed(m, n, k, PA, PB, C, ldc, ith, nth);
+        const int64_t njt = (n + NR - 1) / NR;
+        const int64_t jpt = (njt + nth - 1) / nth;
+        const int64_t jt0 = (int64_t)ith*jpt;
+        const int64_t jt1 = (ith+1)*jpt < njt ? (ith+1)*jpt : njt;
+        if (jt0 < jt1) {
+            const int64_t j0 = jt0*NR;
+            const int64_t nc = (n - j0) < (jt1 - jt0)*NR ? (n - j0) : (jt1 - jt0)*NR;
+            void * PBl = aligned_alloc(64, grid16_bpack_size(nc, k));
+            if (!PBl) { GGML_ABORT("ppc-mma: pack alloc failed"); }
+            grid16_pack_b_q8_0(B + j0*ldb, ldb, nc, k, PBl);
+            grid16_gemm_packed(m, nc, k, PA, PBl, C + j0*ldc, ldc, 0, 1);
+            free(PBl);
+        }
     } else {
+        void * PB = aligned_alloc(64, grid16_bpack_size(n, k));
+        if (!PB) { GGML_ABORT("ppc-mma: pack alloc failed"); }
+        grid16_pack_b_q8_0(B, ldb, n, k, PB);
         void * PT = aligned_alloc(64, grid16_apack_size(MR, k));
         if (!PT) { GGML_ABORT("ppc-mma: pack alloc failed"); }
         const int64_t mt = (m + MR - 1) / MR;
@@ -800,8 +825,8 @@ extern "C" void gemm_nvfp4_q8_0_ppc(int64_t m, int64_t n, int64_t k,
             grid16_gemm_packed(rows, n, k, PT, PB, C + i, ldc, 0, 1);
         }
         free(PT);
+        free(PB);
     }
-    free(PB);
 }
 
 #endif // __MMA__

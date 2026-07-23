@@ -19,8 +19,17 @@
 //     override, 0 disables).  On miss-with-full-cache or allocation
 //     failure, acquire returns NULL and callers fall back to the
 //     per-call packing path -- behavior is never wrong, only slower.
-//   * Round-robin eviction of ready entries; entries being packed are
-//     never evicted.
+//   * NO eviction: once full (slots or bytes), new tensors are simply
+//     not admitted and their callers use the per-call path.  Eviction
+//     was rejected deliberately: an inference working set that exceeds
+//     the cap cycles through every tensor once per token, and any
+//     evicting policy then re-packs evicted tensors every token --
+//     strictly worse than the per-call baseline.  Admission-only makes
+//     the cache's effect monotonic: cached tensors win, the rest are
+//     exactly at baseline.
+//   * A cheap content fingerprint (first+last 32 bytes of the tensor)
+//     is folded into the key, so a model unload/reload that lands new
+//     weights at the same address does not serve stale packs.
 
 #include "kquants_ppc_mma.h"
 
@@ -33,6 +42,7 @@
 
 typedef struct {
     const void * key;
+    uint64_t fp;
     int64_t m, k;
     int     variant;
     void  * buf;
@@ -43,9 +53,20 @@ typedef struct {
 
 static slot_t g_slots[PPC_PACK_CACHE_SLOTS];
 static size_t g_total = 0;
+
+static uint64_t fingerprint(const void * p, int64_t m, int64_t k) {
+    // first and last 32 bytes of the raw tensor data; the row extent is
+    // conservatively the smallest any format uses (m rows x k/8 bytes).
+    const uint8_t * b = (const uint8_t *)p;
+    const size_t approx = (size_t)m * (size_t)(k/8);
+    const size_t tail = approx >= 32 ? approx - 32 : 0;
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < 32; i++) { h ^= b[i]; h *= 1099511628211ull; }
+    for (int i = 0; i < 32; i++) { h ^= b[tail + i]; h *= 1099511628211ull; }
+    return h;
+}
 static size_t g_cap   = (size_t)2048 * 1024 * 1024;
 static int    g_cap_init = 0;
-static unsigned g_evict = 0;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_cv = PTHREAD_COND_INITIALIZER;
 
@@ -62,43 +83,57 @@ extern "C" void * ppc_apack_cache_acquire(const void * key, int64_t m, int64_t k
     pthread_mutex_lock(&g_mu);
     cap_init_locked();
     if (g_cap == 0 || bytes > g_cap) { pthread_mutex_unlock(&g_mu); return NULL; }
+    const uint64_t fp = fingerprint(key, m, k);
     for (;;) {
         slot_t * hit = NULL;
+        slot_t * stale = NULL;
         for (int i = 0; i < PPC_PACK_CACHE_SLOTS; i++)
             if (g_slots[i].used && g_slots[i].key == key && g_slots[i].m == m &&
-                g_slots[i].k == k && g_slots[i].variant == variant) { hit = &g_slots[i]; break; }
+                g_slots[i].k == k && g_slots[i].variant == variant) {
+                if (g_slots[i].fp == fp) { hit = &g_slots[i]; }
+                else { stale = &g_slots[i]; }   // same address, new contents
+                break;
+            }
+        if (stale && stale->ready) {            // reload detected: retire it
+            free(stale->buf);
+            g_total -= stale->bytes;
+            memset(stale, 0, sizeof(*stale));
+        } else if (stale) {                     // being packed by another thread
+            while (!stale->ready) pthread_cond_wait(&g_cv, &g_mu);
+            continue;
+        }
         if (hit) {
             while (!hit->ready) pthread_cond_wait(&g_cv, &g_mu);
             void * b = hit->buf;
             pthread_mutex_unlock(&g_mu);
             return b;
         }
-        // insert: find a free or evictable slot, respect capacity
+        // admission only -- no eviction (see header)
         slot_t * dst = NULL;
         for (int i = 0; i < PPC_PACK_CACHE_SLOTS; i++)
             if (!g_slots[i].used) { dst = &g_slots[i]; break; }
-        while (!dst || g_total + bytes > g_cap) {
-            // evict a ready entry round-robin
-            slot_t * victim = NULL;
-            for (int t = 0; t < PPC_PACK_CACHE_SLOTS; t++) {
-                slot_t * s = &g_slots[(g_evict + t) % PPC_PACK_CACHE_SLOTS];
-                if (s->used && s->ready) { victim = s; g_evict += t + 1; break; }
-            }
-            if (!victim) { pthread_mutex_unlock(&g_mu); return NULL; }
-            free(victim->buf);
-            g_total -= victim->bytes;
-            memset(victim, 0, sizeof(*victim));
-            if (!dst) dst = victim;
-        }
+        if (!dst || g_total + bytes > g_cap) { pthread_mutex_unlock(&g_mu); return NULL; }
         void * buf = aligned_alloc(64, bytes);
         if (!buf) { pthread_mutex_unlock(&g_mu); return NULL; }
-        dst->key = key; dst->m = m; dst->k = k; dst->variant = variant;
+        dst->key = key; dst->fp = fp; dst->m = m; dst->k = k; dst->variant = variant;
         dst->buf = buf; dst->bytes = bytes; dst->ready = 0; dst->used = 1;
         g_total += bytes;
         *fresh = 1;
         pthread_mutex_unlock(&g_mu);
         return buf;
     }
+}
+
+// explicit invalidation for embedders that unload models
+extern "C" void ppc_apack_cache_clear(void) {
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < PPC_PACK_CACHE_SLOTS; i++)
+        if (g_slots[i].used && g_slots[i].ready) {
+            free(g_slots[i].buf);
+            g_total -= g_slots[i].bytes;
+            memset(&g_slots[i], 0, sizeof(g_slots[i]));
+        }
+    pthread_mutex_unlock(&g_mu);
 }
 
 extern "C" void ppc_apack_cache_publish(const void * key, int64_t m, int64_t k, int variant) {

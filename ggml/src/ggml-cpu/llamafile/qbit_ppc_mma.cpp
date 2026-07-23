@@ -407,37 +407,50 @@ extern "C" void qbit_gemv_q2(int64_t m, int64_t n, int64_t k,
 // dispatch entries (names preserved from the original v3 integration):
 // n == 1 takes the GEMV path -- no packing, no cache, mask-select and
 // vsum4s only; larger n uses the packed GEMM through the pack cache.
-#define QBIT_DRIVER(NAME, BLKA, REPACK, GEMV, ALPHA, VARIANT)                  \
+#define QBIT_DRIVER(NAME, BLKA, REPACK, GEMV, ALPHA, VARIANT)            \
 extern "C" void NAME(int64_t m, int64_t n, int64_t k,                          \
         const void * Av, int64_t lda, const void * Bv, int64_t ldb,            \
         float * C, int64_t ldc, int ith, int nth) {                            \
     const BLKA * A = (const BLKA *)Av;                                         \
     const block_q8_0 * B = (const block_q8_0 *)Bv;                             \
     if (n == 1) { GEMV(m, n, k, A, lda, B, ldb, C, ldc, ith, nth); return; }   \
-    void * PB = aligned_alloc(64, qbit_bpack_size(n, k));                      \
-    if (!PB) { GGML_ABORT("ppc-mma: pack alloc failed"); }                     \
-    qbit_pack_b(B, ldb, n, k, PB);                                             \
     int fresh = 0;                                                             \
     void * PA = ppc_apack_cache_acquire(Av, m, k, VARIANT,                     \
-                                        qbit_apack_size(m, k), &fresh);        \
+                                        qbit_apack_size(m, k), &fresh);                  \
     if (PA) {                                                                  \
         if (fresh) { REPACK(A, lda, m, k, PA);                                 \
                      ppc_apack_cache_publish(Av, m, k, VARIANT); }             \
-        qbit_gemm_packed(m, n, k, ALPHA, PA, PB, C, ldc, ith, nth);            \
+        const int64_t njt = (n + NR - 1) / NR;                                 \
+        const int64_t jpt = (njt + nth - 1) / nth;                             \
+        const int64_t jt0 = (int64_t)ith*jpt;                                  \
+        const int64_t jt1 = (ith+1)*jpt < njt ? (ith+1)*jpt : njt;             \
+        if (jt0 < jt1) {                                                       \
+            const int64_t j0 = jt0*NR;                                         \
+            const int64_t nc = (n - j0) < (jt1 - jt0)*NR ? (n - j0)            \
+                                                         : (jt1 - jt0)*NR;    \
+            void * PBl = aligned_alloc(64, qbit_bpack_size(nc, k));                      \
+            if (!PBl) { GGML_ABORT("ppc-mma: pack alloc failed"); }           \
+            qbit_pack_b(B + j0*ldb, ldb, nc, k, PBl);                                                 \
+            qbit_gemm_packed(m, nc, k, ALPHA, PA, PBl, C + j0*ldc, ldc, 0, 1);                                                         \
+            free(PBl);                                                         \
+        }                                                                      \
     } else {                                                                   \
-        void * PT = aligned_alloc(64, qbit_apack_size(MR, k));                 \
-        if (!PT) { GGML_ABORT("ppc-mma: pack alloc failed"); }                 \
+        void * PB = aligned_alloc(64, qbit_bpack_size(n, k));                            \
+        if (!PB) { GGML_ABORT("ppc-mma: pack alloc failed"); }                \
+        qbit_pack_b(B, ldb, n, k, PB);                                                      \
+        void * PT = aligned_alloc(64, qbit_apack_size(MR, k));                           \
+        if (!PT) { GGML_ABORT("ppc-mma: pack alloc failed"); }                \
         const int64_t mt = (m + MR - 1) / MR;                                  \
         const int64_t tpt = (mt + nth - 1) / nth;                              \
         for (int64_t it = ith*tpt; it < (ith+1)*tpt && it < mt; it++) {        \
             const int64_t i = it*MR;                                           \
             const int64_t rows = (m - i) < MR ? (m - i) : MR;                  \
             REPACK(A + i*lda, lda, rows, k, PT);                               \
-            qbit_gemm_packed(rows, n, k, ALPHA, PT, PB, C + i, ldc, 0, 1);     \
+            qbit_gemm_packed(rows, n, k, ALPHA, PT, PB, C + i, ldc, 0, 1);                                                          \
         }                                                                      \
         free(PT);                                                              \
+        free(PB);                                                              \
     }                                                                          \
-    free(PB);                                                                  \
 }
 QBIT_DRIVER(gemm_q1_0_q8_0_ppc_v3, block_q1_0, qbit_repack_q1, qbit_gemv_q1, 2.0f, 30)
 QBIT_DRIVER(gemm_q2_0_q8_0_ppc_v3, block_q2_0, qbit_repack_q2, qbit_gemv_q2, 1.0f, 31)

@@ -345,36 +345,49 @@ extern "C" void iq4_gemm_packed(int64_t m, int64_t n, int64_t k,
 }
 
 
-#define IQ4_ONESHOT(NAME, BLKA, REPACK, YBLK, PACKB, VARIANT)                  \
+#define IQ4_ONESHOT(NAME, BLKA, REPACK, YBLK, PACKB, VARIANT)            \
 extern "C" void NAME(int64_t m, int64_t n, int64_t k,                          \
         const void * Av, int64_t lda, const void * Bv, int64_t ldb,            \
         float * C, int64_t ldc, int ith, int nth) {                            \
     const BLKA * A = (const BLKA *)Av;                                         \
     const YBLK * B = (const YBLK *)Bv;                                         \
-    void * PB = aligned_alloc(64, iq4_bpack_size(n, k));                       \
-    if (!PB) { GGML_ABORT("ppc-mma: pack alloc failed"); }                     \
-    PACKB(B, ldb, n, k, PB);                                                   \
     int fresh = 0;                                                             \
     void * PA = ppc_apack_cache_acquire(Av, m, k, VARIANT,                     \
-                                        iq4_apack_size(m, k), &fresh);         \
+                                        iq4_apack_size(m, k), &fresh);                  \
     if (PA) {                                                                  \
-        if (fresh) { REPACK(A, lda, m, k, (void *)PA);                         \
+        if (fresh) { REPACK(A, lda, m, k, PA);                                 \
                      ppc_apack_cache_publish(Av, m, k, VARIANT); }             \
-        iq4_gemm_packed(m, n, k, PA, PB, C, ldc, ith, nth);                    \
+        const int64_t njt = (n + NR - 1) / NR;                                 \
+        const int64_t jpt = (njt + nth - 1) / nth;                             \
+        const int64_t jt0 = (int64_t)ith*jpt;                                  \
+        const int64_t jt1 = (ith+1)*jpt < njt ? (ith+1)*jpt : njt;             \
+        if (jt0 < jt1) {                                                       \
+            const int64_t j0 = jt0*NR;                                         \
+            const int64_t nc = (n - j0) < (jt1 - jt0)*NR ? (n - j0)            \
+                                                         : (jt1 - jt0)*NR;    \
+            void * PBl = aligned_alloc(64, iq4_bpack_size(nc, k));                      \
+            if (!PBl) { GGML_ABORT("ppc-mma: pack alloc failed"); }           \
+            PACKB(B + j0*ldb, ldb, nc, k, PBl);                                                 \
+            iq4_gemm_packed(m, nc, k, PA, PBl, C + j0*ldc, ldc, 0, 1);                                                         \
+            free(PBl);                                                         \
+        }                                                                      \
     } else {                                                                   \
-        void * PT = aligned_alloc(64, iq4_apack_size(MR, k));                  \
-        if (!PT) { GGML_ABORT("ppc-mma: pack alloc failed"); }                 \
+        void * PB = aligned_alloc(64, iq4_bpack_size(n, k));                            \
+        if (!PB) { GGML_ABORT("ppc-mma: pack alloc failed"); }                \
+        PACKB(B, ldb, n, k, PB);                                                      \
+        void * PT = aligned_alloc(64, iq4_apack_size(MR, k));                           \
+        if (!PT) { GGML_ABORT("ppc-mma: pack alloc failed"); }                \
         const int64_t mt = (m + MR - 1) / MR;                                  \
         const int64_t tpt = (mt + nth - 1) / nth;                              \
         for (int64_t it = ith*tpt; it < (ith+1)*tpt && it < mt; it++) {        \
             const int64_t i = it*MR;                                           \
             const int64_t rows = (m - i) < MR ? (m - i) : MR;                  \
             REPACK(A + i*lda, lda, rows, k, PT);                               \
-            iq4_gemm_packed(rows, n, k, PT, PB, C + i, ldc, 0, 1);             \
+            iq4_gemm_packed(rows, n, k, PT, PB, C + i, ldc, 0, 1);                                                          \
         }                                                                      \
         free(PT);                                                              \
+        free(PB);                                                              \
     }                                                                          \
-    free(PB);                                                                  \
 }
 IQ4_ONESHOT(gemm_iq4_nl_q8_0_ppc, block_iq4_nl, iq4nl_repack_a, block_q8_0, iq4_pack_b_q8_0, 1)
 IQ4_ONESHOT(gemm_iq4_xs_q8_K_ppc, block_iq4_xs, iq4xs_repack_a, block_q8_K, iq4_pack_b_q8_K, 2)
