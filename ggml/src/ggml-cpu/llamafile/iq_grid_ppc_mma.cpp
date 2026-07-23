@@ -432,7 +432,7 @@ extern "C" void grid_pack_b_q8_K(const block_q8_K_ppc * B, int64_t ldb,
     }
 }
 
-static void kernel_grid_8x8(const agrid_t * PA, const bgrid_t * PB,
+__attribute__((unused)) static void kernel_grid_8x8(const agrid_t * PA, const bgrid_t * PB,
                             int64_t nch, vfl fin[MR][2]) {
     for (int64_t ch = 0; ch < nch; ch++) {
         const vuc * a = PA->v[ch];
@@ -473,6 +473,72 @@ static void kernel_grid_8x8(const agrid_t * PA, const bgrid_t * PB,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Accumulator ping-pong variant (-DIQGRID_PINGPONG), 32-deep kernel.
+//
+// Microarchitectural rationale (Power10 MMA): the eight accumulators
+// are physically resident in the MMA engine; xxmfacc drains engine
+// state to the VRF and serializes against outstanding GERs on that
+// accumulator. The default kernel therefore idles the engine through
+// every per-chunk fixup. This variant runs two 4-accumulator sets in
+// alternation: chunk c+1's GER stream is issued on set B before set A
+// is drained, so the drain + VSU fixup of chunk c overlap live GER
+// execution. Cost: all 8 accumulators alias VSRs 0-31, raising spill
+// pressure (visible in the static count); benefit: engine-idle removal
+// (invisible to any static count). Only silicon can arbitrate --
+// this is hardware experiment #1 in docs/BENCHMARKS-QEMU.md.
+
+static inline void grid_pp_compute(const vuc * a, const vuc * y,
+                                   __vector_quad acc[2][2]) {
+    for (int g = 0; g < 2; g++)
+        for (int cgi = 0; cgi < 2; cgi++)
+            __builtin_mma_xxsetaccz(&acc[g][cgi]);
+    for (int x = 0; x < 8; x++) {
+        const vuc w0 = a[2*x], w1 = a[2*x + 1];
+        const vuc y0 = y[2*x], y1 = y[2*x + 1];
+        __builtin_mma_xvi8ger4pp(&acc[0][0], w0, y0);
+        __builtin_mma_xvi8ger4pp(&acc[0][1], w0, y1);
+        __builtin_mma_xvi8ger4pp(&acc[1][0], w1, y0);
+        __builtin_mma_xvi8ger4pp(&acc[1][1], w1, y1);
+    }
+}
+
+static inline void grid_pp_fixup(const agrid_t * PA, const bgrid_t * PB,
+                                 int64_t ch, __vector_quad acc[2][2],
+                                 vfl fin[MR][2]) {
+    for (int g = 0; g < 2; g++) {
+        const vfl sA   = PA->sA  [ch][g];
+        const vfl C128 = PA->C128[ch][g];
+        for (int cgi = 0; cgi < 2; cgi++) {
+            vsi rowsP[4];
+            __builtin_mma_disassemble_acc(rowsP, &acc[g][cgi]);
+            const vfl dB = PB->dB[ch][cgi];
+            for (int r = 0; r < 4; r++) {
+                vfl t = vec_msub(vec_ctf(rowsP[r],0),
+                                 vec_splats(sA[r]), vec_splats(C128[r]));
+                fin[4*g + r][cgi] = vec_madd(t, dB, fin[4*g + r][cgi]);
+            }
+        }
+    }
+}
+
+__attribute__((unused)) static void kernel_grid_8x8_pp(const agrid_t * PA, const bgrid_t * PB,
+                               int64_t nch, vfl fin[MR][2]) {
+    if (nch <= 0) return;
+    __vector_quad accA[2][2], accB[2][2];
+    grid_pp_compute(PA->v[0], PB->v[0], accA);
+    int64_t ch = 1;
+    int aLive = 1;                       // which set holds chunk ch-1
+    for (; ch < nch; ch++) {
+        if (aLive) { grid_pp_compute(PA->v[ch], PB->v[ch], accB);
+                     grid_pp_fixup(PA, PB, ch - 1, accA, fin); }
+        else       { grid_pp_compute(PA->v[ch], PB->v[ch], accA);
+                     grid_pp_fixup(PA, PB, ch - 1, accB, fin); }
+        aLive ^= 1;
+    }
+    grid_pp_fixup(PA, PB, nch - 1, aLive ? accA : accB, fin);
+}
+
 extern "C" void grid_gemm_packed(int64_t m, int64_t n, int64_t k,
                                  const void * packedA, const void * packedB,
                                  float * C, int64_t ldc, int ith, int nth) {
@@ -490,7 +556,11 @@ extern "C" void grid_gemm_packed(int64_t m, int64_t n, int64_t k,
             for (int64_t s = 0; s < ns; s++) {
                 const int64_t b0 = s*KC_CH;
                 const int64_t nch = (kb - b0) < KC_CH ? (kb - b0) : KC_CH;
+#ifdef IQGRID_PINGPONG
+                kernel_grid_8x8_pp(&PA[it*ns + s], &PB[jt*ns + s], nch, fin);
+#else
                 kernel_grid_8x8(&PA[it*ns + s], &PB[jt*ns + s], nch, fin);
+#endif
             }
             const int64_t j0 = jt*NR;
             const int64_t cols = (n - j0) < NR ? (n - j0) : NR;
