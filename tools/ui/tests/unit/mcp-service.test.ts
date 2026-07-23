@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+
 import { Client } from '@modelcontextprotocol/sdk/client';
+import {
+	StreamableHTTPClientTransport,
+	StreamableHTTPError
+} from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
+import { WebSocketClientTransport } from '@modelcontextprotocol/sdk/client/websocket.js';
+
 import { MCPService } from '$lib/services/mcp.service';
 import { MCPConnectionPhase, MCPTransportType } from '$lib/enums';
 import type { MCPConnectionLog, MCPServerConfig } from '$lib/types';
@@ -248,5 +256,39 @@ describe('MCPService', () => {
 					log.message === 'Protocol error: runtime protocol error'
 			)
 		).toHaveLength(0);
+	});
+});
+describe('createTransport', () => {
+	it('creates an SSE transport when SSE is configured', () => {
+		const result = MCPService.createTransport('test-server', {
+			url: 'http://localhost:3000/sse',
+			transport: MCPTransportType.SSE
+		});
+
+		expect(result.type).toBe(MCPTransportType.SSE);
+		expect(result.transport).toBeInstanceOf(SSEClientTransport);
+		expect(result.stopPhaseLogging).toEqual(expect.any(Function));
+	});
+
+	it('creates a Streamable HTTP transport when Streamable HTTP is configured', () => {
+		const result = MCPService.createTransport('test-server', {
+			url: 'http://localhost:3000/mcp',
+			transport: MCPTransportType.STREAMABLE_HTTP
+		});
+
+		expect(result.type).toBe(MCPTransportType.STREAMABLE_HTTP);
+		expect(result.transport).toBeInstanceOf(StreamableHTTPClientTransport);
+		expect(result.stopPhaseLogging).toEqual(expect.any(Function));
+	});
+
+	it('creates a WebSocket transport when WebSocket is configured', () => {
+		const result = MCPService.createTransport('test-server', {
+			url: 'ws://localhost:3000/mcp',
+			transport: MCPTransportType.WEBSOCKET
+		});
+
+		expect(result.type).toBe(MCPTransportType.WEBSOCKET);
+		expect(result.transport).toBeInstanceOf(WebSocketClientTransport);
+		expect(result.stopPhaseLogging).toEqual(expect.any(Function));
 	});
 });

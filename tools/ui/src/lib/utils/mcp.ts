@@ -48,11 +48,15 @@ export function detectMcpTransportFromUrl(url: string): MCPTransportType {
     }
 
     // Legacy MCP SSE transport
-    if (
-        normalized.endsWith("/sse") ||
-        normalized.includes("/sse?")
-    ) {
-        return MCPTransportType.SSE;
+    try {
+        const parsed = new URL(url);
+        const path = parsed.pathname.replace(/\/+$/, "").toLowerCase();
+
+        if (path.endsWith("/sse")) {
+            return MCPTransportType.SSE;
+        }
+    } catch {
+        // Ignore invalid URLs and fall through to the default transport.
     }
 
     return MCPTransportType.STREAMABLE_HTTP;
