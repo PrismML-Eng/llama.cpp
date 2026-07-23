@@ -91,6 +91,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                     ggml-cpu/llamafile/iq4_ppc_mma.cpp
                     ggml-cpu/llamafile/legacy_ppc_mma.cpp
                     ggml-cpu/llamafile/iq_grid_ppc_mma.cpp
+                    ggml-cpu/llamafile/ppc_pack_cache.cpp
                     ggml-cpu/llamafile/iq_grids_ppc.h
                     ggml-cpu/llamafile/kquants_ppc_mma.h
                     ggml-cpu/llamafile/qbit_ppc_mma.h

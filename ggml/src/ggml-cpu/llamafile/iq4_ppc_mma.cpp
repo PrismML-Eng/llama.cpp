@@ -1,5 +1,6 @@
 // iq4_ppc_mma.cpp - imported from github.com/mavin2009/ppc-mma-kernels
 // (standalone-verified vs exact double references under qemu -cpu power10).
+// IQ4_NL x Q8_0, IQ4_XS x Q8_K, MXFP4 x Q8_0 on POWER10/POWER11 MMA.
 
 #include "ggml-impl.h"
 #include "ggml-cpu-impl.h"
@@ -19,12 +20,21 @@
 
 
 
+
 static_assert(sizeof(block_iq4_nl) == sizeof(ggml_half) + QK4_NL/2, "bad iq4_nl");
+static_assert(sizeof(block_mxfp4) == 1 + QK_MXFP4/2, "bad mxfp4");
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + 2 + QK_K/64 + QK_K/2, "bad iq4_xs");
 
 static const int8_t iq4_kvalues_local[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 };
+// MXFP4 e2m1 values, pre-doubled to integers (the E8M0 "half" scale
+// supplies the /2): {0,1,2,3,4,6,8,12} with sign.
+static const int8_t kvalues_mxfp4_[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+};
+#include <cmath>
+static inline float e8m0_half_to_fp32(uint8_t e) { return ldexpf(1.0f, (int)e - 128); }
 
 
 #if defined(__MMA__) && defined(__powerpc64__)
@@ -35,8 +45,9 @@ typedef vector unsigned int   vui;
 typedef vector signed int     vsi;
 typedef vector float          vfl;
 
-// Unaligned 16-byte load via memcpy: single lxv, well-defined for the
-// odd struct offsets several block formats use.
+// Unaligned 16-byte load via memcpy: compiles to a single lxv (which is
+// alignment-agnostic on POWER) while staying well-defined C++ for any
+// source alignment -- several block structs place qs at odd offsets.
 static inline vuc load16u(const void * p) { vuc v; memcpy(&v, p, 16); return v; }
 
 
@@ -71,8 +82,8 @@ static inline void mma_transpose4(const vui rows[4], vuc * out, int stride) {
 
 // 32 signed codebook values from 16 packed bytes; elements j / j+16
 // come from qs[j] low / high nibble.  One vec_perm each.
-static inline void iq4_lookup32(const uint8_t * qs, vsc v[2]) {
-    vsc tbl; memcpy(&tbl, iq4_kvalues_local, 16);
+static inline void iq4_lookup32t(const uint8_t * qs, const int8_t * table, vsc v[2]) {
+    vsc tbl; memcpy(&tbl, table, 16);
     vuc raw = load16u((const uint8_t *)(qs) + (0));
     vuc lo  = vec_and(raw, vec_splats((unsigned char)0xF));
     vuc hi  = vec_sr(raw, vec_splats((unsigned char)4));
@@ -132,7 +143,30 @@ extern "C" void iq4nl_repack_a(const block_iq4_nl * A, int64_t lda,
                 int64_t rr = it*MR + r; if (rr >= m) rr = m - 1;
                 const block_iq4_nl * bp = &A[rr*lda + b0 + b];
                 sc[r] = GGML_FP16_TO_FP32(bp->d);
-                iq4_lookup32(bp->qs, w[r]);
+                iq4_lookup32t(bp->qs, iq4_kvalues_local, w[r]);
+            }
+            iq4_place_chunk(T, b, w, sc);
+        }
+    }
+}
+
+// ---- weight repack: MXFP4 (same shape as IQ4_NL, different table+scale) ----
+extern "C" void mxfp4_repack_a(const block_mxfp4 * A, int64_t lda,
+                               int64_t m, int64_t k, void * packed) {
+    aiq4_t * P = (aiq4_t *)packed;
+    const int64_t kb = k/32, ns = sl32(k);
+    for (int64_t it = 0; it < rt8(m); it++)
+    for (int64_t s = 0; s < ns; s++) {
+        aiq4_t * T = &P[it*ns + s];
+        const int64_t b0 = s*KC_CH;
+        const int64_t nb = (kb - b0) < KC_CH ? (kb - b0) : KC_CH;
+        for (int64_t b = 0; b < nb; b++) {
+            vsc w[MR][2]; float sc[MR];
+            for (int r = 0; r < MR; r++) {
+                int64_t rr = it*MR + r; if (rr >= m) rr = m - 1;
+                const block_mxfp4 * bp = &A[rr*lda + b0 + b];
+                sc[r] = e8m0_half_to_fp32(bp->e);
+                iq4_lookup32t(bp->qs, kvalues_mxfp4_, w[r]);
             }
             iq4_place_chunk(T, b, w, sc);
         }
@@ -162,7 +196,7 @@ extern "C" void iq4xs_repack_a(const block_iq4_xs * A, int64_t lda,
                     const int ls = ((bp[r]->scales_l[ib/2] >> 4*(ib%2)) & 0xF)
                                  | (((bp[r]->scales_h >> 2*ib) & 3) << 4);
                     sc[r] = d[r] * (float)(ls - 32);
-                    iq4_lookup32(bp[r]->qs + 16*ib, w[r]);
+                    iq4_lookup32t(bp[r]->qs + 16*ib, iq4_kvalues_local, w[r]);
                 }
                 iq4_place_chunk(T, 8*sb + ib, w, sc);
             }
@@ -311,45 +345,40 @@ extern "C" void iq4_gemm_packed(int64_t m, int64_t n, int64_t k,
 }
 
 
-extern "C" void gemm_iq4_nl_q8_0_ppc(int64_t m, int64_t n, int64_t k,
-        const void * Av, int64_t lda, const void * Bv, int64_t ldb,
-        float * C, int64_t ldc, int ith, int nth) {
-    const block_iq4_nl * A = (const block_iq4_nl *)Av;
-    const block_q8_0 * B = (const block_q8_0 *)Bv;
-    void * PA = aligned_alloc(64, iq4_apack_size(MR, k));
-    void * PB = aligned_alloc(64, iq4_bpack_size(n, k));
-    if (!PA || !PB) { GGML_ABORT("ppc-mma: pack buffer allocation failed"); }
-    iq4_pack_b_q8_0(B, ldb, n, k, PB);
-    const int64_t mt = (m + MR - 1) / MR;
-    const int64_t tpt = (mt + nth - 1) / nth;
-    for (int64_t it = ith*tpt; it < (ith+1)*tpt && it < mt; it++) {
-        const int64_t i = it*MR;
-        const int64_t rows = (m - i) < MR ? (m - i) : MR;
-        iq4nl_repack_a(A + i*lda, lda, rows, k, PA);
-        iq4_gemm_packed(rows, n, k, PA, PB, C + i, ldc, 0, 1);
-    }
-    free(PA); free(PB);
+#define IQ4_ONESHOT(NAME, BLKA, REPACK, YBLK, PACKB, VARIANT)                  \
+extern "C" void NAME(int64_t m, int64_t n, int64_t k,                          \
+        const void * Av, int64_t lda, const void * Bv, int64_t ldb,            \
+        float * C, int64_t ldc, int ith, int nth) {                            \
+    const BLKA * A = (const BLKA *)Av;                                         \
+    const YBLK * B = (const YBLK *)Bv;                                         \
+    void * PB = aligned_alloc(64, iq4_bpack_size(n, k));                       \
+    if (!PB) { GGML_ABORT("ppc-mma: pack alloc failed"); }                     \
+    PACKB(B, ldb, n, k, PB);                                                   \
+    int fresh = 0;                                                             \
+    void * PA = ppc_apack_cache_acquire(Av, m, k, VARIANT,                     \
+                                        iq4_apack_size(m, k), &fresh);         \
+    if (PA) {                                                                  \
+        if (fresh) { REPACK(A, lda, m, k, (void *)PA);                         \
+                     ppc_apack_cache_publish(Av, m, k, VARIANT); }             \
+        iq4_gemm_packed(m, n, k, PA, PB, C, ldc, ith, nth);                    \
+    } else {                                                                   \
+        void * PT = aligned_alloc(64, iq4_apack_size(MR, k));                  \
+        if (!PT) { GGML_ABORT("ppc-mma: pack alloc failed"); }                 \
+        const int64_t mt = (m + MR - 1) / MR;                                  \
+        const int64_t tpt = (mt + nth - 1) / nth;                              \
+        for (int64_t it = ith*tpt; it < (ith+1)*tpt && it < mt; it++) {        \
+            const int64_t i = it*MR;                                           \
+            const int64_t rows = (m - i) < MR ? (m - i) : MR;                  \
+            REPACK(A + i*lda, lda, rows, k, PT);                               \
+            iq4_gemm_packed(rows, n, k, PT, PB, C + i, ldc, 0, 1);             \
+        }                                                                      \
+        free(PT);                                                              \
+    }                                                                          \
+    free(PB);                                                                  \
 }
-
-extern "C" void gemm_iq4_xs_q8_K_ppc(int64_t m, int64_t n, int64_t k,
-        const void * Av, int64_t lda, const void * Bv, int64_t ldb,
-        float * C, int64_t ldc, int ith, int nth) {
-    const block_iq4_xs * A = (const block_iq4_xs *)Av;
-    const block_q8_K * B = (const block_q8_K *)Bv;
-    void * PA = aligned_alloc(64, iq4_apack_size(MR, k));
-    void * PB = aligned_alloc(64, iq4_bpack_size(n, k));
-    if (!PA || !PB) { GGML_ABORT("ppc-mma: pack buffer allocation failed"); }
-    iq4_pack_b_q8_K(B, ldb, n, k, PB);
-    const int64_t mt = (m + MR - 1) / MR;
-    const int64_t tpt = (mt + nth - 1) / nth;
-    for (int64_t it = ith*tpt; it < (ith+1)*tpt && it < mt; it++) {
-        const int64_t i = it*MR;
-        const int64_t rows = (m - i) < MR ? (m - i) : MR;
-        iq4xs_repack_a(A + i*lda, lda, rows, k, PA);
-        iq4_gemm_packed(rows, n, k, PA, PB, C + i, ldc, 0, 1);
-    }
-    free(PA); free(PB);
-}
+IQ4_ONESHOT(gemm_iq4_nl_q8_0_ppc, block_iq4_nl, iq4nl_repack_a, block_q8_0, iq4_pack_b_q8_0, 1)
+IQ4_ONESHOT(gemm_iq4_xs_q8_K_ppc, block_iq4_xs, iq4xs_repack_a, block_q8_K, iq4_pack_b_q8_K, 2)
+IQ4_ONESHOT(gemm_mxfp4_q8_0_ppc, block_mxfp4, mxfp4_repack_a, block_q8_0, iq4_pack_b_q8_0, 3)
 
 #endif // __MMA__
 

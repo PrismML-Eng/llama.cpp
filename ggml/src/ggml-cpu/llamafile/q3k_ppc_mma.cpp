@@ -262,19 +262,29 @@ extern "C" void gemm_q3_K_q8_K_ppc(int64_t m, int64_t n, int64_t k,
         float * C, int64_t ldc, int ith, int nth) {
     const block_q3_K * A = (const block_q3_K *)Av;
     const block_q8_K * B = (const block_q8_K *)Bv;
-    void * PA = aligned_alloc(64, q3k_apack_size(MR, k));
     void * PB = aligned_alloc(64, q3k_bpack_size(n, k));
-    if (!PA || !PB) { GGML_ABORT("ppc-mma: pack buffer allocation failed"); }
+    if (!PB) { GGML_ABORT("ppc-mma: pack alloc failed"); }
     q3k_pack_b(B, ldb, n, k, PB);
-    const int64_t mt = (m + MR - 1) / MR;
-    const int64_t tpt = (mt + nth - 1) / nth;
-    for (int64_t it = ith*tpt; it < (ith+1)*tpt && it < mt; it++) {
-        const int64_t i = it*MR;
-        const int64_t rows = (m - i) < MR ? (m - i) : MR;
-        q3k_repack_a(A + i*lda, lda, rows, k, PA);
-        q3k_gemm_packed(rows, n, k, PA, PB, C + i, ldc, 0, 1);
+    int fresh = 0;
+    void * PA = ppc_apack_cache_acquire(Av, m, k, 24, q3k_apack_size(m, k), &fresh);
+    if (PA) {
+        if (fresh) { q3k_repack_a(A, lda, m, k, PA);
+                     ppc_apack_cache_publish(Av, m, k, 24); }
+        q3k_gemm_packed(m, n, k, PA, PB, C, ldc, ith, nth);
+    } else {
+        void * PT = aligned_alloc(64, q3k_apack_size(MR, k));
+        if (!PT) { GGML_ABORT("ppc-mma: pack alloc failed"); }
+        const int64_t mt = (m + MR - 1) / MR;
+        const int64_t tpt = (mt + nth - 1) / nth;
+        for (int64_t it = ith*tpt; it < (ith+1)*tpt && it < mt; it++) {
+            const int64_t i = it*MR;
+            const int64_t rows = (m - i) < MR ? (m - i) : MR;
+            q3k_repack_a(A + i*lda, lda, rows, k, PT);
+            q3k_gemm_packed(rows, n, k, PT, PB, C + i, ldc, 0, 1);
+        }
+        free(PT);
     }
-    free(PA); free(PB);
+    free(PB);
 }
 
 #endif // __MMA__

@@ -54,6 +54,26 @@ void gemm_iq3_s_q8_K_ppc(int64_t m, int64_t n, int64_t k,
 void gemm_iq1_s_q8_K_ppc(int64_t m, int64_t n, int64_t k,
         const void * A, int64_t lda, const void * B, int64_t ldb,
         float * C, int64_t ldc, int ith, int nth);
+void gemm_mxfp4_q8_0_ppc(int64_t m, int64_t n, int64_t k,
+        const void * A, int64_t lda, const void * B, int64_t ldb,
+        float * C, int64_t ldc, int ith, int nth);
+void gemm_iq2_xs_q8_K_ppc(int64_t m, int64_t n, int64_t k,
+        const void * A, int64_t lda, const void * B, int64_t ldb,
+        float * C, int64_t ldc, int ith, int nth);
+void gemm_iq2_s_q8_K_ppc(int64_t m, int64_t n, int64_t k,
+        const void * A, int64_t lda, const void * B, int64_t ldb,
+        float * C, int64_t ldc, int ith, int nth);
+void gemm_iq1_m_q8_K_ppc(int64_t m, int64_t n, int64_t k,
+        const void * A, int64_t lda, const void * B, int64_t ldb,
+        float * C, int64_t ldc, int ith, int nth);
+void gemm_nvfp4_q8_0_ppc(int64_t m, int64_t n, int64_t k,
+        const void * A, int64_t lda, const void * B, int64_t ldb,
+        float * C, int64_t ldc, int ith, int nth);
+// tensor-keyed cache for repacked weights (ppc_pack_cache.cpp)
+#include <stddef.h>
+void * ppc_apack_cache_acquire(const void * key, int64_t m, int64_t k,
+                               int variant, size_t bytes, int * fresh);
+void ppc_apack_cache_publish(const void * key, int64_t m, int64_t k, int variant);
 #ifdef __cplusplus
 }
 #endif
