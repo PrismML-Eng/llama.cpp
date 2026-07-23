@@ -278,8 +278,11 @@ static void kernel_iq4_8x8(const aiq4_t * PA, const biq4_t * PB,
         const vuc * a = PA->v[ch];
         const vuc * y = PB->v[ch];
         if (ch + 1 < nch) {
+            // each chunk's packed panel spans two 128B lines; touch both
             __builtin_prefetch(PA->v[ch + 1], 0, 3);
+            __builtin_prefetch((const char *)PA->v[ch + 1] + 128, 0, 3);
             __builtin_prefetch(PB->v[ch + 1], 0, 3);
+            __builtin_prefetch((const char *)PB->v[ch + 1] + 128, 0, 3);
         }
         __vector_quad acc[2][2];
         for (int g = 0; g < 2; g++)
