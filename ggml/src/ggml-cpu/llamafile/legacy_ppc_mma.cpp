@@ -35,6 +35,11 @@ typedef vector unsigned int   vui;
 typedef vector signed int     vsi;
 typedef vector float          vfl;
 
+// Unaligned 16-byte load via memcpy: single lxv, well-defined for the
+// odd struct offsets several block formats use.
+static inline vuc load16u(const void * p) { vuc v; memcpy(&v, p, 16); return v; }
+
+
 #define KC_CH 64                          // 32-elem chunks per slab (2048)
 #define MR    16
 #define NR    8
@@ -63,7 +68,7 @@ static inline void mma_transpose4(const vui rows[4], vuc * out, int stride) {
 }
 
 static inline void nibbles32(const uint8_t * qs, vuc v[2]) {
-    vuc raw = vec_xl(0, (const unsigned char *)qs);
+    vuc raw = load16u((const uint8_t *)(qs) + (0));
     v[0] = vec_and(raw, vec_splats((unsigned char)0xF));
     v[1] = vec_sr(raw, vec_splats((unsigned char)4));
 }
@@ -71,7 +76,7 @@ static inline void nibbles32(const uint8_t * qs, vuc v[2]) {
 // merge qh bits: elems 0..15 use bits 0..15 (bytes 0-1), elems 16..31
 // use bits 16..31 (bytes 2-3); bit -> position 4.
 static inline void qh_merge(const uint8_t * qh, vuc v[2]) {
-    vuc raw = vec_xl(0, (const unsigned char *)qh);   // first 4 bytes used
+    vuc raw = load16u((const uint8_t *)(qh) + (0));   // first 4 bytes used
     const vuc repL = { 0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1 };
     const vuc repH = { 2,2,2,2,2,2,2,2, 3,3,3,3,3,3,3,3 };
     const vuc sh   = { 0,1,2,3,4,5,6,7, 0,1,2,3,4,5,6,7 };
@@ -88,10 +93,10 @@ static inline int64_t ct(int64_t n) { return (n + NR - 1) / NR; }
 static inline int64_t sl(int64_t k) { return (k/32 + KC_CH - 1) / KC_CH; }
 
 extern "C" size_t leg_apack_size(int64_t m, int64_t k) {
-    return (size_t)(rt(m) * sl(k)) * sizeof(aleg_t);
+    return (((size_t)(rt(m) * sl(k)) * sizeof(aleg_t)) + 63) & ~(size_t)63;
 }
 extern "C" size_t leg_bpack_size(int64_t n, int64_t k) {
-    return (size_t)(ct(n) * sl(k)) * sizeof(bleg_t);
+    return (((size_t)(ct(n) * sl(k)) * sizeof(bleg_t)) + 63) & ~(size_t)63;
 }
 
 // generic weight repack over a per-block "codes + d + m" extractor
@@ -160,8 +165,8 @@ static void pack_b_generic(const YBLK * B, int64_t ldb, int64_t n, int64_t k, bl
                     SB[j] = GGML_FP16_TO_FP32(((const ggml_half *)yb[j])[1]);
                 } else {
                     vsi z = vec_splats(0);
-                    vsi sm = vec_sum4s((vsc)vec_xl(0,  (const unsigned char *)yb[j]->qs), z);
-                    sm = vec_sum4s((vsc)vec_xl(16, (const unsigned char *)yb[j]->qs), sm);
+                    vsi sm = vec_sum4s((vsc)load16u((const uint8_t *)(yb[j]->qs) + (0)), z);
+                    sm = vec_sum4s((vsc)load16u((const uint8_t *)(yb[j]->qs) + (16)), sm);
                     SB[j] = (float)SFACT * dB[j] * (float)(sm[0]+sm[1]+sm[2]+sm[3]);
                 }
             }
@@ -173,7 +178,7 @@ static void pack_b_generic(const YBLK * B, int64_t ldb, int64_t n, int64_t k, bl
             for (int a = 0; a < 2; a++)
                 for (int h = 0; h < 2; h++) {
                     for (int j = 0; j < 4; j++)
-                        rows4[j] = (vui)vec_xl(16*h, (const unsigned char *)yb[4*a + j]->qs);
+                        rows4[j] = (vui)load16u((const uint8_t *)(yb[4*a + j]->qs) + (16*h));
                     mma_transpose4(rows4, &T->v[b][8*h + a], 2);
                 }
         }
@@ -295,7 +300,7 @@ extern "C" void NAME(int64_t m, int64_t n, int64_t k,                          \
     const YBLK * B = (const YBLK *)Bv;                                         \
     void * PA = aligned_alloc(64, leg_apack_size(MR, k));                      \
     void * PB = aligned_alloc(64, leg_bpack_size(n, k));                       \
-    if (!PA || !PB) { free(PA); free(PB); return; }                            \
+    if (!PA || !PB) { GGML_ABORT("ppc-mma: pack buffer allocation failed"); }                            \
     PACKB(B, ldb, n, k, PB);                                                   \
     const int64_t mt = (m + MR - 1) / MR;                                      \
     const int64_t tpt = (mt + nth - 1) / nth;                                  \

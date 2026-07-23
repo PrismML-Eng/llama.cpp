@@ -22,6 +22,11 @@ typedef vector unsigned int   vui;
 typedef vector signed int     vsi;
 typedef vector float          vfl;
 
+// Unaligned 16-byte load via memcpy: single lxv, well-defined for the
+// odd struct offsets several block formats use.
+static inline vuc load16u(const void * p) { vuc v; memcpy(&v, p, 16); return v; }
+
+
 #define KC_BLKS   16                       // 2048-element K slab
 #define KC_CHUNKS (KC_BLKS * 4)
 #define MR        16                       // weight rows per tile
@@ -87,7 +92,7 @@ static void pack_A16_q1(const block_q1_0 * A, int64_t lda, int64_t rows,
             int64_t rr = r < rows ? r : rows - 1;
             const block_q1_0 * bp = &A[rr*lda + blk0 + b];
             d[r]   = GGML_FP16_TO_FP32(bp->d);
-            raw[r] = vec_xl(0, (const unsigned char *)bp->qs);
+            raw[r] = load16u((const uint8_t *)(bp->qs) + (0));
         }
         for (int g = 0; g < 4; g++)
             P->dA[b][g] = (vfl){ d[4*g], d[4*g+1], d[4*g+2], d[4*g+3] };
@@ -113,8 +118,8 @@ static void pack_A16_q2(const block_q2_0 * A, int64_t lda, int64_t rows,
             int64_t rr = r < rows ? r : rows - 1;
             const block_q2_0 * bp = &A[rr*lda + blk0 + b];
             d[r]  = GGML_FP16_TO_FP32(bp->d);
-            lo[r] = vec_xl(0,  (const unsigned char *)bp->qs);
-            hi[r] = vec_xl(16, (const unsigned char *)bp->qs);
+            lo[r] = load16u((const uint8_t *)(bp->qs) + (0));
+            hi[r] = load16u((const uint8_t *)(bp->qs) + (16));
         }
         for (int g = 0; g < 4; g++)
             P->dA[b][g] = (vfl){ d[4*g], d[4*g+1], d[4*g+2], d[4*g+3] };
@@ -151,8 +156,8 @@ static void pack_B8(const block_q8_0 * B, int64_t ldb, int64_t cols,
             for (int a = 0; a < 2; a++) {
                 vuc q[4][2];
                 for (int j = 0; j < 4; j++) {
-                    q[j][0] = vec_xl(0,  (const unsigned char *)yb[4*a + j]->qs);
-                    q[j][1] = vec_xl(16, (const unsigned char *)yb[4*a + j]->qs);
+                    q[j][0] = load16u((const uint8_t *)(yb[4*a + j]->qs) + (0));
+                    q[j][1] = load16u((const uint8_t *)(yb[4*a + j]->qs) + (16));
                     vsi z = vec_splats(0);
                     vsi s = vec_sum4s((vsc)q[j][0], z);
                     s = vec_sum4s((vsc)q[j][1], s);
@@ -260,6 +265,7 @@ static void gemm_qbit(int64_t m, int64_t n, int64_t k,
     apack_t * PA = (apack_t*)aligned_alloc(64, sizeof(apack_t));
     bpack_t * PB = (bpack_t*)aligned_alloc(64, njt * sizeof(bpack_t));
     vfl (*fin)[NR][4] = (vfl(*)[NR][4])aligned_alloc(64, njt * sizeof(vfl[NR][4]));
+    if (!PA || !PB || !fin) { GGML_ABORT("ppc-mma: pack buffer allocation failed"); }
 
     for (int64_t i = i0; i < i1; i += MR) {
         const int64_t rows = (i1 - i) < MR ? (i1 - i) : MR;

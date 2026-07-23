@@ -29,6 +29,11 @@ typedef vector unsigned int   vui;
 typedef vector signed int     vsi;
 typedef vector float          vfl;
 
+// Unaligned 16-byte load via memcpy: single lxv, well-defined for the
+// odd struct offsets several block formats use.
+static inline vuc load16u(const void * p) { vuc v; memcpy(&v, p, 16); return v; }
+
+
 #define KC_SB     8                        // superblocks per slab (2048 elems)
 #define KC_CH16   (KC_SB * 16)             // 16-element chunks per slab
 #define MR        16
@@ -59,10 +64,10 @@ static inline void mma_transpose4(const vui rows[4], vuc * out, int stride) {
 // 16 unsigned 3-bit codes q' = code | (hbit << 2) of chunk c (0..15).
 static inline vuc q3k_codes16(const uint8_t * qs, const uint8_t * hmask, int c) {
     const int h = c >> 3, idx = c & 7, j = idx >> 1, lo = idx & 1;
-    vuc code = vec_and(vec_sr(vec_xl(32*h + 16*lo, (const unsigned char *)qs),
+    vuc code = vec_and(vec_sr(load16u((const uint8_t *)(qs) + (32*h + 16*lo)),
                               vec_splats((unsigned char)(2*j))),
                        vec_splats((unsigned char)3));
-    vuc hb = vec_sl(vec_and(vec_sr(vec_xl(16*lo, (const unsigned char *)hmask),
+    vuc hb = vec_sl(vec_and(vec_sr(load16u((const uint8_t *)(hmask) + (16*lo)),
                                    vec_splats((unsigned char)(4*h + j))),
                             vec_splats((unsigned char)1)),
                     vec_splats((unsigned char)2));
@@ -74,10 +79,10 @@ static inline int64_t ct(int64_t n) { return (n + NR - 1) / NR; }
 static inline int64_t sl(int64_t k) { return (k/QK_K + KC_SB - 1) / KC_SB; }
 
 extern "C" size_t q3k_apack_size(int64_t m, int64_t k) {
-    return (size_t)(rt(m) * sl(k)) * sizeof(a3k_t);
+    return (((size_t)(rt(m) * sl(k)) * sizeof(a3k_t)) + 63) & ~(size_t)63;
 }
 extern "C" size_t q3k_bpack_size(int64_t n, int64_t k) {
-    return (size_t)(ct(n) * sl(k)) * sizeof(b3k_t);
+    return (((size_t)(ct(n) * sl(k)) * sizeof(b3k_t)) + 63) & ~(size_t)63;
 }
 
 extern "C" void q3k_repack_a(const block_q3_K * A, int64_t lda,
@@ -151,7 +156,7 @@ extern "C" void q3k_pack_b(const block_q8_K * B, int64_t ldb,
                 vui rows4[4];
                 for (int a = 0; a < 2; a++) {
                     for (int j = 0; j < 4; j++)
-                        rows4[j] = (vui)vec_xl(16*c, (const unsigned char *)yb[4*a + j]->qs);
+                        rows4[j] = (vui)load16u((const uint8_t *)(yb[4*a + j]->qs) + (16*c));
                     mma_transpose4(rows4, &T->v[ch][a], 2);
                 }
             }
@@ -259,7 +264,7 @@ extern "C" void gemm_q3_K_q8_K_ppc(int64_t m, int64_t n, int64_t k,
     const block_q8_K * B = (const block_q8_K *)Bv;
     void * PA = aligned_alloc(64, q3k_apack_size(MR, k));
     void * PB = aligned_alloc(64, q3k_bpack_size(n, k));
-    if (!PA || !PB) { free(PA); free(PB); return; }
+    if (!PA || !PB) { GGML_ABORT("ppc-mma: pack buffer allocation failed"); }
     q3k_pack_b(B, ldb, n, k, PB);
     const int64_t mt = (m + MR - 1) / MR;
     const int64_t tpt = (mt + nth - 1) / nth;

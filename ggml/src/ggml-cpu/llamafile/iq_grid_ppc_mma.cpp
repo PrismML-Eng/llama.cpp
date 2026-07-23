@@ -181,6 +181,11 @@ typedef vector unsigned int   vui;
 typedef vector signed int     vsi;
 typedef vector float          vfl;
 
+// Unaligned 16-byte load via memcpy: single lxv, well-defined for the
+// odd struct offsets several block formats use.
+static inline vuc load16u(const void * p) { vuc v; memcpy(&v, p, 16); return v; }
+
+
 #define KC_ELEMS  2048
 #define KC_CH     (KC_ELEMS / 32)
 #define MR        8
@@ -236,10 +241,10 @@ static inline int64_t ct(int64_t n) { return (n + NR - 1) / NR; }
 static inline int64_t sl(int64_t k) { return (k/32 + KC_CH - 1) / KC_CH; }
 
 extern "C" size_t grid_apack_size(int64_t m, int64_t k) {
-    return (size_t)(rt(m) * sl(k)) * sizeof(agrid_t);
+    return (((size_t)(rt(m) * sl(k)) * sizeof(agrid_t)) + 63) & ~(size_t)63;
 }
 extern "C" size_t grid_bpack_size(int64_t n, int64_t k) {
-    return (size_t)(ct(n) * sl(k)) * sizeof(bgrid_t);
+    return (((size_t)(ct(n) * sl(k)) * sizeof(bgrid_t)) + 63) & ~(size_t)63;
 }
 
 // generic repack over any superblock decoder
@@ -309,7 +314,7 @@ extern "C" void grid_pack_b_q8_K(const block_q8_K_ppc * B, int64_t ldb,
                     for (int h = 0; h < 2; h++) {
                         for (int j = 0; j < 4; j++)
                             rows4[j] = (vui)vec_xor(
-                                vec_xl(32*ib + 16*h, (const unsigned char *)yb[4*a + j]->qs), flip);
+                                load16u((const uint8_t *)(yb[4*a + j]->qs) + (32*ib + 16*h)), flip);
                         mma_transpose4(rows4, &T->v[ch][8*h + a], 2);
                     }
             }
@@ -392,7 +397,7 @@ extern "C" void NAME(int64_t m, int64_t n, int64_t k,                          \
     const block_q8_K_ppc * B = (const block_q8_K_ppc *)Bv;                     \
     void * PA = aligned_alloc(64, grid_apack_size(MR, k));                     \
     void * PB = aligned_alloc(64, grid_bpack_size(n, k));                      \
-    if (!PA || !PB) { free(PA); free(PB); return; }                            \
+    if (!PA || !PB) { GGML_ABORT("ppc-mma: pack buffer allocation failed"); }                            \
     grid_pack_b_q8_K(B, ldb, n, k, PB);                                        \
     const int64_t mt = (m + MR - 1) / MR;                                      \
     const int64_t tpt = (mt + nth - 1) / nth;                                  \
