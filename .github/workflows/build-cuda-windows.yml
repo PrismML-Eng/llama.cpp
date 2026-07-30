@@ -1,16 +1,9 @@
 name: CI (CUDA, windows)
 
-# TODO: this workflow is only triggered manually because it is very heavy on the CI
-#       when we provision dedicated windows runners, we can enable it for pushes too
 # note: running this workflow manually will populate the ccache for the release builds
 #       this can be used before merging a PR to speed up the release workflow
 on:
   workflow_dispatch: # allows manual triggering
-
-# note: this will run in queue with the release workflow
-concurrency:
-  group: release
-  queue: max
 
 env:
   GH_TOKEN: ${{ github.token }}
@@ -29,7 +22,7 @@ jobs:
 
     strategy:
       matrix:
-        cuda: ['12.4', '13.3']
+        cuda: ['13.3'] # use '12.4' instead if you're pinned to an older toolkit
 
     steps:
       - name: Clone
@@ -39,7 +32,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: release-windows-2022-x64-cuda-${{ matrix.cuda }}
+          key: release-windows-2022-x64-cuda-${{ matrix.cuda }}-fa-all-quants
 
       - name: Install Cuda Toolkit
         uses: ./.github/actions/windows-setup-cuda
@@ -55,6 +48,10 @@ jobs:
         id: cmake_build
         shell: cmd
         # TODO: Remove GGML_CUDA_CUB_3DOT2 flag once CCCL 3.2 is bundled within CTK and that CTK version is used in this project
+        # GGML_CUDA_FA_ALL_QUANTS: compiles fused FlashAttention kernels for every KV cache
+        #   quant-type combo, so quantized KV cache (--cache-type-k/-v) actually saves VRAM
+        #   instead of silently falling back to a slow/inflated dequant path. Adds a lot of
+        #   compile time, which is why it isn't on by default.
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           cmake -S . -B build -G "Ninja Multi-Config" ^
@@ -64,6 +61,7 @@ jobs:
             -DGGML_BACKEND_DL=ON ^
             -DGGML_CPU_ALL_VARIANTS=ON ^
             -DGGML_CUDA=ON ^
+            -DGGML_CUDA_FA_ALL_QUANTS=ON ^
             -DGGML_RPC=ON ^
             -DGGML_CUDA_CUB_3DOT2=ON
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
@@ -73,90 +71,22 @@ jobs:
       - name: ccache-clear
         uses: ./.github/actions/ccache-clear
         with:
-          key: release-windows-2022-x64-cuda-${{ matrix.cuda }}
+          key: release-windows-2022-x64-cuda-${{ matrix.cuda }}-fa-all-quants
 
-  hip:
-    runs-on: windows-2022
-
-    permissions:
-      actions: write
-
-    env:
-      # Make sure this is in sync with build-cache.yml
-      HIPSDK_INSTALLER_VERSION: "26.Q1"
-
-    strategy:
-      matrix:
-        include:
-          # sync with release.yml
-          - name: "radeon"
-            gpu_targets: "gfx1150;gfx1151;gfx1200;gfx1201;gfx1100;gfx1101;gfx1102;gfx1030;gfx1031;gfx1032"
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-
-      - name: Grab rocWMMA package
-        id: grab_rocwmma
+      - name: Bundle CUDA runtime DLLs into the same package
         run: |
-          curl -o rocwmma.deb "https://repo.radeon.com/rocm/apt/7.2.1/pool/main/r/rocwmma-dev/rocwmma-dev_2.2.0.70201-81~24.04_amd64.deb"
-          7z x rocwmma.deb
-          7z x data.tar
+          robocopy "${{ env.CUDA_PATH }}\bin" .\build\bin\Release cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{ env.CUDA_PATH }}\lib" .\build\bin\Release cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{ env.CUDA_PATH }}\bin\x64" .\build\bin\Release cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          exit 0 # robocopy's exit codes aren't normal 0=success; don't fail the step on partial matches
 
-      - name: Use ROCm Installation Cache
-        uses: actions/cache@v5
-        id: cache-rocm
-        with:
-          path: C:\Program Files\AMD\ROCm
-          key: cache-gha-rocm-${{ env.HIPSDK_INSTALLER_VERSION }}-${{ runner.os }}
-
-      - name: Setup ROCm
-        if: steps.cache-rocm.outputs.cache-hit != 'true'
-        uses: ./.github/actions/windows-setup-rocm
-        with:
-          version: ${{ env.HIPSDK_INSTALLER_VERSION }}
-
-      - name: Verify ROCm
-        id: verify
+      - name: Pack artifact
         run: |
-          # Find and test ROCm installation
-          $clangPath = Get-ChildItem 'C:\Program Files\AMD\ROCm\*\bin\clang.exe' | Select-Object -First 1
-          if (-not $clangPath) {
-            Write-Error "ROCm installation not found"
-            exit 1
-          }
-          & $clangPath.FullName --version
+          copy LICENSE .\build\bin\Release\
+          7z a -snl bonsai-llamacpp-cuda-${{ matrix.cuda }}-fa-all-quants.zip .\build\bin\Release\*
 
-      - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
         with:
-          # TODO: this build does not match the build in release.yml, so we use a different cache key
-          #       ideally, the builds should match, similar to the CUDA build above so that we would be able
-          #       to populate the ccache for the release with manual runs of this workflow
-          #key: release-windows-2022-x64-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-${{ matrix.name }}
-          key: cuda-windows-2022-x64-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-${{ matrix.name }}
-
-      - name: Build
-        id: cmake_build
-        run: |
-          $env:HIP_PATH=$(Resolve-Path 'C:\Program Files\AMD\ROCm\*\bin\clang.exe' | split-path | split-path)
-          $env:CMAKE_PREFIX_PATH="${env:HIP_PATH}"
-          cmake -G "Unix Makefiles" -B build -S . `
-            -DCMAKE_C_COMPILER="${env:HIP_PATH}\bin\clang.exe" `
-            -DCMAKE_CXX_COMPILER="${env:HIP_PATH}\bin\clang++.exe" `
-            -DCMAKE_CXX_FLAGS="-I$($PWD.Path.Replace('\', '/'))/opt/rocm-7.2.1/include/" `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DLLAMA_BUILD_BORINGSSL=ON `
-            -DROCM_DIR="${env:HIP_PATH}" `
-            -DGGML_HIP=ON `
-            -DGGML_HIP_ROCWMMA_FATTN=ON `
-            -DGPU_TARGETS="gfx1100"  `
-            -DGGML_RPC=ON
-          cmake --build build -j ${env:NUMBER_OF_PROCESSORS}
-
-      - name: ccache-clear
-        uses: ./.github/actions/ccache-clear
-        with:
-          #key: release-windows-2022-x64-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-${{ matrix.name }}
-          key: cuda-windows-2022-x64-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-${{ matrix.name }}
+          path: bonsai-llamacpp-cuda-${{ matrix.cuda }}-fa-all-quants.zip
+          name: bonsai-llamacpp-cuda-${{ matrix.cuda }}-fa-all-quants.zip
