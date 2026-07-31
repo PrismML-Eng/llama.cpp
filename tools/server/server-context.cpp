@@ -901,6 +901,10 @@ private:
                     params_dft.cache_type_k          = params_spec.cache_type_k;
                     params_dft.cache_type_v          = params_spec.cache_type_v;
                     params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+                    // the K-cache mean-center bias is calibrated for the target model
+                    // (per-head/channel K layout); the draft model has a different K
+                    // geometry, so it must not inherit the bias
+                    params_dft.kv_mean_center_path.clear();
                 } else {
                     // MTP draft context lives on the target model, only context+compute are new
                     measure_model_bytes = false;
@@ -991,6 +995,10 @@ private:
             params_dft.n_gpu_layers = params_spec.n_gpu_layers;
             params_dft.cache_type_k = params_spec.cache_type_k;
             params_dft.cache_type_v = params_spec.cache_type_v;
+            // the K-cache mean-center bias is calibrated for the target model
+            // (per-head/channel K layout); the draft model has a different K
+            // geometry, so it must not inherit the bias
+            params_dft.kv_mean_center_path.clear();
 
             if (params_spec.cpuparams.n_threads > 0) {
                 params_dft.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
