@@ -1025,11 +1025,18 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
 
         // windowed staging bounds (see the member comment on `window`): keep
         // the drafter's positions inside its trained context regardless of the
-        // target's n_ctx. A drafter GGUF without context_length metadata
-        // falls back to the batch size (i.e. the old behavior's ceiling).
+        // target's n_ctx. context_length is a required GGUF key, so a drafter
+        // missing it fails to load before this runs -- the n_ctx_train_dft <= 0
+        // branch is only a defensive guard, not a metadata-free fallback.
         const int32_t n_ctx_train_dft = llama_model_n_ctx_train(model_dft);
         window = std::min<int64_t>(n_ctx_train_dft > 0 ? n_ctx_train_dft : n_b, n_b);
-        GGML_ASSERT(window > 2 * (int64_t) block_size && "dspark: staging window too small for a draft block");
+        if (window <= 2 * (int64_t) block_size) {
+            LOG_ERR("%s: staging window=%lld (drafter n_ctx_train=%d, n_batch=%d) too small for block_size=%d\n",
+                    __func__, (long long) window, n_ctx_train_dft, n_b, block_size);
+            throw std::runtime_error("dspark: staging window too small for a draft block "
+                    "(raise -b above 2*block_size)");
+        }
+        // a window barely above 2*block_size rebases every round or two
         w_keep = std::min<int64_t>(window / 2, window - block_size);
         LOG_INF("%s: - staging window=%lld (drafter n_ctx_train=%d, n_batch=%d), w_keep=%lld\n",
                 __func__, (long long) window, n_ctx_train_dft, n_b, (long long) w_keep);

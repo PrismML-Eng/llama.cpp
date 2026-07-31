@@ -1050,14 +1050,15 @@ private:
                 if (n_ctx_train_dft > 0) {
                     n_batch_dspark = std::min<uint32_t>(n_batch_dspark, (uint32_t) n_ctx_train_dft);
                 }
-                if (cparams.n_batch < n_batch_dspark) {
-                    SRV_INF("draft-dspark: raising draft ctx n_batch %u -> %u (windowed staging + block)\n",
+                // set it, do not only raise it: an explicit -b above the drafter's
+                // trained range would otherwise keep reserving a compute batch the
+                // draft context can never address
+                if (cparams.n_batch != n_batch_dspark) {
+                    SRV_INF("draft-dspark: draft ctx n_batch %u -> %u (windowed staging + block)\n",
                             cparams.n_batch, n_batch_dspark);
                     cparams.n_batch = n_batch_dspark;
                 }
-                if (cparams.n_ubatch < cparams.n_batch) {
-                    cparams.n_ubatch = cparams.n_batch;
-                }
+                cparams.n_ubatch = cparams.n_batch;
             }
 
             ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
