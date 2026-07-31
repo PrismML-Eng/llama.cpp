@@ -441,7 +441,7 @@ struct server_slot {
         prompt.tokens.insert(spec_draft);
     }
 
-    void release() {
+    void release(bool clear_prompt = false) {
         if (is_processing()) {
             GGML_ASSERT(task);
 
@@ -453,7 +453,7 @@ struct server_slot {
             state = SLOT_STATE_IDLE;
 
             // do not keep context of the child slots - the parent's context is enough
-            if (task->is_child()) {
+            if (clear_prompt || task->is_child()) {
                 prompt_clear(false);
             }
 
@@ -2274,10 +2274,10 @@ private:
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
-                    // release slot linked with the task id
+                    // release slot linked with the task id; cancelled requests should drop the slot state
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
-                            slot.release();
+                            slot.release(true);
                             break;
                         }
                     }
