@@ -1,3 +1,5 @@
+I haven't created this, but the people over at PrismML have. I have only created the optimised builds of PrismML's llama.cpp engine to run Tenary Bonsai 27B, etc at full context on consumer cards with a minimum of 12 GB VRAM.
+
 # llama.cpp
 
 > [!IMPORTANT]
