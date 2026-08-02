@@ -1,8 +1,15 @@
 // Hopper (sm_90a) wgmma MMQ path for Q1_0: dequant-in-SMEM + int8 wgmma with exact per-block scaling.
-// Experimental opt-in path (env GGML_HOPPER_Q1) targeting large-batch prefill on sm_90a.
-// Activations are quantized fp32 -> int8 with a per-128-K absmax scale (coarser than q8_1's per-32;
-// flagged for KLD validation). Dispatched only when M,N,K % 128 == 0 and cc >= 900; otherwise the
-// caller falls through to the standard MMQ path.
+// Active by default in builds configured with GGML_CUDA_HOPPER_Q1; set GGML_HOPPER_Q1_DISABLE to
+// fall back to the standard MMQ path. Dispatched only when M,N,K % 128 == 0 and cc >= 900 (Hopper
+// only: not Ada, not Blackwell); every other shape falls through to standard MMQ.
+//
+// Activations are quantized fp32 -> int8 with a per-128-K absmax scale, coarser than q8_1's
+// per-32, so this path is NOT bit-identical to standard MMQ. The deviation has been measured
+// against the same build with the path disabled, using a same-path control to establish the
+// floor: it is small, the tail is bounded, and only a small fraction of tokens change their
+// argmax. Figures are recorded in the internal notes. If you need bit-exact output, set
+// GGML_HOPPER_Q1_DISABLE.
+
 #include "common.cuh"
 
 #include <mutex>
@@ -442,8 +449,8 @@ bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context & ctx,
                                  const ggml_tensor *         src1,
                                  ggml_tensor *               dst) {
 #if defined(GGML_USE_HOPPER_Q1)
-    static const bool enabled = getenv("GGML_HOPPER_Q1") != nullptr;
-    if (!enabled) {
+    static const bool disabled = getenv("GGML_HOPPER_Q1_DISABLE") != nullptr;
+    if (disabled) {
         return false;
     }
     const int     cc = ggml_cuda_info().devices[ctx.device].cc;
