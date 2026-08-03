@@ -2,6 +2,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "mmvq.cuh"
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
@@ -221,6 +222,200 @@ void ggml_cuda_mul_mat_q(
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         use_stream_k, ne12};
+
+    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+}
+
+bool ggml_cuda_can_fuse_mmq_glu(const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * glu) {
+    static const bool disabled = getenv("GGML_CUDA_MMQ_GLU_FUSION_DISABLE") != nullptr;
+    if (disabled) {
+        return false;
+    }
+
+    if (gate->op != GGML_OP_MUL_MAT_ID || up->op != GGML_OP_MUL_MAT_ID || glu->op != GGML_OP_GLU) {
+        return false;
+    }
+
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) {
+        return false;
+    }
+
+    if (((const int32_t *) glu->op_params)[1] /* swapped */) {
+        return false;
+    }
+
+    if (glu->src[0] != gate || glu->src[1] != up) {
+        return false;
+    }
+
+    const ggml_tensor * gate_w = gate->src[0];
+    const ggml_tensor * up_w   = up->src[0];
+    const ggml_tensor * src1   = gate->src[1];
+    const ggml_tensor * ids    = gate->src[2];
+
+    if (!ids || up->src[1] != src1 || up->src[2] != ids) {
+        return false;
+    }
+
+    if (gate_w->type != up_w->type || !ggml_are_same_shape(gate_w, up_w) || !ggml_are_same_stride(gate_w, up_w)) {
+        return false;
+    }
+
+    if (src1->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 ||
+        glu->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) {
+        return false;
+    }
+
+    // The fused kernel writes dst with the same (row, expert slot, token) addressing the unfused
+    // mul_mat_id would use, so the GLU output has to be the plain contiguous result.
+    if (!ggml_is_contiguous(glu) || !ggml_are_same_shape(glu, gate)) {
+        return false;
+    }
+
+    if (gate_w->ne[3] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !turing_mma_available(cc)) {
+        return false;
+    }
+
+    if (!mmq_glu_fusion_supported(gate_w->type)) {
+        return false;
+    }
+
+    if (!ggml_cuda_should_use_mmq(gate_w->type, cc, src1->ne[2], gate_w->ne[2])) {
+        return false;
+    }
+
+    // Leave the batch-1 / small-batch dispatch (mul_mat_vec_q and its own fusion) untouched.
+    if (src1->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
+        return false;
+    }
+
+    // A fused row tile holds mmq_y/2 gate rows and mmq_y/2 up rows; require an exact fit so the
+    // row bounds check can stay off.
+    const int mmq_y = get_mmq_y_host(cc);
+    if (gate_w->ne[1] % (mmq_y/2) != 0) {
+        return false;
+    }
+
+    if (getenv("GGML_CUDA_MMQ_GLU_FUSION_VERBOSE")) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            fprintf(stderr, "%s: fusing mul_mat_id + SwiGLU into MMQ (type=%s, n_ff=%lld, n_expert=%lld, n_tokens=%lld)\n",
+                    __func__, ggml_type_name(gate_w->type), (long long) gate_w->ne[1],
+                    (long long) gate_w->ne[2], (long long) src1->ne[2]);
+        }
+    }
+
+    return true;
+}
+
+void ggml_cuda_mul_mat_q_fused_glu(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * up_w,
+        const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(ids && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(gate_w->type == up_w->type);
+
+    cudaStream_t stream = ctx.stream();
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    const int64_t ne00 = gate_w->ne[0];
+    const int64_t ne01 = gate_w->ne[1];
+    const int64_t ne02 = gate_w->ne[2];
+
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+    const int64_t ne13 = src1->ne[3];
+
+    GGML_ASSERT(ne13 == 1);
+    GGML_ASSERT(gate_w->ne[3] == 1);
+    GGML_ASSERT(dst->ne[0] == ne01);
+
+    const size_t ts_src0 = ggml_type_size(gate_w->type);
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    const size_t ts_dst  = ggml_type_size(dst->type);
+
+    GGML_ASSERT(gate_w->nb[0] == ts_src0);
+    GGML_ASSERT(src1->nb[0]   == ts_src1);
+    GGML_ASSERT(dst->nb[0]    == ts_dst);
+    GGML_ASSERT(ids->nb[0]    == ggml_type_size(ids->type));
+    GGML_ASSERT(src1->nb[2] % src1->nb[1] == 0);
+    GGML_ASSERT(dst->nb[2]  % dst->nb[1]  == 0);
+
+    const int64_t s01 = gate_w->nb[1] / ts_src0;
+    const int64_t s02 = gate_w->nb[2] / ts_src0;
+    const int64_t s1  = dst->nb[1] / ts_dst;
+    const int64_t s2  = dst->nb[2] / ts_dst;
+
+    GGML_ASSERT((int64_t) (up_w->nb[1] / ts_src0) == s01);
+    GGML_ASSERT((int64_t) (up_w->nb[2] / ts_src0) == s02);
+
+    // If a weight lives in a temporary compute buffer, clear any potential padding.
+    for (const ggml_tensor * w : { gate_w, up_w }) {
+        if (ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            const size_t size_data  = ggml_nbytes(w);
+            const size_t size_alloc = ggml_backend_buffer_get_alloc_size(w->buffer, w);
+            if (size_alloc > size_data) {
+                GGML_ASSERT(ggml_is_contiguously_allocated(w));
+                GGML_ASSERT(!w->view_src);
+                CUDA_CHECK(cudaMemsetAsync((char *) w->data + size_data, 0, size_alloc - size_data, stream));
+            }
+        }
+    }
+
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t ne_get_rows   = ne12 * n_expert_used;
+    GGML_ASSERT(dst->ne[1] == n_expert_used);
+
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
+
+    {
+        const int si1  = ids->nb[1] / ggml_element_size(ids);
+        const int sis1 = src1->nb[2] / src1->nb[1];
+
+        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+            ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1)/QK8_1 +
+        get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+
+    {
+        const int64_t s11 = src1->nb[1] / ts_src1;
+        const int64_t s12 = src1->nb[2] / ts_src1;
+        const int64_t s13 = src1->nb[3] / ts_src1;
+
+        quantize_mmq_q8_1_cuda((const float *) src1->data, ids_src1.get(), src1_q8_1.get(), gate_w->type, ne10,
+                               s11, s12, s13, ne10_padded, ne12*n_expert_used, 1, 1, stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    const int64_t s12_q = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+    const int64_t s13_q = ne12*s12_q;
+
+    // nrows_x counts the gate and the up rows: a fused row tile draws half of its rows from each.
+    const mmq_args args = {
+        (const char *) gate_w->data, gate_w->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(),
+        (float *) dst->data,
+        ne00, 2*ne01, ne_get_rows, s01, ne_get_rows, s1,
+        ne02, ne02, s02, s12_q, s2,
+        1, 1, 0, s13_q, 0,
+        /*use_stream_k =*/ true, ne12,
+        (const char *) up_w->data};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }

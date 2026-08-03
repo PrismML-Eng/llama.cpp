@@ -4124,6 +4124,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fused_node_count  = 3;
                 break;
             }
+
+            // Prefill / large-batch routed experts: fold the SwiGLU into the MMQ epilogue so the
+            // gate and up products are never written to global memory.
+            if (ggml_cuda_can_fuse_mmq_glu(gate, up, glu)) {
+                ggml_cuda_mul_mat_q_fused_glu(*cuda_ctx, gate->src[0], up->src[0], src1, ids, glu);
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
         }
     }
 

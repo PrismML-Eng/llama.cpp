@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "vecdotq.cuh"
 #include "mma.cuh"
+#include "unary.cuh"
 
 #include <climits>
 #include <cstdint>
@@ -3352,6 +3353,98 @@ static __device__ __forceinline__ void mmq_write_back_mma(
     }
 }
 
+// Types for which the fused SwiGLU epilogue is compiled. Every type listed here doubles the
+// number of MMQ kernels compiled for it, so keep this to the types where the fusion pays off.
+static constexpr bool mmq_glu_fusion_supported(ggml_type type) {
+    return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q2_0;
+}
+
+// Write-back for the fused SwiGLU epilogue.
+//
+// The row tile holds mmq_y/2 rows of the gate matrix in rows [0, mmq_y/2) and the mmq_y/2 matching
+// rows of the up matrix in rows [mmq_y/2, mmq_y). Both halves therefore live in the registers of a
+// single block, but not of a single warp, so the up half is staged through shared memory before the
+// gate half consumes it. Only mmq_y/2 rows are written to dst, which is the SwiGLU output.
+template<int mmq_x, int mmq_y>
+static __device__ __forceinline__ void mmq_write_back_mma_glu(
+        const float * __restrict__ sum, const int * __restrict__ ids_dst, float * __restrict__ dst,
+        const int stride, const int j_max, float * __restrict__ scratch) {
+#if defined(TURING_MMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    constexpr int granularity = mmq_get_granularity_device(mmq_x);
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    constexpr int tileC_IJ = mmq_get_granularity_device(0);
+    typedef tile<tileC_IJ, tileC_IJ, int, DATA_LAYOUT_J_MAJOR> tile_C;
+    constexpr int rows_per_warp = granularity;
+#else
+    typedef tile<16, 8, int> tile_C;
+    constexpr int rows_per_warp = 2 * granularity;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    constexpr int ntx = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
+
+    constexpr int nrows_glu = mmq_y/2;
+    static_assert(mmq_y % 2 == 0, "mmq_y must be even for the fused GLU epilogue");
+    // The scratch buffer aliases the x tile, which holds mmq_y*mmq_get_mma_tile_x_k(type) ints.
+    // MMQ_MMA_TILE_X_K_Q8_0 is the smallest of those, so this bound is conservative.
+    static_assert(nrows_glu*mmq_x <= mmq_y*MMQ_MMA_TILE_X_K_Q8_0, "GLU scratch does not fit in the x tile");
+    static_assert(mmq_get_nwarps_device()*tile_C::I == mmq_y, "nwarps*tile_C::I != mmq_y");
+
+    const int i0 = (threadIdx.y / ntx) * (ntx*tile_C::I);
+
+    // Stage the up half.
+#pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += ntx*tile_C::J) {
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int i = i0 + n*tile_C::I + tile_C::get_i(l);
+
+                if (i < nrows_glu) {
+                    continue;
+                }
+
+                const int j = j0 + (threadIdx.y % ntx) * tile_C::J + tile_C::get_j(l);
+
+                scratch[(i - nrows_glu)*mmq_x + j] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+            }
+        }
+    }
+
+    __syncthreads();
+
+    // Apply the epilogue on the gate half and write the only output of the fused op.
+#pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += ntx*tile_C::J) {
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int i = i0 + n*tile_C::I + tile_C::get_i(l);
+
+                if (i >= nrows_glu) {
+                    continue;
+                }
+
+                const int j = j0 + (threadIdx.y % ntx) * tile_C::J + tile_C::get_j(l);
+
+                if (j > j_max) {
+                    continue;
+                }
+
+                const float gate = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                const float up   = scratch[i*mmq_x + j];
+
+                dst[ids_dst[j]*stride + i] = ggml_cuda_op_silu_single(gate) * up;
+            }
+        }
+    }
+#else
+    NO_DEVICE_CODE;
+    GGML_UNUSED_VARS(sum, ids_dst, dst, stride, j_max, scratch);
+#endif // defined(TURING_MMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+}
+
 // -------------------------------------------------------------------------------------------------------------------------------------
 
 template <int mmq_x, int mmq_y, bool need_check, ggml_type type>
@@ -3543,9 +3636,9 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_IQ4_XS> {
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
 };
 
-template <ggml_type type, int mmq_x, bool need_check, bool fixup>
+template <ggml_type type, int mmq_x, bool need_check, bool fixup, bool fuse_glu = false>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
-        const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
+        const char * __restrict__ x, const char * __restrict__ x_up, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
@@ -3583,7 +3676,19 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
-        load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+        if constexpr (fuse_glu) {
+            // Load mmq_y/2 gate rows followed by the mmq_y/2 matching up rows into one x tile.
+            // need_check is forced on for the half loads because a single loader pass can cover
+            // more rows than mmq_y/2; the clamp keeps those writes inside the half tile.
+            constexpr int glu_nrows = mmq_y/2;
+            constexpr load_tiles_mmq_t load_tiles_glu = mmq_type_traits<mmq_x, glu_nrows, true, type>::load_tiles;
+            constexpr int glu_tile_stride = mmq_get_mma_tile_x_k(type);
+
+            load_tiles_glu(x,    tile_x,                             offset_x + kb0, glu_nrows - 1, stride_row_x);
+            load_tiles_glu(x_up, tile_x + glu_nrows*glu_tile_stride, offset_x + kb0, glu_nrows - 1, stride_row_x);
+        } else {
+            load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+        }
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll
@@ -3617,7 +3722,11 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         __syncthreads();
     }
 
-    if (fixup) {
+    if constexpr (fuse_glu) {
+        __syncthreads(); // the x tile is reused as scratch space by the epilogue
+        mmq_write_back_mma_glu<mmq_x, mmq_y>(sum, ids_dst, dst, stride_col_dst, tile_y_max_j, (float *) tile_x);
+        GGML_UNUSED(write_back);
+    } else if (fixup) {
         write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(mmq_x*mmq_y), mmq_y, mmq_y, mmq_x);
     } else {
         write_back(sum, ids_dst, dst, stride_col_dst, tile_x_max_i, tile_y_max_j);
@@ -3627,7 +3736,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
-template <ggml_type type, int mmq_x, bool need_check>
+template <ggml_type type, int mmq_x, bool need_check, bool fuse_glu = false>
 #if defined(GGML_USE_HIP)
 #if defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
@@ -3640,7 +3749,8 @@ template <ggml_type type, int mmq_x, bool need_check>
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
 #endif // defined(GGML_USE_HIP)
 static __global__ void mul_mat_q(
-        const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
+        const char * __restrict__ x, const char * __restrict__ x_up,
+        const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
         const int32_t * __restrict__ expert_bounds, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
@@ -3653,11 +3763,22 @@ static __global__ void mul_mat_q(
         return;
     }
 
+#if !(defined(TURING_MMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE))
+    // The fused epilogue relies on the mma x-tile layout, whose row stride does not depend on mmq_y.
+    if constexpr (fuse_glu) {
+        NO_DEVICE_CODE;
+        return;
+    }
+#endif // !(defined(TURING_MMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE))
+
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr int qk    = ggml_cuda_type_traits<type>::qk;
     constexpr int mmq_y = get_mmq_y_device();
+
+    // With the fused epilogue a row tile consumes mmq_y weight rows but produces mmq_y/2 output rows.
+    constexpr int mmq_y_dst = fuse_glu ? mmq_y/2 : mmq_y;
 
     const uint32_t nty = (nrows_x + mmq_y - 1) / mmq_y; // Number of tiles y
 
@@ -3720,16 +3841,16 @@ static __global__ void mul_mat_q(
         }
 
         offset_y   += (col_low + jt*mmq_x)*(sizeof(block_q8_1_mmq)/sizeof(int));
-        offset_dst += it*mmq_y;
+        offset_dst += it*mmq_y_dst;
 
         const int tile_x_max_i = nrows_x  - it*mmq_y - 1;
         const int tile_y_max_j = col_diff - jt*mmq_x - 1;
 
-        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
+        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y_dst*stride_row_x;
 
         constexpr bool fixup = false;
-        mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+        mul_mat_q_process_tile<type, mmq_x, need_check, fixup, fuse_glu>
+            (x, x_up, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
         return;
     }
@@ -3800,16 +3921,16 @@ static __global__ void mul_mat_q(
         }
 
         offset_y += (col_low + jt * mmq_x) * (sizeof(block_q8_1_mmq) / sizeof(int));
-        offset_dst += it*mmq_y;
+        offset_dst += it*mmq_y_dst;
 
         const int tile_x_max_i = nrows_x  - it*mmq_y - 1;
         const int tile_y_max_j = col_diff - jt*mmq_x - 1;
 
-        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
+        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y_dst*stride_row_x;
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
-        mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+        mul_mat_q_process_tile<type, mmq_x, need_check, fixup, fuse_glu>
+            (x, x_up, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 
         kbc += blocks_per_ne00.z;
@@ -3817,6 +3938,12 @@ static __global__ void mul_mat_q(
 
         kb0_start = 0;
         kb0_stop  = min(blocks_per_ne00.z, uint32_t(kbc_stop - kbc));
+    }
+
+    if constexpr (fuse_glu) {
+        // The epilogue needs the complete k range of a tile inside one block. The launcher uses one
+        // block per output tile for the fused path, so the stream-k fixup tail is unreachable.
+        return;
     }
 
     if (kbc >= kbc_stop) {
@@ -3869,16 +3996,16 @@ static __global__ void mul_mat_q(
     }
 
     offset_y += (col_low + jt * mmq_x) * (sizeof(block_q8_1_mmq) / sizeof(int));
-    offset_dst += it*mmq_y;
+    offset_dst += it*mmq_y_dst;
 
     const int tile_x_max_i = nrows_x  - it*mmq_y - 1;
     const int tile_y_max_j = col_diff - jt*mmq_x - 1;
 
-    const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
+    const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y_dst*stride_row_x;
 
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
-    mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
-        (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+    mul_mat_q_process_tile<type, mmq_x, need_check, fixup, fuse_glu>
+        (x, x_up, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 }
 
@@ -4027,6 +4154,9 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     bool use_stream_k; int64_t ncols_max;
+    // Fused SwiGLU epilogue: when non-null, dst = silu(x @ y) * (x_up @ y) and nrows_x is the sum of
+    // the row counts of x and x_up. Only mmq_glu_fusion_supported() types honour this.
+    const char * x_up = nullptr;
 };
 
 template<ggml_type type>
@@ -4072,11 +4202,30 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
+    if constexpr (mmq_glu_fusion_supported(type)) {
+        if (args.x_up) {
+            // One block per output tile: every tile is completed by a single block, so the fused
+            // epilogue always sees the full k range and the stream-k fixup is never needed.
+            GGML_ASSERT(args.nrows_x % mmq_y == 0);
+            const int ntiles_dst_glu = nty * ntx * ntzw;
+
+            CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false, true>), nbytes_shared);
+
+            mul_mat_q<type, mmq_x, false, true><<<dim3(ntiles_dst_glu, 1, 1), block_dims, nbytes_shared, stream>>>
+                (args.x, args.x_up, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                 blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                 channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                 sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                 ntx_fd);
+            return;
+        }
+    }
+
     if (!args.use_stream_k) {
         if (args.nrows_x % mmq_y == 0) {
             constexpr bool need_check = false;
             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
-                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                (args.x, nullptr, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -4084,7 +4233,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         } else {
             constexpr bool need_check = true;
             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
-                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                (args.x, nullptr, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -4116,7 +4265,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     if (args.nrows_x % mmq_y == 0) {
         constexpr bool need_check = false;
         mul_mat_q<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
-            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
+            (args.x, nullptr, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -4134,7 +4283,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     } else {
         constexpr bool need_check = true;
         mul_mat_q<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
-            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
+            (args.x, nullptr, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -4265,6 +4414,14 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+
+// Fused routed gate/up mul_mat_id + SwiGLU. Writes only the SwiGLU result; the gate and up products
+// are never materialized in global memory.
+void ggml_cuda_mul_mat_q_fused_glu(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * up_w,
+        const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+
+bool ggml_cuda_can_fuse_mmq_glu(const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * glu);
 
 void ggml_cuda_op_mul_mat_q(
     ggml_backend_cuda_context & ctx,
