@@ -31,6 +31,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/moe-reduce.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -3835,6 +3836,117 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+static bool ggml_cuda_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const int64_t a_start = (int64_t) a->data;
+    const int64_t a_end   = a_start + (int64_t) ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
+
+    const int64_t b_start = (int64_t) b->data;
+    const int64_t b_end   = b_start + (int64_t) ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
+
+    return (b_start <= a_start && a_start < b_end) || (a_start <= b_start && b_start < a_end);
+}
+
+// MoE weighted-expert reduce, as emitted by llm_graph_context::build_moe_ffn:
+//     MUL(down_out, router_weights)  ->  n_exp x VIEW  ->  (n_exp - 1) x ADD
+// The MUL writes a second full-size [n_embd, n_expert_used, n_tokens] F32 tensor that only
+// exists so the add chain can read it back, which at large ubatch is tens of MB written and
+// read again per layer. Folding the weighting into the reduction removes that round trip and
+// is bit-identical to the unfused sequence.
+static bool ggml_cuda_should_fuse_moe_weighted_reduce(const ggml_cgraph * cgraph,
+                                                      int                 node_idx,
+                                                      int                 n_exp,
+                                                      bool &              stage_weights) {
+    const ggml_tensor * mul = cgraph->nodes[node_idx];
+    const ggml_tensor * x   = mul->src[0];
+    const ggml_tensor * w   = mul->src[1];
+
+    stage_weights = false;
+
+    if (!x || !w) {
+        return false;
+    }
+
+    if (mul->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (!ggml_is_contiguous(mul) || !ggml_is_contiguous(x) || !ggml_are_same_shape(mul, x)) {
+        return false;
+    }
+
+    const int64_t ne0   = mul->ne[0];
+    const int64_t n_tok = mul->ne[2];
+
+    // the router weights must be a per (expert, token) scalar, broadcast along ne0
+    if (w->ne[0] != 1 || w->ne[1] != n_exp || w->ne[2] != n_tok || w->ne[3] != 1) {
+        return false;
+    }
+
+    // one block row per token
+    if (n_tok > 65535) {
+        return false;
+    }
+
+    // n_exp views of the weighted tensor, one per expert slot, in slot order
+    for (int e = 0; e < n_exp; ++e) {
+        const ggml_tensor * v = cgraph->nodes[node_idx + 1 + e];
+
+        if (v->view_src != mul || v->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (v->ne[0] != ne0 || v->ne[1] != n_tok || v->ne[2] != 1 || v->ne[3] != 1) {
+            return false;
+        }
+        if (v->nb[0] != mul->nb[0] || v->nb[1] != mul->nb[2]) {
+            return false;
+        }
+        if ((const char *) v->data != (const char *) mul->data + e*mul->nb[1]) {
+            return false;
+        }
+    }
+
+    // left-to-right add chain over those views
+    for (int k = 0; k < n_exp - 1; ++k) {
+        const ggml_tensor * add = cgraph->nodes[node_idx + 1 + n_exp + k];
+
+        const ggml_tensor * expected_a = (k == 0) ? cgraph->nodes[node_idx + 1] : cgraph->nodes[node_idx + n_exp + k];
+        const ggml_tensor * expected_b = cgraph->nodes[node_idx + 2 + k];
+
+        if (add->src[0] != expected_a || add->src[1] != expected_b) {
+            return false;
+        }
+        if (add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add)) {
+            return false;
+        }
+        if (add->ne[0] != ne0 || add->ne[1] != n_tok || add->ne[2] != 1 || add->ne[3] != 1) {
+            return false;
+        }
+    }
+
+    // Aliasing. The fused kernel reads x and w while it is writing dst, so anything the
+    // graph allocator has placed under dst is a cross-block race. ggml_cuda_check_fusion_
+    // memory_ranges is not used here because it ignores sources whose op is GGML_OP_NONE
+    // and because it can only reject, while the weights case has a cheap repair.
+    const ggml_tensor * dst = cgraph->nodes[node_idx + 2*n_exp - 1];
+
+    if (ggml_cuda_tensors_overlap(dst, x)) {
+        return false;
+    }
+
+    if (ggml_cuda_tensors_overlap(dst, w)) {
+        // The router weights die at the MUL, so the allocator routinely packs the add-chain
+        // output over them. They are only n_expert_used*n_tokens floats, so the op snapshots
+        // them into pool scratch rather than giving up the fusion.
+        if (!ggml_is_contiguous(w)) {
+            return false;
+        }
+
+        stage_weights = true;
+    }
+
+    return true;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3965,6 +4077,41 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (types_ok && shape_ok && dim_ok && x_in_add == x) {
             ggml_cuda_op_snake_fused(*cuda_ctx, x, a, inv_b, add);
             return 4;
+        }
+    }
+
+    // MoE router weighting + expert reduction  [kill switch: GGML_CUDA_MOE_REDUCE_DISABLE=1]
+    static bool disable_moe_reduce = getenv("GGML_CUDA_MOE_REDUCE_DISABLE") != nullptr &&
+                                     std::atoi(getenv("GGML_CUDA_MOE_REDUCE_DISABLE"));
+
+    if (!disable_moe_reduce && node->op == GGML_OP_MUL && node->ne[3] == 1 &&
+        node->ne[1] >= 2 && node->ne[1] <= GGML_CUDA_MOE_REDUCE_MAX_EXPERTS) {
+
+        const int n_exp   = (int) node->ne[1];
+        const int n_nodes = 2*n_exp;  // MUL + n_exp views + (n_exp - 1) adds
+
+        std::vector<ggml_op> ops;
+        ops.reserve(n_nodes);
+        ops.push_back(GGML_OP_MUL);
+        ops.insert(ops.end(), n_exp,     GGML_OP_VIEW);
+        ops.insert(ops.end(), n_exp - 1, GGML_OP_ADD);
+
+        const int out_node = i + n_nodes - 1;
+
+        bool stage_weights = false;
+
+        if (ggml_can_fuse_subgraph(cgraph, i, n_nodes, ops.data(), &out_node, 1) &&
+            ggml_cuda_should_fuse_moe_weighted_reduce(cgraph, i, n_exp, stage_weights)) {
+
+            static bool debug_moe_reduce = getenv("GGML_CUDA_MOE_REDUCE_DEBUG") != nullptr;
+            if (debug_moe_reduce) {
+                GGML_LOG_INFO("%s: fused moe weighted reduce: n_expert_used=%d ne0=%d n_tokens=%d staged=%d\n",
+                              __func__, n_exp, (int) node->ne[0], (int) node->ne[2], (int) stage_weights);
+            }
+
+            ggml_cuda_op_moe_weighted_reduce(*cuda_ctx, node->src[0], node->src[1], cgraph->nodes[out_node],
+                                             n_exp, stage_weights);
+            return n_nodes - 1;
         }
     }
 
