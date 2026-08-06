@@ -84,15 +84,19 @@ scheduler eval-callback mechanism `llama-imatrix` uses to capture activations). 
 
 - Only `GGML_TYPE_Q4_0` is supported; other K cache types are rejected. Generalizing the mechanism
   to other quantization types is future work.
-- Only the plain (non-recurrent, non-hybrid, non-MLA/DSA) KV cache is supported.
+- Every standard-attention KV cache layout is supported: the plain cache, the base/SWA pair of
+  sliding-window models, and the attention sub-cache of hybrid (recurrent + attention) models,
+  with or without SWA. Recurrent-only and MLA/DSA memory types are not.
 - The calibration hook (`k_cache_in`) is currently only wired into the standard
   dense/GQA attention path (`llm_graph_context::build_attn(llm_graph_input_attn_kv *, ...)`),
   which covers the large majority of architectures. MLA and other specialized attention variants
   are not covered yet.
-- If this fork's optional Hadamard K/Q rotation feature is also active (automatic for `Q4_0`
-  caches whose head dimension is a multiple of 64, unless `LLAMA_ATTN_ROT_DISABLE=1`), the bias is
-  calibrated in the pre-rotation basis while it is applied in whatever basis `cpy_k()` sees
-  (post-rotation, if active). This remains exactly safe (the invariance argument above is
-  basis-independent), but the calibrated bias is a less accurate estimate of that channel's true
-  post-rotation mean in that configuration. Calibrating directly against the post-rotation
-  representation is a natural follow-up.
+- The bias lives in the basis the calibration run's K cache used. With this fork's optional
+  Hadamard K rotation (automatic for quantized K caches whose head dimension is a multiple of 64,
+  unless `LLAMA_ATTN_ROT_DISABLE=1`), that means: calibrate with the same `--cache-type-k` and
+  rotation settings you serve with, e.g. `-ctk q4_0` for the common case. Applying a bias in the
+  wrong basis remains exactly safe for attention logits (the invariance argument above is
+  basis-independent) but measurably degrades quantization quality instead of improving it, so the
+  calibration tool records its basis in the file (`kv_mean_center.k_rot`) and the loader rejects
+  a mismatch. In the matching basis the two features compose; see tools/kv-mean-center/README.md
+  for measured numbers.

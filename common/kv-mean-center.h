@@ -20,7 +20,11 @@ struct common_kv_mean_center_layer {
 };
 
 // write a K-cache mean-centering bias file in GGUF format.
+// `k_rot` records whether the bias was measured with the Hadamard K-cache rotation active
+// (stored as the "kv_mean_center.k_rot" KV); the loader refuses a bias whose basis does not
+// match the inference-time rotation state.
 // returns false (and logs an error) on failure.
 bool common_kv_mean_center_write(
         const std::string & fname,
-        const std::vector<common_kv_mean_center_layer> & layers);
+        const std::vector<common_kv_mean_center_layer> & layers,
+        bool k_rot = false);
