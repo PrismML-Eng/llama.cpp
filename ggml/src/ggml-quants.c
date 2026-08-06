@@ -109,6 +109,41 @@ void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_REST
     }
 }
 
+// Q2_0_g128: identical 2-bit codec to Q2_0, one fp16 scale per 128 weights.
+void quantize_row_q2_0_g128_ref(const float * GGML_RESTRICT x, block_q2_0_g128 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK2_0_G128;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            const float a = fabsf(x[i*qk + j]);
+            if (a > amax) amax = a;
+        }
+        const float d = amax;
+        const float id = d > 0.0f ? 1.0f / d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        for (int j = 0; j < qk / 4; ++j) {
+            y[i].qs[j] = 0;
+        }
+
+        for (int j = 0; j < qk; ++j) {
+            const float w = x[i*qk + j];
+            int q = (int)roundf(w * id) + 1;
+            if (q < 0) q = 0;
+            if (q > 3) q = 3;
+            const int byte_index = j / 4;
+            const int bit_offset = (j % 4) * 2;
+            y[i].qs[byte_index] |= ((uint8_t)q << bit_offset);
+        }
+    }
+}
+
 // reference implementation for deterministic creation of model files
 void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK4_0;
@@ -438,6 +473,26 @@ void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GGML_RESTRI
 
 void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK2_0;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int j = 0; j < qk; ++j) {
+            const int byte_index = j / 4;
+            const int bit_offset = (j % 4) * 2;
+            const uint8_t q = (x[i].qs[byte_index] >> bit_offset) & 0x03;
+            // 00=-1, 01=0, 10=+1, 11=+2
+            y[i*qk + j] = ((int)q - 1) * d;
+        }
+    }
+}
+
+void dequantize_row_q2_0_g128(const block_q2_0_g128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK2_0_G128;
 
     assert(k % qk == 0);
 
@@ -2119,6 +2174,21 @@ size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     char * qrow = (char *)dst;
     for (int64_t row = 0; row < nrow; ++row) {
         quantize_row_q2_0_ref(src, (block_q2_0*)qrow, n_per_row);
+        src += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
+}
+
+size_t quantize_q2_0_g128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    if (!quant_weights) {
+        quantize_row_q2_0_g128_ref(src, dst, (int64_t)nrow*n_per_row);
+        return nrow * ggml_row_size(GGML_TYPE_Q2_0_G128, n_per_row);
+    }
+    size_t row_size = ggml_row_size(GGML_TYPE_Q2_0_G128, n_per_row);
+    char * qrow = (char *)dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_q2_0_g128_ref(src, (block_q2_0_g128*)qrow, n_per_row);
         src += n_per_row;
         qrow += row_size;
     }
