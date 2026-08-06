@@ -29,6 +29,8 @@ public:
 
     std::vector<common_kv_mean_center_layer> finalize() const;
 
+    bool saw_k_rot() const { return m_saw_k_rot; }
+
 private:
     std::mutex m_mutex;
     std::vector<uint8_t> m_host_buf;
@@ -36,7 +38,31 @@ private:
 
     std::unordered_map<int32_t, std::vector<double>> m_sum;   // il -> [n_embd_head * n_head]
     std::unordered_map<int32_t, int64_t>              m_count; // il -> total tokens seen
+
+    // whether the captured K tensors were produced with the Hadamard K-cache rotation
+    // active, detected from the graph itself: the rotation is a mul_mat against the
+    // "attn_inp_k_rot" input, so it shows up in the ancestry of "k_cache_in-<il>".
+    // recorded in the output file so the loader can reject a basis mismatch.
+    bool m_saw_k_rot = false;
 };
+
+// look for the "attn_inp_k_rot" input within a few links of the captured tensor. matched as a
+// substring: views append a suffix ("attn_inp_k_rot (reshaped)") and the backend scheduler
+// decorates split inputs with a backend prefix and split index ("MTL0#attn_inp_k_rot#0")
+static bool tensor_has_k_rot_ancestor(const struct ggml_tensor * t, int depth = 8) {
+    if (t == nullptr || depth < 0) {
+        return false;
+    }
+    if (strstr(t->name, "attn_inp_k_rot") != nullptr) {
+        return true;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (t->src[i] && tensor_has_k_rot_ancestor(t->src[i], depth - 1)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 // "k_cache_in-<il>" -> il, as formatted by llm_graph_context::cb() (ggml_format_name("%s-%d", ...))
 static bool parse_k_cache_in_layer(const char * name, int32_t & il) {
@@ -69,6 +95,10 @@ bool kv_mean_collector::collect(struct ggml_tensor * t, bool ask) {
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (!m_saw_k_rot && tensor_has_k_rot_ancestor(t)) {
+        m_saw_k_rot = true;
+    }
 
     // cpy_k() can be fed an F32, F16, or BF16 Kcur depending on backend/compute settings.
     GGML_ASSERT(t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16);
@@ -262,12 +292,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (!common_kv_mean_center_write(params.out_file, layers)) {
+    if (!common_kv_mean_center_write(params.out_file, layers, g_collector.saw_k_rot())) {
         return 1;
     }
 
-    LOG_INF("%s: wrote K-cache mean-centering bias for %zu layer(s) to %s\n",
-            __func__, layers.size(), params.out_file.c_str());
+    LOG_INF("%s: wrote K-cache mean-centering bias for %zu layer(s) to %s (measured with K rotation %s)\n",
+            __func__, layers.size(), params.out_file.c_str(), g_collector.saw_k_rot() ? "active" : "inactive");
 
     llama_backend_free();
 
