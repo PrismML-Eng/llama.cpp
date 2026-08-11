@@ -195,6 +195,12 @@ struct llama_hparams {
     // e.g. the eagle3 encoder fuses target_layers * target_hidden features
     uint32_t n_embd_inp_enc_impl = 0;
 
+    // dspark GIDD log-SNR conditioning (LogSnrEmbed); off unless the drafter
+    // GGUF sets <arch>.log_snr_conditioning
+    bool  dspark_log_snr_conditioning = false;
+    float dspark_min_log_snr = 0.0f;
+    float dspark_max_log_snr = 0.0f;
+
     // output embedding dimension (0 = use n_embd)
     uint32_t n_embd_out_impl = 0;
 

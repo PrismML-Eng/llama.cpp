@@ -317,6 +317,9 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
 
     { LLM_KV_TARGET_LAYERS,         "%s.target_layers"        },
     { LLM_KV_TARGET_HIDDEN_SIZE,    "%s.target_hidden_size"   },
+    { LLM_KV_LOG_SNR_CONDITIONING,  "%s.log_snr_conditioning" },
+    { LLM_KV_MIN_LOG_SNR,           "%s.min_log_snr"          },
+    { LLM_KV_MAX_LOG_SNR,           "%s.max_log_snr"          },
     { LLM_KV_NORM_BEFORE_RESIDUAL,  "%s.norm_before_residual" },
     { LLM_KV_NORM_BEFORE_FC,        "%s.norm_before_fc"       },
 
@@ -620,6 +623,8 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_DSPARK_MARKOV_W1,                       "markov_w1" },
     { LLM_TENSOR_DSPARK_MARKOV_W2,                       "markov_w2" },
     { LLM_TENSOR_DSPARK_CONF_PROJ,                       "conf_proj" },
+    { LLM_TENSOR_DSPARK_LOG_SNR_FC1,                     "log_snr_fc1" },
+    { LLM_TENSOR_DSPARK_LOG_SNR_FC2,                     "log_snr_fc2" },
 };
 
 // declare information about the model weight tensors:
@@ -878,6 +883,8 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_DSPARK_MARKOV_W1,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
     {LLM_TENSOR_DSPARK_MARKOV_W2,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_DSPARK_CONF_PROJ,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DSPARK_LOG_SNR_FC1,         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DSPARK_LOG_SNR_FC2,         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}
