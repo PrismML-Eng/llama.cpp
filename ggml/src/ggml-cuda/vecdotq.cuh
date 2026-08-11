@@ -747,11 +747,40 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     // iqs selects which of the 4 chunks of 32 elements to process (0-3)
 
     const float     d2 = bq2_0->d;
-    // each 32-element chunk occupies 8 bytes of qs (4 int16), regardless of group size
-    const int16_t * qs = (const int16_t *) bq2_0->qs + iqs * 4;
-
     // Process only the chunk specified by iqs
     const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
+
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    // AMD path (same split as unpack_q1_0_bytes above): the dynamic-selector
+    // __byte_perm chain below is built around NVIDIA's PRMT; on HIP it lowers
+    // poorly and the decode GEMV loses ~30% end-to-end. Instead, bit-spread
+    // the raw codes c in {0,1,2,3} into bytes and use the identity
+    //   dot(s, u) = dot(c, u) - sum(u),   s = c - 1
+    // applying the -sum(u) offset once at the end via the q8_1 stored sum
+    // (ds.y = d8 * sum(u)) -- no per-code subtract, plain shift/mask + dp4a.
+    const int offset = iqs * 8;
+    const int qs0 = bq2_0->qs[offset + 0] | (bq2_0->qs[offset + 1] << 8) |
+                    (bq2_0->qs[offset + 2] << 16) | (bq2_0->qs[offset + 3] << 24);
+    const int qs1 = bq2_0->qs[offset + 4] | (bq2_0->qs[offset + 5] << 8) |
+                    (bq2_0->qs[offset + 6] << 16) | (bq2_0->qs[offset + 7] << 24);
+
+    int sumi = 0;   // = dot(c, u), c in {0,1,2,3}
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int b0 = (qs0 >> (j*8)) & 0xFF;
+        const int s0 = (b0 | (b0 << 6) | (b0 << 12) | (b0 << 18)) & 0x03030303; // 4 codes -> 4 bytes
+        sumi = ggml_cuda_dp4a(s0, get_int_b4(bq8_1_chunk->qs, j), sumi);
+        const int b1 = (qs1 >> (j*8)) & 0xFF;
+        const int s1 = (b1 | (b1 << 6) | (b1 << 12) | (b1 << 18)) & 0x03030303;
+        sumi = ggml_cuda_dp4a(s1, get_int_b4(bq8_1_chunk->qs, 4 + j), sumi);
+    }
+
+    const float d8 = __low2float(bq8_1_chunk->ds);
+    const float s8 = __high2float(bq8_1_chunk->ds); // = d8 * sum(u)
+    return d2 * (d8 * sumi - s8);
+#else
+    // each 32-element chunk occupies 8 bytes of qs (4 int16), regardless of group size
+    const int16_t * qs = (const int16_t *) bq2_0->qs + iqs * 4;
 
     int sumi = 0;
 #pragma unroll
@@ -775,6 +804,7 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     // symbols are already signed, so no deferred sum(act) correction is needed
     const float d8 = __low2float(bq8_1_chunk->ds);
     return d2 * d8 * sumi;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(

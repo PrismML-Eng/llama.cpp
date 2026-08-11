@@ -29,6 +29,9 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/hipblaslt_wcache.cuh"
+#include "ggml-cuda/mul_mat_q2_0_hipblaslt.cuh"
+#include "ggml-cuda/mul_mat_q1_0_hipblaslt.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -639,6 +642,10 @@ struct ggml_backend_cuda_buffer_context {
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    // The hipBLASLt prefill routes key their converted-weight caches on device
+    // addresses inside this buffer; drop those entries before the address range
+    // can be reused by a later allocation (see hipblaslt_wcache.cuh).
+    ggml_hipblaslt_wcache_invalidate(ctx->dev_ptr, buffer->size);
     delete ctx;
 }
 
@@ -2587,6 +2594,27 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
     }
 
+    // Opt-in RDNA4 prefill levers (see mul_mat_q2_0_hipblaslt.cuh): route Q2_0 /
+    // Q1_0 large-M (prefill) matmuls through AMD's tuned hipBLASLt int8 GEMM
+    // instead of the dp4a/mmq path. W8A8, per-channel weight scale. Both are
+    // env-gated OFF by default; a soft-fail (false) falls through to the
+    // unmodified paths below, and non-HIP builds compile the routes to stubs
+    // that always return false.
+    if (!split) {
+        static const bool q2_0_hipblaslt_prefill_enabled = (getenv("GGML_HIP_Q2_0_HIPBLASLT_PREFILL") != nullptr);
+        if (q2_0_hipblaslt_prefill_enabled && ggml_cuda_q2_0_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_q2_0_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+        }
+        static const bool q1_0_hipblaslt_prefill_enabled = (getenv("GGML_HIP_Q1_0_HIPBLASLT_PREFILL") != nullptr);
+        if (q1_0_hipblaslt_prefill_enabled && ggml_cuda_q1_0_hipblaslt_prefill_supports(src0, src1, dst)) {
+            if (ggml_cuda_op_mul_mat_q1_0_hipblaslt(ctx, src0, src1, dst)) {
+                return;
+            }
+        }
+    }
+
     // debug helpers
     //printf("src0: %8d %8d %8d %8d\n", src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
     //printf("      %8d %8d %8d %8d\n", src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3]);
@@ -4470,6 +4498,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // Reset the opt-in mmvq activation-quant dedup cache at every graph build:
+    // it is keyed by tensor pointer, which is only meaningful within one graph
+    // evaluation (see common.cuh / mmvq.cu).
+    cuda_ctx->mmvq_quant_cache_tensor = nullptr;
+    cuda_ctx->mmvq_quant_cache_buf.reset();
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

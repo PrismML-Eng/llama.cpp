@@ -4,6 +4,36 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <memory>
+
+// GGML_HIP_DEDUP_MMVQ_QUANT (default: unset/OFF): dedup the quantize_row_q8_1
+// dispatch across sibling mmvq matmuls that share one input tensor. Sibling
+// matmuls reading the exact same activation tensor (wq/wk/wv, ffn_gate/ffn_up,
+// wqkv/wqkv_gate within one decoder layer) each launch a quantize that
+// recomputes byte-identical output; this lever keeps quantize as a separate
+// launch (the packed dp4a decode path is untouched) and only skips launches
+// whose result is already cached for the same src1 tensor. The cache lives on
+// the backend context and is reset at every graph_compute, so entries can
+// never survive a graph rebuild (see ggml-cuda.cu). Measured on RDNA4
+// (2x R9700): Bonsai-27B Q2_0 MTP decode 51 -> 67 t/s; lossless, the cached
+// bytes are the same bytes the skipped launch would have produced.
+static bool ggml_cuda_dedup_mmvq_quant_enabled() {
+    static const bool enabled = getenv("GGML_HIP_DEDUP_MMVQ_QUANT") != nullptr;
+    return enabled;
+}
+
+// GGML_HIP_DEDUP_MMVQ_QUANT_BATCH (default OFF, REQUIRES the base flag too):
+// widen the sibling quant-dedup above to ncols_dst>1 (ne11>1) -- i.e. a
+// spec-decode verify pass batching n_draft+1 candidate tokens through the
+// target in one forward, not just the ne11==1 single-token decode path the
+// base flag is scoped to. The underlying redundancy is identical at any batch
+// size: sibling matmuls still read the exact same activation tensor whether
+// it holds 1 token or N. Kept as a separate flag so the single-stream win and
+// the verify-pass extension can be A/B'd independently.
+static bool ggml_cuda_dedup_mmvq_quant_batch_enabled() {
+    static const bool enabled = getenv("GGML_HIP_DEDUP_MMVQ_QUANT_BATCH") != nullptr;
+    return enabled;
+}
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
@@ -1192,12 +1222,32 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+
+    // Opt-in sibling-matmul activation-quant dedup (see the flag doc at the top
+    // of this file). MUL_MAT_ID is excluded: the expert path reorders rows.
+    const bool dedup_quant_batch_ok = ne11 == 1 || (ne11 > 1 && ggml_cuda_dedup_mmvq_quant_batch_enabled());
+    const bool dedup_quant = ggml_cuda_dedup_mmvq_quant_enabled() && !ids && dedup_quant_batch_ok;
+    const bool dedup_hit   = dedup_quant &&
+        ctx.mmvq_quant_cache_tensor == src1 && ctx.mmvq_quant_cache_buf;
+
+    // dedup_quant (hit OR miss-that-populates) ALWAYS routes data through
+    // ctx.mmvq_quant_cache_buf, never through the local src1_q8_1 -- so the
+    // local buffer must be skipped (size 0) whenever dedup_quant is true, not
+    // just on a hit: gating on dedup_hit alone would leave the miss
+    // occurrence's vy pointer aimed at an allocated-but-never-written local
+    // buffer while the real quantized data went into the cache.
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), dedup_quant ? 0 : ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    if (!dedup_hit) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        if (dedup_quant) {
+            ctx.mmvq_quant_cache_buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+            ctx.mmvq_quant_cache_tensor = src1;
+            quantize_row_q8_1_cuda(src1_d, nullptr, ctx.mmvq_quant_cache_buf->get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        } else {
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1222,8 +1272,11 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
+    const void * vy_ptr = dedup_quant ? (const void *) ctx.mmvq_quant_cache_buf->get()
+                                      : (const void *) src1_q8_1.get();
+
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, vy_ptr, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

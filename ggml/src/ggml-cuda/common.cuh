@@ -868,6 +868,62 @@ static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 }
 
+// Signed E4M3 (OCP e4m3fn) encoder. Portable closed-form bit manipulation, no
+// hardware fp8 instruction dependency -- usable on any device (unlike the
+// unsigned Blackwell-only scale encoder above). Used by the RDNA4 Q1_0/Q2_0
+// hipBLASLt prefill routes to requantize weights to e4m3 for the fp8 GEMM
+// variant (mul_mat_q{1,2}_0_hipblaslt.cu).
+static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_e4m3(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, 4);
+    const int sign = (bits >> 31) & 1;
+
+    if (x != x) { // NaN in -> NaN out
+        return (uint8_t) ((sign << 7) | 0x7F);
+    }
+
+    float ax = fabsf(x);
+    if (ax > 448.0f) {
+        ax = 448.0f; // clamp, e4m3fn has no infinity
+    }
+    if (!(ax > 0.0f)) {
+        return (uint8_t) (sign << 7); // +-0
+    }
+
+    memcpy(&bits, &ax, 4);
+    int fp32_exp = ((bits >> 23) & 0xFF) - 127;
+    int fp32_man = (bits >> 20) & 0x7;
+    int e4_exp   = fp32_exp + 7;
+
+    if (e4_exp <= 0) {
+        // subnormal: value = man * 2^-9, man = round(ax * 2^9)
+        int man = (int) (ax * 512.0f + 0.5f);
+        if (man > 7) {
+            man = 7;
+        }
+        if (man < 1) {
+            return (uint8_t) (sign << 7);
+        }
+        return (uint8_t) ((sign << 7) | man);
+    }
+
+    const int round_bit = (bits >> 19) & 1;
+    int e4_man = fp32_man + round_bit;
+    if (e4_man > 7) {
+        e4_man = 0;
+        e4_exp++;
+    }
+    if (e4_exp >= 15 && e4_man == 7) {
+        // never emit the NaN pattern (S.1111.111) from rounding: clamp to max finite
+        e4_exp = 15;
+        e4_man = 6;
+    } else if (e4_exp > 15) {
+        e4_exp = 15;
+        e4_man = 6;
+    }
+    return (uint8_t) ((sign << 7) | (e4_exp << 3) | e4_man);
+}
+
 __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e) {
     const uint8_t sign_bit = (x < 0.0f) << 3;
     float         ax       = fabsf(x) * e;
@@ -1404,6 +1460,15 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 
     int curr_stream_no = 0;
+
+    // Opt-in (GGML_HIP_DEDUP_MMVQ_QUANT) sibling-matmul activation-quant dedup
+    // cache: the last src1 tensor whose q8_1 quantization was computed, and the
+    // buffer holding it. Keyed by tensor pointer, valid only within one graph
+    // evaluation -- reset at every graph_compute (ggml-cuda.cu) so an entry can
+    // never survive into a graph where the pointer identifies a different
+    // tensor. See mmvq.cu for the full rationale.
+    const ggml_tensor * mmvq_quant_cache_tensor = nullptr;
+    std::unique_ptr<ggml_cuda_pool_alloc<char>> mmvq_quant_cache_buf;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
