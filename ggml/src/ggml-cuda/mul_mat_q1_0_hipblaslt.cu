@@ -393,8 +393,17 @@ const lt_plan & get_plan(int64_t N, int64_t M, int64_t K, int mode) {
 // Q1_0 on a 32 GB card, so cap the cache at a VRAM budget: weights that fit are
 // cached (requant paid once), the rest fall back to on-the-fly pool requant.
 // hipMalloc failure also falls back -- never OOM-crash.
-struct cached_w { int8_t * q8 = nullptr; float * wscale = nullptr; size_t bytes = 0; };
-struct cached_w_f8 { uint8_t * q8f8 = nullptr; float * wscale = nullptr; size_t bytes = 0; };
+// build_stream/build_done: entries are published under the mutex right after
+// the requant kernel is LAUNCHED, not after it completes. Same-stream
+// consumers are ordered by the stream itself; a consumer on any other stream
+// must wait on build_done before its GEMM reads the converted weights
+// (review hardening -- today's backend uses one compute stream per device,
+// so the wait never fires, but the invariant is now enforced rather than
+// assumed).
+struct cached_w { int8_t * q8 = nullptr; float * wscale = nullptr; size_t bytes = 0;
+                  hipStream_t build_stream = nullptr; hipEvent_t build_done = nullptr; };
+struct cached_w_f8 { uint8_t * q8f8 = nullptr; float * wscale = nullptr; size_t bytes = 0;
+                     hipStream_t build_stream = nullptr; hipEvent_t build_done = nullptr; };
 std::map<const void *, cached_w> g_wcache_i8;
 std::map<const void *, cached_w_f8> g_wcache_f8;
 size_t g_wcache_bytes = 0;
@@ -417,7 +426,13 @@ const cached_w * try_cache_weight_i8(const void * key, const char * wdata, int64
                                      int64_t N, int64_t K, int64_t n_blocks, cudaStream_t stream) {
     std::lock_guard<std::mutex> lk(g_wcache_mtx);
     auto it = g_wcache_i8.find(key);
-    if (it != g_wcache_i8.end()) return &it->second;
+    if (it != g_wcache_i8.end()) {
+        if (it->second.build_stream != stream &&
+            hipStreamWaitEvent(stream, it->second.build_done, 0) != hipSuccess) {
+            return nullptr;   // can't prove ordering -> caller requants on the fly
+        }
+        return &it->second;
+    }
 
     const size_t need = (size_t)N * K + (size_t)N * sizeof(float);
     if (g_wcache_bytes + need > wcache_budget_bytes()) return nullptr;   // budget hit
@@ -425,9 +440,14 @@ const cached_w * try_cache_weight_i8(const void * key, const char * wdata, int64
     cached_w c;
     if (hipMalloc(&c.q8, (size_t)N * K) != hipSuccess) return nullptr;
     if (hipMalloc(&c.wscale, (size_t)N * sizeof(float)) != hipSuccess) { hipFree(c.q8); return nullptr; }
+    if (hipEventCreateWithFlags(&c.build_done, hipEventDisableTiming) != hipSuccess) {
+        hipFree(c.q8); hipFree(c.wscale); return nullptr;
+    }
     c.bytes = need;
+    c.build_stream = stream;
     const dim3 grid((unsigned)N), block(256);
     k_requant_q1_0_to_int8_perchannel<<<grid, block, 0, stream>>>(wdata, nb01, c.q8, c.wscale, K, n_blocks);
+    hipEventRecord(c.build_done, stream);
     g_wcache_bytes += need;
     auto res = g_wcache_i8.emplace(key, c);
     return &res.first->second;
@@ -437,7 +457,13 @@ const cached_w_f8 * try_cache_weight_f8(const void * key, const char * wdata, in
                                         int64_t N, int64_t K, int64_t n_blocks, cudaStream_t stream) {
     std::lock_guard<std::mutex> lk(g_wcache_mtx);
     auto it = g_wcache_f8.find(key);
-    if (it != g_wcache_f8.end()) return &it->second;
+    if (it != g_wcache_f8.end()) {
+        if (it->second.build_stream != stream &&
+            hipStreamWaitEvent(stream, it->second.build_done, 0) != hipSuccess) {
+            return nullptr;   // can't prove ordering -> caller requants on the fly
+        }
+        return &it->second;
+    }
 
     const size_t need = (size_t)N * K + (size_t)N * sizeof(float);
     if (g_wcache_bytes + need > wcache_budget_bytes()) return nullptr;   // budget hit
@@ -445,9 +471,14 @@ const cached_w_f8 * try_cache_weight_f8(const void * key, const char * wdata, in
     cached_w_f8 c;
     if (hipMalloc(&c.q8f8, (size_t)N * K) != hipSuccess) return nullptr;
     if (hipMalloc(&c.wscale, (size_t)N * sizeof(float)) != hipSuccess) { hipFree(c.q8f8); return nullptr; }
+    if (hipEventCreateWithFlags(&c.build_done, hipEventDisableTiming) != hipSuccess) {
+        hipFree(c.q8f8); hipFree(c.wscale); return nullptr;
+    }
     c.bytes = need;
+    c.build_stream = stream;
     const dim3 grid((unsigned)N), block(256);
     k_requant_q1_0_to_e4m3_perchannel<<<grid, block, 0, stream>>>(wdata, nb01, c.q8f8, c.wscale, K, n_blocks);
+    hipEventRecord(c.build_done, stream);
     g_wcache_bytes += need;
     auto res = g_wcache_f8.emplace(key, c);
     return &res.first->second;
@@ -462,8 +493,9 @@ void wcache_invalidate_range(const void * base, size_t size) {
     for (auto it = g_wcache_i8.begin(); it != g_wcache_i8.end(); ) {
         const char * k = (const char *) it->first;
         if (k >= b && k < b + size) {
-            if (it->second.q8)     hipFree(it->second.q8);
-            if (it->second.wscale) hipFree(it->second.wscale);
+            if (it->second.q8)         hipFree(it->second.q8);
+            if (it->second.wscale)     hipFree(it->second.wscale);
+            if (it->second.build_done) hipEventDestroy(it->second.build_done);
             g_wcache_bytes -= it->second.bytes;
             it = g_wcache_i8.erase(it);
         } else { ++it; }
@@ -471,8 +503,9 @@ void wcache_invalidate_range(const void * base, size_t size) {
     for (auto it = g_wcache_f8.begin(); it != g_wcache_f8.end(); ) {
         const char * k = (const char *) it->first;
         if (k >= b && k < b + size) {
-            if (it->second.q8f8)   hipFree(it->second.q8f8);
-            if (it->second.wscale) hipFree(it->second.wscale);
+            if (it->second.q8f8)       hipFree(it->second.q8f8);
+            if (it->second.wscale)     hipFree(it->second.wscale);
+            if (it->second.build_done) hipEventDestroy(it->second.build_done);
             g_wcache_bytes -= it->second.bytes;
             it = g_wcache_f8.erase(it);
         } else { ++it; }
