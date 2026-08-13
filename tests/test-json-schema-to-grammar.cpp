@@ -1538,8 +1538,20 @@ int main() {
                 tc.verify_status(FAILURE);
             }
         };
+        // Same as `run`, but for SUCCESS cases also feeds the generated grammar through
+        // src/llama-grammar.cpp's own parser (llama_grammar_parser::parse) to confirm it is
+        // valid, well-formed GBNF -- not just that the converter didn't throw. This matters
+        // in particular for the PCRE shorthand character-class (\d, \w, \s, ...) translation
+        // below, since the whole point of that fix is that llama-grammar.cpp's parser used to
+        // reject the untranslated escapes at grammar-parse time.
+        auto run_and_check_gbnf = [&](const TestCase & tc) {
+            run(tc);
+            if (tc.expected_status == SUCCESS) {
+                tc.verify_expectation_parseable();
+            }
+        };
 
-        run({
+        run_and_check_gbnf({
             SUCCESS,
             "regexp with non-capturing group",
             R"""({
@@ -1552,7 +1564,7 @@ int main() {
             )""",
         });
 
-        run({
+        run_and_check_gbnf({
             SUCCESS,
             "regexp with nested non-capturing groups",
             R"""({
@@ -1564,6 +1576,133 @@ int main() {
                 space ::= | " " | "\n"{1,2} [ \t]{0,20}
             )""",
         });
+
+        // Regression coverage for the PCRE shorthand character-class escapes (\d, \D, \w, \W,
+        // \s, \S) that JSON Schema `pattern` regexes commonly use but that GBNF has no native
+        // escape for: src/llama-grammar.cpp's parse_char() throws "unknown escape" if one reaches
+        // it untranslated. A single such pattern anywhere in a combined tool-calling grammar used
+        // to disable grammar-constrained decoding for the whole request (confirmed against a
+        // PagerDuty `create_schedule` MCP tool schema using a leap-year-validated ISO-8601
+        // `pattern`, e.g. containing "\d\d[2468][048]", that reliably logged
+        // "parse: error parsing grammar: unknown escape at \d\d...").
+
+        run_and_check_gbnf({
+            SUCCESS,
+            "regexp with \\d \\w \\s shorthand classes inside [...] (mixed with literal members)",
+            R"""({
+                "type": "string",
+                "pattern": "^[\\dA-F]{4}-[\\w.-]+ [\\s,;]$"
+            })""",
+            R"""(
+                root ::= "\"" (root-1{4,4} "-" [A-Za-z0-9_.-]+ " " [ \t\n\r,;]) "\"" space
+                root-1 ::= [0-9A-F]
+                space ::= | " " | "\n"{1,2} [ \t]{0,20}
+            )""",
+        });
+
+        run_and_check_gbnf({
+            SUCCESS,
+            "regexp with standalone \\d \\w \\s shorthand classes and quantifiers",
+            R"""({
+                "type": "string",
+                "pattern": "^\\d+\\.\\w+\\s?$"
+            })""",
+            R"""(
+                d ::= [0-9]
+                root ::= "\"" (d+ "." w+ s?) "\"" space
+                s ::= [ \t\n\r]
+                space ::= | " " | "\n"{1,2} [ \t]{0,20}
+                w ::= [A-Za-z0-9_]
+            )""",
+        });
+
+        run_and_check_gbnf({
+            SUCCESS,
+            "regexp with standalone negated shorthand classes \\D \\W \\S",
+            R"""({
+                "type": "string",
+                "pattern": "^\\D\\W\\S$"
+            })""",
+            R"""(
+                not-d ::= [^0-9]
+                not-s ::= [^ \t\n\r]
+                not-w ::= [^A-Za-z0-9_]
+                root ::= "\"" (not-d not-w not-s) "\"" space
+                space ::= | " " | "\n"{1,2} [ \t]{0,20}
+            )""",
+        });
+
+        run_and_check_gbnf({
+            SUCCESS,
+            "regexp shaped like an ISO-8601 date (\\d immediately after literal '-', "
+            "exercising \\d recognition mid-literal-run, not just at the start of a token)",
+            R"""({
+                "type": "string",
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+            })""",
+            R"""(
+                d ::= [0-9]
+                root ::= "\"" (root-1{4,4} "-" root-1{2,2} "-" root-1{2,2}) "\"" space
+                root-1 ::= d
+                space ::= | " " | "\n"{1,2} [ \t]{0,20}
+            )""",
+        });
+
+        run_and_check_gbnf({
+            SUCCESS,
+            "regexp shaped like the PagerDuty leap-year-validated ISO-8601 pattern that broke "
+            "grammar-constrained decoding in production (\\d\\d[2468][048] etc, top-level "
+            "alternation)",
+            R"""({
+                "type": "string",
+                "pattern": "^\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]$"
+            })""",
+            R"""(
+                d ::= [0-9]
+                root ::= "\"" (d d [2468] [048] | d d [13579] [26] | d d "0" [48]) "\"" space
+                space ::= | " " | "\n"{1,2} [ \t]{0,20}
+            )""",
+        });
+
+        // \D, \W, \S mixed inside a [...] class alongside other members have no clean
+        // single-range GBNF translation (a positive class can't compose with a negated-shorthand
+        // member), so conversion must fail loudly and *name the offending pattern* right here at
+        // schema-conversion time, rather than emitting grammar text that only fails later --
+        // without any schema context -- inside llama-grammar.cpp's parser.
+        run({
+            FAILURE,
+            "regexp with \\D negated shorthand mixed inside [...] must fail at conversion time, not silently produce invalid GBNF",
+            R"""({
+                "type": "string",
+                "pattern": "^[\\D!?]+$"
+            })""",
+            ""
+        });
+
+        // Verify the failure above is a clean, actionable error (names the pattern and the
+        // offending escape), not a generic/opaque failure -- this is the property that makes it
+        // debuggable at conversion time instead of a bare "unknown escape" from the GBNF parser
+        // with no indication of which schema or pattern caused it.
+        {
+            const std::string bad_pattern = "^[\\D!?]+$";
+            bool threw = false;
+            try {
+                json_schema_to_grammar(nlohmann::ordered_json::parse(
+                    R"({"type": "string", "pattern": "^[\\D!?]+$"})"), true);
+            } catch (const std::invalid_argument & ex) {
+                threw = true;
+                std::string msg = ex.what();
+                fprintf(stderr, "- negated shorthand class error message: %s\n", msg.c_str());
+                if (msg.find(bad_pattern) == std::string::npos || msg.find("\\D") == std::string::npos) {
+                    fprintf(stderr, "# FAILED: error message does not name the offending pattern/escape:\n%s\n", msg.c_str());
+                    assert(false);
+                }
+            }
+            if (!threw) {
+                fprintf(stderr, "# FAILED: expected a negated shorthand class mixed inside [...] to raise std::invalid_argument\n");
+                assert(false);
+            }
+        }
     }
 
     if (getenv("LLAMA_SKIP_TESTS_SLOW_ON_EMULATOR")) {
