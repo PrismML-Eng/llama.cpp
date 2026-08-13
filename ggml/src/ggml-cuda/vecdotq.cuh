@@ -783,10 +783,11 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     // applying the -sum(u) offset once at the end via the q8_1 stored sum
     // (ds.y = d8 * sum(u)) -- no per-code subtract, plain shift/mask + dp4a.
     const int offset = iqs * 8;
-    const int qs0 = bq2_0->qs[offset + 0] | (bq2_0->qs[offset + 1] << 8) |
-                    (bq2_0->qs[offset + 2] << 16) | (bq2_0->qs[offset + 3] << 24);
-    const int qs1 = bq2_0->qs[offset + 4] | (bq2_0->qs[offset + 5] << 8) |
-                    (bq2_0->qs[offset + 6] << 16) | (bq2_0->qs[offset + 7] << 24);
+    // pack as unsigned: a byte >= 128 shifted by 24 overflows the promoted int (UB)
+    const uint32_t qs0 = (uint32_t) bq2_0->qs[offset + 0]        | ((uint32_t) bq2_0->qs[offset + 1] <<  8) |
+                        ((uint32_t) bq2_0->qs[offset + 2] << 16) | ((uint32_t) bq2_0->qs[offset + 3] << 24);
+    const uint32_t qs1 = (uint32_t) bq2_0->qs[offset + 4]        | ((uint32_t) bq2_0->qs[offset + 5] <<  8) |
+                        ((uint32_t) bq2_0->qs[offset + 6] << 16) | ((uint32_t) bq2_0->qs[offset + 7] << 24);
 
     int sumi = 0;   // = dot(c, u), c in {0,1,2,3}
 #pragma unroll

@@ -390,7 +390,11 @@ const lt_plan & get_plan(int64_t N, int64_t M, int64_t K, int mode) {
 // assumed).
 struct cached_w { int8_t * q8 = nullptr; float * wscale = nullptr; size_t bytes = 0;
                   hipStream_t build_stream = nullptr; hipEvent_t build_done = nullptr; };
-std::map<const void *, cached_w> g_wcache;
+// Key: the raw weight address alone is not unique -- another GPU can expose the
+// same numeric address, and a reshaped view can reuse an address with different
+// N/K -- so include (device, N, K) to make a hit provably the same conversion.
+using wcache_key = std::tuple<int, const void *, int64_t, int64_t>;   // (device, addr, N, K)
+std::map<wcache_key, cached_w> g_wcache;
 size_t g_wcache_bytes = 0;
 std::mutex g_wcache_mtx;
 
@@ -409,8 +413,9 @@ size_t wcache_budget_bytes() {
 // so the one-time requant is correctly ordered before any GEMM that reads it.
 const cached_w * try_cache_weight(const void * key, const char * wdata, int64_t nb01,
                                   int64_t N, int64_t K, int64_t n_blocks, int mode, cudaStream_t stream) {
+    const wcache_key wk = std::make_tuple(ggml_cuda_get_device(), key, N, K);
     std::lock_guard<std::mutex> lk(g_wcache_mtx);
-    auto it = g_wcache.find(key);
+    auto it = g_wcache.find(wk);
     if (it != g_wcache.end()) {                     // mode is fixed per process (env-checked once)
         if (it->second.build_stream != stream &&
             hipStreamWaitEvent(stream, it->second.build_done, 0) != hipSuccess) {
@@ -440,7 +445,7 @@ const cached_w * try_cache_weight(const void * key, const char * wdata, int64_t 
     }
     hipEventRecord(c.build_done, stream);
     g_wcache_bytes += need;
-    auto res = g_wcache.emplace(key, c);
+    auto res = g_wcache.emplace(wk, c);
     return &res.first->second;
 }
 
@@ -451,7 +456,9 @@ void wcache_invalidate_range(const void * base, size_t size) {
     std::lock_guard<std::mutex> lk(g_wcache_mtx);
     const char * b = (const char *) base;
     for (auto it = g_wcache.begin(); it != g_wcache.end(); ) {
-        const char * k = (const char *) it->first;
+        // match on address regardless of device: a cross-device false positive
+        // only costs a redundant re-requant, never a wrong result
+        const char * k = (const char *) std::get<1>(it->first);
         if (k >= b && k < b + size) {
             if (it->second.q8)         hipFree(it->second.q8);
             if (it->second.wscale)     hipFree(it->second.wscale);

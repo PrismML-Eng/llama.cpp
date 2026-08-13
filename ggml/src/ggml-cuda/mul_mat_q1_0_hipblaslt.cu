@@ -404,8 +404,12 @@ struct cached_w { int8_t * q8 = nullptr; float * wscale = nullptr; size_t bytes 
                   hipStream_t build_stream = nullptr; hipEvent_t build_done = nullptr; };
 struct cached_w_f8 { uint8_t * q8f8 = nullptr; float * wscale = nullptr; size_t bytes = 0;
                      hipStream_t build_stream = nullptr; hipEvent_t build_done = nullptr; };
-std::map<const void *, cached_w> g_wcache_i8;
-std::map<const void *, cached_w_f8> g_wcache_f8;
+// Key: the raw weight address alone is not unique -- another GPU can expose the
+// same numeric address, and a reshaped view can reuse an address with different
+// N/K -- so include (device, N, K) to make a hit provably the same conversion.
+using wcache_key = std::tuple<int, const void *, int64_t, int64_t>;   // (device, addr, N, K)
+std::map<wcache_key, cached_w> g_wcache_i8;
+std::map<wcache_key, cached_w_f8> g_wcache_f8;
 size_t g_wcache_bytes = 0;
 std::mutex g_wcache_mtx;
 
@@ -424,8 +428,9 @@ size_t wcache_budget_bytes() {
 // so the one-time requant is correctly ordered before any GEMM that reads it.
 const cached_w * try_cache_weight_i8(const void * key, const char * wdata, int64_t nb01,
                                      int64_t N, int64_t K, int64_t n_blocks, cudaStream_t stream) {
+    const wcache_key wk = std::make_tuple(ggml_cuda_get_device(), key, N, K);
     std::lock_guard<std::mutex> lk(g_wcache_mtx);
-    auto it = g_wcache_i8.find(key);
+    auto it = g_wcache_i8.find(wk);
     if (it != g_wcache_i8.end()) {
         if (it->second.build_stream != stream &&
             hipStreamWaitEvent(stream, it->second.build_done, 0) != hipSuccess) {
@@ -436,6 +441,8 @@ const cached_w * try_cache_weight_i8(const void * key, const char * wdata, int64
 
     const size_t need = (size_t)N * K + (size_t)N * sizeof(float);
     if (g_wcache_bytes + need > wcache_budget_bytes()) return nullptr;   // budget hit
+    { size_t freeb = 0, totb = 0;   // VRAM-adaptive: keep headroom for the transient pool bufs
+      if (hipMemGetInfo(&freeb, &totb) == hipSuccess && freeb < need + (size_t)(2ull << 30)) return nullptr; }
 
     cached_w c;
     if (hipMalloc(&c.q8, (size_t)N * K) != hipSuccess) return nullptr;
@@ -449,14 +456,15 @@ const cached_w * try_cache_weight_i8(const void * key, const char * wdata, int64
     k_requant_q1_0_to_int8_perchannel<<<grid, block, 0, stream>>>(wdata, nb01, c.q8, c.wscale, K, n_blocks);
     hipEventRecord(c.build_done, stream);
     g_wcache_bytes += need;
-    auto res = g_wcache_i8.emplace(key, c);
+    auto res = g_wcache_i8.emplace(wk, c);
     return &res.first->second;
 }
 
 const cached_w_f8 * try_cache_weight_f8(const void * key, const char * wdata, int64_t nb01,
                                         int64_t N, int64_t K, int64_t n_blocks, cudaStream_t stream) {
+    const wcache_key wk = std::make_tuple(ggml_cuda_get_device(), key, N, K);
     std::lock_guard<std::mutex> lk(g_wcache_mtx);
-    auto it = g_wcache_f8.find(key);
+    auto it = g_wcache_f8.find(wk);
     if (it != g_wcache_f8.end()) {
         if (it->second.build_stream != stream &&
             hipStreamWaitEvent(stream, it->second.build_done, 0) != hipSuccess) {
@@ -467,6 +475,8 @@ const cached_w_f8 * try_cache_weight_f8(const void * key, const char * wdata, in
 
     const size_t need = (size_t)N * K + (size_t)N * sizeof(float);
     if (g_wcache_bytes + need > wcache_budget_bytes()) return nullptr;   // budget hit
+    { size_t freeb = 0, totb = 0;   // VRAM-adaptive: keep headroom for the transient pool bufs
+      if (hipMemGetInfo(&freeb, &totb) == hipSuccess && freeb < need + (size_t)(2ull << 30)) return nullptr; }
 
     cached_w_f8 c;
     if (hipMalloc(&c.q8f8, (size_t)N * K) != hipSuccess) return nullptr;
@@ -480,7 +490,7 @@ const cached_w_f8 * try_cache_weight_f8(const void * key, const char * wdata, in
     k_requant_q1_0_to_e4m3_perchannel<<<grid, block, 0, stream>>>(wdata, nb01, c.q8f8, c.wscale, K, n_blocks);
     hipEventRecord(c.build_done, stream);
     g_wcache_bytes += need;
-    auto res = g_wcache_f8.emplace(key, c);
+    auto res = g_wcache_f8.emplace(wk, c);
     return &res.first->second;
 }
 
@@ -490,8 +500,10 @@ const cached_w_f8 * try_cache_weight_f8(const void * key, const char * wdata, in
 void wcache_invalidate_range(const void * base, size_t size) {
     std::lock_guard<std::mutex> lk(g_wcache_mtx);
     const char * b = (const char *) base;
+    // match on address regardless of device: a cross-device false positive
+    // only costs a redundant re-requant, never a wrong result
     for (auto it = g_wcache_i8.begin(); it != g_wcache_i8.end(); ) {
-        const char * k = (const char *) it->first;
+        const char * k = (const char *) std::get<1>(it->first);
         if (k >= b && k < b + size) {
             if (it->second.q8)         hipFree(it->second.q8);
             if (it->second.wscale)     hipFree(it->second.wscale);
@@ -501,7 +513,7 @@ void wcache_invalidate_range(const void * base, size_t size) {
         } else { ++it; }
     }
     for (auto it = g_wcache_f8.begin(); it != g_wcache_f8.end(); ) {
-        const char * k = (const char *) it->first;
+        const char * k = (const char *) std::get<1>(it->first);
         if (k >= b && k < b + size) {
             if (it->second.q8f8)       hipFree(it->second.q8f8);
             if (it->second.wscale)     hipFree(it->second.wscale);
@@ -574,6 +586,17 @@ bool ggml_cuda_op_mul_mat_q1_0_hipblaslt(ggml_backend_cuda_context & ctx, const 
             wq8f8_ptr = cw_f8->q8f8;
             wsc_ptr = cw_f8->wscale;
         }
+    }
+
+    // Pre-flight VRAM guard: fall back to mmq (return false) instead of letting a pool
+    // alloc OOM-abort when a near-full model leaves too little free VRAM for the transient
+    // int8/fp8 + accumulator + GEMM-workspace buffers.
+    {
+        size_t freeb = 0, totb = 0;
+        const size_t wq8_need  = (wq8_ptr || wq8f8_ptr) ? 0 : (size_t)N * K;   // pool alloc for weight only on cache miss
+        const size_t transient = wq8_need + (size_t)K*M + (size_t)N*M*4 + (size_t)M*4
+                               + LT_WS_BYTES + (size_t)(64ull << 20);
+        if (hipMemGetInfo(&freeb, &totb) == hipSuccess && freeb < transient) return false;
     }
 
     if (mode == MODE_I8 && !wq8_ptr) {

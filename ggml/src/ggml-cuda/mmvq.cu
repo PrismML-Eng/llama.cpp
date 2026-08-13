@@ -1245,9 +1245,20 @@ void ggml_cuda_mul_mat_vec_q(
             ctx.mmvq_quant_cache_buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
             ctx.mmvq_quant_cache_tensor = src1;
             quantize_row_q8_1_cuda(src1_d, nullptr, ctx.mmvq_quant_cache_buf->get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+            // publish the completion point: a hit consuming from a sibling
+            // stream (concurrent graph regions) must order after this quantize
+            if (ctx.mmvq_quant_cache_event == nullptr) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&ctx.mmvq_quant_cache_event, cudaEventDisableTiming));
+            }
+            CUDA_CHECK(cudaEventRecord(ctx.mmvq_quant_cache_event, stream));
+            ctx.mmvq_quant_cache_stream = stream;
         } else {
             quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         }
+    } else if (stream != ctx.mmvq_quant_cache_stream && ctx.mmvq_quant_cache_event != nullptr) {
+        // hit from a sibling stream: the populating quantize was enqueued on
+        // cache_stream, so order this stream's reads after its completion
+        CUDA_CHECK(cudaStreamWaitEvent(stream, ctx.mmvq_quant_cache_event, 0));
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;

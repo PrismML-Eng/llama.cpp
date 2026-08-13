@@ -899,7 +899,9 @@ static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_e4m3(float x) {
         // subnormal: value = man * 2^-9, man = round(ax * 2^9)
         int man = (int) (ax * 512.0f + 0.5f);
         if (man > 7) {
-            man = 7;
+            // rounded up across the subnormal/normal boundary: 8 * 2^-9 == 2^-6,
+            // the minimum normal (exp field 1, mantissa 0), not mantissa 7
+            return (uint8_t) ((sign << 7) | 0x08);
         }
         if (man < 1) {
             return (uint8_t) (sign << 7);
@@ -1469,6 +1471,13 @@ struct ggml_backend_cuda_context {
     // tensor. See mmvq.cu for the full rationale.
     const ggml_tensor * mmvq_quant_cache_tensor = nullptr;
     std::unique_ptr<ggml_cuda_pool_alloc<char>> mmvq_quant_cache_buf;
+    // Stream-safety: concurrent graph regions run sibling matmuls on forked
+    // streams, so a hit may consume from a different stream than the one the
+    // populating quantize was enqueued on. The populating occurrence records
+    // cache_event on cache_stream; a hit on any other stream waits on it.
+    // Event is created lazily and destroyed with the context.
+    cudaStream_t mmvq_quant_cache_stream = nullptr;
+    cudaEvent_t  mmvq_quant_cache_event  = nullptr;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
