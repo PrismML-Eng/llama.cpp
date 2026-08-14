@@ -959,6 +959,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_F16> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQ1_0> {
+    static constexpr int qk = QK_K;      // 256 weights per block
+    static constexpr int qr = 1;
+    static constexpr int qi = QK_K / 32; // 8 chunks of 32, matches VDR_TQ1_0_Q8_1_MMVQ 1
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q1_0> {
     static constexpr int qk = QK1_0;
     static constexpr int qr = QR1_0;

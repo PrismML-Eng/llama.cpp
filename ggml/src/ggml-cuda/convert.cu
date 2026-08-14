@@ -698,6 +698,59 @@ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k,
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
 }
 
+
+// ---- TQ1_0 (ternary, base-3 packed: 5 trits/byte, 3^5 = 243 < 256) ----
+// One CUDA block per 256-weight superblock. Threads are assigned by SOURCE BYTE
+// rather than by output element, so each thread loads exactly one byte and emits
+// the 4-5 outputs that byte encodes. That keeps the base-3 digit extraction in
+// registers and avoids recomputing the element->byte mapping per output.
+template<typename dst_t>
+static __global__ void dequantize_block_tq1_0(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const int64_t i = blockIdx.x;
+    const block_tq1_0 * x = (const block_tq1_0 *) vx;
+    const int tid = threadIdx.x; // 64 threads; 52 active
+
+    const float d = __half2float(x[i].d);
+    dst_t * y = yy + i*QK_K;
+
+    // pow3[n] for n = 0..4; nvcc folds these to immediates under #pragma unroll
+    const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+
+    if (tid < 32) {                    // qs[0..31]  -> elements 32*n + m, n = 0..4
+        const uint8_t q = x[i].qs[tid];
+#pragma unroll
+        for (int n = 0; n < 5; ++n) {
+            const uint8_t qq = (uint8_t) (q * pow3[n]);
+            const int     xi = ((uint16_t) qq * 3) >> 8;
+            y[tid + 32*n] = (dst_t) ((xi - 1) * d);
+        }
+    } else if (tid < 48) {             // qs[32..47] -> elements 160 + 16*n + m
+        const int m = tid - 32;
+        const uint8_t q = x[i].qs[32 + m];
+#pragma unroll
+        for (int n = 0; n < 5; ++n) {
+            const uint8_t qq = (uint8_t) (q * pow3[n]);
+            const int     xi = ((uint16_t) qq * 3) >> 8;
+            y[160 + m + 16*n] = (dst_t) ((xi - 1) * d);
+        }
+    } else if (tid < 52) {             // qh[0..3]   -> elements 240 + 4*n + j
+        const int j = tid - 48;
+        const uint8_t q = x[i].qh[j];
+#pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            const uint8_t qq = (uint8_t) (q * pow3[n]);
+            const int     xi = ((uint16_t) qq * 3) >> 8;
+            y[240 + j + 4*n] = (dst_t) ((xi - 1) * d);
+        }
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_tq1_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK_K;
+    dequantize_block_tq1_0<<<nb, 64, 0, stream>>>(vx, y);
+}
+
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
@@ -711,6 +764,8 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
 
 to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_TQ1_0:
+            return dequantize_row_tq1_0_cuda;
         case GGML_TYPE_Q1_0:
             return dequantize_block_cont_cuda<QK1_0, QR1_0, dequantize_q1_0>;
         case GGML_TYPE_Q2_0:
@@ -771,6 +826,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_TQ1_0:
+            return dequantize_row_tq1_0_cuda;
         case GGML_TYPE_Q1_0:
             return dequantize_block_cont_cuda<QK1_0, QR1_0, dequantize_q1_0>;
         case GGML_TYPE_Q2_0:
