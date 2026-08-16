@@ -688,15 +688,20 @@ static __device__ __forceinline__ int4 unpack_q1_0_bytes(const uint16_t q) {
     return make_int4(__byte_perm(s0, s1, 0x5410), __byte_perm(s0, s1, 0x7632), __byte_perm(s2, s3, 0x5410),
                      __byte_perm(s2, s3, 0x7632));
 #else
+    // HIP/MUSA: borrow-free SWAR instead of per-bit ternary selects. The
+    // selects compile to v_cmp_eq + v_cndmask chains serializing on VCC --
+    // PC-sampled at 9.5% of mul_mat_q on gfx1201, with their live ranges
+    // driving the mmq_x=128 tile to 256 VGPRs + scratch spills. Bit-spread
+    // to {0,1} bytes (3 fused lshl_or + and), then map 1 -> 0x01 / 0 -> 0xFF
+    // per byte, carry-free: ((2b + 0x7F) ^ 0x80). Bit-identical output to
+    // the select version; measured +12.6% pp2048 (Q1_0 27B, RDNA4) with the
+    // spills eliminated (vgpr 256 -> 239, scratch 76B -> 0).
     int values[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-        const int bits4 = (q >> (4 * j)) & 0x0F;
-        const int b0    = (bits4 & 0x01) ? 1 : -1;
-        const int b1    = (bits4 & 0x02) ? 1 : -1;
-        const int b2    = (bits4 & 0x04) ? 1 : -1;
-        const int b3    = (bits4 & 0x08) ? 1 : -1;
-        values[j]       = (b0 & 0xFF) | ((b1 & 0xFF) << 8) | ((b2 & 0xFF) << 16) | ((b3 & 0xFF) << 24);
+        const int bits4  = (q >> (4 * j)) & 0x0F;
+        const int spread = (bits4 | (bits4 << 7) | (bits4 << 14) | (bits4 << 21)) & 0x01010101;
+        values[j]        = ((spread << 1) + 0x7F7F7F7F) ^ 0x80808080;
     }
     return make_int4(values[0], values[1], values[2], values[3]);
 #endif
