@@ -16,8 +16,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <mutex>
-#include <shared_mutex>
 #include <unordered_map>
 
 #include <sched.h>
@@ -85,13 +85,28 @@ struct ggml_numa_mirror_entry {
     void * copy[GGML_NUMA_MIRROR_MAX_NODES] = { nullptr };
 };
 
-static std::shared_mutex & ggml_numa_mirror_mutex() {
-    static std::shared_mutex m;
+// Writers (register/free, load-time only) rebuild an immutable snapshot under
+// a mutex; the compute-path reader does a plain atomic load + lookup on the
+// immutable map - no shared lock, no writer-visible cacheline traffic.
+using ggml_numa_mirror_map_t = std::unordered_map<const void *, ggml_numa_mirror_entry>;
+
+static std::mutex & ggml_numa_mirror_mutex() {
+    static std::mutex m;
     return m;
 }
-static std::unordered_map<const void *, ggml_numa_mirror_entry> & ggml_numa_mirror_registry() {
-    static std::unordered_map<const void *, ggml_numa_mirror_entry> m;
+static ggml_numa_mirror_map_t & ggml_numa_mirror_registry() {
+    static ggml_numa_mirror_map_t m; // master copy, guarded by the mutex
     return m;
+}
+static std::atomic<const ggml_numa_mirror_map_t *> & ggml_numa_mirror_snapshot() {
+    static std::atomic<const ggml_numa_mirror_map_t *> s{nullptr};
+    return s;
+}
+// must be called with the mutex held; old snapshots are intentionally leaked
+// (bytes, not mirrors - readers may still hold them, load happens rarely)
+static void ggml_numa_mirror_publish() {
+    ggml_numa_mirror_snapshot().store(new ggml_numa_mirror_map_t(ggml_numa_mirror_registry()),
+                                      std::memory_order_release);
 }
 
 static bool ggml_numa_mirror_bind(void * p, size_t size, int node) {
@@ -114,7 +129,7 @@ void ggml_numa_mirror_register(const void * base, size_t size) {
     ggml_numa_mirror_entry e;
     bool exists = false;
     {
-        std::shared_lock lock(ggml_numa_mirror_mutex());
+        std::lock_guard lock(ggml_numa_mirror_mutex());
         auto it = ggml_numa_mirror_registry().find(base);
         if (it != ggml_numa_mirror_registry().end()) {
             e      = it->second;
@@ -146,8 +161,9 @@ void ggml_numa_mirror_register(const void * base, size_t size) {
         memcpy(e.copy[n], base, size);
     }
     {
-        std::unique_lock lock(ggml_numa_mirror_mutex());
+        std::lock_guard lock(ggml_numa_mirror_mutex());
         ggml_numa_mirror_registry()[base] = e;
+        ggml_numa_mirror_publish();
     }
 }
 
@@ -156,18 +172,24 @@ const void * ggml_numa_mirror_map(const void * base) {
     if (!topo.enabled) {
         return base;
     }
+    const ggml_numa_mirror_map_t * snap = ggml_numa_mirror_snapshot().load(std::memory_order_acquire);
+    if (snap == nullptr) {
+        return base;
+    }
+    auto it = snap->find(base);
+    if (it == snap->end()) {
+        return base;
+    }
     int cpu  = sched_getcpu();
     int node = (cpu >= 0 && cpu < (int) topo.cpu_node.size()) ? topo.cpu_node[cpu] : 0;
-    std::shared_lock lock(ggml_numa_mirror_mutex());
-    auto it = ggml_numa_mirror_registry().find(base);
-    return it != ggml_numa_mirror_registry().end() ? it->second.copy[node] : base;
+    return it->second.copy[node];
 }
 
 void ggml_numa_mirror_free_range(const void * lo, size_t size) {
     auto & topo = ggml_numa_mirror_get_topo();
     const char * l = (const char *) lo;
     const char * h = l + size;
-    std::unique_lock lock(ggml_numa_mirror_mutex());
+    std::lock_guard lock(ggml_numa_mirror_mutex());
     for (auto it = ggml_numa_mirror_registry().begin(); it != ggml_numa_mirror_registry().end();) {
         const char * b = (const char *) it->first;
         if (b >= l && b < h) {
@@ -181,6 +203,7 @@ void ggml_numa_mirror_free_range(const void * lo, size_t size) {
             ++it;
         }
     }
+    ggml_numa_mirror_publish();
 }
 
 #else // !__linux__
