@@ -17,6 +17,7 @@
 #include <cstdio>  // for GGML_ASSERT
 
 #include "repack.h"
+#include "numa-mirror.h"
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Woverlength-strings"
@@ -4836,7 +4837,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int64_t i1 = i11;
         const int64_t i2 = i12;
 
-        const char * src0_ptr = (const char *) src0->data + i02 * nb02;
+        const char * src0_ptr = (const char *) ggml_numa_mirror_map(src0->data) + i02 * nb02;
         const char * src1_ptr = (const char *) params->wdata + (i11 + i12 * ne11) * src1_col_stride;
         char *       dst_ptr  = ((char *) dst->data + (i1 * nb1 + i2 * nb2));
 
@@ -5084,7 +5085,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 continue;
             }
 
-            const auto * src0_cur = (const char *) src0->data + cur_a*nb02;
+            const auto * src0_cur = (const char *) ggml_numa_mirror_map(src0->data) + cur_a*nb02;
 
             //const int64_t nr0 = ne01; // src0 rows
             const int64_t nr1 = cne1; // src1 rows
@@ -5386,6 +5387,7 @@ static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buff
     auto OK            = tensor_traits->repack(tensor, data, size);
 
     GGML_ASSERT(OK == 0);
+    ggml_numa_mirror_register(tensor->data, size);
     GGML_UNUSED(buffer);
 }
 
@@ -5393,6 +5395,15 @@ static const char * ggml_backend_cpu_repack_buffer_type_get_name(ggml_backend_bu
     return "CPU_REPACK";
 
     GGML_UNUSED(buft);
+}
+
+static void (*ggml_backend_cpu_repack_orig_free_buffer)(ggml_backend_buffer_t) = nullptr;
+
+static void ggml_backend_cpu_repack_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_numa_mirror_free_range(ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer));
+    if (ggml_backend_cpu_repack_orig_free_buffer) {
+        ggml_backend_cpu_repack_orig_free_buffer(buffer);
+    }
 }
 
 static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -5407,6 +5418,8 @@ static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(gg
     buffer->iface.set_tensor  = ggml_backend_cpu_repack_buffer_set_tensor;
     buffer->iface.get_tensor  = nullptr;
     buffer->iface.cpy_tensor  = nullptr;
+    ggml_backend_cpu_repack_orig_free_buffer = buffer->iface.free_buffer;
+    buffer->iface.free_buffer = ggml_backend_cpu_repack_buffer_free_buffer;
     return buffer;
 }
 

@@ -30,6 +30,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ggml-cpu.c
         ggml-cpu/ggml-cpu.cpp
         ggml-cpu/repack.cpp
+        ggml-cpu/numa-mirror.cpp
+        ggml-cpu/numa-mirror.h
         ggml-cpu/repack.h
         ggml-cpu/hbm.cpp
         ggml-cpu/hbm.h
