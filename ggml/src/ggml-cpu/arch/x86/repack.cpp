@@ -6580,14 +6580,16 @@ void ggml_gemv_q1_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
             }
 
             for (int l = 0; l < nb; l++) {
-                float d0f[4];
+                // per-block accumulators carry only the activation scale d1;
+                // the per-column weight scale d0[c] is folded once per block
+                __m256 accl[4];
                 for (int c = 0; c < 4; c++) {
-                    d0f[c] = GGML_CPU_FP16_TO_FP32(b_ptr[l].d[c]);
+                    accl[c] = _mm256_setzero_ps();
                 }
 
                 for (int k = 0; k < QK1_0 / QK8_0; ++k) {
                     const block_q8_0 * GGML_RESTRICT a_blk = a_ptr + l * (QK1_0 / QK8_0) + k;
-                    const float d1 = GGML_CPU_FP16_TO_FP32(a_blk->d);
+                    const __m256 fd1 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_blk->d));
 
                     const __m256i qs16 = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) (b_ptr[l].qs + 16 * k)));
                     const __m256i qa   = _mm256_loadu_si256((const __m256i *) a_blk->qs);
@@ -6598,8 +6600,12 @@ void ggml_gemv_q1_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                         const __m256i ic = __dot32_u8s8_avx2(w, qa);
                         // signed dot partials: 2*dot(bits, qy) - sum(qy)
                         const __m256 f = _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_add_epi32(ic, ic), sq));
-                        accf[c] = _mm256_fmadd_ps(f, _mm256_set1_ps(d0f[c] * d1), accf[c]);
+                        accl[c] = _mm256_fmadd_ps(f, fd1, accl[c]);
                     }
+                }
+
+                for (int c = 0; c < 4; c++) {
+                    accf[c] = _mm256_fmadd_ps(accl[c], _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(b_ptr[l].d[c])), accf[c]);
                 }
             }
 
@@ -6831,14 +6837,16 @@ void ggml_gemv_q2_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
             }
 
             for (int l = 0; l < nb; l++) {
-                float d0f[4];
+                // per-block accumulators carry only the activation scale d1;
+                // the per-column weight scale d0[c] is folded once per block
+                __m256 accl[4];
                 for (int c = 0; c < 4; c++) {
-                    d0f[c] = GGML_CPU_FP16_TO_FP32(b_ptr[l].d[c]);
+                    accl[c] = _mm256_setzero_ps();
                 }
 
                 for (int k = 0; k < QK2_0 / QK8_0; ++k) {
                     const block_q8_0 * GGML_RESTRICT a_blk = a_ptr + l * (QK2_0 / QK8_0) + k;
-                    const float d1 = GGML_CPU_FP16_TO_FP32(a_blk->d);
+                    const __m256 fd1 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(a_blk->d));
 
                     const __m256i qa = _mm256_loadu_si256((const __m256i *) a_blk->qs);
                     const __m256i sq = __dot32_u8s8_avx2(ones, qa);
@@ -6848,8 +6856,12 @@ void ggml_gemv_q2_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                         const __m256i ic = __dot32_u8s8_avx2(w, qa);
                         // signed dot partials: dot(codes, qy) - sum(qy), codes-1 in {-1,0,1,2}
                         const __m256 f = _mm256_cvtepi32_ps(_mm256_sub_epi32(ic, sq));
-                        accf[c] = _mm256_fmadd_ps(f, _mm256_set1_ps(d0f[c] * d1), accf[c]);
+                        accl[c] = _mm256_fmadd_ps(f, fd1, accl[c]);
                     }
+                }
+
+                for (int c = 0; c < 4; c++) {
+                    accf[c] = _mm256_fmadd_ps(accl[c], _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(b_ptr[l].d[c])), accf[c]);
                 }
             }
 
