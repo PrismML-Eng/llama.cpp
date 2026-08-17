@@ -603,6 +603,63 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
         }
         sumf += d0 * sumi;
     }
+#elif defined(__AVX2__)
+    // AVX2 (no VNNI needed): pshufb-replicate + nibble-LUT crumb decode,
+    // maddubs with the dot(c-1,u) = dot(c,u) - sum(u) fold. Same math as the
+    // VNNI tier above; covers Haswell/Zen1+.
+    const __m256i ones_8  = _mm256_set1_epi8(1);
+    const __m256i ones_16 = _mm256_set1_epi16(1);
+    const __m256i m4      = _mm256_set1_epi8(0x0F);
+    // replicate each of the 8 source bytes into 4 consecutive positions (per lane)
+    const __m256i rep_shuf = _mm256_setr_epi8(
+            0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3,
+            4,4,4,4, 5,5,5,5, 6,6,6,6, 7,7,7,7);
+    // nibble LUTs: low crumb (n & 3) and high crumb (n >> 2)
+    const __m256i lut_lo = _mm256_setr_epi8(
+            0,1,2,3, 0,1,2,3, 0,1,2,3, 0,1,2,3,
+            0,1,2,3, 0,1,2,3, 0,1,2,3, 0,1,2,3);
+    const __m256i lut_hi = _mm256_setr_epi8(
+            0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3,
+            0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3);
+    // element 4*b+l takes crumb l of byte b: odd positions use the (n >> 2)
+    // LUT, positions 2,3 read the high nibble.
+    const __m256i sel_odd = _mm256_setr_epi8(
+            0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1,
+            0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1);
+    const __m256i sel_hi = _mm256_setr_epi8(
+            0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1,
+            0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1);
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const block_q8_0 * GGML_RESTRICT y_ptr = &y[ib * 4];
+        __m256 acc_block = _mm256_setzero_ps();
+
+        for (int K = 0; K < 4; ++K) {
+            uint64_t q64;
+            memcpy(&q64, &x[ib].qs[K * 8], 8);
+            const __m256i rep = _mm256_shuffle_epi8(_mm256_set1_epi64x((long long) q64), rep_shuf);
+            const __m256i lo  = _mm256_and_si256(rep, m4);
+            const __m256i hi  = _mm256_and_si256(_mm256_srli_epi16(rep, 4), m4);
+            const __m256i c_lo = _mm256_blendv_epi8(_mm256_shuffle_epi8(lut_lo, lo),
+                                                    _mm256_shuffle_epi8(lut_hi, lo), sel_odd);
+            const __m256i c_hi = _mm256_blendv_epi8(_mm256_shuffle_epi8(lut_lo, hi),
+                                                    _mm256_shuffle_epi8(lut_hi, hi), sel_odd);
+            const __m256i c    = _mm256_blendv_epi8(c_lo, c_hi, sel_hi);  // codes {0..3}
+
+            const __m256i qy   = _mm256_loadu_si256((const __m256i *) y_ptr[K].qs);
+            // dot(c-1, u) = dot(c, u) - sum(u)  (borrow-free fold, same as the HIP kernel)
+            const __m256i cd16 = _mm256_maddubs_epi16(c, qy);
+            const __m256i su16 = _mm256_maddubs_epi16(ones_8, qy);
+            const __m256i s32  = _mm256_madd_epi16(_mm256_sub_epi16(cd16, su16), ones_16);
+            acc_block = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y_ptr[K].d)),
+                                        _mm256_cvtepi32_ps(s32), acc_block);
+        }
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d0), acc_block, acc);
+    }
+
+    sumf = hsum_float_8(acc);
 #else
     for (int i = 0; i < nb; i++) {
         const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
