@@ -4800,7 +4800,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (a->nb[0] != ggml_element_size(a) || b->nb[0] != ggml_element_size(b)) {
                     return false; // TODO this could in principle be implemented though currently there is no use case.
                 }
-                if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16) {
+                const bool is_hadamard = op->op == GGML_OP_MUL_MAT &&
+                    ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD;
+                if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 &&
+                    !(is_hadamard && a->type == GGML_TYPE_F32)) {
                     return false;
                 }
 #ifdef GGML_USE_MUSA
