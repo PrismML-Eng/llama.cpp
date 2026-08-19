@@ -1,9 +1,19 @@
 #include "common.cuh"
 #include "fwht.cuh"
 
-template <int N>
+template <typename T>
+__device__ __forceinline__ float fwht_load(const T value) {
+    return value;
+}
+
+template <>
+__device__ __forceinline__ float fwht_load<half>(const half value) {
+    return __half2float(value);
+}
+
+template <int N, typename T>
 __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
-__global__ void fwht_cuda(const float * src, float * dst, const int64_t n_rows, const float scale) {
+__global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, const float scale) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     const int64_t r = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
@@ -22,7 +32,7 @@ __global__ void fwht_cuda(const float * src, float * dst, const int64_t n_rows, 
     ggml_cuda_pdl_sync();
 #pragma unroll
     for (int i = 0; i < el_w; ++i) {
-        reg[i] = src[i * warp_size + lane] * scale;
+        reg[i] = fwht_load(src[i * warp_size + lane]) * scale;
     }
 
 #pragma unroll
@@ -66,7 +76,11 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
     const int     n    = src->ne[0];
     const int64_t rows = ggml_nrows(src);
 
-    const float * src_d = (const float *) src->data;
+    if ((src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16) || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const void * src_d = src->data;
     float *       dst_d = (float *) dst->data;
 
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
@@ -82,18 +96,39 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
 
     const float scale = 1 / sqrtf(n);
 
+    if (src->type == GGML_TYPE_F32) {
+        const float * src_f32 = (const float *) src_d;
+        switch (n) {
+            case 64:
+                ggml_cuda_kernel_launch(fwht_cuda<64, float>, launch_params, src_f32, dst_d, rows, scale);
+                return true;
+            case 128:
+                ggml_cuda_kernel_launch(fwht_cuda<128, float>, launch_params, src_f32, dst_d, rows, scale);
+                return true;
+            case 256:
+                ggml_cuda_kernel_launch(fwht_cuda<256, float>, launch_params, src_f32, dst_d, rows, scale);
+                return true;
+            case 512:
+                ggml_cuda_kernel_launch(fwht_cuda<512, float>, launch_params, src_f32, dst_d, rows, scale);
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    const half * src_f16 = (const half *) src_d;
     switch (n) {
         case 64:
-            ggml_cuda_kernel_launch(fwht_cuda<64>, launch_params, src_d, dst_d, rows, scale);
+            ggml_cuda_kernel_launch(fwht_cuda<64, half>, launch_params, src_f16, dst_d, rows, scale);
             return true;
         case 128:
-            ggml_cuda_kernel_launch(fwht_cuda<128>, launch_params, src_d, dst_d, rows, scale);
+            ggml_cuda_kernel_launch(fwht_cuda<128, half>, launch_params, src_f16, dst_d, rows, scale);
             return true;
         case 256:
-            ggml_cuda_kernel_launch(fwht_cuda<256>, launch_params, src_d, dst_d, rows, scale);
+            ggml_cuda_kernel_launch(fwht_cuda<256, half>, launch_params, src_f16, dst_d, rows, scale);
             return true;
         case 512:
-            ggml_cuda_kernel_launch(fwht_cuda<512>, launch_params, src_d, dst_d, rows, scale);
+            ggml_cuda_kernel_launch(fwht_cuda<512, half>, launch_params, src_f16, dst_d, rows, scale);
             return true;
         default:
             return false;
