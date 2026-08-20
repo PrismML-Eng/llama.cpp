@@ -1665,7 +1665,49 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ctx_buf_maps.emplace_back(ctx, buf_map);
     }
 
-    if (!ml.no_alloc && !hadamard_weight_blocks.empty()) {
+
+    if (llama_supports_gpu_offload()) {
+        const int n_gpu = std::min(n_gpu_layers, n_layer_all);
+
+        int n_repeating = n_gpu;
+        if (n_repeating > 0) {
+            LLAMA_LOG_INFO("%s: offloading output layer to GPU\n", __func__);
+            n_repeating--;
+        }
+        LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, n_repeating);
+
+        const int max_backend_supported_layers = n_layer_all + 1;
+        const int max_offloadable_layers       = n_layer_all + 1;
+
+        LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
+    }
+
+    // print memory requirements per buffer type
+    for (auto & [_, bufs] : pimpl->ctxs_bufs) {
+        for (auto & buf: bufs) {
+            LLAMA_LOG_INFO("%s: %12s model buffer size = %8.2f MiB\n",
+                __func__, ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get()) / 1024.0 / 1024.0);
+        }
+    }
+
+    if (ml.no_alloc) {
+        return true;
+    }
+
+    // load tensor data
+    for (auto & [ctx, buf_map] : ctx_buf_maps) {
+        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+            return false;
+        }
+    }
+
+    if (use_mmap_buffer) {
+        for (auto & mapping : ml.mappings) {
+            pimpl->mappings.emplace_back(std::move(mapping));
+        }
+    }
+
+    if (!hadamard_weight_blocks.empty()) {
         struct hadamard_rotation {
             uint32_t block_size;
             ggml_backend_buffer_type_t buft;
@@ -1745,47 +1787,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         LLAMA_LOG_INFO("%s: loaded %zu Hadamard-folded weight(s) using %zu persistent rotation(s)\n",
                 __func__, hadamard_rotations.size(), rotations.size());
-    }
-
-    if (llama_supports_gpu_offload()) {
-        const int n_gpu = std::min(n_gpu_layers, n_layer_all);
-
-        int n_repeating = n_gpu;
-        if (n_repeating > 0) {
-            LLAMA_LOG_INFO("%s: offloading output layer to GPU\n", __func__);
-            n_repeating--;
-        }
-        LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, n_repeating);
-
-        const int max_backend_supported_layers = n_layer_all + 1;
-        const int max_offloadable_layers       = n_layer_all + 1;
-
-        LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
-    }
-
-    // print memory requirements per buffer type
-    for (auto & [_, bufs] : pimpl->ctxs_bufs) {
-        for (auto & buf: bufs) {
-            LLAMA_LOG_INFO("%s: %12s model buffer size = %8.2f MiB\n",
-                __func__, ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get()) / 1024.0 / 1024.0);
-        }
-    }
-
-    if (ml.no_alloc) {
-        return true;
-    }
-
-    // load tensor data
-    for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
-            return false;
-        }
-    }
-
-    if (use_mmap_buffer) {
-        for (auto & mapping : ml.mappings) {
-            pimpl->mappings.emplace_back(std::move(mapping));
-        }
     }
 
     return true;
