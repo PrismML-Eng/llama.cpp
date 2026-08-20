@@ -664,6 +664,13 @@ struct llama_model {
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 
+    // Hadamard-folded GGUF weights are matched with persistent model tensors
+    // containing the activation-side transform.  The string map is populated
+    // from GGUF metadata while loading hparams; the pointer map is populated
+    // after model buffers have been allocated.
+    std::unordered_map<std::string, uint32_t> hadamard_weight_blocks;
+    llama_hadamard_rotations hadamard_rotations;
+
     // list of devices used in this model
     std::vector<llama_device> devices;
 

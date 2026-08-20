@@ -11,10 +11,15 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <unordered_map>
 
 struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
+
+// Maps a folded model weight to the normalized Hadamard matrix required to
+// restore its activation-side basis immediately before the matmul.
+using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, ggml_tensor *>;
 
 struct llama_cparams;
 struct llama_layer;
@@ -797,6 +802,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_hadamard_rotations * hadamard_rotations;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1037,6 +1043,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_hadamard_rotations * hadamard_rotations;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
