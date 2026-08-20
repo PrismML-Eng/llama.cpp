@@ -611,6 +611,57 @@ class ModelBase:
             raise ValueError(f"Can not map tensor {name!r}")
         return new_name
 
+    def add_hadamard_metadata(self) -> None:
+        """Transfer a packed-checkpoint transform contract into GGUF metadata."""
+        manifest_path = self.dir_model / "hadamard_packing.json"
+        if not manifest_path.is_file():
+            return
+
+        with manifest_path.open("r", encoding="utf-8") as f:
+            manifest = json.load(f)
+
+        if manifest.get("schema_version") != 1 or manifest.get("kind") != "hadamard-weight-fold":
+            raise ValueError(f"Unsupported Hadamard manifest: {manifest_path}")
+        if manifest.get("status") != "requires-matching-runtime":
+            raise ValueError(f"Unexpected Hadamard manifest status: {manifest.get('status')!r}")
+
+        transform = manifest.get("transform")
+        if not isinstance(transform, dict):
+            raise ValueError("Hadamard manifest is missing transform metadata")
+        block_size = transform.get("block_size")
+        if not isinstance(block_size, int) or block_size <= 0 or block_size & (block_size - 1):
+            raise ValueError(f"Invalid Hadamard block size: {block_size!r}")
+        if transform.get("name") != "normalized-signed-sylvester-walsh-hadamard":
+            raise ValueError(f"Unsupported Hadamard transform: {transform.get('name')!r}")
+        if transform.get("sign_mode") != "identity":
+            raise ValueError(
+                "GGUF Hadamard runtime currently supports only identity signs; "
+                "repack with --sign-mode identity"
+            )
+
+        tensor_records = manifest.get("tensors")
+        if not isinstance(tensor_records, list) or not tensor_records:
+            raise ValueError("Hadamard manifest has no folded tensors")
+
+        weight_names: list[str] = []
+        for record in tensor_records:
+            if not isinstance(record, dict) or not isinstance(record.get("name"), str):
+                raise ValueError("Hadamard manifest has an invalid tensor record")
+            if record.get("axis") != -1:
+                raise ValueError(f"Unsupported Hadamard tensor axis for {record['name']!r}")
+            filtered = self.filter_tensors((record["name"], lambda: None))
+            if filtered is None:
+                raise ValueError(f"Hadamard tensor is filtered out: {record['name']!r}")
+            weight_names.append(self.map_tensor_name(filtered[0]))
+
+        self.gguf_writer.add_uint32("prism.hadamard.version", 1)
+        self.gguf_writer.add_uint32("prism.hadamard.block_size", block_size)
+        self.gguf_writer.add_string("prism.hadamard.transform", "normalized-sylvester-walsh-hadamard")
+        self.gguf_writer.add_string("prism.hadamard.axis", "input-last-dimension")
+        self.gguf_writer.add_string("prism.hadamard.sign_mode", "identity")
+        self.gguf_writer.add_array("prism.hadamard.weight_names", weight_names)
+        logger.info("GGUF Hadamard contract: H%d for %d folded weight(s)", block_size, len(weight_names))
+
     def set_gguf_parameters(self):
         raise NotImplementedError("set_gguf_parameters() must be implemented in subclasses")
 
@@ -1017,6 +1068,8 @@ class ModelBase:
 
         logger.info("Set model quantization version")
         self.gguf_writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
+
+        self.add_hadamard_metadata()
 
     def write_vocab(self):
         raise NotImplementedError("write_vocab() must be implemented in subclasses")
