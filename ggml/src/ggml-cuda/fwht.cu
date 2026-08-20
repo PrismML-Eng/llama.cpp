@@ -111,6 +111,12 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
             case 512:
                 ggml_cuda_kernel_launch(fwht_cuda<512, float>, launch_params, src_f32, dst_d, rows, scale);
                 return true;
+            case 1024:
+                ggml_cuda_kernel_launch(fwht_cuda<1024, float>, launch_params, src_f32, dst_d, rows, scale);
+                return true;
+            case 2048:
+                ggml_cuda_kernel_launch(fwht_cuda<2048, float>, launch_params, src_f32, dst_d, rows, scale);
+                return true;
             default:
                 return false;
         }
@@ -129,6 +135,12 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
             return true;
         case 512:
             ggml_cuda_kernel_launch(fwht_cuda<512, half>, launch_params, src_f16, dst_d, rows, scale);
+            return true;
+        case 1024:
+            ggml_cuda_kernel_launch(fwht_cuda<1024, half>, launch_params, src_f16, dst_d, rows, scale);
+            return true;
+        case 2048:
+            ggml_cuda_kernel_launch(fwht_cuda<2048, half>, launch_params, src_f16, dst_d, rows, scale);
             return true;
         default:
             return false;
