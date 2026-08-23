@@ -23,6 +23,12 @@ struct ggml_tensor;
 struct llama_hadamard_transform {
     ggml_tensor * rot;
     ggml_tensor * signs; // nullptr for identity sign mode
+    // when perm_rep > 1 the activation arrives with its feature axis in tiled
+    // head order [hd, nk, rep] and must be permuted to the grouped order
+    // [hd, rep, nk] the fold was computed in, before signs and rotation
+    int64_t perm_hd  = 0;
+    int64_t perm_nk  = 0;
+    int64_t perm_rep = 0;
 };
 using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, llama_hadamard_transform>;
 

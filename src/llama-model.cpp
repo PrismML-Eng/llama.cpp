@@ -1137,6 +1137,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             }
         }
 
+        ml.get_key("prism.hadamard.gdn_v_grouped", hadamard_gdn_v_grouped, false);
+
         // the activation-side transform is applied only by build_lora_mm/build_lora_mm_id;
         // refuse to load folded weights for architectures or tensor kinds that are not
         // verified to route every matmul through those helpers, rather than run wrong math
@@ -1160,6 +1162,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 "ffn_gate", "ffn_up", "ffn_down",
                 "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps", "ffn_gate_up_exps",
                 "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",
+                "ssm_out",
             };
             if (name.compare(0, 4, "blk.") != 0) {
                 return false;
@@ -1923,7 +1926,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 sign_tensor = st->second;
             }
 
-            target->emplace(weight, llama_hadamard_transform { it->tensor, sign_tensor });
+            llama_hadamard_transform transform { it->tensor, sign_tensor };
+            if (hadamard_gdn_v_grouped && weight_name.find(".ssm_out.") != std::string::npos) {
+                const int64_t n_v = hparams.ssm_dt_rank;
+                const int64_t n_k = hparams.ssm_n_group;
+                if (n_k <= 0 || n_v <= 0 || n_v % n_k != 0 || weight->ne[0] % n_v != 0) {
+                    throw std::runtime_error(format("prism.hadamard: bad GDN head geometry for %s", weight_name.c_str()));
+                }
+                transform.perm_hd  = weight->ne[0] / n_v;
+                transform.perm_nk  = n_k;
+                transform.perm_rep = n_v / n_k;
+            }
+            target->emplace(weight, transform);
         }
 
         LLAMA_LOG_INFO("%s: loaded %zu Hadamard-folded weight(s) (%zu inverse-lookup) using %zu rotation(s) and %zu sign vector(s)\n",
