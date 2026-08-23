@@ -1190,6 +1190,22 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 throw std::runtime_error(format("duplicate prism.hadamard weight: %s", weight_name.c_str()));
             }
         }
+
+        // tensors consumed by row lookup store latent rows and need the
+        // inverse transform applied to the lookup result instead
+        std::vector<std::string> inverse_names;
+        ml.get_arr("prism.hadamard.inverse_weight_names", inverse_names, false);
+        for (const auto & name : inverse_names) {
+            // the graph applies the inverse only to the token-embedding lookup; any
+            // other latent table would load and silently stay rotated
+            if (name != "token_embd.weight") {
+                throw std::runtime_error(format(
+                    "prism.hadamard: weight '%s' is not a verified inverse-after-lookup table", name.c_str()));
+            }
+            if (hadamard_weight_blocks.count(name) || !hadamard_inverse_blocks.emplace(name, block_size).second) {
+                throw std::runtime_error(format("duplicate prism.hadamard inverse weight: %s", name.c_str()));
+            }
+        }
     }
 
     // get general kv
@@ -1780,7 +1796,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    if (!hadamard_weight_blocks.empty()) {
+    if (!hadamard_weight_blocks.empty() || !hadamard_inverse_blocks.empty()) {
         struct hadamard_rotation {
             uint32_t block_size;
             ggml_backend_buffer_type_t buft;
@@ -1790,7 +1806,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         std::vector<hadamard_rotation> rotations;
         std::map<std::pair<uint32_t, ggml_backend_buffer_type_t>, ggml_tensor *> sign_tensors;
 
-        for (const auto & entry : hadamard_weight_blocks) {
+        const std::pair<const std::unordered_map<std::string, uint32_t> *, llama_hadamard_rotations *> groups[] = {
+            { &hadamard_weight_blocks,  &hadamard_rotations },
+            { &hadamard_inverse_blocks, &hadamard_inverses  },
+        };
+        for (const auto & [blocks, target] : groups)
+        for (const auto & entry : *blocks) {
             const std::string & weight_name = entry.first;
             const uint32_t block_size = entry.second;
             const ggml_tensor * weight = get_tensor(weight_name.c_str());
@@ -1902,11 +1923,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 sign_tensor = st->second;
             }
 
-            hadamard_rotations.emplace(weight, llama_hadamard_transform { it->tensor, sign_tensor });
+            target->emplace(weight, llama_hadamard_transform { it->tensor, sign_tensor });
         }
 
-        LLAMA_LOG_INFO("%s: loaded %zu Hadamard-folded weight(s) using %zu rotation(s) and %zu sign vector(s)\n",
-                __func__, hadamard_rotations.size(), rotations.size(), sign_tensors.size());
+        LLAMA_LOG_INFO("%s: loaded %zu Hadamard-folded weight(s) (%zu inverse-lookup) using %zu rotation(s) and %zu sign vector(s)\n",
+                __func__, hadamard_rotations.size() + hadamard_inverses.size(), hadamard_inverses.size(),
+                rotations.size(), sign_tensors.size());
     }
 
     return true;

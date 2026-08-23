@@ -634,8 +634,10 @@ struct llama_model {
     // after model buffers have been allocated.  In explicit sign mode the
     // per-width sign vectors come from GGUF metadata as well.
     std::unordered_map<std::string, uint32_t> hadamard_weight_blocks;
+    std::unordered_map<std::string, uint32_t> hadamard_inverse_blocks;
     std::map<uint32_t, std::vector<int32_t>> hadamard_sign_data;
     llama_hadamard_rotations hadamard_rotations;
+    llama_hadamard_rotations hadamard_inverses;
 
     // list of devices used in this model
     std::vector<llama_device> devices;

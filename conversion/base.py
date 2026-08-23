@@ -680,21 +680,35 @@ class ModelBase:
             r")\.weight"
         )
         weight_names: list[str] = []
+        inverse_weight_names: list[str] = []
         for record in tensor_records:
             if not isinstance(record, dict) or not isinstance(record.get("name"), str):
                 raise ValueError("Hadamard manifest has an invalid tensor record")
             if record.get("axis") != -1:
                 raise ValueError(f"Unsupported Hadamard tensor axis for {record['name']!r}")
+            role = record.get("role", "fold-before-matmul")
+            if role not in ("fold-before-matmul", "inverse-after-lookup"):
+                raise ValueError(f"Unsupported Hadamard tensor role for {record['name']!r}: {role!r}")
             filtered = self.filter_tensors((record["name"], lambda: None))
             if filtered is None:
                 raise ValueError(f"Hadamard tensor is filtered out: {record['name']!r}")
             mapped = self.map_tensor_name(filtered[0])
-            if not _HADAMARD_KINDS.fullmatch(mapped):
-                raise ValueError(
-                    f"Hadamard tensor {record['name']!r} maps to {mapped!r}, which is not on a "
-                    "verified Hadamard-aware matmul path"
-                )
-            weight_names.append(mapped)
+            if role == "inverse-after-lookup":
+                # the runtime applies the inverse transform only to the token-embedding
+                # lookup; any other latent table would load and silently stay rotated
+                if mapped != "token_embd.weight":
+                    raise ValueError(
+                        f"Hadamard tensor {record['name']!r} maps to {mapped!r}, which is not a "
+                        "verified inverse-after-lookup table"
+                    )
+                inverse_weight_names.append(mapped)
+            else:
+                if not _HADAMARD_KINDS.fullmatch(mapped):
+                    raise ValueError(
+                        f"Hadamard tensor {record['name']!r} maps to {mapped!r}, which is not on a "
+                        "verified Hadamard-aware matmul path"
+                    )
+                weight_names.append(mapped)
 
         self.gguf_writer.add_uint32("prism.hadamard.version", 1)
         self.gguf_writer.add_uint32("prism.hadamard.block_size", block_size)
@@ -705,8 +719,10 @@ class ModelBase:
         if sign_mode == "explicit":
             self.gguf_writer.add_array("prism.hadamard.sign_widths", sign_widths)
             self.gguf_writer.add_array("prism.hadamard.sign_values", sign_values)
-        logger.info("GGUF Hadamard contract: H%d, sign_mode=%s, %d folded weight(s)",
-                    block_size, sign_mode, len(weight_names))
+        if inverse_weight_names:
+            self.gguf_writer.add_array("prism.hadamard.inverse_weight_names", inverse_weight_names)
+        logger.info("GGUF Hadamard contract: H%d, sign_mode=%s, %d folded weight(s), %d inverse-lookup",
+                    block_size, sign_mode, len(weight_names), len(inverse_weight_names))
 
     def set_gguf_parameters(self):
         raise NotImplementedError("set_gguf_parameters() must be implemented in subclasses")
