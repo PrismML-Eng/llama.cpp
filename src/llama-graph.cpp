@@ -1495,7 +1495,10 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     if (hadamard_rotations) {
         const auto it = hadamard_rotations->find(w);
         if (it != hadamard_rotations->end()) {
-            cur_mm = llama_mul_mat_hadamard(ctx0, cur, it->second);
+            if (it->second.signs) {
+                cur_mm = ggml_mul(ctx0, cur_mm, it->second.signs);
+            }
+            cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, it->second.rot);
         }
     }
 
@@ -1535,7 +1538,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     if (hadamard_rotations) {
         const auto it = hadamard_rotations->find(w);
         if (it != hadamard_rotations->end()) {
-            cur_mm = llama_mul_mat_hadamard(ctx0, cur, it->second);
+            if (it->second.signs) {
+                cur_mm = ggml_mul(ctx0, cur_mm, it->second.signs);
+            }
+            cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, it->second.rot);
         }
     }
 

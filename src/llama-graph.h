@@ -17,9 +17,14 @@ struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
 
-// Maps a folded model weight to the normalized Hadamard matrix required to
-// restore its activation-side basis immediately before the matmul.
-using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, ggml_tensor *>;
+// Maps a folded model weight to the activation-side transform applied
+// immediately before the matmul: optional sign flip, then the normalized
+// blockwise Hadamard rotation.
+struct llama_hadamard_transform {
+    ggml_tensor * rot;
+    ggml_tensor * signs; // nullptr for identity sign mode
+};
+using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, llama_hadamard_transform>;
 
 struct llama_cparams;
 struct llama_layer;
