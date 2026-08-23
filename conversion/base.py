@@ -617,6 +617,21 @@ class ModelBase:
             raise ValueError(f"Can not map tensor {name!r}")
         return new_name
 
+    def hadamard_folded_names(self) -> set[str]:
+        """Source-tensor names folded under a Hadamard manifest, or empty."""
+        cached = getattr(self, "_hadamard_folded_names", None)
+        if cached is not None:
+            return cached
+        names: set[str] = set()
+        manifest_path = self.dir_model / "hadamard_packing.json"
+        if manifest_path.is_file():
+            with manifest_path.open("r", encoding="utf-8") as f:
+                for record in json.load(f).get("tensors", []):
+                    if isinstance(record, dict) and isinstance(record.get("name"), str):
+                        names.add(record["name"])
+        self._hadamard_folded_names = names
+        return names
+
     def add_hadamard_metadata(self) -> None:
         """Transfer a packed-checkpoint transform contract into GGUF metadata."""
         manifest_path = self.dir_model / "hadamard_packing.json"
@@ -683,6 +698,7 @@ class ModelBase:
             r"|ffn_gate|ffn_up|ffn_down"
             r"|ffn_gate_exps|ffn_up_exps|ffn_down_exps|ffn_gate_up_exps"
             r"|ffn_gate_shexp|ffn_up_shexp|ffn_down_shexp"
+            r"|ssm_out"
             r")\.weight"
         )
         weight_names: list[str] = []
@@ -727,6 +743,9 @@ class ModelBase:
             self.gguf_writer.add_array("prism.hadamard.sign_values", sign_values)
         if inverse_weight_names:
             self.gguf_writer.add_array("prism.hadamard.inverse_weight_names", inverse_weight_names)
+        if getattr(self, "_hadamard_gdn_v_grouped", False):
+            self.gguf_writer.add_bool("prism.hadamard.gdn_v_grouped", True)
+            logger.info("GGUF Hadamard: linear-attention out_proj kept in grouped V order")
         logger.info("GGUF Hadamard contract: H%d, sign_mode=%s, %d folded weight(s), %d inverse-lookup",
                     block_size, sign_mode, len(weight_names), len(inverse_weight_names))
 

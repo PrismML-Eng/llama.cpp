@@ -605,8 +605,14 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
                 data_torch = torch.cat([qk_part, v_part], dim=0)
 
             elif ".out_proj." in name:
-                # Out projection weight: reorder columns (input dimension)
-                data_torch = self._reorder_v_heads(data_torch, 1, num_k_heads, num_v_per_k, head_v_dim)
+                if name in self.hadamard_folded_names():
+                    # Hadamard-folded latent: the rotation axis must keep the
+                    # training (grouped) V order; the runtime permutes the
+                    # activation tiled->grouped before the transform instead.
+                    self._hadamard_gdn_v_grouped = True
+                else:
+                    # Out projection weight: reorder columns (input dimension)
+                    data_torch = self._reorder_v_heads(data_torch, 1, num_k_heads, num_v_per_k, head_v_dim)
 
         yield from super().modify_tensors(data_torch, name, bid)
 
