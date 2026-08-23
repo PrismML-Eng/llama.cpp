@@ -649,6 +649,31 @@ class ModelBase:
         if not isinstance(tensor_records, list) or not tensor_records:
             raise ValueError("Hadamard manifest has no folded tensors")
 
+        # The runtime applies the activation transform only where the graph goes through
+        # build_lora_mm/build_lora_mm_id. Restrict the contract to architectures and tensor
+        # kinds verified to route every matmul through those helpers; anything else must
+        # fail here instead of producing a GGUF that loads but skips the transform.
+        _HADAMARD_ARCHS = {
+            gguf.MODEL_ARCH.LLAMA,
+            gguf.MODEL_ARCH.QWEN3,
+            gguf.MODEL_ARCH.QWEN3MOE,
+            gguf.MODEL_ARCH.QWEN35,
+            gguf.MODEL_ARCH.QWEN35MOE,
+            gguf.MODEL_ARCH.QWEN3NEXT,
+        }
+        if self.model_arch not in _HADAMARD_ARCHS:
+            raise ValueError(
+                f"Hadamard folding is not verified for arch {self.model_arch.name}; "
+                "the runtime would load the GGUF without applying the activation transform"
+            )
+        _HADAMARD_KINDS = re.compile(
+            r"blk\.\d+\.("
+            r"attn_q|attn_k|attn_v|attn_qkv|attn_output"
+            r"|ffn_gate|ffn_up|ffn_down"
+            r"|ffn_gate_exps|ffn_up_exps|ffn_down_exps|ffn_gate_up_exps"
+            r"|ffn_gate_shexp|ffn_up_shexp|ffn_down_shexp"
+            r")\.weight"
+        )
         weight_names: list[str] = []
         for record in tensor_records:
             if not isinstance(record, dict) or not isinstance(record.get("name"), str):
@@ -658,7 +683,13 @@ class ModelBase:
             filtered = self.filter_tensors((record["name"], lambda: None))
             if filtered is None:
                 raise ValueError(f"Hadamard tensor is filtered out: {record['name']!r}")
-            weight_names.append(self.map_tensor_name(filtered[0]))
+            mapped = self.map_tensor_name(filtered[0])
+            if not _HADAMARD_KINDS.fullmatch(mapped):
+                raise ValueError(
+                    f"Hadamard tensor {record['name']!r} maps to {mapped!r}, which is not on a "
+                    "verified Hadamard-aware matmul path"
+                )
+            weight_names.append(mapped)
 
         self.gguf_writer.add_uint32("prism.hadamard.version", 1)
         self.gguf_writer.add_uint32("prism.hadamard.block_size", block_size)
