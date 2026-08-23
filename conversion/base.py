@@ -620,7 +620,8 @@ class ModelBase:
         with manifest_path.open("r", encoding="utf-8") as f:
             manifest = json.load(f)
 
-        if manifest.get("schema_version") != 1 or manifest.get("kind") != "hadamard-weight-fold":
+        schema_version = manifest.get("schema_version")
+        if schema_version not in (1, 2) or manifest.get("kind") != "hadamard-weight-fold":
             raise ValueError(f"Unsupported Hadamard manifest: {manifest_path}")
         if manifest.get("status") != "requires-matching-runtime":
             raise ValueError(f"Unexpected Hadamard manifest status: {manifest.get('status')!r}")
@@ -633,11 +634,21 @@ class ModelBase:
             raise ValueError(f"Invalid Hadamard block size: {block_size!r}")
         if transform.get("name") != "normalized-signed-sylvester-walsh-hadamard":
             raise ValueError(f"Unsupported Hadamard transform: {transform.get('name')!r}")
-        if transform.get("sign_mode") != "identity":
-            raise ValueError(
-                "GGUF Hadamard runtime currently supports only identity signs; "
-                "repack with --sign-mode identity"
-            )
+        sign_mode = transform.get("sign_mode")
+        if sign_mode not in ("identity", "explicit"):
+            raise ValueError(f"Unsupported Hadamard sign mode: {sign_mode!r}")
+        sign_widths: list[int] = []
+        sign_values: list[int] = []
+        if sign_mode == "explicit":
+            signs = manifest.get("signs")
+            if not isinstance(signs, dict) or not signs:
+                raise ValueError("explicit sign mode requires a signs table")
+            for width_str, vec in sorted(signs.items(), key=lambda kv: int(kv[0])):
+                width = int(width_str)
+                if len(vec) != width or any(v not in (-1, 1) for v in vec):
+                    raise ValueError(f"invalid sign vector for width {width}")
+                sign_widths.append(width)
+                sign_values.extend(int(v) for v in vec)
 
         tensor_records = manifest.get("tensors")
         if not isinstance(tensor_records, list) or not tensor_records:
@@ -689,9 +700,13 @@ class ModelBase:
         self.gguf_writer.add_uint32("prism.hadamard.block_size", block_size)
         self.gguf_writer.add_string("prism.hadamard.transform", "normalized-sylvester-walsh-hadamard")
         self.gguf_writer.add_string("prism.hadamard.axis", "input-last-dimension")
-        self.gguf_writer.add_string("prism.hadamard.sign_mode", "identity")
+        self.gguf_writer.add_string("prism.hadamard.sign_mode", sign_mode)
         self.gguf_writer.add_array("prism.hadamard.weight_names", weight_names)
-        logger.info("GGUF Hadamard contract: H%d for %d folded weight(s)", block_size, len(weight_names))
+        if sign_mode == "explicit":
+            self.gguf_writer.add_array("prism.hadamard.sign_widths", sign_widths)
+            self.gguf_writer.add_array("prism.hadamard.sign_values", sign_values)
+        logger.info("GGUF Hadamard contract: H%d, sign_mode=%s, %d folded weight(s)",
+                    block_size, sign_mode, len(weight_names))
 
     def set_gguf_parameters(self):
         raise NotImplementedError("set_gguf_parameters() must be implemented in subclasses")
