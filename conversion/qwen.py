@@ -597,7 +597,11 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
                 data_torch = torch.cat([qk_part, v_part], dim=0)
 
             elif ".out_proj." in name:
-                if name in self.hadamard_folded_names():
+                # the tensor name may have had wrapper prefixes stripped by the
+                # time it reaches modify_tensors, so match manifest entries by
+                # suffix rather than exact name
+                suffix = "linear_attn.out_proj.weight"
+                if name.endswith(suffix) and any(n.endswith(suffix) for n in self.hadamard_folded_names()):
                     # Hadamard-folded latent: the rotation axis must keep the
                     # training (grouped) V order; the runtime permutes the
                     # activation tiled->grouped before the transform instead.
