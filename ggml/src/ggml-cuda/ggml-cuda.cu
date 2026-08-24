@@ -3381,6 +3381,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Hadamard sign flip + reshape + FWHT-hint matmul: multiply the sign
+    // vector during the transform's load instead of a separate full pass
+    if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i + 2 })) {
+        const ggml_tensor * mul     = cgraph->nodes[i];
+        const ggml_tensor * reshape = cgraph->nodes[i + 1];
+        ggml_tensor *       mm      = cgraph->nodes[i + 2];
+
+        const ggml_tensor * x     = mul->src[0];
+        const ggml_tensor * signs = mul->src[1];
+
+        const bool pattern_ok = ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+            mm->src[1] == reshape && reshape->src[0] == mul &&
+            signs->ne[1] == 1 && signs->ne[2] == 1 && signs->ne[3] == 1 &&
+            signs->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
+            (x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16) &&
+            ggml_is_contiguous(x) && ggml_is_contiguous(signs) &&
+            signs->ne[0] == x->ne[0] && signs->ne[0] % mm->src[0]->ne[0] == 0;
+
+        if (pattern_ok && ggml_cuda_op_fwht_signed(*cuda_ctx, x, signs, mm)) {
+            return 2;
+        }
+    }
+
     //RoPE + view + set-rows
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_tensor * rope     = cgraph->nodes[i];
