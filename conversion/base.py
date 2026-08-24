@@ -693,8 +693,9 @@ class ModelBase:
                 "the runtime would load the GGUF without applying the activation transform"
             )
         _HADAMARD_KINDS = re.compile(
+            r"output\.weight|"
             r"blk\.\d+\.("
-            r"attn_q|attn_k|attn_v|attn_qkv|attn_output"
+            r"attn_q|attn_k|attn_v|attn_qkv|attn_gate|attn_output"
             r"|ffn_gate|ffn_up|ffn_down"
             r"|ffn_gate_exps|ffn_up_exps|ffn_down_exps|ffn_gate_up_exps"
             r"|ffn_gate_shexp|ffn_up_shexp|ffn_down_shexp"
