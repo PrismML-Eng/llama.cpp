@@ -1158,12 +1158,15 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 
         const auto is_foldable_weight = [](const std::string & name) {
             static const char * kinds[] = {
-                "attn_q", "attn_k", "attn_v", "attn_qkv", "attn_output",
+                "attn_q", "attn_k", "attn_v", "attn_qkv", "attn_gate", "attn_output",
                 "ffn_gate", "ffn_up", "ffn_down",
                 "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps", "ffn_gate_up_exps",
                 "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",
                 "ssm_out",
             };
+            if (name == "output.weight") {
+                return true; // the output head is built through build_lora_mm in every arch
+            }
             if (name.compare(0, 4, "blk.") != 0) {
                 return false;
             }
@@ -1813,6 +1816,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             { &hadamard_weight_blocks,  &hadamard_rotations },
             { &hadamard_inverse_blocks, &hadamard_inverses  },
         };
+        // inverse (lookup-side) transforms must not inherit a host buffer
+        // type from a CPU-mapped table: the per-token transform would then
+        // ping-pong across the PCIe boundary. Prefer the buffer type the
+        // forward rotations live on (the GPU when layers are offloaded).
+        ggml_backend_buffer_type_t preferred_buft = nullptr;
+
         for (const auto & [blocks, target] : groups)
         for (const auto & entry : *blocks) {
             const std::string & weight_name = entry.first;
@@ -1830,7 +1839,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 throw std::runtime_error(format("prism.hadamard weight has no buffer: %s", weight_name.c_str()));
             }
 
-            const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(weight->buffer);
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(weight->buffer);
+            if (target == &hadamard_rotations) {
+                preferred_buft = buft;
+            } else if (preferred_buft) {
+                buft = preferred_buft;
+            }
             auto it = std::find_if(rotations.begin(), rotations.end(),
                     [block_size, buft](const hadamard_rotation & rotation) {
                         return rotation.block_size == block_size && rotation.buft == buft;
