@@ -82,6 +82,16 @@ static void llama_verify_hadamard_graph(
 
     for (const auto & [node, ok] : lookups) {
         if (!ok) {
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                const ggml_tensor * n2 = ggml_graph_node(gf, i);
+                for (int s = 0; s < GGML_MAX_SRC && n2->src[s]; ++s) {
+                    if (unwrap(n2->src[s]) == node) {
+                        LLAMA_LOG_WARN("%s: latent lookup '%s' consumed by op=%s name='%s' src%d hint=%d\n",
+                                __func__, node->name, ggml_op_name(n2->op), n2->name, s,
+                                ((const int32_t *) n2->op_params)[1]);
+                    }
+                }
+            }
             throw std::runtime_error(format(
                 "Hadamard-latent table '%s' is read without the inverse transform",
                 node->src[0]->name));
@@ -736,12 +746,6 @@ void llama_context::sched_reserve() {
 
         n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_pp  = ggml_graph_n_nodes(gf);
-
-        // a folded weight consumed without its activation-side transform loads
-        // cleanly but computes wrong results; refuse to run such a graph
-        if (!model.hadamard_rotations.empty() || !model.hadamard_inverses.empty()) {
-            llama_verify_hadamard_graph(gf, model.hadamard_rotations, model.hadamard_inverses);
-        }
     }
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
@@ -2510,6 +2514,13 @@ ggml_cgraph * llama_context::graph_reserve(
     res->reset();
 
     auto * gf = model.build_graph(gparams);
+
+    // verify transform coverage on the pristine graph: after scheduling,
+    // cross-backend copies break the producer chain the check follows
+    if (!hadamard_verified && gf && (!model.hadamard_rotations.empty() || !model.hadamard_inverses.empty())) {
+        llama_verify_hadamard_graph(gf, model.hadamard_rotations, model.hadamard_inverses);
+        hadamard_verified = true;
+    }
 
     this->n_outputs = save_n_outputs;
 
