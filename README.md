@@ -1,19 +1,26 @@
 # llama.cpp
 
 > [!IMPORTANT]
-> **This is the PrismML fork of llama.cpp.** It adds the `Q2_0` 2-bit quantization used by the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models.
+> **This is the PrismML fork of llama.cpp.** It adds the 1-bit/2-bit quantizations used by the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models.
 >
 > **New here? Start with the [Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo) repo.** It downloads the right models and the correct prebuilt binaries for your hardware/backend automatically.
+
+> [!WARNING]
+> ## `prism-v7` changes how Q2_0 model files are read
 >
-> Ternary (`Q2_0`) support is migrating into mainline llama.cpp backend-by-backend, so which build + model file to use depends on where you run:
+> This branch is rebased onto current mainline llama.cpp, where **`Q2_0` (ggml type id 42) is the official group-64 format**. The fork's original group-128 format now lives under its own name and id: **`PQ2_0` (ggml type id 142)**.
 >
-> - `*-Q2_0.gguf` (group size 128): the format **this fork** uses. Run it with this fork's builds / [releases](https://github.com/PrismML-Eng/llama.cpp/releases). Does not load on mainline llama.cpp.
-> - `*-Q2_0_g64.gguf` (group size 64): the **official mainline** llama.cpp format (currently CPU and Metal). Use a recent `ggml-org/llama.cpp` build for these, not this fork.
-> - `*-PQ2_0.gguf`: planned future fork format, **not supported anywhere yet**.
+> Which model file works where:
 >
-> Use a complete matching build. Do NOT drop this fork's `ggml-*` libraries into a stock llama.cpp build (ABI/format mismatch, models fail to load).
+> - `*-Q2_0_g64.gguf` (group 64): loads on `prism-v7` **and** on mainline llama.cpp.
+> - `*-PQ2_0.gguf` (group 128, id 142): loads on `prism-v7`. Not supported by mainline or by older fork releases.
+> - `*-Q2_0.gguf` (legacy group 128 stored as id 42): does **NOT** load on `prism-v7`. The loader detects it and tells you to use the `PQ2_0` or `Q2_0_g64` file instead. Legacy files keep working on the `prism` branch and its releases.
 >
-> **For the latest backend-by-backend migration status, see [Upstream Status for Ternary](https://github.com/PrismML-Eng/Bonsai-demo#upstream-status-for-ternary) in the Bonsai-demo README.**
+> **Want the previously released behavior in the meantime? Use the [`prism`](https://github.com/PrismML-Eng/llama.cpp/tree/prism) branch (= `prism-v5`) and its [releases](https://github.com/PrismML-Eng/llama.cpp/releases).**
+>
+> **Do NOT build from `prism-v6`: it is a stale mid-migration snapshot, kept only as a reference point.**
+>
+> Use a complete matching build. Do NOT mix this fork's `ggml-*` libraries with a stock llama.cpp build (ABI/format mismatch, models fail to load).
 
 ---
 
