@@ -30,8 +30,8 @@ void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
     quantize_row_q2_0_ref(x, y, k);
 }
 
-void quantize_row_q2_0_g128(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
-    quantize_row_q2_0_g128_ref(x, y, k);
+void quantize_row_pq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_pq2_0_ref(x, y, k);
 }
 
 void quantize_row_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
@@ -226,10 +226,10 @@ void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     *s = sumf;
 }
 
-// Q2_0_g128: 128 weights per block = four Q8_0 blocks (4 * 32). No arch defines
+// PQ2_0: 128 weights per block = four Q8_0 blocks (4 * 32). No arch defines
 // a SIMD variant yet, so this scalar path is the symbol referenced by the traits.
-void ggml_vec_dot_q2_0_g128_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    const int qk = QK2_0_G128;
+void ggml_vec_dot_pq2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK_PQ2_0;
     const int nb = n / qk;
 
     assert(n % qk == 0);
@@ -239,7 +239,7 @@ void ggml_vec_dot_q2_0_g128_q8_0_generic(int n, float * GGML_RESTRICT s, size_t 
     UNUSED(by);
     UNUSED(bs);
 
-    const block_q2_0_g128 * GGML_RESTRICT x = vx;
+    const block_pq2_0 * GGML_RESTRICT x = vx;
     const block_q8_0      * GGML_RESTRICT y = vy;
 
     float sumf = 0.0f;
