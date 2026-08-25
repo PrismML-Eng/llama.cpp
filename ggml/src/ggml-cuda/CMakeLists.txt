@@ -139,6 +139,18 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_FORCE_MMQ)
     endif()
 
+    if (GGML_CUDA_HOPPER_Q1)
+        # opt-in Hopper (sm_90a) wgmma path for Q1_0/PQ2_0 prefill; needs CUTLASS headers (CuTe)
+        if (NOT GGML_CUDA_CUTLASS_DIR)
+            message(FATAL_ERROR "GGML_CUDA_HOPPER_Q1 requires GGML_CUDA_CUTLASS_DIR (CUTLASS checkout root)")
+        endif()
+        target_compile_definitions(ggml-cuda PRIVATE GGML_USE_HOPPER_Q1)
+        target_include_directories(ggml-cuda PRIVATE
+            ${GGML_CUDA_CUTLASS_DIR}/include
+            ${GGML_CUDA_CUTLASS_DIR}/tools/util/include)
+        target_compile_options(ggml-cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+    endif()
+
     if (GGML_CUDA_FORCE_CUBLAS)
         add_compile_definitions(GGML_CUDA_FORCE_CUBLAS)
     endif()
