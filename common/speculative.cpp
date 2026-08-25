@@ -2339,6 +2339,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
+
+    // the K-cache mean-center bias is calibrated for the target model
+    // (per-head/channel K layout); the draft model has a different K
+    // geometry, so it must not inherit the bias
+    result.kv_mean_center_path.clear();
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 
