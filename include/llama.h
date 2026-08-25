@@ -156,7 +156,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
-        LLAMA_FTYPE_MOSTLY_PQ2_0     = 142, // except 1d tensors (Prism group-128 Q2_0)
+        LLAMA_FTYPE_MOSTLY_PQ2_0     = 141, // except 1d tensors (Prism group-128 Q2_0; matches published PQ2_0 ggufs)
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
