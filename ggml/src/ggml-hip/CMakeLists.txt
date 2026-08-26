@@ -47,6 +47,11 @@ find_package(hip     REQUIRED)
 find_package(hipblas REQUIRED)
 find_package(rocblas REQUIRED)
 
+# Optional: the RDNA4 Q1_0/Q2_0 prefill routes (mul_mat_q{1,2}_0_hipblaslt.cu)
+# use hipBLASLt. It is Linux-only in current ROCm distributions, so it must not
+# be a hard requirement -- without it the routes compile to inert stubs.
+find_package(hipblaslt QUIET)
+
 if (GGML_HIP_RCCL)
     find_package(rccl REQUIRED)
 endif()
@@ -155,3 +160,11 @@ if (GGML_HIP_RCCL)
 endif()
 
 target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
+
+if (hipblaslt_FOUND)
+    message(STATUS "hipBLASLt found: RDNA4 Q1_0/Q2_0 hipBLASLt prefill routes enabled")
+    target_link_libraries(ggml-hip PRIVATE roc::hipblaslt)
+else()
+    message(STATUS "hipBLASLt not found: RDNA4 Q1_0/Q2_0 hipBLASLt prefill routes disabled")
+    target_compile_definitions(ggml-hip PRIVATE GGML_HIP_NO_HIPBLASLT)
+endif()

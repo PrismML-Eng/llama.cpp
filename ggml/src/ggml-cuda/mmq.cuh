@@ -434,12 +434,27 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
         for (int j = 0; j < 4; ++j) {
             const int q  = qxi[j];
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+            // HIP: __byte_perm emulates PRMT nibble selectors with a runtime
+            // control-word conversion before v_perm_b32, so the 4-perm unpack
+            // below costs several VALU ops per call here. Borrow-free SWAR is
+            // cheaper and bit-identical: 2-bit spread to {0,1,2} bytes, then
+            // c-1 per byte via ((c + 0x7F) ^ 0x80), carry-free (same family
+            // as the unpack_q1_0_bytes HIP path).
+            const int b0 = (q >> 0) & 0xFF;
+            const int b1 = (q >> 8) & 0xFF;
+            const int s0 = (b0 | (b0 << 6) | (b0 << 12) | (b0 << 18)) & 0x03030303;
+            const int s1 = (b1 | (b1 << 6) | (b1 << 12) | (b1 << 18)) & 0x03030303;
+            const int qx = (s0 + 0x7F7F7F7F) ^ 0x80808080;
+            const int qy = (s1 + 0x7F7F7F7F) ^ 0x80808080;
+#else
             // unpack even and odd crumbs into byte values
             const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
             const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
             // unshuffle values
             const int qx = __byte_perm(qe, qo, 0x5140);
             const int qy = __byte_perm(qe, qo, 0x7362);
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
             x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + dst_offset + j*2+0] = qx;

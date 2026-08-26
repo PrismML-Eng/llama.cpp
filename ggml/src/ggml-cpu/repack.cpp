@@ -17,6 +17,7 @@
 #include <cstdio>  // for GGML_ASSERT
 
 #include "repack.h"
+#include "numa-mirror.h"
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Woverlength-strings"
@@ -4033,11 +4034,12 @@ static int repack_q1_0_to_q1_0_4_bl(struct ggml_tensor *       t,
 
     GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_q1_0));
 
-    if (t->ne[1] % nrows_interleaved != 0) {
-        return -1;
+    if (t->ne[1] % nrows_interleaved != 0 && t->ne[2] != 1) {
+        return -1; // 3D (mul_mat_id) keeps the aligned-only rule
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
+    const int nrow_al = nrow - (nrow % nrows_interleaved);
+    for (int b = 0; b < nrow_al; b += nrows_interleaved) {
         for (int64_t x = 0; x < nblocks; x++) {
             for (int i = 0; i < nrows_interleaved; i++) {
                 dst_tmp[i] = src[x + i * nblocks];
@@ -4045,6 +4047,11 @@ static int repack_q1_0_to_q1_0_4_bl(struct ggml_tensor *       t,
             *dst++ = make_block_q1_0x4(dst_tmp, interleave_block);
         }
         src += nrows_interleaved * nblocks;
+    }
+    if (nrow_al < nrow) {
+        // tail rows stay in the original row-major block format; their file
+        // offset equals row * row_size, which the tail path relies on
+        memcpy((void *) dst, (const void *) src, (size_t) (nrow - nrow_al) * nblocks * sizeof(block_q1_0));
     }
     return 0;
 }
@@ -4065,11 +4072,12 @@ static int repack_q2_0_to_q2_0_4_bl(struct ggml_tensor *       t,
 
     GGML_ASSERT(data_size == (size_t) nrow * nblocks * sizeof(block_q2_0));
 
-    if (t->ne[1] % nrows_interleaved != 0) {
-        return -1;
+    if (t->ne[1] % nrows_interleaved != 0 && t->ne[2] != 1) {
+        return -1; // 3D (mul_mat_id) keeps the aligned-only rule
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
+    const int nrow_al = nrow - (nrow % nrows_interleaved);
+    for (int b = 0; b < nrow_al; b += nrows_interleaved) {
         for (int64_t x = 0; x < nblocks; x++) {
             for (int i = 0; i < nrows_interleaved; i++) {
                 dst_tmp[i] = src[x + (int64_t) i * nblocks];
@@ -4077,6 +4085,11 @@ static int repack_q2_0_to_q2_0_4_bl(struct ggml_tensor *       t,
             *dst++ = make_block_q2_0x4(dst_tmp, interleave_block);
         }
         src += nrows_interleaved * nblocks;
+    }
+    if (nrow_al < nrow) {
+        // tail rows stay in the original row-major block format; their file
+        // offset equals row * row_size, which the tail path relies on
+        memcpy((void *) dst, (const void *) src, (size_t) (nrow - nrow_al) * nblocks * sizeof(block_q2_0));
     }
     return 0;
 }
@@ -4836,25 +4849,75 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int64_t i1 = i11;
         const int64_t i2 = i12;
 
-        const char * src0_ptr = (const char *) src0->data + i02 * nb02;
+        const char * src0_ptr = (const char *) ggml_numa_mirror_map(src0->data) + i02 * nb02;
         const char * src1_ptr = (const char *) params->wdata + (i11 + i12 * ne11) * src1_col_stride;
         char *       dst_ptr  = ((char *) dst->data + (i1 * nb1 + i2 * nb2));
 
         const int64_t nrows = src1_end - src1_start;
-        const int64_t ncols = src0_end - src0_start;
+
+        // rows >= ne01_al are tail rows kept in the original block format
+        // (see repack_*_bl); the tile kernels only ever see aligned ranges
+        const int64_t ne01_al   = ne01 - (ne01 % NB_COLS);
+        const int64_t col_end   = MIN(src0_end, ne01_al);
+        const int64_t ncols     = col_end > src0_start ? col_end - src0_start : 0;
 
         GGML_ASSERT(src1_ptr + src1_col_stride * nrows <= (const char *) params->wdata + params->wsize);
 
         // If there are more than three rows in src1, use gemm; otherwise, use gemv.
-        if (nrows > 3) {
+        if (ncols > 0 && nrows > 3) {
             gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst_ptr) + src0_start, nb1 / nb0,
                                                              src0_ptr + src0_start * nb01, src1_ptr,
                                                              nrows - (nrows % 4), ncols);
         }
-        for (int iter = nrows - (nrows % 4); iter < nrows; iter++) {
-            gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst_ptr + (iter * nb1)) + src0_start,
-                                                             ne01, src0_ptr + src0_start * nb01,
-                                                             src1_ptr + (src1_col_stride * iter), 1 /* nrows */, ncols);
+        if (ncols > 0) {
+            for (int iter = nrows - (nrows % 4); iter < nrows; iter++) {
+                gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst_ptr + (iter * nb1)) + src0_start,
+                                                                 ne01, src0_ptr + src0_start * nb01,
+                                                                 src1_ptr + (src1_col_stride * iter), 1 /* nrows */, ncols);
+            }
+        }
+
+        if (src0_end > ne01_al) {
+            // tail columns: dot each remaining weight row against every src1
+            // row with the type-generic vec_dot. src1 rows quantized by the
+            // 4-row interleaver need a per-row deinterleave first.
+            const auto * cpu_traits = ggml_get_type_traits_cpu(src0->type);
+            const size_t wrow_sz    = ggml_row_size(src0->type, ne00);
+            const int64_t tail0     = MAX(src0_start, ne01_al);
+            const int64_t nblk      = ne00 / QK8_0;
+            const int64_t grouped   = ne11 - (ne11 % 4); // rows below this sit in x4-interleaved storage
+
+            static thread_local std::vector<uint8_t> tail_rowbuf;
+
+            for (int64_t iter = 0; iter < nrows; iter++) {
+                const int64_t rr = i11 + iter; // absolute src1 row in this plane
+                const char * yrow = src1_ptr + iter * src1_col_stride;
+                if constexpr (PARAM_TYPE == GGML_TYPE_Q8_0) {
+                    if (rr < grouped) {
+                        tail_rowbuf.resize((size_t) nblk * sizeof(block_q8_0));
+                        const int m = (int) (rr % 4);
+                        const block_q8_0x4 * gb =
+                            (const block_q8_0x4 *) (src1_ptr + (int64_t) (rr - m - i11) * src1_col_stride);
+                        block_q8_0 * out = (block_q8_0 *) tail_rowbuf.data();
+                        const int cpb = (int) (QK8_0 / INTER_SIZE); // interleave chunks per 32 values
+                        for (int64_t b = 0; b < nblk; ++b) {
+                            out[b].d = gb[b].d[m];
+                            for (int c = 0; c < cpb; ++c) {
+                                memcpy(out[b].qs + (size_t) c * INTER_SIZE,
+                                       gb[b].qs + ((size_t) c * 4 + m) * INTER_SIZE, INTER_SIZE);
+                            }
+                        }
+                        yrow = (const char *) tail_rowbuf.data();
+                    }
+                } else {
+                    GGML_ASSERT(rr >= grouped && "tail columns only supported for q8_0-quantized src1");
+                }
+                for (int64_t ir = tail0; ir < src0_end; ++ir) {
+                    float r;
+                    cpu_traits->vec_dot((int) ne00, &r, 0, src0_ptr + (size_t) ir * wrow_sz, 0, yrow, 0, 1);
+                    ((float *) (dst_ptr + iter * nb1))[ir] = r;
+                }
+            }
         }
     }
 
@@ -5084,7 +5147,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 continue;
             }
 
-            const auto * src0_cur = (const char *) src0->data + cur_a*nb02;
+            const auto * src0_cur = (const char *) ggml_numa_mirror_map(src0->data) + cur_a*nb02;
 
             //const int64_t nr0 = ne01; // src0 rows
             const int64_t nr1 = cne1; // src1 rows
@@ -5339,6 +5402,11 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
                 return &q1_0_4x8_q8_0;
             }
         }
+        if (ggml_cpu_has_avx2()) {
+            if (cur->ne[1] % 4 == 0 || (cur->ne[2] == 1 && cur->ne[1] >= 4)) {
+                return &q1_0_4x8_q8_0;
+            }
+        }
         if (ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8()) {
             if (cur->ne[1] % 4 == 0) {
                 return &q1_0_4x8_q8_0;
@@ -5352,6 +5420,11 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
     } else if (cur->type == GGML_TYPE_Q2_0) {
         if (ggml_cpu_has_avx512() && ggml_cpu_has_avx512_vnni()) {
             if (cur->ne[1] % 4 == 0) {
+                return &q2_0_4x8_q8_0;
+            }
+        }
+        if (ggml_cpu_has_avx2()) {
+            if (cur->ne[1] % 4 == 0 || (cur->ne[2] == 1 && cur->ne[1] >= 4)) {
                 return &q2_0_4x8_q8_0;
             }
         }
@@ -5376,6 +5449,7 @@ static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buff
     auto OK            = tensor_traits->repack(tensor, data, size);
 
     GGML_ASSERT(OK == 0);
+    ggml_numa_mirror_register(tensor->data, size);
     GGML_UNUSED(buffer);
 }
 
@@ -5383,6 +5457,15 @@ static const char * ggml_backend_cpu_repack_buffer_type_get_name(ggml_backend_bu
     return "CPU_REPACK";
 
     GGML_UNUSED(buft);
+}
+
+static void (*ggml_backend_cpu_repack_orig_free_buffer)(ggml_backend_buffer_t) = nullptr;
+
+static void ggml_backend_cpu_repack_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_numa_mirror_free_range(ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer));
+    if (ggml_backend_cpu_repack_orig_free_buffer) {
+        ggml_backend_cpu_repack_orig_free_buffer(buffer);
+    }
 }
 
 static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -5397,6 +5480,8 @@ static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(gg
     buffer->iface.set_tensor  = ggml_backend_cpu_repack_buffer_set_tensor;
     buffer->iface.get_tensor  = nullptr;
     buffer->iface.cpy_tensor  = nullptr;
+    ggml_backend_cpu_repack_orig_free_buffer = buffer->iface.free_buffer;
+    buffer->iface.free_buffer = ggml_backend_cpu_repack_buffer_free_buffer;
     return buffer;
 }
 

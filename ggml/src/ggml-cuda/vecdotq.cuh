@@ -688,15 +688,20 @@ static __device__ __forceinline__ int4 unpack_q1_0_bytes(const uint16_t q) {
     return make_int4(__byte_perm(s0, s1, 0x5410), __byte_perm(s0, s1, 0x7632), __byte_perm(s2, s3, 0x5410),
                      __byte_perm(s2, s3, 0x7632));
 #else
+    // HIP/MUSA: borrow-free SWAR instead of per-bit ternary selects. The
+    // selects compile to v_cmp_eq + v_cndmask chains serializing on VCC --
+    // PC-sampled at 9.5% of mul_mat_q on gfx1201, with their live ranges
+    // driving the mmq_x=128 tile to 256 VGPRs + scratch spills. Bit-spread
+    // to {0,1} bytes (3 fused lshl_or + and), then map 1 -> 0x01 / 0 -> 0xFF
+    // per byte, carry-free: ((2b + 0x7F) ^ 0x80). Bit-identical output to
+    // the select version; measured +12.6% pp2048 (Q1_0 27B, RDNA4) with the
+    // spills eliminated (vgpr 256 -> 239, scratch 76B -> 0).
     int values[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-        const int bits4 = (q >> (4 * j)) & 0x0F;
-        const int b0    = (bits4 & 0x01) ? 1 : -1;
-        const int b1    = (bits4 & 0x02) ? 1 : -1;
-        const int b2    = (bits4 & 0x04) ? 1 : -1;
-        const int b3    = (bits4 & 0x08) ? 1 : -1;
-        values[j]       = (b0 & 0xFF) | ((b1 & 0xFF) << 8) | ((b2 & 0xFF) << 16) | ((b3 & 0xFF) << 24);
+        const int bits4  = (q >> (4 * j)) & 0x0F;
+        const int spread = (bits4 | (bits4 << 7) | (bits4 << 14) | (bits4 << 21)) & 0x01010101;
+        values[j]        = ((spread << 1) + 0x7F7F7F7F) ^ 0x80808080;
     }
     return make_int4(values[0], values[1], values[2], values[3]);
 #endif
@@ -712,10 +717,33 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     // iqs selects which of the 4 chunks of 32 elements to process (0-3)
 
     const float     d1 = bq1_0->d;
-    const uint16_t * qs = (const uint16_t *) bq1_0->qs + iqs * 2;
 
     // Process only the chunk specified by iqs
     const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
+
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    // AMD path, same identity as the Q2_0 HIP path above: with raw code bits
+    // c in {0,1}, s = 2c - 1, so dot(s,u) = 2*dot(c,u) - sum(u). Bit-spread
+    // each qs byte into two {0,1}-byte dp4a operands (4 fused shift-or ops
+    // each) and apply -sum(u) once at the end via the q8_1 stored sum
+    // (ds.y = d8*sum(u)). This replaces the select-chain fallback in
+    // unpack_q1_0_bytes on a VALU-bound kernel (~2.5x fewer VALU ops).
+    const int offset = iqs * 4;
+    int sumi = 0;   // = dot(c, u), c in {0,1}
+#pragma unroll
+    for (int j2 = 0; j2 < 4; ++j2) {
+        const int b  = bq1_0->qs[offset + j2];
+        const int lo = ( b       | (b << 7) | (b << 14) | (b << 21)) & 0x01010101; // bits 0..3 -> bytes
+        const int hi = ((b >> 4) | (b << 3) | (b << 10) | (b << 17)) & 0x01010101; // bits 4..7 -> bytes
+        sumi = ggml_cuda_dp4a(lo, get_int_b4(bq8_1_chunk->qs, 2*j2 + 0), sumi);
+        sumi = ggml_cuda_dp4a(hi, get_int_b4(bq8_1_chunk->qs, 2*j2 + 1), sumi);
+    }
+
+    const float d8 = __low2float(bq8_1_chunk->ds);
+    const float s8 = __high2float(bq8_1_chunk->ds); // = d8 * sum(u)
+    return d1 * (2.0f * d8 * (float) sumi - s8);
+#else
+    const uint16_t * qs = (const uint16_t *) bq1_0->qs + iqs * 2;
 
     int sumi = 0;
 #pragma unroll
@@ -735,6 +763,7 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
 
     const float d8 = __low2float(bq8_1_chunk->ds);
     return d1 * d8 * sumi;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
 static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
@@ -747,11 +776,41 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     // iqs selects which of the 4 chunks of 32 elements to process (0-3)
 
     const float     d2 = bq2_0->d;
-    // each 32-element chunk occupies 8 bytes of qs (4 int16), regardless of group size
-    const int16_t * qs = (const int16_t *) bq2_0->qs + iqs * 4;
-
     // Process only the chunk specified by iqs
     const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
+
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    // AMD path (same split as unpack_q1_0_bytes above): the dynamic-selector
+    // __byte_perm chain below is built around NVIDIA's PRMT; on HIP it lowers
+    // poorly and the decode GEMV loses ~30% end-to-end. Instead, bit-spread
+    // the raw codes c in {0,1,2,3} into bytes and use the identity
+    //   dot(s, u) = dot(c, u) - sum(u),   s = c - 1
+    // applying the -sum(u) offset once at the end via the q8_1 stored sum
+    // (ds.y = d8 * sum(u)) -- no per-code subtract, plain shift/mask + dp4a.
+    const int offset = iqs * 8;
+    // pack as unsigned: a byte >= 128 shifted by 24 overflows the promoted int (UB)
+    const uint32_t qs0 = (uint32_t) bq2_0->qs[offset + 0]        | ((uint32_t) bq2_0->qs[offset + 1] <<  8) |
+                        ((uint32_t) bq2_0->qs[offset + 2] << 16) | ((uint32_t) bq2_0->qs[offset + 3] << 24);
+    const uint32_t qs1 = (uint32_t) bq2_0->qs[offset + 4]        | ((uint32_t) bq2_0->qs[offset + 5] <<  8) |
+                        ((uint32_t) bq2_0->qs[offset + 6] << 16) | ((uint32_t) bq2_0->qs[offset + 7] << 24);
+
+    int sumi = 0;   // = dot(c, u), c in {0,1,2,3}
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int b0 = (qs0 >> (j*8)) & 0xFF;
+        const int s0 = (b0 | (b0 << 6) | (b0 << 12) | (b0 << 18)) & 0x03030303; // 4 codes -> 4 bytes
+        sumi = ggml_cuda_dp4a(s0, get_int_b4(bq8_1_chunk->qs, j), sumi);
+        const int b1 = (qs1 >> (j*8)) & 0xFF;
+        const int s1 = (b1 | (b1 << 6) | (b1 << 12) | (b1 << 18)) & 0x03030303;
+        sumi = ggml_cuda_dp4a(s1, get_int_b4(bq8_1_chunk->qs, 4 + j), sumi);
+    }
+
+    const float d8 = __low2float(bq8_1_chunk->ds);
+    const float s8 = __high2float(bq8_1_chunk->ds); // = d8 * sum(u)
+    return d2 * (d8 * sumi - s8);
+#else
+    // each 32-element chunk occupies 8 bytes of qs (4 int16), regardless of group size
+    const int16_t * qs = (const int16_t *) bq2_0->qs + iqs * 4;
 
     int sumi = 0;
 #pragma unroll
@@ -775,6 +834,7 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     // symbols are already signed, so no deferred sum(act) correction is needed
     const float d8 = __low2float(bq8_1_chunk->ds);
     return d2 * d8 * sumi;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
