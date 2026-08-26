@@ -152,6 +152,8 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
+    bool can_reuse(const llm_graph_params & params) override;
+
     ggml_tensor * feat = nullptr; // F32 [128, n_tokens]
 
     std::vector<float> v_feat;
