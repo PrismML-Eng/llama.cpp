@@ -264,6 +264,11 @@ struct llama_hparams {
     uint32_t dsv4_o_group_count        = 0;
     uint32_t dsv4_o_lora_rank          = 0;
     uint32_t dsv4_hc_mult              = 0;
+
+    // dspark GIDD log-SNR conditioning; GGUF sets <arch>.log_snr_conditioning
+    bool  dspark_log_snr_conditioning = false;
+    float dspark_min_log_snr = 0.0f;
+    float dspark_max_log_snr = 0.0f;
     uint32_t dsv4_hc_sinkhorn_iters    = 0;
     uint32_t dsv4_hash_layer_count     = 0;
     float    dsv4_compress_rope_base   = 0.0f;

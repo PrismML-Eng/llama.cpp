@@ -123,6 +123,24 @@ protected:
 
 using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
 
+// dspark GIDD log-SNR conditioning (LogSnrEmbed): the sinusoidal feature matrix
+// fed into log_snr_fc1/fc2. Carries no external staged state, because the
+// per-position log-SNR pattern (each block's anchor at max_log_snr, mask
+// positions at min_log_snr) and its featurization are a pure function of
+// n_tokens/block_drafts/min_log_snr/max_log_snr, all known at graph-build time.
+// The caller precomputes the whole [128, n_tokens] matrix and this just stages it.
+class llm_graph_input_dspark_logsnr : public llm_graph_input_i {
+public:
+    llm_graph_input_dspark_logsnr(std::vector<float> feat) : v_feat(std::move(feat)) {}
+    virtual ~llm_graph_input_dspark_logsnr() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * feat = nullptr; // F32 [128, n_tokens]
+
+    std::vector<float> v_feat;
+};
+
 class llm_graph_input_embd : public llm_graph_input_i {
 public:
     llm_graph_input_embd(int64_t n_embd) : n_embd(n_embd) {}
