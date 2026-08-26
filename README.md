@@ -10,7 +10,7 @@
 > - It reads the **legacy** `*-Q2_0.gguf` files (group 128 stored as ggml type id 42). It is the only line that does.
 > - It can NOT read the official mainline `*-Q2_0_g64.gguf` files or the new `*-PQ2_0.gguf` files (group 128 under its own type id 142). `prism-v7` reads both.
 > - It is based on an early-July upstream snapshot and will not receive upstream fixes or features.
-> - dspark speculative decoding still lives here (and in the released binaries) until it lands on the new line as prism-v8.
+> - dspark speculative decoding still lives here (and in the released binaries) until it lands on `prism-v7`.
 >
 > **New here? Start with the [Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo) repo.** It downloads the right models and the correct prebuilt binaries for your hardware/backend automatically. Use a complete matching build; do NOT mix this fork's `ggml-*` libraries with a stock llama.cpp build (ABI/format mismatch, models fail to load).
 
