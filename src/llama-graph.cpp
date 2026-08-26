@@ -75,6 +75,12 @@ void llm_graph_input_dspark_logsnr::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+bool llm_graph_input_dspark_logsnr::can_reuse(const llm_graph_params & params) {
+    // v_feat is a function of n_tokens and n_seqs_unq, both already checked by
+    // llm_graph_params::allow_reuse, and of min/max_log_snr, fixed per model
+    return feat && feat->ne[1] == params.ubatch.n_tokens;
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
