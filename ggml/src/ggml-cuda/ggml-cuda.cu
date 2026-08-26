@@ -3394,8 +3394,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const bool pattern_ok = ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
             mm->src[1] == reshape && reshape->src[0] == mul &&
             signs->ne[1] == 1 && signs->ne[2] == 1 && signs->ne[3] == 1 &&
-            signs->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
+            signs->type == GGML_TYPE_F32 &&
             (x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16) &&
+            // ggml_mul keeps src0's type, so an F16 x gives an F16 mul
+            mul->type == x->type &&
             ggml_is_contiguous(x) && ggml_is_contiguous(signs) &&
             signs->ne[0] == x->ne[0] && signs->ne[0] % mm->src[0]->ne[0] == 0;
 

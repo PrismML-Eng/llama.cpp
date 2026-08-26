@@ -1230,6 +1230,11 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             std::vector<int32_t> sign_values;
             ml.get_arr("prism.hadamard.sign_widths", sign_widths);
             ml.get_arr("prism.hadamard.sign_values", sign_values);
+            // explicit mode with no widths would leave the sign table empty, which reads
+            // as identity later and silently changes the model function
+            if (sign_widths.empty()) {
+                throw std::runtime_error("prism.hadamard.sign_mode is explicit but sign_widths is empty");
+            }
             size_t off = 0;
             for (const int32_t width : sign_widths) {
                 if (width <= 0 || (uint32_t) width % block_size != 0 || off + width > sign_values.size()) {

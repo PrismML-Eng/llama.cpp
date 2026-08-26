@@ -666,6 +666,11 @@ class ModelBase:
                 raise ValueError("explicit sign mode requires a signs table")
             for width_str, vec in sorted(signs.items(), key=lambda kv: int(kv[0])):
                 width = int(width_str)
+                # same width rule the runtime enforces, so a manifest that converts also loads
+                if width <= 0 or width % block_size != 0:
+                    raise ValueError(
+                        f"sign width {width} must be positive and a multiple of block size {block_size}"
+                    )
                 if len(vec) != width or any(v not in (-1, 1) for v in vec):
                     raise ValueError(f"invalid sign vector for width {width}")
                 sign_widths.append(width)

@@ -547,17 +547,27 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         elif name.endswith((".linear_attn.in_proj_a.weight", ".linear_attn.in_proj_b.weight")):
             weight, scale = reorder_rows(weight, scale, 1)
         elif name.endswith(".linear_attn.out_proj.weight"):
-            col_perm = self._reorder_v_heads(
-                torch.arange(num_v_heads * head_v_dim, dtype=torch.long).unsqueeze(0),
-                1, num_k_heads, num_v_per_k, head_v_dim,
-            ).squeeze(0)
-            weight, scale = apply_col_perm(weight, scale, col_perm)
+            if self._hadamard_folds_tensor(name):
+                # folded latent: a column permutation on the rotation axis cannot be
+                # refolded, so keep the training (grouped) order and let the runtime
+                # permute the activation instead
+                self._hadamard_gdn_v_grouped = True
+            else:
+                col_perm = self._reorder_v_heads(
+                    torch.arange(num_v_heads * head_v_dim, dtype=torch.long).unsqueeze(0),
+                    1, num_k_heads, num_v_per_k, head_v_dim,
+                ).squeeze(0)
+                weight, scale = apply_col_perm(weight, scale, col_perm)
 
         return weight, scale
 
     def _repack_nvfp4(self, name: str, weight: Tensor, scale: Tensor, scale2: Tensor, input_scale: Tensor):
         weight, scale = self._transform_nvfp4_weight(name, weight, scale)
         super()._repack_nvfp4(name, weight, scale, scale2, input_scale)
+
+    def _hadamard_folds_tensor(self, name: str) -> bool:
+        # a manifest entry and `name` may differ only by leading wrapper prefixes
+        return any(name.endswith(n) or n.endswith(name) for n in self.hadamard_folded_names())
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         num_k_heads = self.hparams.get("linear_num_key_heads", 0)
@@ -605,11 +615,11 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
                 data_torch = torch.cat([qk_part, v_part], dim=0)
 
             elif ".out_proj." in name:
-                # the tensor name may have had wrapper prefixes stripped by the
-                # time it reaches modify_tensors, so match manifest entries by
-                # suffix rather than exact name
-                suffix = "linear_attn.out_proj.weight"
-                if name.endswith(suffix) and any(n.endswith(suffix) for n in self.hadamard_folded_names()):
+                # wrapper prefixes may already be stripped by the time the name reaches
+                # modify_tensors, so match on the full name modulo those prefixes. Matching
+                # on the tensor-kind suffix alone would treat every layer as folded as soon
+                # as one layer is.
+                if self._hadamard_folds_tensor(name):
                     # Hadamard-folded latent: the rotation axis must keep the
                     # training (grouped) V order; the runtime permutes the
                     # activation tiled->grouped before the transform instead.
