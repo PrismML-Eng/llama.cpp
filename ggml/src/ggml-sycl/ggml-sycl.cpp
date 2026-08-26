@@ -5272,11 +5272,6 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
 
-                // disable Q1_0 until implementation
-                if (a->type == GGML_TYPE_Q1_0 || b->type == GGML_TYPE_Q1_0) {
-                    return false;
-                }
-
                 if (a->ne[3] != b->ne[3]) {
                     return false;
                 }
@@ -5308,6 +5303,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_F32:
                     case GGML_TYPE_Q1_0:
+                    case GGML_TYPE_Q2_0:
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_NVFP4:
                     case GGML_TYPE_IQ2_XXS:
