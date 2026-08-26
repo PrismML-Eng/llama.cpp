@@ -53,6 +53,43 @@ def test_with_and_without_draft():
     assert tokens_no_draft == tokens_draft
 
 
+def test_draft_acceptance_floor():
+    # test_with_and_without_draft asserts that drafting happens (draft_n > 0), not that
+    # any draft is accepted. Those are different failures: a drafter can run at full
+    # speed, produce well-formed blocks, and have essentially every token rejected. That
+    # is what a wrong block layout or a mis-tapped feature looks like, and it is a pure
+    # slowdown with identical output, so every existing assertion here still passes.
+    #
+    # This drafter/target pair is deliberately mismatched (q4_0 stories15M drafting for
+    # the F16 MoE), so acceptance is low by nature: 15.0% and 17.4% measured on the two
+    # prompts below, deterministic at temperature 0. The floor sits well under that and
+    # well over a collapse -- the regression this guards against measured 0.27%.
+    #
+    # Scope: this covers the draft-simple path only. The block-layout-sensitive draft
+    # types need their own drafters and are not exercised by any tiny fixture model.
+    global server
+    server.start()
+    for prompt in [
+        "I believe the meaning of life is",
+        "Once upon a time there was a little girl who",
+    ]:
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt,
+            "temperature": 0.0,
+            "top_k": 1,
+            "n_predict": 64,
+        })
+        assert res.status_code == 200
+        draft_n = res.body["timings"]["draft_n"]
+        draft_n_accepted = res.body["timings"]["draft_n_accepted"]
+        assert draft_n > 0, f"nothing was drafted for {prompt!r}"
+        accept_rate = draft_n_accepted / draft_n
+        assert accept_rate > 0.05, (
+            f"draft acceptance collapsed to {100 * accept_rate:.2f}% "
+            f"({draft_n_accepted}/{draft_n}) for {prompt!r}"
+        )
+
+
 def test_different_draft_min_draft_max():
     global server
     test_values = [
