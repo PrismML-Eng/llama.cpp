@@ -54,19 +54,8 @@ def test_with_and_without_draft():
 
 
 def test_draft_acceptance_floor():
-    # test_with_and_without_draft asserts that drafting happens (draft_n > 0), not that
-    # any draft is accepted. Those are different failures: a drafter can run at full
-    # speed, produce well-formed blocks, and have essentially every token rejected. That
-    # is what a wrong block layout or a mis-tapped feature looks like, and it is a pure
-    # slowdown with identical output, so every existing assertion here still passes.
-    #
-    # This drafter/target pair is deliberately mismatched (q4_0 stories15M drafting for
-    # the F16 MoE), so acceptance is low by nature: 15.0% and 17.4% measured on the two
-    # prompts below, deterministic at temperature 0. The floor sits well under that and
-    # well over a collapse -- the regression this guards against measured 0.27%.
-    #
-    # Scope: this covers the draft-simple path only. The block-layout-sensitive draft
-    # types need their own drafters and are not exercised by any tiny fixture model.
+    # The other tests check that drafting happens, not that drafts are accepted.
+    # This drafter/target pair is mismatched on purpose, so accept is only 15-17%.
     global server
     server.start()
     for prompt in [
