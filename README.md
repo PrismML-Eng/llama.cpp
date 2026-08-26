@@ -5,6 +5,8 @@
 >
 > You are on the **`prism` branch**, the release line behind all fork [releases](https://github.com/PrismML-Eng/llama.cpp/releases) up to and including this one. It is preserved as **`prism-v5`** going forward, and **this line is going away**: active development has moved to [`prism-v7`](https://github.com/PrismML-Eng/llama.cpp/tree/prism-v7), which is rebased onto current mainline llama.cpp. Do not use `prism-v6` (stale mid-migration snapshot).
 >
+> **The final release of this line is [`prism-b9601-68faa14`](https://github.com/PrismML-Eng/llama.cpp/releases/tag/prism-b9601-68faa14).**
+>
 > Current limitations of this branch:
 >
 > - It reads the **legacy** `*-Q2_0.gguf` files (group 128 stored as ggml type id 42). It is the only line that does.
