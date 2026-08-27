@@ -1,26 +1,19 @@
 # llama.cpp
 
 > [!IMPORTANT]
-> **This is the PrismML fork of llama.cpp.** It adds the 1-bit/2-bit quantizations used by the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models.
+> **This is the PrismML fork of llama.cpp**, the main line behind the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models (branch `prism`, developed as `prism-v7`). It tracks current mainline llama.cpp and adds the fork's low-bit formats and runtime features on top.
 >
 > **New here? Start with the [Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo) repo.** It downloads the right models and the correct prebuilt binaries for your hardware/backend automatically.
-
-> [!WARNING]
-> ## `prism-v7` changes how Q2_0 model files are read
 >
-> This branch is rebased onto current mainline llama.cpp, where **`Q2_0` (ggml type id 42) is the official group-64 format**. The fork's original group-128 format now lives under its own name and id: **`PQ2_0` (ggml type id 142)**.
+> **Which ternary model file to use:**
 >
-> Which model file works where:
+> - `*-PQ2_0.gguf` (fork group-128, ggml id 142): preferred on Metal, CUDA, HIP and CPU. About 6% smaller than group-64.
+> - `*-Q2_0_g64.gguf` / 27B `*-Q2_g64.gguf` (official group-64, ggml id 42): runs on every backend here AND on mainline llama.cpp. If unsure, use this. Newer model releases name this file plain `*-Q2_0.gguf`.
+> - `*-Q2_0.gguf` on OLDER model repos is the **deprecated legacy format** (group 128 stored as id 42). It does not load on these builds; the error tells you which file to get instead. If you must run it, use the frozen [`prism-v5`](https://github.com/PrismML-Eng/llama.cpp/tree/prism-v5) line and its final release [`prism-b9601`](https://github.com/PrismML-Eng/llama.cpp/releases/tag/prism-b9601-68faa14).
 >
-> - `*-Q2_0_g64.gguf` (group 64): loads on `prism-v7` **and** on mainline llama.cpp.
-> - `*-PQ2_0.gguf` (group 128, id 142): loads on `prism-v7`. Not supported by mainline or by older fork releases.
-> - `*-Q2_0.gguf` (legacy group 128 stored as id 42): does **NOT** load on `prism-v7`. The loader detects it and tells you to use the `PQ2_0` or `Q2_0_g64` file instead. Legacy files keep working on the `prism` branch and its releases.
+> **Speculative decoding (dspark)** is supported via mainline's draft-dspark plus fork patches. Drafters published for older model releases need a one-time conversion with `gguf-dspark-to-dflash` (see [SPECULATIVE.md](https://github.com/PrismML-Eng/Bonsai-demo/blob/main/SPECULATIVE.md) in Bonsai-demo); newer releases ship ready-to-use drafters.
 >
-> **Want the previously released behavior in the meantime? Use the [`prism`](https://github.com/PrismML-Eng/llama.cpp/tree/prism) branch (= `prism-v5`) and its [releases](https://github.com/PrismML-Eng/llama.cpp/releases).**
->
-> **Do NOT build from `prism-v6`: it is a stale mid-migration snapshot, kept only as a reference point.**
->
-> Use a complete matching build. Do NOT mix this fork's `ggml-*` libraries with a stock llama.cpp build (ABI/format mismatch, models fail to load).
+> Do NOT build from `prism-v6` (stale mid-migration snapshot) and do NOT mix this fork's `ggml-*` libraries with a stock llama.cpp build.
 
 ---
 
