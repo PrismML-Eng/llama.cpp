@@ -678,6 +678,31 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
     return d6 * sumf_d;
 }
 
+#if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
+// HIP implements __byte_perm as a software routine; these helpers use the hardware byte permute
+// (v_perm_b32) instead and produce the same bytes as the __byte_perm sequences below.
+
+// 16 Q1_0 sign bits -> four ints holding weights 4j..4j+3 as int8 (+1 / -1) in bytes 0..3.
+// Per nibble n: spread = bit i of n -> LSB of byte i (n * 0x00204081 lands bit i at 7i+i = 8i, then mask);
+// sel = 0x0D - spread_byte selects the constant 0xFF (sel 0x0D) or 0x00 (sel 0x0C) per byte; OR the spread back in.
+static __device__ __forceinline__ int q1_0_unpack4_hip(const uint32_t q, const int j) {
+    const uint32_t n      = (q >> (4 * j)) & 0x0Fu;
+    const uint32_t spread = (n * 0x00204081u) & 0x01010101u;
+    const uint32_t sel    = 0x0D0D0D0Du - spread;
+    return (int) (__builtin_amdgcn_perm(0u, 0u, sel) | spread);
+}
+
+// Four 2-bit codes (one byte) -> four int8 symbols {-1, 0, 1, 2}[code] in byte lanes.
+//   y: f0@0, f2@4 stay; f1 (bits 2-3) -> 8, f3 (bits 6-7) -> 12
+//   z: f0@0, f1@8 stay; f2 (bits 4-5) -> 16, f3 (bits 12-13) -> 24
+//   v_perm_b32 byte selectors 0..3 index the low-word LUT 0x020100FF = {0xFF, 0x00, 0x01, 0x02}
+static __device__ __forceinline__ int q2_0_symbols4_hip(const uint32_t b) {
+    const uint32_t y = (b & 0x33u) | ((b & 0xCCu) << 6);
+    const uint32_t z = (y & 0x0303u) | ((y & 0x3030u) << 12);
+    return (int) __builtin_amdgcn_perm(0x020100FFu, 0x020100FFu, z);
+}
+#endif  // defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
+
 static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -703,6 +728,12 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
         const int u2 = get_int_b4(bq8_1_chunk->qs, j*4+2);
         const int u3 = get_int_b4(bq8_1_chunk->qs, j*4+3);
 
+#if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
+        const int v0 = q1_0_unpack4_hip((uint32_t) q, 0);
+        const int v1 = q1_0_unpack4_hip((uint32_t) q, 1);
+        const int v2 = q1_0_unpack4_hip((uint32_t) q, 2);
+        const int v3 = q1_0_unpack4_hip((uint32_t) q, 3);
+#else
         // unpack crumbs into nibble indices
         const int n0 = __byte_perm(0x11100100, 0x11100100, q >> 0); // [0, 1, 4, 5] [ 8,  9, 12, 13]
         const int n1 = __byte_perm(0x11100100, 0x11100100, q >> 2); // [2, 3, 6, 7] [10, 11, 14, 15]
@@ -716,6 +747,7 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
         const int v1 = __byte_perm(s0, s1, 0x7632);
         const int v2 = __byte_perm(s2, s3, 0x5410);
         const int v3 = __byte_perm(s2, s3, 0x7632);
+#endif
 
         sumi = ggml_cuda_dp4a(v0, u0, sumi);
         sumi = ggml_cuda_dp4a(v1, u1, sumi);
@@ -750,12 +782,17 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
         const int u  = get_int_b4(bq8_1_chunk->qs, j*2+0);
         const int v  = get_int_b4(bq8_1_chunk->qs, j*2+1);
 
+#if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
+        const int qx = q2_0_symbols4_hip((uint32_t) q & 0xFFu);
+        const int qy = q2_0_symbols4_hip(((uint32_t) q >> 8) & 0xFFu);
+#else
         // unpack even and odd crumbs into byte values
         const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
         const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
         // unshuffle values
         const int qx = __byte_perm(qe, qo, 0x5140);
         const int qy = __byte_perm(qe, qo, 0x7362);
+#endif
 
         sumi = ggml_cuda_dp4a(u, qx, sumi);
         sumi = ggml_cuda_dp4a(v, qy, sumi);
@@ -785,10 +822,15 @@ static __device__ __forceinline__ float vec_dot_pq2_0_q8_1(
         const int u  = get_int_b4(bq8_1_chunk->qs, j*2+0);
         const int v  = get_int_b4(bq8_1_chunk->qs, j*2+1);
 
+#if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
+        const int qx = q2_0_symbols4_hip((uint32_t) q & 0xFFu);
+        const int qy = q2_0_symbols4_hip(((uint32_t) q >> 8) & 0xFFu);
+#else
         const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
         const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
         const int qx = __byte_perm(qe, qo, 0x5140);
         const int qy = __byte_perm(qe, qo, 0x7362);
+#endif
 
         sumi = ggml_cuda_dp4a(u, qx, sumi);
         sumi = ggml_cuda_dp4a(v, qy, sumi);
