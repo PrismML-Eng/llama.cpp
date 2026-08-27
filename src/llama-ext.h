@@ -124,6 +124,9 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+// returns true if the draft model carries a DSpark Markov head. Both lineages declare
+// general.architecture = dflash, so this is how to tell them apart.
+LLAMA_API bool            llama_model_has_dspark_markov_head(const struct llama_model * model);
 
 // retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
 // returns total number of elements or 0 on error

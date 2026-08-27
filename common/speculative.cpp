@@ -923,8 +923,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t     block_size    = 0;
     llama_token mask_token_id = 0;
 
-    // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
-    const bool is_dspark;
+    // draft-dspark: the draft carries a Markov head. Comes from the model, not the
+    // requested type. The DSpark path also truncates on confidence, and for
+    // sample_from_anchor models it starts one row earlier.
+    bool is_dspark = false;
 
     // dspark speculators
     bool sample_from_anchor = true;
@@ -939,7 +941,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq)
         , params(params.draft)
-        , is_dspark(type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
     {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
@@ -951,6 +952,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         target_layer_ids   = llama_model_target_layer_ids  (model_dft);
         target_layer_ids_n = llama_model_target_layer_ids_n(model_dft);
         GGML_ASSERT(target_layer_ids_n > 0 && "DFlash model has no target_layer_ids");
+
+        // Both lineages declare general.architecture = dflash, so the requested type cannot
+        // pick the draft path. The Markov head is the on-disk marker and is already loaded.
+        is_dspark = llama_model_has_dspark_markov_head(model_dft);
+        const bool type_says_dspark = (type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
+        if (type_says_dspark != is_dspark) {
+            LOG_WRN("%s: draft model carries %s, but --spec-type requested %s. Using %s, which is "
+                    "what the model needs. The wrong path drops confidence truncation, and for "
+                    "sample_from_anchor models it also reads the drafts one row late.\n", __func__,
+                    is_dspark ? "a DSpark Markov head" : "no DSpark Markov head",
+                    common_speculative_type_to_str(type).c_str(),
+                    is_dspark ? "DSpark" : "DFlash");
+        }
 
         n_embd_tgt    = llama_model_n_embd(model_tgt);
         n_embd_dec    = llama_model_n_embd(model_dft);
@@ -971,8 +985,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
-        LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
-                block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
+        LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s, lineage=%s\n", __func__,
+                block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false",
+                is_dspark ? "dspark" : "dflash");
 
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
         // block_size-1 draft tokens, anchor-first DSpark yields a full block_size draft tokens
