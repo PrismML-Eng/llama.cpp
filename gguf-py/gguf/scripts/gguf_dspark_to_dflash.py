@@ -27,7 +27,14 @@ target_layers +1: the runtime taps a layer's INPUT
 which is what these drafters were trained against. Both reference pairs show
 the same shift, [1,16,31,46,61] -> [2,17,32,47,62].
 
-usage: dspark_to_dflash.py <legacy.gguf> <donor-with-tokenizer.gguf> <out.gguf>
+usage: dspark_to_dflash.py [--drop-shared-tensors] <legacy.gguf> <donor-with-tokenizer.gguf> <out.gguf>
+
+--drop-shared-tensors: omit token_embd.weight and output.weight from the output.
+Both are TENSOR_NOT_REQUIRED on the runtime side; a full-vocab draft borrows the
+target's embedding and lm head via ctx_other, which shrinks the drafter by the
+two largest tensors (11x total with a Q4_0 repack) at unchanged acceptance. Keep
+them only for reduced-vocab drafts or for running the draft on devices the
+target does not use.
 """
 import os
 import shutil
@@ -156,9 +163,13 @@ def transform_kv(src_kv, donor_kv):
 
 
 def main():
-    if len(sys.argv) != 4:
+    args = sys.argv[1:]
+    drop_shared = "--drop-shared-tensors" in args
+    if drop_shared:
+        args.remove("--drop-shared-tensors")
+    if len(args) != 3:
         sys.exit(__doc__)
-    src_path, donor_path, out_path = sys.argv[1:4]
+    src_path, donor_path, out_path = args
 
     src = Reader(src_path)
     donor = Reader(donor_path)
@@ -169,37 +180,67 @@ def main():
 
     new_kv = transform_kv(src.kv, donor.kv)
 
+    SHARED_TENSORS = {"token_embd.weight", "output.weight"}
+
+    # per-tensor data sizes from the offset ordering (last one runs to EOF)
+    file_size = os.path.getsize(src_path)
+    by_off = sorted(src.tensors, key=lambda t: t[3])
+    t_size = {}
+    for i, (nm, dims, ty, off) in enumerate(by_off):
+        end = by_off[i + 1][3] if i + 1 < len(by_off) else file_size - src.data_start
+        t_size[nm] = end - off
+
     new_tensors = []
+    dropped = []
+    new_off = 0
     for nm, dims, ty, off in src.tensors:
         nn = TENSOR_MAP.get(nm, nm)
         if nm.startswith("dspark.") and nn == nm:
             sys.exit(f"refusing: unmapped legacy tensor {nm!r}; add it to TENSOR_MAP")
-        new_tensors.append((nn, dims, ty, off))
+        if drop_shared and nn in SHARED_TENSORS:
+            dropped.append(nn)
+            continue
+        # (name, dims, type, new offset, source offset, size)
+        new_tensors.append((nn, dims, ty, new_off, off, t_size[nm]))
+        new_off = (new_off + t_size[nm] + src.alignment - 1) // src.alignment * src.alignment
 
     # header
     hdr = GGUF_MAGIC + struct.pack("<I", src.version)
     hdr += struct.pack("<Q", len(new_tensors)) + struct.pack("<Q", len(new_kv))
     for k, t, v in new_kv:
         hdr += enc_str(k) + struct.pack("<I", t) + enc_val(t, v)
-    for nm, dims, ty, off in new_tensors:
+    for nm, dims, ty, noff, _ooff, _sz in new_tensors:
         hdr += enc_str(nm) + struct.pack("<I", len(dims))
         for d in dims:
             hdr += struct.pack("<Q", d)
-        hdr += struct.pack("<I", ty) + struct.pack("<Q", off)
+        hdr += struct.pack("<I", ty) + struct.pack("<Q", noff)
 
     pad = -len(hdr) % src.alignment
-    data_bytes = os.path.getsize(src_path) - src.data_start
+    data_bytes = sum(sz for *_, sz in new_tensors)
 
     with open(out_path, "wb") as o:
         o.write(hdr)
         o.write(b"\x00" * pad)
-        src.f.seek(src.data_start)
-        shutil.copyfileobj(src.f, o, 1024 * 1024 * 8)
+        if not drop_shared:
+            # contiguous verbatim copy of the whole data section
+            src.f.seek(src.data_start)
+            shutil.copyfileobj(src.f, o, 1024 * 1024 * 8)
+        else:
+            blob_start = o.tell()
+            for nm, dims, ty, noff, ooff, sz in new_tensors:
+                o.seek(blob_start + noff)
+                src.f.seek(src.data_start + ooff)
+                left = sz
+                while left > 0:
+                    chunk = src.f.read(min(1024 * 1024 * 8, left))
+                    o.write(chunk)
+                    left -= len(chunk)
 
     print(f"  {os.path.basename(src_path)}")
     print(f"    -> {os.path.basename(out_path)}")
+    note = f", dropped shared: {', '.join(dropped)}" if dropped else ""
     print(f"    kv {len(src.kv)} -> {len(new_kv)}, tensors {len(new_tensors)}, "
-          f"data {data_bytes} bytes copied verbatim")
+          f"data {data_bytes} bytes copied verbatim{note}")
 
 
 if __name__ == "__main__":
