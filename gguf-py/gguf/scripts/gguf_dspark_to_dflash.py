@@ -27,7 +27,7 @@ target_layers +1: the runtime taps a layer's INPUT
 which is what these drafters were trained against. Both reference pairs show
 the same shift, [1,16,31,46,61] -> [2,17,32,47,62].
 
-usage: dspark_to_dflash.py [--drop-shared-tensors] <legacy.gguf> <donor-with-tokenizer.gguf> <out.gguf>
+usage: gguf-dspark-to-dflash [--drop-shared-tensors] <legacy.gguf> <donor-with-tokenizer.gguf> <out.gguf>
 
 --drop-shared-tensors: omit token_embd.weight and output.weight from the output.
 Both are TENSOR_NOT_REQUIRED on the runtime side; a full-vocab draft borrows the
