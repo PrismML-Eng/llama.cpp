@@ -340,6 +340,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_CLASSIFIER_OUTPUT_LABELS, "%s.classifier.output_labels" },
 
     { LLM_KV_TARGET_LAYERS,         "%s.target_layers"        },
+    { LLM_KV_CONFIDENCE_HEAD,       "%s.confidence_head"      },
     { LLM_KV_LOG_SNR_CONDITIONING,  "%s.log_snr_conditioning" },
     { LLM_KV_MIN_LOG_SNR,           "%s.min_log_snr"          },
     { LLM_KV_MAX_LOG_SNR,           "%s.max_log_snr"          },
