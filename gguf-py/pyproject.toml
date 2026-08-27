@@ -24,6 +24,7 @@ gguf-dump = "gguf.scripts.gguf_dump:main"
 gguf-set-metadata = "gguf.scripts.gguf_set_metadata:main"
 gguf-new-metadata = "gguf.scripts.gguf_new_metadata:main"
 gguf-editor-gui = "gguf.scripts.gguf_editor_gui:main"
+gguf-dspark-to-dflash = "gguf.scripts.gguf_dspark_to_dflash:main"
 
 [project.optional-dependencies]
 gui = ['PySide6 (>=6.9,<7.0) ; python_version >= "3.9" and python_version < "3.14"']
