@@ -938,6 +938,8 @@ ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev) {
         // https://github.com/ggml-org/llama.cpp/issues/25937
         ggml_metal_dummy_work(dev);
     }
+#else
+    GGML_UNUSED(dev);
 #endif
 
     return res;
