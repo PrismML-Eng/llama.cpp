@@ -403,6 +403,44 @@ typedef decltype(kernel_set_rows_f<float, int64_t, float>) set_rows_f_t;
 
 template [[host_name("kernel_set_rows_f32_i64_f32")]]   kernel set_rows_f_t kernel_set_rows_f<float, int64_t, float>;
 template [[host_name("kernel_set_rows_f32_i32_f32")]]   kernel set_rows_f_t kernel_set_rows_f<float, int32_t, float>;
+
+// wide f32 rows (e.g. recurrent-state snapshots): the generic kernel above
+// assigns a single threadgroup per row, which cannot saturate the memory
+// bandwidth for rows of 100k+ elements. tile each row across threadgroups
+// (tgpig.x) and copy with float4 accesses. dims 2 and 3 are folded into
+// tgpig.z (split via args.ne02)
+template<typename TI>
+kernel void kernel_set_rows_f32_wide(
+        constant ggml_metal_kargs_set_rows_wide & args,
+        device const  void * src0,
+        device const  void * src1,
+        device        void * dst,
+        uint3                tgpig[[threadgroup_position_in_grid]],
+        uint                 tiitg[[thread_index_in_threadgroup]],
+        uint3                tptg [[threads_per_threadgroup]]) {
+    const int32_t i01 = tgpig.y;
+    const int32_t i02 = tgpig.z%args.ne02;
+    const int32_t i03 = tgpig.z/args.ne02;
+
+    const int32_t i11 = i02%args.ne11;
+    const int32_t i12 = i03%args.ne12;
+
+    const TI i1 = ((const device TI *) ((const device char *) src1 + i01*args.nb10 + i11*args.nb11 + i12*args.nb12))[0];
+
+          device float4 * dst_row = (      device float4 *) ((      device char *) dst  +  i1*args.nb1  + i02*args.nb2  + i03*args.nb3);
+    const device float4 * src_row = (const device float4 *) ((const device char *) src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
+
+    const int32_t i00 = tgpig.x*tptg.x + tiitg;
+    if (i00 < args.nv00) {
+        dst_row[i00] = src_row[i00];
+    }
+}
+
+
+typedef decltype(kernel_set_rows_f32_wide<int64_t>) set_rows_f32_wide_t;
+
+template [[host_name("kernel_set_rows_f32_wide_i64")]] kernel set_rows_f32_wide_t kernel_set_rows_f32_wide<int64_t>;
+template [[host_name("kernel_set_rows_f32_wide_i32")]] kernel set_rows_f32_wide_t kernel_set_rows_f32_wide<int32_t>;
 template [[host_name("kernel_set_rows_f32_i64_f16")]]   kernel set_rows_f_t kernel_set_rows_f<float, int64_t, half>;
 template [[host_name("kernel_set_rows_f32_i32_f16")]]   kernel set_rows_f_t kernel_set_rows_f<float, int32_t, half>;
 #if defined(GGML_METAL_HAS_BF16)
