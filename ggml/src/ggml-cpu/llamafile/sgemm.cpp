@@ -49,6 +49,8 @@
 #endif
 
 #include "sgemm.h"
+#include "qbit_ppc_mma.h"
+#include "kquants_ppc_mma.h"
 #include "ggml-impl.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-quants.h"
@@ -3625,7 +3627,11 @@ class tinyBLAS_PPC {
         } else if constexpr(RM == 8 && RN == 8) {
             KERNEL_8x8(ii, jj);
         } else {
-            static_assert(false, "RN/RM values not supported");
+            // dependent form: GCC < 13 evaluates a non-dependent
+            // static_assert(false) eagerly even in a discarded
+            // constexpr branch (pre-P2593); RM != RM defers it to
+            // instantiation, which never occurs for supported tiles.
+            static_assert(RM != RM, "RN/RM values not supported");
         }
     }
 
@@ -3950,12 +3956,341 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
            return false;
         if (m < 8 && m != 4)
            return false;
-        tinyBLAS_Q0_PPC<block_q8_0> tb{
-            k, (const block_q8_0 *)A, lda,
-            (const block_q8_0 *)B, ldb,
-            (float *)C, ldc,
-            params->ith, params->nth};
-        tb.matmul(m, n);
+        // routed through the pack-cached MMA kernels (patch 0011); replaces
+        // tinyBLAS_Q0_PPC, whose per-call weight repack, scalar comparray
+        // fixup and absent GEMV path made it the slow producer here.
+        gemm_q8_0_q8_0_ppc(m, n, k * QK8_0, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_Q4_K: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
+        gemm_q4_K_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_Q5_K: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
+        gemm_q5_K_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_Q6_K: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
+        gemm_q6_K_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_Q2_K: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
+        gemm_q2_K_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_Q3_K: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
+        gemm_q3_K_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_IQ4_XS: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
+        gemm_iq4_xs_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_Q4_1: {
+        if (Btype != GGML_TYPE_Q8_1)
+            return false;
+#if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
+        gemm_q4_1_q8_1_ppc(m, n, k * QK4_1, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_Q5_1: {
+        if (Btype != GGML_TYPE_Q8_1)
+            return false;
+#if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
+        gemm_q5_1_q8_1_ppc(m, n, k * QK5_1, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_TQ2_0: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
+        gemm_tq2_0_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_TQ1_0: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        // 0015 guard deliberately absent for this format: its ggml
+        // vec_dot is compute-starved on Power (2-3%% of the memory
+        // wall, VALIDATION-POWER10.md #9), so the cached packed path
+        // wins generation despite the int8 expansion (patch 0017).
+        gemm_tq1_0_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_IQ2_XXS: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        if (n > 1 && n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
+        gemm_iq2_xxs_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_IQ3_XXS: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        if (n > 1 && n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
+        gemm_iq3_xxs_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_IQ3_S: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        if (n > 1 && n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
+        gemm_iq3_s_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_IQ1_S: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        if (n > 1 && n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
+        gemm_iq1_s_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_MXFP4: {
+        if (Btype != GGML_TYPE_Q8_0)
+            return false;
+#if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
+        gemm_mxfp4_q8_0_ppc(m, n, k * QK_MXFP4, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_IQ2_XS: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
+        gemm_iq2_xs_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_IQ2_S: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
+        gemm_iq2_s_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_IQ1_M: {
+        if (Btype != GGML_TYPE_Q8_K)
+            return false;
+#if defined(__MMA__)
+        // 0015 guard deliberately absent for this format: its ggml
+        // vec_dot is compute-starved on Power (2-3%% of the memory
+        // wall, VALIDATION-POWER10.md #9), so the cached packed path
+        // wins generation despite the int8 expansion (patch 0017).
+        gemm_iq1_m_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_NVFP4: {
+        if (Btype != GGML_TYPE_Q8_0)
+            return false;
+#if defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
+        gemm_nvfp4_q8_0_ppc(m, n, k * QK_NVFP4, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_Q1_0: {
+        if (Btype != GGML_TYPE_Q8_0)
+            return false;
+#if defined(__MMA__)
+        gemm_q1_0_q8_0_ppc_v3(m, n, k * QK1_0,
+            A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    case GGML_TYPE_Q2_0: {
+        if (Btype != GGML_TYPE_Q8_0)
+            return false;
+#if defined(__MMA__)
+        gemm_q2_0_q8_0_ppc_v3(m, n, k * QK2_0,
+            A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
         return true;
 #else
         return false;
@@ -3987,12 +4322,11 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
            return false;
         if (m < 8 && m != 4)
            return false;
-        tinyBLAS_Q0_PPC<block_q4_0> tb{
-            k, (const block_q4_0 *)A, lda,
-            (const block_q8_0 *)B, ldb,
-            (float *)C, ldc,
-            params->ith, params->nth};
-        tb.matmul(m, n);
+        // routed through the pack-cached MMA kernels (patch 0011); replaces
+        // tinyBLAS_Q0_PPC, whose per-call weight repack, scalar comparray
+        // fixup and absent GEMV path made it the slow producer here.
+        gemm_q4_0_q8_0_ppc(m, n, k * QK4_0, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
         return true;
 #else
         return false;
@@ -4010,6 +4344,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
             params->ith, params->nth};
         tb.matmul(m, n);
         return true;
+#elif defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
+        gemm_q5_0_q8_0_ppc(m, n, k * QK5_0, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
+        return true;
 #else
         return false;
 #endif
@@ -4025,6 +4367,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
             (float *)C, ldc,
             params->ith, params->nth};
         tb.matmul(m, n);
+        return true;
+#elif defined(__MMA__)
+        if (n < 8)
+            return false;   // packed path reads int8-expanded weights;
+                            // below one column tile vec_dot wins the
+                            // bandwidth race on silicon (patch 0015)
+        gemm_iq4_nl_q8_0_ppc(m, n, k * QK4_NL, A, lda, B, ldb,
+            (float *)C, ldc, params->ith, params->nth);
         return true;
 #else
         return false;
