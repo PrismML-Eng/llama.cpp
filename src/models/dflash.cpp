@@ -118,7 +118,19 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     //
     // TODO: only Qwen3-style backbones are supported for now; other backbones (e.g. Gemma4)
     //       need their own conversion path and graph tweaks
+    // The file states whether it has a confidence head. Prefer that over guessing from
+    // the tensors, and fail loudly if the two disagree: a DSpark export that lost its
+    // markov head would otherwise load as plain DFlash and quietly halve acceptance.
+    bool kv_confidence_head = false;
+    const bool has_kv_confidence_head = ml->get_key(LLM_KV_CONFIDENCE_HEAD, kv_confidence_head, false);
+
     const struct ggml_tensor * markov_meta = ml->get_tensor_meta("markov_w1.weight");
+
+    if (has_kv_confidence_head && kv_confidence_head && !markov_meta) {
+        throw std::runtime_error("dflash: metadata declares a confidence head, but markov_w1.weight is missing. "
+                                 "The export is incomplete; it would load as plain DFlash and read drafts one row late");
+    }
+
     if (markov_meta) {
         const int64_t dspark_markov_rank = markov_meta->ne[0];
 
