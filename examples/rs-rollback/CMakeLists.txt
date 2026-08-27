@@ -1,0 +1,11 @@
+set(TARGET llama-rs-rollback)
+add_executable(${TARGET} rs-rollback.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+set(TARGET2 llama-rs-rollback-multi)
+add_executable(${TARGET2} rs-rollback-multi.cpp)
+install(TARGETS ${TARGET2} RUNTIME)
+target_link_libraries(${TARGET2} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET2} PRIVATE cxx_std_17)
