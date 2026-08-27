@@ -679,8 +679,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
 }
 
 #if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
-// HIP implements __byte_perm as a software routine; these helpers use the hardware byte permute
-// (v_perm_b32) instead and produce the same bytes as the __byte_perm sequences below.
+// HIP implements __byte_perm as a software routine; these helpers use the hardware byte permute (v_perm_b32) instead and produce the same bytes as the __byte_perm sequences below.
 
 // 16 Q1_0 sign bits -> four ints holding weights 4j..4j+3 as int8 (+1 / -1) in bytes 0..3.
 // Per nibble n: spread = bit i of n -> LSB of byte i (n * 0x00204081 lands bit i at 7i+i = 8i, then mask);
