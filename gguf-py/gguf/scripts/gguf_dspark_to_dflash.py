@@ -182,6 +182,13 @@ def main():
 
     SHARED_TENSORS = {"token_embd.weight", "output.weight"}
 
+    if drop_shared and any(nm == "d2t" for nm, _, _, _ in src.tensors):
+        # d2t maps draft rows onto target token ids, so a reduced-vocab draft cannot use
+        # the target's head. Dropping it here yields a file that loads and emits wrong
+        # tokens rather than one that fails.
+        sys.exit("refusing --drop-shared-tensors: this draft carries d2t, so it has a "
+                 "reduced vocabulary and cannot share the target's head")
+
     # per-tensor data sizes from the offset ordering (last one runs to EOF)
     file_size = os.path.getsize(src_path)
     by_off = sorted(src.tensors, key=lambda t: t[3])
