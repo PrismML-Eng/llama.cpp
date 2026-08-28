@@ -147,6 +147,8 @@ jobs:
             cuda_pkg: '12-4'
           - cuda: '12.8'
             cuda_pkg: '12-8'
+          - cuda: '13.3'
+            cuda_pkg: '13-3'
 
     steps:
       - name: Clone
@@ -234,6 +236,10 @@ jobs:
             ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release
 
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
       - name: Pack artifacts
         run: |
           # Resolve the LLVM OpenMP runtime DLL by glob: the MSVC redist version
@@ -243,12 +249,12 @@ jobs:
           if (-not $OmpDll) { throw "libomp140 DLL not found under any MSVC redist version" }
           Write-Host "Using OpenMP runtime: $($OmpDll.FullName)"
           Copy-Item $OmpDll.FullName .\build\bin\Release\
-          7z a -snl llama-bin-win-cpu-${{ matrix.arch }}.zip .\build\bin\Release\*
+          7z a -snl llama-${{ steps.tag.outputs.name }}-bin-win-cpu-${{ matrix.arch }}.zip .\build\bin\Release\*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-bin-win-cpu-${{ matrix.arch }}.zip
+          path: llama-${{ steps.tag.outputs.name }}-bin-win-cpu-${{ matrix.arch }}.zip
           name: llama-bin-win-cpu-${{ matrix.arch }}.zip
 
   windows-cuda:
@@ -256,16 +262,27 @@ jobs:
 
     strategy:
       matrix:
-        cuda: ['12.4']
+        include:
+          - cuda: '12.4'
+            arch: x64
+            defines: ''
+          - cuda: '13.3'
+            arch: x64
+            defines: ''
+          - cuda: '13.4'
+            arch: arm64
+            defines: '-DCMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-msvc-cuda.cmake'
 
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Install ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: windows-cuda-${{ matrix.cuda }}
+          key: windows-cuda-${{ matrix.cuda }}-${{ matrix.arch }}
           variant: ccache
           evict-old-files: 1d
 
@@ -273,6 +290,7 @@ jobs:
         uses: ./.github/actions/windows-setup-cuda
         with:
           cuda_version: ${{ matrix.cuda }}
+          cuda_arch: ${{ matrix.arch }}
 
       - name: Install Ninja
         run: choco install ninja
@@ -280,13 +298,13 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.arch == 'x64' && 'x64' || 'amd64_arm64' }}
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_NATIVE=OFF ^
             -DGGML_CUDA=ON ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
             -DCMAKE_CUDA_FLAGS="-diag-suppress=221" ^
-            ${{ env.CMAKE_ARGS }}
+            ${{ matrix.defines }} ${{ env.CMAKE_ARGS }}
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS%
 
@@ -296,28 +314,39 @@ jobs:
 
       - name: Pack artifacts
         run: |
-          7z a -snl llama-${{ steps.tag.outputs.name }}-bin-win-cuda-${{ matrix.cuda }}-x64.zip .\build\bin\Release\*
+          7z a -snl llama-${{ steps.tag.outputs.name }}-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip .\build\bin\Release\*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-${{ steps.tag.outputs.name }}-bin-win-cuda-${{ matrix.cuda }}-x64.zip
-          name: llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
+          path: llama-${{ steps.tag.outputs.name }}-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip
+          name: llama-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip
 
-      - name: Copy and pack Cuda runtime
+      - name: Copy and pack Cuda runtime (x64)
+        if: ${{ matrix.arch == 'x64' }}
         run: |
           echo "Cuda install location: ${{ env.CUDA_PATH }}"
           $dst='.\build\bin\cudart\'
           robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
           robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
           robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
-          7z a cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip $dst\*
+          7z a cudart-llama-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip $dst\*
+          exit 0
+
+      - name: Copy and pack Cuda runtime (arm64)
+        if: ${{ matrix.arch == 'arm64' }}
+        run: |
+          echo "Cuda install location: ${{ env.CUDA_PATH }}"
+          $dst='.\build\bin\cudart\'
+          robocopy "${{env.CUDA_PATH}}\bin\arm64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          7z a cudart-llama-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip $dst\*
+          exit 0
 
       - name: Upload Cuda runtime
         uses: actions/upload-artifact@v6
         with:
-          path: cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
-          name: cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
+          path: cudart-llama-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip
+          name: cudart-llama-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip
 
   ubuntu-vulkan:
     strategy:
@@ -392,6 +421,8 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -417,14 +448,18 @@ jobs:
           cmake -S . -B build -DGGML_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=OFF -DLLAMA_BUILD_BORINGSSL=ON
           cmake --build build --config Release
 
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
       - name: Pack artifacts
         run: |
-          7z a -snl llama-bin-win-vulkan-x64.zip .\build\bin\Release\*
+          7z a -snl llama-${{ steps.tag.outputs.name }}-bin-win-vulkan-x64.zip .\build\bin\Release\*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-bin-win-vulkan-x64.zip
+          path: llama-${{ steps.tag.outputs.name }}-bin-win-vulkan-x64.zip
           name: llama-bin-win-vulkan-x64.zip
 
   ubuntu-22-rocm:
@@ -523,6 +558,8 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Grab rocWMMA package
         run: |
@@ -598,15 +635,79 @@ jobs:
           cp "${env:HIP_PATH}\bin\rocblas\library\*" "build\bin\rocblas\library\"
           cp "${env:HIP_PATH}\bin\hipblaslt\library\*" "build\bin\hipblaslt\library\"
 
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
       - name: Pack artifacts
         run: |
-          7z a -snl llama-bin-win-hip-${{ matrix.name }}-x64.zip .\build\bin\*
+          7z a -snl llama-${{ steps.tag.outputs.name }}-bin-win-hip-${{ matrix.name }}-x64.zip .\build\bin\*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-bin-win-hip-${{ matrix.name }}-x64.zip
+          path: llama-${{ steps.tag.outputs.name }}-bin-win-hip-${{ matrix.name }}-x64.zip
           name: llama-bin-win-hip-${{ matrix.name }}-x64.zip
+
+  android-arm64:
+    runs-on: ubuntu-latest
+
+    env:
+      NDK_VERSION: "29.0.14206865"
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          log-accepted-android-sdk-licenses: false
+
+      - name: Install NDK
+        run: |
+          sdkmanager "ndk;${{ env.NDK_VERSION }}"
+          echo "ANDROID_NDK=${ANDROID_SDK_ROOT}/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
+
+      - name: Build
+        id: cmake_build
+        run: |
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE=${ANDROID_NDK}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_OPENMP=OFF \
+            -DLLAMA_BUILD_BORINGSSL=ON
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-android-arm64.tar.gz --transform "s,^\.,llama-${{ steps.tag.outputs.name }}," -C ./build/bin .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-android-arm64.tar.gz
+          name: llama-bin-android-arm64.tar.gz
 
   ios-xcode-build:
     runs-on: macos-15
