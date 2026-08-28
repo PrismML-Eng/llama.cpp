@@ -234,6 +234,10 @@ jobs:
             ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release
 
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
       - name: Pack artifacts
         run: |
           # Resolve the LLVM OpenMP runtime DLL by glob: the MSVC redist version
@@ -243,12 +247,12 @@ jobs:
           if (-not $OmpDll) { throw "libomp140 DLL not found under any MSVC redist version" }
           Write-Host "Using OpenMP runtime: $($OmpDll.FullName)"
           Copy-Item $OmpDll.FullName .\build\bin\Release\
-          7z a -snl llama-bin-win-cpu-${{ matrix.arch }}.zip .\build\bin\Release\*
+          7z a -snl llama-${{ steps.tag.outputs.name }}-bin-win-cpu-${{ matrix.arch }}.zip .\build\bin\Release\*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-bin-win-cpu-${{ matrix.arch }}.zip
+          path: llama-${{ steps.tag.outputs.name }}-bin-win-cpu-${{ matrix.arch }}.zip
           name: llama-bin-win-cpu-${{ matrix.arch }}.zip
 
   windows-cuda:
@@ -256,11 +260,13 @@ jobs:
 
     strategy:
       matrix:
-        cuda: ['12.4']
+        cuda: ['12.4', '13.3']
 
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Install ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -392,6 +398,8 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -417,14 +425,18 @@ jobs:
           cmake -S . -B build -DGGML_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=OFF -DLLAMA_BUILD_BORINGSSL=ON
           cmake --build build --config Release
 
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
       - name: Pack artifacts
         run: |
-          7z a -snl llama-bin-win-vulkan-x64.zip .\build\bin\Release\*
+          7z a -snl llama-${{ steps.tag.outputs.name }}-bin-win-vulkan-x64.zip .\build\bin\Release\*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-bin-win-vulkan-x64.zip
+          path: llama-${{ steps.tag.outputs.name }}-bin-win-vulkan-x64.zip
           name: llama-bin-win-vulkan-x64.zip
 
   ubuntu-22-rocm:
@@ -523,6 +535,8 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Grab rocWMMA package
         run: |
@@ -598,15 +612,79 @@ jobs:
           cp "${env:HIP_PATH}\bin\rocblas\library\*" "build\bin\rocblas\library\"
           cp "${env:HIP_PATH}\bin\hipblaslt\library\*" "build\bin\hipblaslt\library\"
 
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
       - name: Pack artifacts
         run: |
-          7z a -snl llama-bin-win-hip-${{ matrix.name }}-x64.zip .\build\bin\*
+          7z a -snl llama-${{ steps.tag.outputs.name }}-bin-win-hip-${{ matrix.name }}-x64.zip .\build\bin\*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-bin-win-hip-${{ matrix.name }}-x64.zip
+          path: llama-${{ steps.tag.outputs.name }}-bin-win-hip-${{ matrix.name }}-x64.zip
           name: llama-bin-win-hip-${{ matrix.name }}-x64.zip
+
+  android-arm64:
+    runs-on: ubuntu-latest
+
+    env:
+      NDK_VERSION: "29.0.14206865"
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          log-accepted-android-sdk-licenses: false
+
+      - name: Install NDK
+        run: |
+          sdkmanager "ndk;${{ env.NDK_VERSION }}"
+          echo "ANDROID_NDK=${ANDROID_SDK_ROOT}/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
+
+      - name: Build
+        id: cmake_build
+        run: |
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE=${ANDROID_NDK}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_OPENMP=OFF \
+            -DLLAMA_BUILD_BORINGSSL=ON
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          tar -czvf llama-${{ steps.tag.outputs.name }}-bin-android-arm64.tar.gz --transform "s,^\.,llama-${{ steps.tag.outputs.name }}," -C ./build/bin .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-android-arm64.tar.gz
+          name: llama-bin-android-arm64.tar.gz
 
   ios-xcode-build:
     runs-on: macos-15
