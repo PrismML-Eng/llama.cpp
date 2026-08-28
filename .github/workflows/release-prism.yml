@@ -299,14 +299,17 @@ jobs:
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.arch == 'x64' && 'x64' || 'amd64_arm64' }}
+          rem arm64: ggml-cpu refuses MSVC for ARM (needs clang), so that leg builds only the
+          rem ggml-cuda.dll companion for the BACKEND_DL cpu-arm64 zip, like upstream does.
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_NATIVE=OFF ^
             -DGGML_CUDA=ON ^
+            ${{ matrix.arch == 'arm64' && '-DGGML_BACKEND_DL=ON -DGGML_CPU=OFF' || '' }} ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
             -DCMAKE_CUDA_FLAGS="-diag-suppress=221" ^
             ${{ matrix.defines }} ${{ env.CMAKE_ARGS }}
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
-          cmake --build build --config Release -j %NINJA_JOBS%
+          cmake --build build --config Release -j %NINJA_JOBS% ${{ matrix.arch == 'arm64' && '--target ggml-cuda' || '' }}
 
       - name: Determine tag name
         id: tag
@@ -314,7 +317,7 @@ jobs:
 
       - name: Pack artifacts
         run: |
-          7z a -snl llama-${{ steps.tag.outputs.name }}-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip .\build\bin\Release\*
+          7z a -snl llama-${{ steps.tag.outputs.name }}-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip .\build\bin\Release\${{ matrix.arch == 'arm64' && 'ggml-cuda.dll' || '*' }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
