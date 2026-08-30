@@ -22,9 +22,6 @@ If AI is used to generate any portion of the code, contributors must adhere to t
 2. Check for an existing PR addressing the same change; if one exists, comment there to work with its author instead of opening a duplicate.
 3. Perform a comprehensive manual review prior to submitting the pull request.
 4. Be prepared to explain every line of code they submitted when asked about it by a maintainer.
-5. It is strictly prohibited to use AI to write your posts for you (bug reports, feature requests, pull request descriptions, Github discussions, responding to humans, ...).
-
-For more info, please refer to the [AGENTS.md](AGENTS.md) file.
 
 # Pull requests (for contributors & collaborators)
 
@@ -32,12 +29,7 @@ For more info, please refer to the [AGENTS.md](AGENTS.md) file.
 
 - Search for existing discussions and PRs first - duplicates will likely be closed without questions.
 - Features must begin with an issue, not a PR - let interest accumulate before writing code; niche features may only land as an example/tool, or on a private fork.
-- Bug-fix PRs must include a reproducible issue and a regression test that fails before your change and passes after. Fixes without a test may be closed without review.
 - New CLI or public API additions carry a **higher bar** than internal changes - justify why an existing mechanism doesn't suffice.
-- Meeting all of the above still doesn't guarantee a merge - see [Pull requests (for maintainers)](#pull-requests-for-maintainers).
-- If you are a new contributor
-    - Limit your open PRs to 1
-    - Do not submit trivial fixes (e.g. typos, formatting changes)
 
 ### Preparing your PR
 
