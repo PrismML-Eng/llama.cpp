@@ -121,6 +121,22 @@ static const std::map<gguf_type, const char *> GGUF_TYPE_NAME = {
     {GGUF_TYPE_INT64,   "i64"},
     {GGUF_TYPE_FLOAT64, "f64"},
 };
+
+static uint32_t gguf_compat_legacy_ftype(uint32_t value) {
+    switch (value) {
+        case 27: return 28;
+        case 28: return 29;
+        default: return value;
+    }
+}
+
+static enum ggml_type gguf_compat_legacy_ggml_type(int32_t value) {
+    switch (value) {
+        case 41: return GGML_TYPE_Q1_0;
+        case 42: return GGML_TYPE_Q2_0;
+        default: return ggml_type(value);
+    }
+}
 static_assert(GGUF_TYPE_COUNT == 13, "GGUF_TYPE_COUNT != 13");
 
 size_t gguf_type_size(enum gguf_type type) {
@@ -317,7 +333,7 @@ struct gguf_reader {
         if (!read(tmp)) {
             return false;
         }
-        dst = ggml_type(tmp);
+        dst = gguf_compat_legacy_ggml_type(tmp);
         return true;
     }
 
@@ -526,6 +542,25 @@ struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_para
             }
             if (!ok) {
                 break;
+            }
+
+            if (key == std::string("general.file_type") && !is_array && (type == GGUF_TYPE_UINT32 || type == GGUF_TYPE_INT32)) {
+                uint32_t value_u32 = 0;
+                int32_t value_i32 = 0;
+                if (type == GGUF_TYPE_UINT32) {
+                    ok = ok && gr.read(value_u32);
+                    if (ok) {
+                        value_u32 = gguf_compat_legacy_ftype(value_u32);
+                        ctx->kv.emplace_back(key, value_u32);
+                    }
+                } else {
+                    ok = ok && gr.read(value_i32);
+                    if (ok) {
+                        value_i32 = static_cast<int32_t>(gguf_compat_legacy_ftype(static_cast<uint32_t>(value_i32)));
+                        ctx->kv.emplace_back(key, value_i32);
+                    }
+                }
+                continue;
             }
 
             switch (type) {

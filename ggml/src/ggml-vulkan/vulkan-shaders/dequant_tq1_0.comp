@@ -1,0 +1,32 @@
+#version 450
+
+#include "dequant_head.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {block_tq1_0 data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+void main() {
+    const uint ib = gl_WorkGroupID.x * 4u + gl_LocalInvocationID.x / 64u;
+    const uint tid = gl_LocalInvocationID.x % 64u;
+    const uint il = tid / 4u;
+    const uint ir = tid % 4u;
+
+    if (ib >= p.nel / 256u) {
+        return;
+    }
+
+    const float d = float(data_a[ib].d);
+    const uint base = (ib * 256u) + (ir * 64u) + (il * 4u);
+
+    [[unroll]] for (uint l = 0; l < 4u; ++l) {
+        const uint pos = base + l;
+        const uint group = pos / 5u;
+        const uint lane = pos % 5u;
+        const uint q = uint(data_a[ib].qs[group]);
+        const uint pow3[5] = uint[](1u, 3u, 9u, 27u, 81u);
+        const uint xi = ((q * pow3[lane] * 3u) >> 8u);
+        data_b[pos] = D_TYPE(float(int(xi) - 1) * d);
+    }
+}

@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cassert>
 #include <algorithm>
+#include <cctype>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <filesystem>
@@ -80,6 +81,58 @@ enum MatMulIdType {
 
 namespace {
 
+std::string quote_windows_command_arg(const std::string& arg) {
+    if (arg.empty()) {
+        return "\"\"";
+    }
+
+    bool needs_quotes = false;
+    for (char c : arg) {
+        if (std::isspace(static_cast<unsigned char>(c)) || c == '"') {
+            needs_quotes = true;
+            break;
+        }
+    }
+
+    if (!needs_quotes) {
+        return arg;
+    }
+
+    std::string quoted;
+    quoted.reserve(arg.size() + 2);
+    quoted.push_back('"');
+
+    for (size_t i = 0; i < arg.size(); ++i) {
+        if (arg[i] == '\\') {
+            size_t backslashes = 1;
+            while (i + 1 < arg.size() && arg[i + 1] == '\\') {
+                ++backslashes;
+                ++i;
+            }
+
+            if (i + 1 < arg.size() && arg[i + 1] == '"') {
+                quoted.append(backslashes * 2, '\\');
+                quoted.push_back('"');
+                ++i;
+                continue;
+            }
+
+            quoted.append(backslashes, '\\');
+            continue;
+        }
+
+        if (arg[i] == '"') {
+            quoted += "\\\"";
+            continue;
+        }
+
+        quoted.push_back(arg[i]);
+    }
+
+    quoted.push_back('"');
+    return quoted;
+}
+
 void execute_command(std::vector<std::string>& command, std::string& stdout_str, std::string& stderr_str) {
 #ifdef _WIN32
     HANDLE stdout_read, stdout_write;
@@ -104,11 +157,16 @@ void execute_command(std::vector<std::string>& command, std::string& stdout_str,
     si.hStdError = stderr_write;
 
     std::string cmd;
-    for (const auto& part : command) {
-        cmd += part + " ";
+    for (size_t i = 0; i < command.size(); ++i) {
+        if (i > 0) {
+            cmd.push_back(' ');
+        }
+        cmd += quote_windows_command_arg(command[i]);
     }
 
-    if (!CreateProcessA(NULL, cmd.data(), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+    std::unique_ptr<char, decltype(&free)> command_line(_strdup(cmd.c_str()), &free);
+
+    if (!CreateProcessA(NULL, command_line.get(), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
         throw std::runtime_error("Failed to create process");
     }
 
@@ -329,11 +387,7 @@ compile_count_guard acquire_compile_slot() {
 void string_to_spv_func(std::string name, std::string in_path, std::string out_path, std::map<std::string, std::string> defines, bool coopmat, bool dep_file, compile_count_guard slot) {
     std::string target_env = (name.find("_cm2") != std::string::npos) ? "--target-env=vulkan1.3" : "--target-env=vulkan1.2";
 
-    #ifdef _WIN32
-        std::vector<std::string> cmd = {GLSLC, "-fshader-stage=compute", target_env, "\"" + in_path + "\"", "-o", "\"" + out_path + "\""};
-    #else
-        std::vector<std::string> cmd = {GLSLC, "-fshader-stage=compute", target_env, in_path, "-o", out_path};
-    #endif
+    std::vector<std::string> cmd = {GLSLC, "-fshader-stage=compute", target_env, in_path, "-o", out_path};
 
     // disable spirv-opt for coopmat shaders for https://github.com/ggml-org/llama.cpp/issues/10734
     // disable spirv-opt for bf16 shaders for https://github.com/ggml-org/llama.cpp/issues/15344
@@ -345,11 +399,7 @@ void string_to_spv_func(std::string name, std::string in_path, std::string out_p
     if (dep_file) {
         cmd.push_back("-MD");
         cmd.push_back("-MF");
-#ifdef _WIN32
-        cmd.push_back("\"" + target_cpp + ".d\"");
-#else
         cmd.push_back(target_cpp + ".d");
-#endif
     }
 
     #ifdef GGML_VULKAN_SHADER_DEBUG_INFO

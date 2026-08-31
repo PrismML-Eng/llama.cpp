@@ -832,7 +832,7 @@ struct random_gguf_context_result {
     ggml_backend_buffer_t buffer;
 };
 
-static struct random_gguf_context_result get_random_gguf_context(ggml_backend_t backend, const unsigned int seed) {
+struct random_gguf_context_result get_random_gguf_context(ggml_backend_t backend, const unsigned int seed) {
     std::mt19937 rng(seed);
 
     struct gguf_context * gguf_ctx = gguf_init_empty();
@@ -1221,6 +1221,57 @@ static std::pair<int, int> test_roundtrip(ggml_backend_dev_t dev, const unsigned
     return std::make_pair(npass, ntest);
 }
 
+static bool test_legacy_gguf_q1_q2_compatibility() {
+    FILE * file = tmpfile();
+    if (!file) {
+        return false;
+    }
+
+    helper_write(file, GGUF_MAGIC, 4);
+    helper_write(file, uint32_t(GGUF_VERSION));
+    helper_write(file, uint64_t(1));
+    helper_write(file, uint64_t(1));
+
+    const char * key = "general.file_type";
+    const uint64_t key_len = strlen(key);
+    helper_write(file, key_len);
+    helper_write(file, key, key_len);
+    helper_write(file, int32_t(GGUF_TYPE_UINT32));
+    helper_write(file, uint32_t(28));
+
+    const std::string tensor_name = "output.weight";
+    helper_write(file, uint64_t(tensor_name.length()));
+    helper_write(file, tensor_name.data(), tensor_name.length());
+    helper_write(file, uint32_t(1));
+    helper_write(file, int64_t(128));
+    helper_write(file, int32_t(42));
+    helper_write(file, uint64_t(0));
+
+    while (ftell(file) % GGUF_DEFAULT_ALIGNMENT != 0) {
+        const char pad = 0;
+        helper_write(file, pad);
+    }
+
+    std::vector<uint8_t> data(ggml_type_size(GGML_TYPE_Q2_0), 0xAA);
+    helper_write(file, data.data(), data.size());
+    rewind(file);
+
+    struct ggml_context * ctx = nullptr;
+    struct gguf_context * gguf_ctx = gguf_init_from_file_ptr(file, {false, &ctx});
+    const int legacy_ftype_key = gguf_find_key(gguf_ctx, key);
+    const bool ok = gguf_ctx != nullptr &&
+        legacy_ftype_key >= 0 &&
+        gguf_get_val_u32(gguf_ctx, legacy_ftype_key) == 29 &&
+        gguf_get_tensor_type(gguf_ctx, 0) == GGML_TYPE_Q2_0;
+
+    fclose(file);
+    if (gguf_ctx) {
+        ggml_free(ctx);
+        gguf_free(gguf_ctx);
+    }
+    return ok;
+}
+
 static std::pair<int, int> test_gguf_set_kv(ggml_backend_dev_t dev, const unsigned int seed) {
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     printf("%s: device=%s, backend=%s\n", __func__, ggml_backend_dev_description(dev), ggml_backend_name(backend));
@@ -1337,6 +1388,13 @@ int main(int argc, char ** argv) {
         std::pair<int, int> result = test_handcrafted_file(seed);
         npass += result.first;
         ntest += result.second;
+    }
+
+    {
+        const bool ok = test_legacy_gguf_q1_q2_compatibility();
+        npass += ok ? 1 : 0;
+        ntest += 1;
+        printf("%s: legacy_gguf_q1_q2_compatibility: %s\n", __func__, ok ? "OK" : "FAIL");
     }
 
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {

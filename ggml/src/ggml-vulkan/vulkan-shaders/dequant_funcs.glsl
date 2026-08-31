@@ -104,7 +104,7 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
-#if defined(DATA_A_Q1_0_G128)
+#if defined(DATA_A_Q1_0_G128) || defined(DATA_A_TQ1_0)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     const uint bits = uint(data_a[a_offset + ib].qs[iqs / 8u]) >> (iqs % 8u);
     return vec2(

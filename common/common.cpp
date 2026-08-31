@@ -1518,6 +1518,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
+    const char * vk_pref_q8_kv = getenv("GGML_VK_PREFER_Q8_0_KV");
+    if (vk_pref_q8_kv != nullptr && std::strcmp(vk_pref_q8_kv, "0") != 0) {
+        cparams.type_k = GGML_TYPE_Q8_0;
+        cparams.type_v = GGML_TYPE_Q8_0;
+    }
+
     return cparams;
 }
 

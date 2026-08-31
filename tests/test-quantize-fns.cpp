@@ -149,7 +149,7 @@ int main(int argc, char * argv[]) {
         if (qfns_cpu->from_float && qfns->to_float) {
             const float total_error = total_quantization_error(qfns, qfns_cpu, test_size, test_data.data());
             const float max_quantization_error =
-                (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q1_0_g128) ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
+                (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q1_0_g128 || type == GGML_TYPE_Q2_0) ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
                 type == GGML_TYPE_TQ1_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_TQ2_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_Q2_K    ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
