@@ -1078,6 +1078,13 @@ struct llm_graph_context {
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
 
+    // Folded weights that share an activation also share its transform: gate and up
+    // take the same post-norm tensor, as do qkv and its gate, and q/k/v. ggml does no
+    // common-subexpression elimination, so without this each one builds its own
+    // identical sign-multiply and FWHT. Keyed on the input and the rotation, since a
+    // shared transform needs both to match. Lives for one graph build.
+    mutable std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hadamard_memo;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
