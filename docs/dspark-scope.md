@@ -25,6 +25,20 @@ work below is gated on that result.
    masked block forward, and the `draft-dspark` speculative impl
    (`common/speculative.cpp`) runs the block-diffusion propose plus the
    sequential Markov resample (host BLAS/scalar, with an optional CUDA path).
+4. Windowed drafter staging. The drafter's own attention/RoPE only ever runs at
+   positions `[0, window)`, `window = min(drafter n_ctx_train, n_batch)`. Staged
+   rows are rebased (`drafter_pos = abs_pos - pos_base`); when the next block
+   would cross the window, the drafter cache is wiped and the last `w_keep`
+   buffered rows are restaged at positions `0..w_keep-1`. The tap features
+   already encode the target's full-context state per row, so long-range
+   information still reaches the drafter; the window keeps it inside its trained
+   position range at any target `n_ctx`. Measured on Ternary-Bonsai-27B (target
+   Q2_0, drafter Q4_1, ctx 131072): staged at absolute positions, acceptance
+   decays 59% -> 4.6% between short and 28k-token prompts; windowed, it holds
+   ~70-78% (54-58 tok/s decode) at short context and ~69% (32 tok/s) at 60k.
+   The server also caps the draft context `n_batch` at the drafter's
+   `n_ctx_train` instead of the full target `n_ctx`, which previously forced a
+   full-context micro-batch that stalled context creation at large `-c`.
 
 ## Open / deferred
 

@@ -3,9 +3,14 @@
 // for a single call) is already gated bit-accurate against the Python reference's real
 // Qwen3DSparkModel -- see test-dspark-forward.cpp. This test exercises the NEW
 // Phase 2 piece: the repeated draft/verify loop around that graph -- persistent
-// KV-cache growth/crop, block seeding (anchor + mask_token_id), continuous
-// absolute RoPE positions across rounds, and the sequential (never-batched)
-// Markov resample.
+// KV-cache growth/crop, block seeding (anchor + mask_token_id), windowed staging
+// positions (drafter positions stay inside [0, window) and rebase to 0 when the
+// next block would cross it -- they are NOT continuous across rounds), and the
+// sequential (never-batched) Markov resample.
+//
+// NOTE: the rounds below do not deliberately drive a rebase. If they cross
+// `window`, the Python reference must rebase identically or the comparison
+// diverges.
 //
 // There is no real target model available for this gate, so this drives a
 // small, fully-synthetic checkpoint (using the real Python reference
@@ -189,6 +194,7 @@ int main(int argc, char ** argv) {
     if (id_last != prefill_bonus_ref) fail("C++/python prefill bonus token disagree -- synth_bonus_token drifted");
 
     int32_t n_mismatch_rounds = 0;
+    int32_t n_rebase_rounds   = 0;
 
     for (size_t r = 0; r < rounds_ref.size(); ++r) {
         const auto & rr = rounds_ref[r];
@@ -196,6 +202,13 @@ int main(int argc, char ** argv) {
         const int64_t ctx_len_ref  = rr.at("ctx_len").get<int64_t>();
         const int64_t start_ref    = rr.at("start").get<int64_t>();
         const std::vector<int32_t> sampled_ref = rr.at("sampled").get<std::vector<int32_t>>();
+
+        // rounds the reference marked as crossing the staging window. Both sides
+        // derive window/w_keep from the same GGUF context_length and n_batch, and
+        // `start` is asserted equal below, so a flagged round rebases on both.
+        if (rr.value("rebase", false)) {
+            n_rebase_rounds++;
+        }
 
         if ((int32_t) ACCEPT_SCHEDULE[r % ACCEPT_SCHEDULE.size()] != n_accepted) {
             fail("ACCEPT_SCHEDULE drifted out of sync with ref.json at round " + std::to_string(r));
@@ -275,8 +288,17 @@ int main(int argc, char ** argv) {
              " rounds mismatched the Python reference");
     }
 
+    // without a window crossing the rounds never touch the rebase path, so the
+    // run would pass while covering none of the windowed staging logic
+    if (n_rebase_rounds == 0) {
+        fail("no round crossed the staging window -- this gate is vacuous. Regenerate "
+             "ref.json from a fixture whose context_length forces a rebase "
+             "(see scripts/dspark/README.md)");
+    }
+
     printf("\nPhase 2 gate PASSED: %zu/%zu rounds token-for-token identical to the Python reference implementation "
-           "(cache growth/crop, block seeding, RoPE positions, sequential markov resample).\n",
-           rounds_ref.size(), rounds_ref.size());
+           "(cache growth/crop, block seeding, windowed RoPE positions across %d rebase(s), "
+           "sequential markov resample).\n",
+           rounds_ref.size(), rounds_ref.size(), n_rebase_rounds);
     return 0;
 }
