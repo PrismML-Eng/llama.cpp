@@ -748,6 +748,50 @@ void dequantize_iq4_xs(device const block_iq4_xs * xb, short il, thread type4x4 
     }
 }
 
+// TQ1_0 packs 5 ternary digits per byte in base 3 (3^5 = 243 < 256), so a byte's
+// digits are strided 32 (or 16) elements apart rather than contiguous. Element
+// layout within a 256-element block, matching dequantize_row_tq1_0:
+//   i <  160: qs[i%32]        digit i/32
+//   i <  240: qs[32 + (i-160)%16] digit (i-160)/16
+//   i <  256: qh[(i-240)%4]   digit (i-240)/4
+// A digit is recovered by multiplying the byte by 3^n modulo 256 and taking the
+// top of (q*3), which is the same trick the CPU reference uses.
+static inline float tq1_0_trit(uchar b, short n) {
+    const uchar pow3[5] = {1, 3, 9, 27, 81};
+    const uchar q  = (uchar) ((uint) b * (uint) pow3[n]);
+    const short xi = (short) ((((ushort) q) * 3) >> 8);
+    return (float) (xi - 1);
+}
+
+template <typename type4x4>
+void dequantize_tq1_0(device const block_tq1_0 * xb, short il, thread type4x4 & reg) {
+    device const uint8_t * qs = xb->qs;
+    device const uint8_t * qh = xb->qh;
+    const float d = xb->d;
+
+    float4x4 reg_f;
+
+    const short base = il * 16;
+    for (short k = 0; k < 16; k++) {
+        const short i = base + k;
+
+        float v;
+        if (i < 160) {
+            v = tq1_0_trit(qs[i % 32], i / 32);
+        } else if (i < 240) {
+            const short t = i - 160;
+            v = tq1_0_trit(qs[32 + (t % 16)], t / 16);
+        } else {
+            const short t = i - 240;
+            v = tq1_0_trit(qh[t % 4], t / 4);
+        }
+
+        reg_f[k/4][k%4] = d * v;
+    }
+
+    reg = (type4x4) reg_f;
+}
+
 template <typename type4x4>
 void dequantize_tq2_0(device const block_tq2_0 * xb, short il, thread type4x4 & reg) {
     device const uint8_t * qs = xb->qs;

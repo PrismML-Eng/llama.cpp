@@ -1716,9 +1716,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 !ggml_metal_fwht_supported_size(op->src[1]->ne[0])) {
                 return false;
             }
-            // TQ1_0: no Metal mat-mul kernels yet either.
-            return has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4 &&
-                   op->src[0]->type != GGML_TYPE_TQ1_0;
+            return has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4;
         case GGML_OP_SET:
         case GGML_OP_CPY:
         case GGML_OP_DUP:
@@ -1784,10 +1782,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 };
             }
         case GGML_OP_GET_ROWS:
-            // TQ1_0: no Metal get_rows kernel yet (added to test-backend-ops
-            // by the Vulkan TQ1_0 PR; declining keeps the op on the CPU).
-            return op->src[0]->type != GGML_TYPE_NVFP4 &&
-                   op->src[0]->type != GGML_TYPE_TQ1_0;
+            return op->src[0]->type != GGML_TYPE_NVFP4;
         case GGML_OP_SET_ROWS:
             {
                 if (op->src[0]->type == GGML_TYPE_F16) {
