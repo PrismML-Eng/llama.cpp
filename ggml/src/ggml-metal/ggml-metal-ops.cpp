@@ -2609,7 +2609,11 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         ggml_metal_op_concurrency_reset(ctx);
 
         {
-            const int nr1 = ne11 == 2 ? 2 : 4;
+            static const int nr1_env = getenv("GGML_METAL_Q1_0_PC_NR1") ? atoi(getenv("GGML_METAL_Q1_0_PC_NR1")) : 0;
+
+            // nr1=2 measured best at every batch height; nr1=4 spills registers
+            // (pp4 84.4 vs 62.8 tok/s, pp8 102.7 vs 82.3)
+            const int nr1 = (nr1_env == 2 || nr1_env == 4) ? nr1_env : 2;
 
             auto pipeline = ggml_metal_library_get_pipeline_mul_mv_q1_0_pc(lib, op, nr1);
 
