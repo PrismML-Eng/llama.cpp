@@ -455,7 +455,6 @@ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k,
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
 }
 
-
 // ---- TQ1_0 (ternary, base-3 packed: 5 trits/byte, 3^5 = 243 < 256) ----
 // One CUDA block per 256-weight superblock. Threads are assigned by SOURCE BYTE
 // rather than by output element, so each thread loads exactly one byte and emits

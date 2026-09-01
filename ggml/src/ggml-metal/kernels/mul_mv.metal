@@ -3138,20 +3138,54 @@ void kernel_mul_mv_tq1_0_f32_impl(
     for (int ib = 0; ib < nb; ++ib) {
         device const float * yb = y + ib*QK_K;
 
-        // activations this thread needs, hoisted out of the row loop
-        float yA[5];
-        FOR_UNROLL (short n = 0; n < 5; ++n) {
-            yA[n] = yb[n*32 + tiisg];
+        // A packed byte is a base-3 fraction of 256: with u = b/256, digit n is
+        //   t_n = g_{n+1} - 3*g_n,   g_k = floor(3^k * u)
+        // and 3^k * u is exact in fp32 (3^k*b <= 61965, and /256 is a power of two),
+        // so the floors are exact and this matches the integer reference bit for bit.
+        // Summing (t_n - 1)*y_n over a byte's digits collapses to
+        //   sum_k g_k * (y_{k-1} - 3*y_k)  +  g_last * y_last  -  sum(y)
+        // whose coefficients depend only on the activations, so they hoist out of the
+        // row loop. That leaves one floor and one fma per element in the inner loop and
+        // no integer arithmetic at all, which matters because this ISA cannot co-issue
+        // integer and floating-point work.
+        float cA[5], cB[5], cC[4];
+        float sumyA = 0.f, sumyB = 0.f, sumyC = 0.f;
+
+        {
+            float yA[5];
+            FOR_UNROLL (short n = 0; n < 5; ++n) {
+                yA[n] = yb[n*32 + tiisg];
+            }
+            FOR_UNROLL (short k = 1; k < 5; ++k) {
+                cA[k-1] = yA[k-1] - 3.0f*yA[k];
+            }
+            cA[4] = yA[4];
+            sumyA = ((yA[0] + yA[1]) + (yA[2] + yA[3])) + yA[4];
         }
 
-        float yB[5];
-        FOR_UNROLL (short n = 0; n < 5; ++n) {
-            yB[n] = hasB ? yb[160 + n*16 + tiisg] : 0.f;
+        if (hasB) {
+            float yB[5];
+            FOR_UNROLL (short n = 0; n < 5; ++n) {
+                yB[n] = yb[160 + n*16 + tiisg];
+            }
+            FOR_UNROLL (short k = 1; k < 5; ++k) {
+                cB[k-1] = yB[k-1] - 3.0f*yB[k];
+            }
+            cB[4] = yB[4];
+            sumyB = ((yB[0] + yB[1]) + (yB[2] + yB[3])) + yB[4];
         }
 
-        float yC[4];
-        FOR_UNROLL (short n = 0; n < 4; ++n) {
-            yC[n] = hasC ? yb[240 + n*4 + tiisg] : 0.f;
+        if (hasC) {
+            // the qh tail carries 4 digits per byte, not 5
+            float yC[4];
+            FOR_UNROLL (short n = 0; n < 4; ++n) {
+                yC[n] = yb[240 + n*4 + tiisg];
+            }
+            FOR_UNROLL (short k = 1; k < 4; ++k) {
+                cC[k-1] = yC[k-1] - 3.0f*yC[k];
+            }
+            cC[3] = yC[3];
+            sumyC = (yC[0] + yC[1]) + (yC[2] + yC[3]);
         }
 
         FOR_UNROLL (short row = 0; row < nr0; ++row) {
@@ -3160,24 +3194,35 @@ void kernel_mul_mv_tq1_0_f32_impl(
             float sum = 0.f;
 
             {
-                const uchar b = xb.qs[tiisg];
-                FOR_UNROLL (short n = 0; n < 5; ++n) {
-                    sum += tq1_0_trit(b, n) * yA[n];
-                }
+                const float u = (float) xb.qs[tiisg] * (1.0f/256.0f);
+                float acc = -sumyA;
+                acc += floor(  3.0f*u)*cA[0];
+                acc += floor(  9.0f*u)*cA[1];
+                acc += floor( 27.0f*u)*cA[2];
+                acc += floor( 81.0f*u)*cA[3];
+                acc += floor(243.0f*u)*cA[4];
+                sum += acc;
             }
 
             if (hasB) {
-                const uchar b = xb.qs[32 + tiisg];
-                FOR_UNROLL (short n = 0; n < 5; ++n) {
-                    sum += tq1_0_trit(b, n) * yB[n];
-                }
+                const float u = (float) xb.qs[32 + tiisg] * (1.0f/256.0f);
+                float acc = -sumyB;
+                acc += floor(  3.0f*u)*cB[0];
+                acc += floor(  9.0f*u)*cB[1];
+                acc += floor( 27.0f*u)*cB[2];
+                acc += floor( 81.0f*u)*cB[3];
+                acc += floor(243.0f*u)*cB[4];
+                sum += acc;
             }
 
             if (hasC) {
-                const uchar b = xb.qh[tiisg];
-                FOR_UNROLL (short n = 0; n < 4; ++n) {
-                    sum += tq1_0_trit(b, n) * yC[n];
-                }
+                const float u = (float) xb.qh[tiisg] * (1.0f/256.0f);
+                float acc = -sumyC;
+                acc += floor( 3.0f*u)*cC[0];
+                acc += floor( 9.0f*u)*cC[1];
+                acc += floor(27.0f*u)*cC[2];
+                acc += floor(81.0f*u)*cC[3];
+                sum += acc;
             }
 
             sumf[row] += (float) xb.d * sum;
