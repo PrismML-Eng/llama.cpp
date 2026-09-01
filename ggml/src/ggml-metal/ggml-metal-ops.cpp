@@ -2567,6 +2567,90 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
     const int ne11_mm_min = op->src[0]->type == GGML_TYPE_Q1_0 ? std::max(8, q1_0_mv_max) : 8;
 
+    // Q1_0 word-parallel verify path (opt-in): quantize the activation columns into
+    // int8 bit-planes once, then consume 32 weights per AND+popcount instead of one
+    // select per weight. See the kernel comment in mul_mv.metal.
+    static const bool q1_0_pc = getenv("GGML_METAL_Q1_0_POPCNT") != nullptr;
+
+    if (q1_0_pc &&
+        op->src[0]->type == GGML_TYPE_Q1_0 &&
+        op->src[1]->type == GGML_TYPE_F32 &&
+        ne11 >= 2 && ne11 <= 16 &&
+        ne00 % 128 == 0 &&
+        ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+        ggml_metal_op_mul_mat_extra_q1_0_planes(op) > 0) {
+        const int32_t nblk = ne00/128;
+
+        ggml_metal_buffer_id bid_src0   = ggml_metal_get_buffer_id(op->src[0]);
+        ggml_metal_buffer_id bid_src1   = ggml_metal_get_buffer_id(op->src[1]);
+        ggml_metal_buffer_id bid_dst    = ggml_metal_get_buffer_id(op);
+        ggml_metal_buffer_id bid_planes = bid_dst;
+
+        bid_planes.offs += ggml_nbytes(op);
+
+        {
+            auto pipeline = ggml_metal_library_get_pipeline_q1_0_planes(lib);
+
+            ggml_metal_kargs_q1_0_planes args = {
+                /*.nblk =*/ nblk,
+                /*.ne11 =*/ (int32_t) ne11,
+                /*.nb11 =*/ nb11,
+            };
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_src1,   1);
+            ggml_metal_encoder_set_buffer  (enc, bid_planes, 2);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, nblk, ne11, 1, 32, 1, 1);
+        }
+
+        // the matmul reads what the plane pass just wrote
+        ggml_metal_op_concurrency_reset(ctx);
+
+        {
+            const int nr1 = ne11 == 2 ? 2 : 4;
+
+            auto pipeline = ggml_metal_library_get_pipeline_mul_mv_q1_0_pc(lib, op, nr1);
+
+            ggml_metal_kargs_mul_mv args = {
+                /*.ne00 =*/ ne00,
+                /*.ne01 =*/ ne01,
+                /*.ne02 =*/ ne02,
+                /*.nb00 =*/ nb00,
+                /*.nb01 =*/ nb01,
+                /*.nb02 =*/ nb02,
+                /*.nb03 =*/ nb03,
+                /*.ne10 =*/ ne10,
+                /*.ne11 =*/ ne11,
+                /*.ne12 =*/ ne12,
+                /*.nb10 =*/ nb10,
+                /*.nb11 =*/ nb11,
+                /*.nb12 =*/ nb12,
+                /*.nb13 =*/ nb13,
+                /*.ne0  =*/ ne0,
+                /*.ne1  =*/ ne1,
+                /*.nr0  =*/ pipeline.nr0,
+                /*.r2   =*/ r2,
+                /*.r3   =*/ r3,
+            };
+
+            const int nr0 = pipeline.nr0;
+            const int nsg = pipeline.nsg;
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_src0,   1);
+            ggml_metal_encoder_set_buffer  (enc, bid_src1,   2);
+            ggml_metal_encoder_set_buffer  (enc, bid_dst,    3);
+            ggml_metal_encoder_set_buffer  (enc, bid_planes, 4);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0*nsg - 1)/(nr0*nsg), (ne11 + nr1 - 1)/nr1, 1, 32, nsg, 1);
+        }
+
+        return 1;
+    }
+
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
     if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
@@ -2772,6 +2856,26 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     }
 
     return 1;
+}
+
+// scratch for the Q1_0 word-parallel verify path: int8 activation bit-planes, one
+// record per (column, 128-element block). Only the small-batch shapes that path
+// serves are padded, so prefill dst buffers are unaffected.
+size_t ggml_metal_op_mul_mat_extra_q1_0_planes(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_MUL_MAT);
+
+    if (!op->src[0] || !op->src[1] || op->src[0]->type != GGML_TYPE_Q1_0) {
+        return 0;
+    }
+
+    const int64_t ne00 = op->src[0]->ne[0];
+    const int64_t ne11 = op->src[1]->ne[1];
+
+    if (ne11 < 2 || ne11 > 16 || ne00 % 128 != 0) {
+        return 0;
+    }
+
+    return (size_t) (ne00/128) * ne11 * Q1_0_PLANE_STRIDE * sizeof(uint32_t);
 }
 
 size_t ggml_metal_op_mul_mat_id_extra_tpe(const ggml_tensor * op) {

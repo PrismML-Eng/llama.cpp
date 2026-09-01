@@ -24,6 +24,11 @@
 #define N_R0_Q1_0 8
 #define N_SG_Q1_0 2
 
+// Q1_0 word-parallel (popcount) verify path: rows per simdgroup, and the uint32
+// stride of one activation bit-plane record (8 planes x 4 words + scale + sum + pad).
+#define N_R0_Q1_0_PC 4
+#define Q1_0_PLANE_STRIDE 36
+
 #define N_R0_Q2_0 8
 #define N_SG_Q2_0 2
 
@@ -504,6 +509,12 @@ typedef struct {
     int16_t  r2;
     int16_t  r3;
 } ggml_metal_kargs_mul_mv;
+
+typedef struct {
+    int32_t  nblk;
+    int32_t  ne11;
+    uint64_t nb11;
+} ggml_metal_kargs_q1_0_planes;
 
 typedef struct {
     int32_t  ne00;
