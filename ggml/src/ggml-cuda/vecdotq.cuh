@@ -702,6 +702,64 @@ static __device__ __forceinline__ int q2_0_symbols4_hip(const uint32_t b) {
 }
 #endif  // defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
 
+// ---- TQ1_0 (ternary, base-3: 5 trits/byte in qs[48], 4 in qh[4], one fp16 scale) ----
+// Decode element e (0..255) of a block to {-1, 0, +1}. Mapping mirrors
+// dequantize_row_tq1_0 in ggml-quants.c exactly:
+//   e <  160 : digit e/32,        byte qs[e%32]
+//   e <  240 : t=e-160, digit t/16, byte qs[32 + t%16]
+//   else     : t=e-240, digit t/4,  byte qh[t%4]
+static __device__ __forceinline__ int tq1_0_elem(const block_tq1_0 * __restrict__ b, const int e) {
+    const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+    uint8_t q;
+    int n;
+    if (e < 160) {
+        n = e >> 5;
+        q = b->qs[e & 31];
+    } else if (e < 240) {
+        const int t = e - 160;
+        n = t >> 4;
+        q = b->qs[32 + (t & 15)];
+    } else {
+        const int t = e - 240;
+        n = t >> 2;
+        q = b->qh[t & 3];
+    }
+    const uint8_t qq = (uint8_t) (q * pow3[n]);
+    return (int) (((uint16_t) qq * 3) >> 8) - 1;
+}
+
+#define VDR_TQ1_0_Q8_1_MMVQ 1
+
+static __device__ __forceinline__ float vec_dot_tq1_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_tq1_0 * btq = (const block_tq1_0 *) vbq + kbx;
+    // iqs selects which 32-element chunk of the 256-element block to process (0..7),
+    // and the matching q8_1 block, which also covers 32 elements.
+    const block_q8_1 * bq8 = bq8_1 + iqs;
+
+    const int e0 = 32 * iqs;
+
+    int sumi = 0;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {          // 8 groups of 4 = 32 elements
+        const int e = e0 + 4*k;
+        const int v0 = tq1_0_elem(btq, e + 0);
+        const int v1 = tq1_0_elem(btq, e + 1);
+        const int v2 = tq1_0_elem(btq, e + 2);
+        const int v3 = tq1_0_elem(btq, e + 3);
+        // pack four int8 lanes little-endian for dp4a
+        const int v = (v0 & 0xFF) | ((v1 & 0xFF) << 8) | ((v2 & 0xFF) << 16) | ((v3 & 0xFF) << 24);
+        const int u = get_int_b4(bq8->qs, k);
+        sumi = ggml_cuda_dp4a(v, u, sumi);
+    }
+
+    // ternary is symmetric (no zero point), so the q8_1 sum term is not needed
+    const float d  = __half2float(btq->d);
+    const float d8 = __low2float(bq8->ds);
+    return d * d8 * sumi;
+}
+
 static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
