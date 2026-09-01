@@ -2868,7 +2868,11 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 size_t ggml_metal_op_mul_mat_extra_q1_0_planes(const ggml_tensor * op) {
     assert(op->op == GGML_OP_MUL_MAT);
 
-    if (!op->src[0] || !op->src[1] || op->src[0]->type != GGML_TYPE_Q1_0) {
+    // the planes are only built when the word-parallel path is enabled, so this
+    // costs nothing (not even address space) when it is off
+    static const bool q1_0_pc = getenv("GGML_METAL_Q1_0_POPCNT") != nullptr;
+
+    if (!q1_0_pc || !op->src[0] || !op->src[1] || op->src[0]->type != GGML_TYPE_Q1_0) {
         return 0;
     }
 
