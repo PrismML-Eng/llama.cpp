@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "ggml-metal-device.h"
 
 #include "ggml-metal-impl.h"
@@ -860,6 +861,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_Q1_0;
                 nr0 = N_R0_Q1_0;
+                // multi-column variants stream each weight block once per nr1 src1
+                // columns (spec-decode verify batches). GGML_METAL_Q1_0_NR1=1 disables,
+                // 2..4 forces a variant.
+                static const int nr1_env = getenv("GGML_METAL_Q1_0_NR1") ? atoi(getenv("GGML_METAL_Q1_0_NR1")) : 0;
+                if (nr1_env >= 2 && nr1_env <= 4) {
+                    nr1 = nr1_env;
+                } else if (nr1_env != 1 && ne11 == 3) {
+                    nr1 = 3;
+                } else if (nr1_env != 1 && ne11 >= 2) {
+                    nr1 = 2;
+                }
+                suffix = nr1 == 2 ? "_nr1_2" : nr1 == 3 ? "_nr1_3" : nr1 == 4 ? "_nr1_4" : "";
             } break;
         case GGML_TYPE_Q2_0:
             {

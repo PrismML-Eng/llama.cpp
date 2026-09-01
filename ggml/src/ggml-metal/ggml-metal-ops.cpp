@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "ggml-metal-ops.h"
 
 #include "ggml.h"
@@ -2558,7 +2559,13 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
     // find the break-even point where the matrix-matrix kernel becomes more efficient compared
     // to the matrix-vector kernel
-    const int ne11_mm_min = 8;
+    // Q1_0: the generic small-batch mul_mv_ext path is ALU-bound (flat ~2.5 TFLOPS for
+    // 2..8 columns, 2.5-4x slower per weight pass than the Q1_0 mul_mv kernel), so Q1_0
+    // stays on the (multi-column) mul_mv kernels up to GGML_METAL_Q1_0_MV_MAX rows.
+    static const bool q1_0_ext_enable = getenv("GGML_METAL_Q1_0_EXT_ENABLE") != nullptr;
+    static const int  q1_0_mv_max     = getenv("GGML_METAL_Q1_0_MV_MAX") ? atoi(getenv("GGML_METAL_Q1_0_MV_MAX")) : 16;
+
+    const int ne11_mm_min = op->src[0]->type == GGML_TYPE_Q1_0 ? std::max(8, q1_0_mv_max) : 8;
 
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
@@ -2569,7 +2576,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_F32  || // TODO: helper function
            op->src[0]->type == GGML_TYPE_F16  ||
            op->src[0]->type == GGML_TYPE_BF16 ||
-           op->src[0]->type == GGML_TYPE_Q1_0 ||
+           (op->src[0]->type == GGML_TYPE_Q1_0 && q1_0_ext_enable) ||
            op->src[0]->type == GGML_TYPE_Q2_0 ||
            op->src[0]->type == GGML_TYPE_PQ2_0 ||
            op->src[0]->type == GGML_TYPE_PTQ1_0 ||

@@ -430,6 +430,153 @@ kernel void kernel_mul_mv_q1_0_f32(
     kernel_mul_mv_q1_0_f32_impl<N_R0_Q1_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
+// Q1_0 multi-column mat-vec: each q1_0 block is read once and dotted against nr1
+// src1 columns (the spec-decode verify batch, ne11 = k+1 rows). tpb threads
+// cooperate on one block, slice width SW = QK1_0/tpb. Register budget (M5 Pro):
+// keep nr1*SW <= 32 staged y values per thread.
+template<short SW>
+static inline float q1_0_dot_y_sw(thread const uint8_t * b, const float d, const float sumy, thread const float * yl) {
+    float acc = 0.0f;
+
+    FOR_UNROLL (short i = 0; i < SW; i++) {
+        acc += select(0.0f, yl[i], bool(b[i/8] & (1u << (i%8))));
+    }
+
+    return d * (2.0f * acc - sumy);
+}
+
+template<int nr0, int nr1, int tpb, typename args_t>
+void kernel_mul_mv_q1_0_f32_nc_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    const short SW  = QK1_0/tpb;
+
+    const int nb = args.ne00/QK1_0;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+    const int c0        = r1 * nr1;
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    device const block_q1_0 * ax[nr0];
+    for (int row = 0; row < nr0; ++row) {
+        const uint64_t offset0 = (first_row + row)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+        ax[row] = (device const block_q1_0 *) ((device char *) src0 + offset0);
+    }
+
+    float yl[nr1][SW];
+    float sumy[nr1];
+    float sumf[nr0][nr1];
+    FOR_UNROLL (short row = 0; row < nr0; row++) {
+        FOR_UNROLL (short c = 0; c < nr1; c++) {
+            sumf[row][c] = 0.f;
+        }
+    }
+
+    const short ix = (tiisg/tpb);      // block in flight
+    const short il = (tiisg%tpb)*SW;   // element offset within the block
+
+    device const float * yb[nr1];
+    FOR_UNROLL (short c = 0; c < nr1; c++) {
+        // tail columns are clamped (computed but not stored)
+        const int ic = min(c0 + c, args.ne11 - 1);
+        const uint64_t offset1 = (uint64_t)ic*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+        yb[c] = (device const float *) (src1 + offset1) + ix*QK1_0 + il;
+    }
+
+    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/tpb) {
+        FOR_UNROLL (short c = 0; c < nr1; c++) {
+            sumy[c] = 0.f;
+            FOR_UNROLL (short i = 0; i < SW; i++) {
+                yl[c][i] = yb[c][i];
+                sumy[c] += yb[c][i];
+            }
+        }
+
+        FOR_UNROLL (short row = 0; row < nr0; row++) {
+            device const block_q1_0 * qb = ax[row] + ib;
+            device const uint8_t    * qs = qb->qs + il/8;
+
+            uint8_t b[SW/8];
+            FOR_UNROLL (short i = 0; i < SW/8; i++) {
+                b[i] = qs[i];
+            }
+            const float d = qb->d;
+
+            FOR_UNROLL (short c = 0; c < nr1; c++) {
+                sumf[row][c] += q1_0_dot_y_sw<SW>(b, d, sumy[c], yl[c]);
+            }
+        }
+
+        FOR_UNROLL (short c = 0; c < nr1; c++) {
+            yb[c] += QK1_0 * (N_SIMDWIDTH/tpb);
+        }
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1;
+
+    for (short c = 0; c < nr1; c++) {
+        if (c0 + c >= args.ne11) {
+            break;
+        }
+        for (int row = 0; row < nr0; ++row) {
+            const float tot = simd_sum(sumf[row][c]);
+
+            if (tiisg == 0 && first_row + row < args.ne01) {
+                dst_f32[(uint64_t)(c0 + c)*args.ne0 + first_row + row] = tot;
+            }
+        }
+    }
+}
+
+[[host_name("kernel_mul_mv_q1_0_f32_nr1_2")]]
+kernel void kernel_mul_mv_q1_0_f32_nr1_2(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q1_0_f32_nc_impl<N_R0_Q1_0, 2, 8, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q1_0_f32_nr1_3")]]
+kernel void kernel_mul_mv_q1_0_f32_nr1_3(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q1_0_f32_nc_impl<N_R0_Q1_0, 3, 16, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q1_0_f32_nr1_4")]]
+kernel void kernel_mul_mv_q1_0_f32_nr1_4(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q1_0_f32_nc_impl<N_R0_Q1_0, 4, 16, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
 template<int nr0, typename args_t>
 void kernel_mul_mv_q2_0_f32_impl(
         args_t args,
