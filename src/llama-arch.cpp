@@ -657,6 +657,13 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_DSPARK_CONF_PROJ,                       "conf_proj" },
     { LLM_TENSOR_DSPARK_LOG_SNR_FC1,                     "log_snr_fc1" },
     { LLM_TENSOR_DSPARK_LOG_SNR_FC2,                     "log_snr_fc2" },
+    { LLM_TENSOR_DFLY_LAYER_FUSION,                      "layer_fusion" },
+    { LLM_TENSOR_DFLY_CTX_NORM,                          "context_norm" },
+    { LLM_TENSOR_DFLY_HC_HIDDEN_NORM,                    "hidden_correction.hidden_norm" },
+    { LLM_TENSOR_DFLY_HC_EMBED_NORM,                     "hidden_correction.embed_norm" },
+    { LLM_TENSOR_DFLY_HC_GATE,                           "hidden_correction.gate" },
+    { LLM_TENSOR_DFLY_HC_UP,                             "hidden_correction.up" },
+    { LLM_TENSOR_DFLY_HC_DOWN,                           "hidden_correction.down" },
 };
 
 // declare information about the model weight tensors:
@@ -920,6 +927,13 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_D2T,                        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
     // dspark
     {LLM_TENSOR_DSPARK_MARKOV_W1,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
+    {LLM_TENSOR_DFLY_LAYER_FUSION,          {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DFLY_CTX_NORM,              {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_DFLY_HC_HIDDEN_NORM,        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_DFLY_HC_EMBED_NORM,         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_DFLY_HC_GATE,               {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DFLY_HC_UP,                 {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DFLY_HC_DOWN,               {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_DSPARK_MARKOV_W2,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_DSPARK_CONF_PROJ,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_DSPARK_LOG_SNR_FC1,         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
