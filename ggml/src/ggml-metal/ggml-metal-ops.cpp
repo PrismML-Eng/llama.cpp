@@ -2522,6 +2522,40 @@ int ggml_metal_op_pool_2d(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// Q1_0 word-parallel verify path (opt-in): quantize the activation columns into
+// int8 bit-planes once, then consume 32 weights per AND+popcount instead of one
+// select per weight. See the kernel comment in mul_mv.metal.
+//
+// The plane scratch is carved out of the padding the allocator adds behind dst, so
+// the encoder must take this path exactly when the allocator reserved for it. Both
+// call this predicate rather than repeating the shape test.
+static bool ggml_metal_op_mul_mat_q1_0_pc_supported(const ggml_tensor * op) {
+    static const bool q1_0_pc = getenv("GGML_METAL_Q1_0_POPCNT") != nullptr;
+
+    if (!q1_0_pc || !op->src[0] || !op->src[1]) {
+        return false;
+    }
+
+    if (op->src[0]->type != GGML_TYPE_Q1_0 || op->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const int64_t ne00 = op->src[0]->ne[0];
+    const int64_t ne02 = op->src[0]->ne[2];
+    const int64_t ne03 = op->src[0]->ne[3];
+
+    const int64_t ne11 = op->src[1]->ne[1];
+    const int64_t ne12 = op->src[1]->ne[2];
+    const int64_t ne13 = op->src[1]->ne[3];
+
+    if (ne11 < 2 || ne11 > 16 || ne00 < 128 || ne00 % 128 != 0) {
+        return false;
+    }
+
+    // the kernel indexes src0/src1 without the broadcast strides
+    return ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1;
+}
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2567,18 +2601,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
     const int ne11_mm_min = op->src[0]->type == GGML_TYPE_Q1_0 ? std::max(8, q1_0_mv_max) : 8;
 
-    // Q1_0 word-parallel verify path (opt-in): quantize the activation columns into
-    // int8 bit-planes once, then consume 32 weights per AND+popcount instead of one
-    // select per weight. See the kernel comment in mul_mv.metal.
-    static const bool q1_0_pc = getenv("GGML_METAL_Q1_0_POPCNT") != nullptr;
-
-    if (q1_0_pc &&
-        op->src[0]->type == GGML_TYPE_Q1_0 &&
-        op->src[1]->type == GGML_TYPE_F32 &&
-        ne11 >= 2 && ne11 <= 16 &&
-        ne00 % 128 == 0 &&
-        ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
-        ggml_metal_op_mul_mat_extra_q1_0_planes(op) > 0) {
+    if (ggml_metal_op_mul_mat_q1_0_pc_supported(op)) {
         const int32_t nblk = ne00/128;
 
         ggml_metal_buffer_id bid_src0   = ggml_metal_get_buffer_id(op->src[0]);
@@ -2868,20 +2891,14 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 size_t ggml_metal_op_mul_mat_extra_q1_0_planes(const ggml_tensor * op) {
     assert(op->op == GGML_OP_MUL_MAT);
 
-    // the planes are only built when the word-parallel path is enabled, so this
-    // costs nothing (not even address space) when it is off
-    static const bool q1_0_pc = getenv("GGML_METAL_Q1_0_POPCNT") != nullptr;
-
-    if (!q1_0_pc || !op->src[0] || !op->src[1] || op->src[0]->type != GGML_TYPE_Q1_0) {
+    // the encoder gates on this exact predicate, so nothing is reserved for a shape
+    // that path would not take -- and nothing at all when the path is off
+    if (!ggml_metal_op_mul_mat_q1_0_pc_supported(op)) {
         return 0;
     }
 
     const int64_t ne00 = op->src[0]->ne[0];
     const int64_t ne11 = op->src[1]->ne[1];
-
-    if (ne11 < 2 || ne11 > 16 || ne00 % 128 != 0) {
-        return 0;
-    }
 
     return (size_t) (ne00/128) * ne11 * Q1_0_PLANE_STRIDE * sizeof(uint32_t);
 }

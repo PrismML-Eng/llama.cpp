@@ -30,8 +30,10 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 // available ops:
 //
 
-// tokens per expert
+// activation bit-planes for the Q1_0 word-parallel path
 size_t ggml_metal_op_mul_mat_extra_q1_0_planes(const struct ggml_tensor * op);
+
+// tokens per expert
 size_t ggml_metal_op_mul_mat_id_extra_tpe(const struct ggml_tensor * op);
 
 // id map [n_tokens, n_expert]

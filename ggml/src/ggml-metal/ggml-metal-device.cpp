@@ -925,14 +925,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 } else if (nr1_env != 1 && ne11 >= 2) {
                     nr1 = 2;
                 }
-                // half2 variants pack two src1 columns per lane (opt-in, see the kernel comment)
-                static const bool h2 = getenv("GGML_METAL_Q1_0_H2") != nullptr;
-                if (h2 && nr1 >= 2) {
-                    nr1 = nr1 == 2 ? 2 : 4;
-                    suffix = nr1 == 2 ? "_h2_nr1_2" : "_h2_nr1_4";
-                } else {
-                    suffix = nr1 == 2 ? "_nr1_2" : nr1 == 3 ? "_nr1_3" : nr1 == 4 ? "_nr1_4" : "";
-                }
+                suffix = nr1 == 2 ? "_nr1_2" : nr1 == 3 ? "_nr1_3" : nr1 == 4 ? "_nr1_4" : "";
             } break;
         case GGML_TYPE_Q2_0:
             {
