@@ -139,6 +139,16 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
                                  "The reference chain runs the full target head");
     }
 
+    // A predecessor correction without the per-layer fusion is a third lineage (DSpark plus
+    // correction, tap_fusion none). It is not supported here, and the correction weights are
+    // only created on the DFly path, so letting it through means an opaque
+    // "wrong number of tensors" from done_getting_tensors rather than a reason.
+    if (!is_dfly && ml->get_tensor_meta("hidden_correction.down.weight")) {
+        throw std::runtime_error("dflash: checkpoint carries hidden_correction weights but no layer_fusion. "
+                                 "That lineage (DSpark plus predecessor correction) is not supported; "
+                                 "loading it as plain DSpark would drop the trained correction");
+    }
+
     // DSpark = DFlash + a semi-autoregressive Markov head and Confidence head
     //
     // TODO: only Qwen3-style backbones are supported for now; other backbones (e.g. Gemma4)
