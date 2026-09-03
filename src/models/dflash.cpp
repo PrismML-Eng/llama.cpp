@@ -17,12 +17,16 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * hparams.n_embd;
 
     // AngelSpec DFly fuses the target context once per DRAFT layer, so the encoder emits
-    // [n_embd, n_layer] per token instead of a single [n_embd] row. Both the nextn output
-    // buffer and the embd batch that feeds it back are sized from n_embd_out(), so widening
-    // it here is the whole host-side contract change. Detected from the fusion tensor rather
-    // than a KV so a DFly export cannot load as plain DFlash.
+    // [n_embd, n_layer] per token instead of a single [n_embd] row. Detected from the fusion
+    // tensor rather than a KV so a DFly export cannot load as plain DFlash.
     if (ml.get_tensor_meta("layer_fusion")) {
+        // Both ends of the round-trip must widen: the encoder emits n_layer contexts
+        // (n_embd_out) and the decoder's embd batch consumes them (n_embd_inp). Setting only
+        // the former is not enough -- a dflash draft context is not MTP-typed, so
+        // llama_context::decode sizes an embd batch from n_embd_inp(), and leaving that at
+        // n_embd hands the graph one layer's context and n_layer-1 layers of junk.
         hparams.n_embd_out_impl = hparams.n_layer() * hparams.n_embd;
+        hparams.n_embd_inp_impl = hparams.n_layer() * hparams.n_embd;
         LLAMA_LOG_INFO("%s: DFly per-layer context fusion (n_layer = %u, n_embd_out = %u)\n",
                 __func__, hparams.n_layer(), hparams.n_embd_out());
     }
@@ -206,10 +210,6 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
             dfly_hc_down        = create_tensor(tn(LLM_TENSOR_DFLY_HC_DOWN,        "weight"), { n_ff_hc,  n_embd },    0);
 
             LLAMA_LOG_INFO("%s: DFly predecessor correction (n_ff = %lld)\n", __func__, (long long) n_ff_hc);
-            LLAMA_LOG_WARN("%s: DFly predecessor-correction CHAIN IS NOT ENABLED. It is still under "
-                    "development (nondeterministic uninitialised read; see the notes on this branch), "
-                    "so drafts are produced WITHOUT the correction and acceptance will be near zero. "
-                    "Set LLAMA_DFLY_CHAIN=1 to run it anyway.\n", __func__);
         } else {
             LLAMA_LOG_INFO("%s: DFly without predecessor correction\n", __func__);
         }
@@ -518,11 +518,10 @@ static void build_dfly_correction_head(llm_graph_context & g, const llama_model 
         return;
     }
 
-    // Only a noise block carries a chain. The draft context also decodes ordinary batches
-    // (context staging before the K/V injection), and those have no anchor to condition on --
-    // their slot 0 is the caller's id_last, which is LLAMA_TOKEN_NULL until the first token is
-    // committed. Chaining one of those would read token embedding row -1. A block is
-    // [id_last, MASK, MASK, ...] per sequence, so check that shape before building anything.
+    // Only a noise block carries a chain. The draft context also decodes ordinary staging
+    // batches, whose slot 0 is the caller's id_last -- LLAMA_TOKEN_NULL until the first token
+    // is committed, which would index the embedding table with row -1. A block is
+    // [id_last, MASK, ...] per sequence, so check that shape before building anything.
     if (g.ubatch.token == nullptr) {
         return;
     }
@@ -900,7 +899,9 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
 
     // DFly: re-derive the draft logits through the chained predecessor correction
-    if (model.dfly_hc_down && getenv("LLAMA_DFLY_CHAIN") != nullptr) {
+    // LLAMA_DFLY_NO_CHAIN drops the correction, for A/B measurement only: DFly's acceptance
+    // depends on it, so a run without it is not a meaningful DFly configuration.
+    if (model.dfly_hc_down && getenv("LLAMA_DFLY_NO_CHAIN") == nullptr) {
         build_dfly_correction_head(*this, model, inp_tokens, inp_embd_raw);
     }
 }
