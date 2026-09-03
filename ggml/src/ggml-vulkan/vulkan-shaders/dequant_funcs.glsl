@@ -126,6 +126,44 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_PTQ1_0)
+// Element order is not positional: a 16-byte chunk of qs, then an 8-byte chunk, then
+// qh at four trits per byte, matching the CPU codec. Trits come out by the base-3
+// remainder recurrence t = (v*3)>>8, v = (v*3)&0xFF.
+float ptq1_0_trit(uint ib, uint a_offset, uint e) {
+    uint b;
+    uint n;
+    if (e < 80u) {
+        b = uint(data_a[a_offset + ib].qs[e & 15u]);
+        n = e >> 4u;
+    } else if (e < 120u) {
+        const uint t = e - 80u;
+        b = uint(data_a[a_offset + ib].qs[16u + (t & 7u)]);
+        n = t >> 3u;
+    } else {
+        const uint t = e - 120u;
+        b = uint(data_a[a_offset + ib].qh[t & 1u]);
+        n = t >> 1u;
+    }
+
+    uint v = b;
+    for (uint i = 0u; i < n; ++i) {
+        v = (v * 3u) & 0xFFu;
+    }
+    return float(int((v * 3u) >> 8u) - 1);
+}
+
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    return vec2(ptq1_0_trit(ib, a_offset, iqs), ptq1_0_trit(ib, a_offset, iqs + 1u));
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    return vec4(ptq1_0_trit(ib, a_offset, iqs),
+                ptq1_0_trit(ib, a_offset, iqs + 1u),
+                ptq1_0_trit(ib, a_offset, iqs + 2u),
+                ptq1_0_trit(ib, a_offset, iqs + 3u));
+}
+#endif
+
 #if defined(DATA_A_Q1_0)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     const uint bits = uint(data_a[a_offset + ib].qs[iqs / 8u]) >> (iqs % 8u);
@@ -561,6 +599,13 @@ vec2 get_dm(uint ib, uint a_offset) {
 #if defined(DATA_A_Q2_0) || defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
 vec2 get_dm(uint ib, uint a_offset) {
     return vec2(float(data_a[a_offset + ib].d), 0);
+}
+#endif
+
+#if defined(DATA_A_PTQ1_0)
+vec2 get_dm(uint ib, uint a_offset) {
+    const float d = float(data_a[a_offset + ib].d);
+    return vec2(d, 0);
 }
 #endif
 
