@@ -966,6 +966,25 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
                     ggml_cuda_cvta_generic_to_shared(tile_y_next_bytes + byte0), by1 + byte0);
             }
 
+            if constexpr (type == GGML_TYPE_Q1_0 && J == 128) {
+                const int kb0_next = kb0 + blocks_per_iter;
+                if (kb0_next < kb0_stop) {
+                    constexpr int hint_stride = 32;
+                    constexpr int hints_per_row =
+                        (blocks_per_iter*sizeof(block_q1_0) + hint_stride - 1) / hint_stride;
+#pragma unroll
+                    for (int linear = tid; linear < I*hints_per_row; linear += nwarps*warp_size) {
+                        const int row  = min(linear / hints_per_row, tile_x_max_i);
+                        const int hint = linear % hints_per_row;
+                        const char * next = reinterpret_cast<const char *>(reinterpret_cast<const block_q1_0 *>(x) +
+                            offset_x + row*stride_row_x + kb0_next) + hint*hint_stride;
+#if defined(__CUDA_ARCH__)
+                        asm volatile("prefetch.global.L2 [%0];" :: "l"(__cvta_generic_to_global(next)));
+#endif
+                    }
+                }
+            }
+
             vec_dot(tile_x, tile_y, sum, 0);
             cp_async_wait_all();
             __syncthreads();
