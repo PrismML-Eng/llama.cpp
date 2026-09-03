@@ -113,6 +113,7 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 #define VDR_Q2_0_Q8_1_MMQ  2  // Q2_0 group 64: 128 bits (4 ints) per block, 2 32-element chunks
 
 #define VDR_PQ2_0_Q8_1_MMVQ 1  // one 32-element chunk at a time (same per-chunk codec as Q2_0)
+#define VDR_PTQ1_0_Q8_1_MMVQ 1 // one 32-element chunk at a time (4 chunks per 128 block)
 #define VDR_PQ2_0_Q8_1_MMQ  2  // Q2_0 group 128: 4 32-element chunks per block
 
 #define VDR_Q4_0_Q8_1_MMVQ 2
@@ -800,6 +801,38 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     // Apply Q2_0's single scale and this chunk's Q8_1 scale
     const float d8 = __low2float(bq8_1_chunk->ds);
     return d2 * d8 * sumi;
+}
+
+// PTQ1_0 x Q8_1. iqs selects one of the four 32-element chunks of the 128-weight
+// block, pairing with one Q8_1 block, same convention as PQ2_0. Trits are gathered
+// individually because base-3 packing gives no byte-aligned run inside a chunk, then
+// packed four at a time into an int so the accumulation can still use dp4a.
+// NOT COMPILED OR RUN: no CUDA toolchain was available where this was written.
+static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_ptq1_0 * bq   = (const block_ptq1_0 *) vbq + kbx;
+    const block_q8_1   * bq8  = bq8_1 + iqs;
+
+    const int base = iqs * 32;
+
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int t0 = ptq1_0_trit(bq, base + j*4 + 0);
+        const int t1 = ptq1_0_trit(bq, base + j*4 + 1);
+        const int t2 = ptq1_0_trit(bq, base + j*4 + 2);
+        const int t3 = ptq1_0_trit(bq, base + j*4 + 3);
+
+        // four signed int8 lanes, -1/0/1
+        const int qx = (t0 & 0xFF) | ((t1 & 0xFF) << 8) | ((t2 & 0xFF) << 16) | ((t3 & 0xFF) << 24);
+        const int u  = get_int_b4(bq8->qs, j);
+
+        sumi = ggml_cuda_dp4a(u, qx, sumi);
+    }
+
+    const float d8 = __low2float(bq8->ds);
+    return (float) bq->d * d8 * sumi;
 }
 
 static __device__ __forceinline__ float vec_dot_pq2_0_q8_1(
