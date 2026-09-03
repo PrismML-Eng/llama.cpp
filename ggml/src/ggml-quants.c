@@ -5712,6 +5712,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_pq2_0, data, nb);
             } break;
+        case GGML_TYPE_PTQ1_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_ptq1_0, data, nb);
+            } break;
         case GGML_TYPE_Q4_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q4_0, data, nb);
