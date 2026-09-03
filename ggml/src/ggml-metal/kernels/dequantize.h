@@ -161,6 +161,50 @@ void dequantize_pq2_0_t4(device const block_pq2_0 * xb, short il, thread type4 &
     reg = (type4) reg_f;
 }
 
+// PTQ1_0 stores trits base-3 packed, so element order is not positional: it follows
+// the CPU codec's 16-then-8 byte staging over qs, then qh at 4 trits per byte.
+// Map an element index to its byte and trit rather than assuming contiguity.
+inline float ptq1_0_elem(device const block_ptq1_0 * xb, int e) {
+    const uchar pow3[5] = {1, 3, 9, 27, 81};
+    uchar q;
+    if (e < 80) {                       // qs[0..15], chunk of 16, 5 trits per byte
+        q = xb->qs[e & 15] * pow3[e >> 4];
+    } else if (e < 120) {               // qs[16..23], chunk of 8
+        const int t = e - 80;
+        q = xb->qs[16 + (t & 7)] * pow3[t >> 3];
+    } else {                            // qh[0..1], 4 trits per byte
+        const int t = e - 120;
+        q = xb->qh[t & 1] * pow3[t >> 1];
+    }
+    return (float) ((int) (((ushort) q * 3) >> 8) - 1);
+}
+
+template <typename type4x4>
+void dequantize_ptq1_0(device const block_ptq1_0 * xb, short il, thread type4x4 & reg) {
+    const float d = xb->d;
+    const int base = il * 16;
+
+    float4x4 reg_f;
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            reg_f[i][j] = ptq1_0_elem(xb, base + i*4 + j) * d;
+        }
+    }
+    reg = (type4x4) reg_f;
+}
+
+template <typename type4>
+void dequantize_ptq1_0_t4(device const block_ptq1_0 * xb, short il, thread type4 & reg) {
+    const float d = xb->d;
+    const int base = il * 4;
+
+    float4 reg_f;
+    for (int j = 0; j < 4; j++) {
+        reg_f[j] = ptq1_0_elem(xb, base + j) * d;
+    }
+    reg = (type4) reg_f;
+}
+
 template <typename type4x4>
 void dequantize_q4_0(device const block_q4_0 * xb, short il, thread type4x4 & reg) {
     device const uint16_t * qs = ((device const uint16_t *)xb + 1);
