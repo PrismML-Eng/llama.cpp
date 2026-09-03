@@ -29,7 +29,7 @@
 
 #define N_R0_PQ2_0 8
 #define N_SG_PQ2_0 2
-#define N_R0_PTQ1_0 8
+#define N_R0_PTQ1_0 4
 #define N_SG_PTQ1_0 2
 
 #define N_R0_Q4_0 4

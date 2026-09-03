@@ -161,35 +161,74 @@ void dequantize_pq2_0_t4(device const block_pq2_0 * xb, short il, thread type4 &
     reg = (type4) reg_f;
 }
 
+// PTQ1_0: one lookup replaces the base-3 arithmetic. Entry b holds the five trits of
+// byte b packed two bits each, low trit first, as 0/1/2 (subtract 1 for the value).
+// Generated from, and verified against, the reference decode ((b*3^n & 0xFF)*3)>>8 for
+// all 256 bytes and all five trit positions. This puts extraction on par with a 2-bit
+// format: shift, mask, subtract, with a single cached table read amortised over 5 trits.
+constant ushort ptq1_0_lut[256] = {
+       0,    0,  256,  512,   64,  320,  576,  128,  384,  640,   16,  272,  528,   80,  336,  592,
+     144,  400,  656,   32,   32,  288,  544,   96,  352,  608,  160,  416,  672,    4,  260,  516,
+      68,  324,  580,  132,  388,  644,   20,  276,  276,  532,   84,  340,  596,  148,  404,  660,
+      36,  292,  548,  100,  356,  612,  164,  420,  676,    8,  264,  520,  520,   72,  328,  584,
+     136,  392,  648,   24,  280,  536,   88,  344,  600,  152,  408,  664,   40,  296,  552,  552,
+     104,  360,  616,  168,  424,  680,    1,  257,  513,   65,  321,  577,  129,  385,  641,   17,
+     273,  529,   81,   81,  337,  593,  145,  401,  657,   33,  289,  545,   97,  353,  609,  161,
+     417,  673,    5,  261,  517,   69,  325,  325,  581,  133,  389,  645,   21,  277,  533,   85,
+     341,  597,  149,  405,  661,   37,  293,  549,  101,  357,  357,  613,  165,  421,  677,    9,
+     265,  521,   73,  329,  585,  137,  393,  649,   25,  281,  537,   89,  345,  601,  601,  153,
+     409,  665,   41,  297,  553,  105,  361,  617,  169,  425,  681,    2,  258,  514,   66,  322,
+     578,  130,  130,  386,  642,   18,  274,  530,   82,  338,  594,  146,  402,  658,   34,  290,
+     546,   98,  354,  610,  162,  162,  418,  674,    6,  262,  518,   70,  326,  582,  134,  390,
+     646,   22,  278,  534,   86,  342,  598,  150,  406,  406,  662,   38,  294,  550,  102,  358,
+     614,  166,  422,  678,   10,  266,  522,   74,  330,  586,  138,  394,  650,  650,   26,  282,
+     538,   90,  346,  602,  154,  410,  666,   42,  298,  554,  106,  362,  618,  170,  426,  682,
+};
+
 // PTQ1_0 stores trits base-3 packed, so element order is not positional: it follows
 // the CPU codec's 16-then-8 byte staging over qs, then qh at 4 trits per byte.
 // Map an element index to its byte and trit rather than assuming contiguity.
 inline float ptq1_0_elem(device const block_ptq1_0 * xb, int e) {
-    const uchar pow3[5] = {1, 3, 9, 27, 81};
-    uchar q;
+    uchar b;
+    short n;
     if (e < 80) {                       // qs[0..15], chunk of 16, 5 trits per byte
-        q = xb->qs[e & 15] * pow3[e >> 4];
+        b = xb->qs[e & 15];      n = e >> 4;
     } else if (e < 120) {               // qs[16..23], chunk of 8
         const int t = e - 80;
-        q = xb->qs[16 + (t & 7)] * pow3[t >> 3];
+        b = xb->qs[16 + (t & 7)]; n = t >> 3;
     } else {                            // qh[0..1], 4 trits per byte
         const int t = e - 120;
-        q = xb->qh[t & 1] * pow3[t >> 1];
+        b = xb->qh[t & 1];        n = t >> 1;
     }
-    return (float) ((int) (((ushort) q * 3) >> 8) - 1);
+    return (float) ((int) ((ptq1_0_lut[b] >> (2*n)) & 3) - 1);
 }
 
 template <typename type4x4>
 void dequantize_ptq1_0(device const block_ptq1_0 * xb, short il, thread type4x4 & reg) {
     const float d = xb->d;
-    const int base = il * 16;
 
     float4x4 reg_f;
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
-            reg_f[i][j] = ptq1_0_elem(xb, base + i*4 + j) * d;
+
+    // il 0..4 addresses the 16-byte chunk at a single trit index, so the pow3 factor
+    // and the branch hoist out and this becomes 16 plain byte loads. il 5..7 straddle
+    // trit indices, or reach into qh, and take the general accessor.
+    if (il < 5) {
+        const short sh = 2*il;
+        device const uchar * qs = xb->qs;
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                reg_f[i][j] = (float) ((int) ((ptq1_0_lut[qs[i*4 + j]] >> sh) & 3) - 1) * d;
+            }
+        }
+    } else {
+        const int base = il * 16;
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                reg_f[i][j] = ptq1_0_elem(xb, base + i*4 + j) * d;
+            }
         }
     }
+
     reg = (type4x4) reg_f;
 }
 

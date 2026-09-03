@@ -510,29 +510,61 @@ kernel void kernel_mul_mv_q2_0_f32(
     kernel_mul_mv_q2_0_f32_impl<N_R0_Q2_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
-// A 16-element span starting at a multiple of 16 below element 80 lies entirely
-// inside one trit index of the 16-byte chunk, so the branch and the pow3 factor
-// hoist out of the loop and the 16 byte loads are the only per-element work.
-// The spans at 80 and above straddle trit indices, so they take the general path.
-inline float ptq1_0_dot_y(device const block_ptq1_0 * qb, thread float * yl, int il) {
-    const uchar pow3[5] = {1, 3, 9, 27, 81};
+// Byte-owning dot for PTQ1_0. The previous mapping gave each thread 16 contiguous
+// weights, which in base-3 layout means every thread reloads the same qs bytes for a
+// different trit index -- five times the byte traffic for the same 24 bytes. Here a
+// thread instead owns whole bytes and consumes all five trits of each one, so a block's
+// 26 bytes are loaded exactly once across the eight threads that cover it. The cost is
+// that the y reads become strided rather than contiguous, which is the cheaper side:
+// weight traffic is what decode is bound by.
+//
+// Byte ownership for thread it in 0..7, matching the CPU codec's element order:
+//   qs[2*it], qs[2*it+1]  -> elements n*16 + m        for n in 0..4
+//   qs[16 + it]           -> elements 80 + n*8 + it   for n in 0..4
+//   qh[it] (it < 2 only)  -> elements 120 + n*2 + it  for n in 0..3
+// Dot against y already staged in registers by the caller and reused across all nr0
+// rows. Trits come out of the byte by the base-3 remainder recurrence
+//   t = (v*3) >> 8,  v = (v*3) & 0xFF,  v starting at the byte
+// which is two integer ops per trit with no table and no pow3 lookup. A 256-entry
+// lookup was measurably worse here: it adds a dependent load per byte, and decode on
+// this kernel is instruction-bound, not bandwidth-bound. Verified against the
+// reference decode for all 256 bytes and all five positions.
+// Accumulates the raw 0/1/2 trit and subtracts the staged y sum once, so there is no
+// per-element offset correction.
+inline float ptq1_0_dot_reg(device const block_ptq1_0 * qb, thread const float * yl, float sumy, short it) {
+    float acc = 0.f;
+    short c = 0;
 
-    float sum = 0.f;
-
-    if (il < 80) {
-        const uchar c = pow3[il >> 4];
-        device const uchar * qs = qb->qs;
-        FOR_UNROLL (short i = 0; i < 16; ++i) {
-            const uchar q = qs[i] * c;
-            sum += (float) ((int) (((ushort) q * 3) >> 8) - 1) * yl[i];
-        }
-    } else {
-        for (short i = 0; i < 16; ++i) {
-            sum += ptq1_0_elem(qb, il + i) * yl[i];
+    FOR_UNROLL (short k = 0; k < 2; ++k) {
+        ushort v = qb->qs[2*it + k];
+        FOR_UNROLL (short n = 0; n < 5; ++n) {
+            const ushort w = v * 3;
+            acc += (float) (w >> 8) * yl[c++];
+            v = w & 0xFF;
         }
     }
 
-    return sum * (float) qb->d;
+    {
+        ushort v = qb->qs[16 + it];
+        FOR_UNROLL (short n = 0; n < 5; ++n) {
+            const ushort w = v * 3;
+            acc += (float) (w >> 8) * yl[c++];
+            v = w & 0xFF;
+        }
+    }
+
+    // qh holds 8 elements; give every thread exactly one so all eight do 16 elements.
+    // Element 120+it sits at trit it>>1 of byte qh[it&1], so step the recurrence to it.
+    {
+        ushort v = qb->qh[it & 1];
+        const short n = it >> 1;
+        for (short i = 0; i < n; ++i) {
+            v = (v * 3) & 0xFF;
+        }
+        acc += (float) ((v * 3) >> 8) * yl[c++];
+    }
+
+    return (acc - sumy) * (float) qb->d;
 }
 
 template<int nr0, typename args_t>
@@ -571,19 +603,39 @@ void kernel_mul_mv_ptq1_0_f32_impl(
     float yl[16];
     float sumf[nr0] = {0.f};
 
-    // group 128: 8 sub-blocks of 16 weights per PTQ1_0 block
+    // eight threads cover one 128-weight block; each owns whole bytes, not a
+    // contiguous element span, so the block's bytes are read once in total
     const short ix = (tiisg/8);
-    const short il = (tiisg%8)*16;
+    const short it = (tiisg%8);
 
-    device const float * yb = y + ix*QK_PTQ1_0 + il;
+    device const float * yb = y + ix*QK_PTQ1_0;
 
     for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/8) {
-        FOR_UNROLL (short i = 0; i < 16; i++) {
-            yl[i] = yb[i];
+        // stage this thread's y values once, then reuse them for every row
+        float sumy = 0.f;
+        short c = 0;
+
+        FOR_UNROLL (short k = 0; k < 2; ++k) {
+            const short m = 2*it + k;
+            FOR_UNROLL (short n = 0; n < 5; ++n) {
+                const float v = yb[n*16 + m];
+                yl[c++] = v;
+                sumy   += v;
+            }
+        }
+        FOR_UNROLL (short n = 0; n < 5; ++n) {
+            const float v = yb[80 + n*8 + it];
+            yl[c++] = v;
+            sumy   += v;
+        }
+        {
+            const float v = yb[120 + it];
+            yl[c++] = v;
+            sumy   += v;
         }
 
         FOR_UNROLL (short row = 0; row < nr0; row++) {
-            sumf[row] += ptq1_0_dot_y(ax[row] + ib, yl, il);
+            sumf[row] += ptq1_0_dot_reg(ax[row] + ib, yl, sumy, it);
         }
 
         yb += QK_PTQ1_0 * (N_SIMDWIDTH/8);
