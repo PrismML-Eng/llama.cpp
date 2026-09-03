@@ -85,6 +85,10 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
+static size_t ggml_cuda_mmq_q8_buffer_size(
+        ggml_type type, bool fallback, int cc,
+        int64_t ne10_padded, int64_t ne11, int64_t ne12, int64_t ne13);
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
         ggml_tensor * dst, const ggml_tensor * gate,
@@ -143,8 +147,10 @@ void ggml_cuda_mul_mat_q(
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
     if (!ids) {
-        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
-            ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+        const size_t nbytes_src1_q8_1 = use_native_fp4 ?
+            ne13*ne12*ne11*ne10_padded*y_block_size/y_values_per_block +
+                ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11)*sizeof(block_q8_1_mmq) :
+            ggml_cuda_mmq_q8_buffer_size(src0->type, fallback, cc, ne10_padded, ne11, ne12, ne13);
         GGML_ASSERT(!external_q8 || (!gate && !use_native_fp4));
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
         char * src1_q8_ptr = external_q8 ? (char *) external_q8 : src1_q8_1.alloc(nbytes_src1_q8_1);
@@ -284,13 +290,18 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
 
+static size_t ggml_cuda_mmq_q8_buffer_size(
+        ggml_type type, bool fallback, int cc,
+        int64_t ne10_padded, int64_t ne11, int64_t ne12, int64_t ne13) {
+    return ne13*ne12*ne11*ne10_padded*sizeof(block_q8_1_mmq)/QK8_1_MMQ +
+        ggml_cuda_mmq_get_J_max(type, fallback, cc, ne11)*sizeof(block_q8_1_mmq);
+}
+
 size_t ggml_cuda_mul_mat_q_q8_size(const ggml_tensor * src0, const ggml_tensor * src1) {
     GGML_ASSERT(src0 && src1 && src1->type == GGML_TYPE_F32);
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
-    const bool fallback = src0->ne[1] % 128 != 0;
-    return src1->ne[3]*src1->ne[2]*src1->ne[1]*ne10_padded*sizeof(block_q8_1_mmq)/QK8_1_MMQ +
-        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, src1->ne[1])*sizeof(block_q8_1_mmq);
+    return ggml_cuda_mmq_q8_buffer_size(src0->type, src0->ne[1] % 128 != 0, cc,
+        GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING), src1->ne[1], src1->ne[2], src1->ne[3]);
 }
 
 void ggml_cuda_mul_mat_q_fused_two(
@@ -317,8 +328,8 @@ void ggml_cuda_mul_mat_q_fused_two(
     const bool fallback = src0_a->ne[1] % 128 != 0;
     GGML_ASSERT(fallback == (src0_b->ne[1] % 128 != 0));
 
-    const size_t nbytes_src1_q8_1 = ne13*ne12*ne11*ne10_padded*sizeof(block_q8_1_mmq)/QK8_1_MMQ +
-        ggml_cuda_mmq_get_J_max(src0_a->type, fallback, cc, ne11)*sizeof(block_q8_1_mmq);
+    const size_t nbytes_src1_q8_1 = ggml_cuda_mmq_q8_buffer_size(
+        src0_a->type, fallback, cc, ne10_padded, ne11, ne12, ne13);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
     const int64_t s11 = src1->nb[1] / sizeof(float);
     const int64_t s12_src = src1->nb[2] / sizeof(float);
@@ -328,7 +339,7 @@ void ggml_cuda_mul_mat_q_fused_two(
                                ne10, s11, s12_src, s13_src, ne10_padded, ne11, ne12, ne13, stream);
     CUDA_CHECK(cudaGetLastError());
 
-    const int64_t stride_q_channel = ne11*ne10_padded*sizeof(block_q8_1)/(QK8_1*sizeof(int));
+    const int64_t stride_q_channel = ne11*ne10_padded*sizeof(block_q8_1_mmq)/(QK8_1_MMQ*sizeof(int));
     const int64_t stride_q_sample = ne12*stride_q_channel;
     auto launch_one = [&](const ggml_tensor * src0, ggml_tensor * dst) {
         GGML_ASSERT(src0->type == src0_a->type && src0->ne[0] == ne10);

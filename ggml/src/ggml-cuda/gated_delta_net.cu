@@ -323,7 +323,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
     if (!kda && S_v == 128 && n_tokens >= 32 &&
             ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK) {
         const int64_t n_g = ggml_nelements(src_g);
-        g_exp_alloc.alloc(n_g*sizeof(float));
+        g_exp_alloc.alloc(n_g);
         const int block = 256;
         const int grid = std::min<int64_t>((n_g + block - 1)/block, 4096);
         gdn_precompute_exp<<<grid, block, 0, stream>>>(g_d, g_exp_alloc.ptr, n_g);

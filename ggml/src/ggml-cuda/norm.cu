@@ -334,18 +334,7 @@ static void norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
-    const char * rms128_env = getenv("GGML_CUDA_GB10_RMS128");
-    const bool use_rms128 = ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK &&
-        ncols <= 128 && (!rms128_env || std::atoi(rms128_env) != 0);
-    if (use_rms128) {
-        const dim3 block_dims(128, 1, 1);
-        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32 * sizeof(float), stream};
-        ggml_cuda_kernel_launch(rms_norm_f32<128, false>, launch_params,
-            x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
-        // underlying cudaLaunchKernelEx does not support default params
-        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
-        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
-    } else if (ncols < 1024) {
+    if (ncols < 1024) {
         const dim3 block_dims(WARP_SIZE, 1, 1);
         norm_f32<WARP_SIZE><<<blocks_num, block_dims, 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
     } else {
@@ -369,7 +358,21 @@ static void rms_norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
-    if (ncols < 1024) {
+    static const bool rms128_enabled = [] {
+        const char * env = getenv("GGML_CUDA_GB10_RMS128");
+        return !env || std::atoi(env) != 0;
+    }();
+    const bool use_rms128 = ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK &&
+        ncols <= 128 && rms128_enabled;
+    if (use_rms128) {
+        const dim3 block_dims(128, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32 * sizeof(float), stream};
+        ggml_cuda_kernel_launch(rms_norm_f32<128, false>, launch_params,
+            x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
+        // underlying cudaLaunchKernelEx does not support default params
+        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+    } else if (ncols < 1024) {
         const dim3 block_dims(256, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
         ggml_cuda_kernel_launch(rms_norm_f32<256, false>, launch_params,
@@ -424,9 +427,12 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
         const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
         const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
-        const char * rms128_env = getenv("GGML_CUDA_GB10_RMS128");
+        static const bool rms128_enabled = [] {
+            const char * env = getenv("GGML_CUDA_GB10_RMS128");
+            return !env || std::atoi(env) != 0;
+        }();
         const bool use_rms128 = ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK &&
-            ncols <= 128 && (!rms128_env || std::atoi(rms128_env) != 0);
+            ncols <= 128 && rms128_enabled;
         if (use_rms128) {
             const dim3 block_dims(128, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 32 * sizeof(float), stream};

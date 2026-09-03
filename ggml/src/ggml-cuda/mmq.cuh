@@ -969,6 +969,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             vec_dot(tile_x, tile_y, sum, 0);
             cp_async_wait_all();
             __syncthreads();
+            // by1 is the second half of the same K tile; using a separate shared-memory
+            // buffer changes only its address, while MMQ_TILE_NE_K preserves its logical offset.
             vec_dot(tile_x, tile_y_next, sum, MMQ_TILE_NE_K);
             __syncthreads();
             continue;

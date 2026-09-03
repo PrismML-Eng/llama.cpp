@@ -495,7 +495,8 @@ static __global__ void quantize_mmq_q8_1(
     // Load 4 floats per thread and calculate max. abs. value between them:
     float4 xi = i0 < ne00 ? x4[(base_idx + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     if constexpr (swiglu) {
-        const float4 gi = ((const float4 *) gate)[(base_idx + i00)/4];
+        const float4 gi = i0 < ne00 ? ((const float4 *) gate)[(base_idx + i00)/4] :
+                                      make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         xi.x *= ggml_cuda_op_silu_single(gi.x);
         xi.y *= ggml_cuda_op_silu_single(gi.y);
         xi.z *= ggml_cuda_op_silu_single(gi.z);
