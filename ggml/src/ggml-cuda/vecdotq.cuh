@@ -803,82 +803,158 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     return d2 * d8 * sumi;
 }
 
-// PTQ1_0 x Q8_1. One call consumes the whole 128-weight block and all four q8_1
-// blocks that cover it, so VDR is 4 rather than 1: that keeps the byte walk uniform
-// across lanes instead of branching on which byte holds element e, which diverges
-// because iqs differs per lane.
-//
-// MEASURED AND STILL SLOW. On a 4090 against pq2_0, us/run at m=4096 k=14336:
-//   n=1   46.8 -> (per-chunk version)      pq2_0  9.75
-//   n=2   70.6 -> 64.6 with this version   pq2_0 11.05
-//   n=8                        287.3       pq2_0 31.27
-// So roughly 6x to 9x slower. Removing the divergent branch bought only ~9%, so the
-// branch was not the dominant cost. The remaining cost is load shape: this issues 128
-// scalar int8 reads of the q8_1 activations, one per element, where pq2_0 issues eight
-// dp4a calls over 4-byte words.
-//
-// The fix, not implemented here: for elements 4j..4j+3 below element 80 the stride is
-// 16 and 4 divides 16, so four CONSECUTIVE elements are four consecutive BYTES at the
-// same trit index. Four recurrences packed into one int would then feed dp4a against a
-// 4-byte q8_1 load, matching pq2_0's load shape. That needs a build to verify and is
-// left as the next step rather than guessed at.
-static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+#if !defined(GGML_USE_HIP)
+template <int ncols_dst>
+static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __restrict__ vbq,
+                                                                 const block_q8_1 * __restrict__ bq8_1,
+                                                                 const int &    kbx,
+                                                                 const int &    iqs,
+                                                                 const uint32_t stride_col_y,
+                                                                 float *        result) {
+    const block_ptq1_0 * bq                 = (const block_ptq1_0 *) vbq + kbx;
+    int                  sumi[ncols_dst][4] = {};
 
-    const block_ptq1_0 * bq = (const block_ptq1_0 *) vbq + kbx;
+    // Widen four bytes to 16-bit lanes so multiply-by-three cannot carry between bytes.
+#    pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        const uint32_t packed = get_int_b4(bq->qs, g);
+        uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);
+        uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342);
 
-    int sumi[4] = {0, 0, 0, 0};
+#    pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo                = w_lo & 0x00FF00FF;
+            v_hi                = w_hi & 0x00FF00FF;
 
-#pragma unroll
-    for (int m = 0; m < 16; ++m) {                 // qs[0..15]: element m + 16*t
+            const int q = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+            const int e = t * 16 + 4 * g;
+#    pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const int u     = get_int_b4(bq8_1[j * stride_col_y + iqs + (e >> 5)].qs, (e & 31) >> 2);
+                sumi[j][e >> 5] = ggml_cuda_dp4a(q, u, sumi[j][e >> 5]);
+            }
+        }
+    }
+
+#    pragma unroll
+    for (int g = 0; g < 2; ++g) {
+        const uint32_t packed = get_int_b4(bq->qs + 16, g);
+        uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);
+        uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342);
+
+#    pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo                = w_lo & 0x00FF00FF;
+            v_hi                = w_hi & 0x00FF00FF;
+
+            const int q = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+            const int e = 80 + t * 8 + 4 * g;
+#    pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const int u     = get_int_b4(bq8_1[j * stride_col_y + iqs + (e >> 5)].qs, (e & 31) >> 2);
+                sumi[j][e >> 5] = ggml_cuda_dp4a(q, u, sumi[j][e >> 5]);
+            }
+        }
+    }
+
+    uint32_t v = (uint32_t) bq->qh[0] | ((uint32_t) bq->qh[1] << 16);
+#    pragma unroll
+    for (int t = 0; t < 4; t += 2) {
+        const uint32_t w0 = v * 3;
+        v                 = w0 & 0x00FF00FF;
+        const uint32_t w1 = v * 3;
+        v                 = w1 & 0x00FF00FF;
+
+        const int q = __vsub4(__byte_perm(w0, w1, 0x7531), 0x01010101);
+#    pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const int u = get_int_b4(bq8_1[j * stride_col_y + iqs + 3].qs, 6 + t / 2);
+            sumi[j][3]  = ggml_cuda_dp4a(q, u, sumi[j][3]);
+        }
+    }
+
+    const float d = (float) bq->d;
+#    pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        float acc = 0.0f;
+#    pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            acc += __low2float(bq8_1[j * stride_col_y + iqs + k].ds) * (float) sumi[j][k];
+        }
+        result[j] = d * acc;
+    }
+}
+#endif
+
+// PTQ1_0 x Q8_1. One call consumes the full 128-weight block.
+static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(const void * __restrict__ vbq,
+                                                            const block_q8_1 * __restrict__ bq8_1,
+                                                            const int & kbx,
+                                                            const int & iqs) {
+#if defined(GGML_USE_HIP)
+    const block_ptq1_0 * bq      = (const block_ptq1_0 *) vbq + kbx;
+    int                  sumi[4] = { 0, 0, 0, 0 };
+
+#    pragma unroll
+    for (int m = 0; m < 16; ++m) {
         uint32_t v = bq->qs[m];
-#pragma unroll
+#    pragma unroll
         for (int t = 0; t < 5; ++t) {
             const uint32_t w = v * 3;
-            const int q = (int) (w >> 8) - 1;
-            v = w & 0xFF;
-            const int e = t*16 + m;
+            const int      q = (int) (w >> 8) - 1;
+            v                = w & 0xFF;
+            const int e      = t * 16 + m;
             sumi[e >> 5] += q * (int) bq8_1[iqs + (e >> 5)].qs[e & 31];
         }
     }
 
-#pragma unroll
-    for (int m = 0; m < 8; ++m) {                  // qs[16..23]: element 80 + 8*t + m
+#    pragma unroll
+    for (int m = 0; m < 8; ++m) {
         uint32_t v = bq->qs[16 + m];
-#pragma unroll
+#    pragma unroll
         for (int t = 0; t < 5; ++t) {
             const uint32_t w = v * 3;
-            const int q = (int) (w >> 8) - 1;
-            v = w & 0xFF;
-            const int e = 80 + t*8 + m;
+            const int      q = (int) (w >> 8) - 1;
+            v                = w & 0xFF;
+            const int e      = 80 + t * 8 + m;
             sumi[e >> 5] += q * (int) bq8_1[iqs + (e >> 5)].qs[e & 31];
         }
     }
 
-#pragma unroll
-    for (int h = 0; h < 2; ++h) {                  // qh[0..1]: element 120 + 2*t + h
+#    pragma unroll
+    for (int h = 0; h < 2; ++h) {
         uint32_t v = bq->qh[h];
-#pragma unroll
+#    pragma unroll
         for (int t = 0; t < 4; ++t) {
             const uint32_t w = v * 3;
-            const int q = (int) (w >> 8) - 1;
-            v = w & 0xFF;
-            const int e = 120 + t*2 + h;
+            const int      q = (int) (w >> 8) - 1;
+            v                = w & 0xFF;
+            const int e      = 120 + t * 2 + h;
             sumi[e >> 5] += q * (int) bq8_1[iqs + (e >> 5)].qs[e & 31];
         }
     }
 
     float acc = 0.0f;
-#pragma unroll
+#    pragma unroll
     for (int k = 0; k < 4; ++k) {
         acc += __low2float(bq8_1[iqs + k].ds) * (float) sumi[k];
     }
     return (float) bq->d * acc;
+#else
+    float result;
+    vec_dot_ptq1_0_q8_1_multi<1>(vbq, bq8_1, kbx, iqs, 0, &result);
+    return result;
+#endif
 }
 
-static __device__ __forceinline__ float vec_dot_pq2_0_q8_1(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
-
+static __device__ __forceinline__ float vec_dot_pq2_0_q8_1(const void * __restrict__ vbq,
+                                                           const block_q8_1 * __restrict__ bq8_1,
+                                                           const int & kbx,
+                                                           const int & iqs) {
     const block_pq2_0 * bq2_0 = (const block_pq2_0 *) vbq + kbx;
 
     // Q2_0 group 128: 128 elements, ONE scale, processed as four 32-element chunks

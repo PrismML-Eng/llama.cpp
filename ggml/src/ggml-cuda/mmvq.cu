@@ -665,24 +665,52 @@ static __global__ void mul_mat_vec_q(
         // x block quant index when casting the quants to int
         const int kqs = vdr * (tid % (qi/vdr));
 
-#pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
-#pragma unroll
+#if !defined(GGML_USE_HIP)
+        if constexpr (type == GGML_TYPE_PTQ1_0 && ncols_dst > 1 && ncols_dst <= 3) {
+#    pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                float dots[ncols_dst];
+                vec_dot_ptq1_0_q8_1_multi<ncols_dst>(vx, &y[kby], kbx_offset + i * stride_row_x + kbx, kqs,
+                                                     stride_col_y, dots);
+#    pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    tmp[j][i] += dots[j];
+                }
+
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        vec_dot_ptq1_0_q8_1_multi<ncols_dst>(vgate, &y[kby], kbx_offset + i * stride_row_x + kbx, kqs,
+                                                             stride_col_y, dots);
+#    pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) {
+                            tmp_gate[j][i] += dots[j];
+                        }
+                    }
+                }
+            }
+        } else
+#endif
+        {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp[j][i] +=
+                        vec_dot_q_cuda(vx, &y[j * stride_col_y + kby], kbx_offset + i * stride_row_x + kbx, kqs);
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_gate[j][i] += vec_dot_q_cuda(vgate, &y[j * stride_col_y + kby],
+                                                             kbx_offset + i * stride_row_x + kbx, kqs);
+                        }
                     }
                 }
             }
         }
     }
 
-    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
-    [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+    __shared__ float tmp_shared[nwarps - 1 > 0 ? nwarps - 1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+    [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps - 1 > 0)) ? nwarps - 1 : 1][ncols_dst]
+                                                     [rows_per_cuda_block][warp_size];
 
     if (threadIdx.y > 0) {
 #pragma unroll
