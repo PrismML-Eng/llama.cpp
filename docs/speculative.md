@@ -78,6 +78,45 @@ See:
 
 - #22105
 
+### DFly
+
+DFly (AngelSpec) is a DFlash variant, so it runs through `draft-dflash` and is detected from the
+checkpoint rather than selected with its own `--spec-type`. It differs from plain DFlash in two
+ways: the captured target features are fused once per *draft layer* instead of once for the whole
+draft model, and a predecessor correction is applied to each block position before the target head,
+chained on the token drafted at the previous position.
+
+Convert it with `--target-model-dir`, as for DFlash. Pin a revision: the reference checkpoint's
+`main` states a target depth and vocabulary that do not match its weights, which loads cleanly and
+then mis-projects.
+
+```bash
+python convert_hf_to_gguf.py AngelSlim/Qwen3-8B-DFly-Block8 \
+    --target-model-dir Qwen/Qwen3-8B --outtype bf16 --outfile Qwen3-8B-DFly.gguf
+
+llama-server -m Qwen3-8B.gguf -md Qwen3-8B-DFly.gguf \
+    --spec-draft-n-max 6 -fa on --jinja
+```
+
+#### Tuning `--spec-draft-n-max`
+
+The correction runs one full output-head projection per block position, so a DFly draft round costs
+roughly `fixed + k * per_position` while the tokens it commits saturate with depth. The optimum is
+therefore interior, and the default (the trained block size minus one) is not always it.
+
+Measured on an M5 Pro with the pairing above, greedy, interleaved rounds:
+
+| `--spec-draft-n-max` | tok/s | acceptance | committed tokens per round |
+|---|---|---|---|
+| 5 | 35.7 | 57.5% | 4.00 |
+| 6 | 42.0 | 64.9% | 4.99 |
+| 7 (default for block size 8) | 37.5 | 52.7% | 4.82 |
+
+Sweep it rather than assuming the largest value wins. The optimum depends on how the backend prices
+a multi-row verify, so it moves with hardware and with the target, and is not a property of the
+drafter alone. Note also that changing the value changes the shape of the drafted block, so the
+drafts differ entirely between settings rather than simply being truncated.
+
 ### DSpark (`draft-dspark`)
 
 DSpark extends DFlash with a semi-autoregressive _Markov head_: the draft still emits a whole
