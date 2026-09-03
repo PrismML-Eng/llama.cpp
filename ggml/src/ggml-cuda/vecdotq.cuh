@@ -113,7 +113,7 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 #define VDR_Q2_0_Q8_1_MMQ  2  // Q2_0 group 64: 128 bits (4 ints) per block, 2 32-element chunks
 
 #define VDR_PQ2_0_Q8_1_MMVQ 1  // one 32-element chunk at a time (same per-chunk codec as Q2_0)
-#define VDR_PTQ1_0_Q8_1_MMVQ 1 // one 32-element chunk at a time (4 chunks per 128 block)
+#define VDR_PTQ1_0_Q8_1_MMVQ 4 // whole 128 block per call: keeps the byte walk uniform across lanes
 #define VDR_PQ2_0_Q8_1_MMQ  2  // Q2_0 group 128: 4 32-element chunks per block
 
 #define VDR_Q4_0_Q8_1_MMVQ 2
@@ -803,36 +803,77 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     return d2 * d8 * sumi;
 }
 
-// PTQ1_0 x Q8_1. iqs selects one of the four 32-element chunks of the 128-weight
-// block, pairing with one Q8_1 block, same convention as PQ2_0. Trits are gathered
-// individually because base-3 packing gives no byte-aligned run inside a chunk, then
-// packed four at a time into an int so the accumulation can still use dp4a.
-// NOT COMPILED OR RUN: no CUDA toolchain was available where this was written.
+// PTQ1_0 x Q8_1. One call consumes the whole 128-weight block and all four q8_1
+// blocks that cover it, so VDR is 4 rather than 1: that keeps the byte walk uniform
+// across lanes instead of branching on which byte holds element e, which diverges
+// because iqs differs per lane.
+//
+// MEASURED AND STILL SLOW. On a 4090 against pq2_0, us/run at m=4096 k=14336:
+//   n=1   46.8 -> (per-chunk version)      pq2_0  9.75
+//   n=2   70.6 -> 64.6 with this version   pq2_0 11.05
+//   n=8                        287.3       pq2_0 31.27
+// So roughly 6x to 9x slower. Removing the divergent branch bought only ~9%, so the
+// branch was not the dominant cost. The remaining cost is load shape: this issues 128
+// scalar int8 reads of the q8_1 activations, one per element, where pq2_0 issues eight
+// dp4a calls over 4-byte words.
+//
+// The fix, not implemented here: for elements 4j..4j+3 below element 80 the stride is
+// 16 and 4 divides 16, so four CONSECUTIVE elements are four consecutive BYTES at the
+// same trit index. Four recurrences packed into one int would then feed dp4a against a
+// 4-byte q8_1 load, matching pq2_0's load shape. That needs a build to verify and is
+// left as the next step rather than guessed at.
 static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
-    const block_ptq1_0 * bq   = (const block_ptq1_0 *) vbq + kbx;
-    const block_q8_1   * bq8  = bq8_1 + iqs;
+    const block_ptq1_0 * bq = (const block_ptq1_0 *) vbq + kbx;
 
-    const int base = iqs * 32;
+    int sumi[4] = {0, 0, 0, 0};
 
-    int sumi = 0;
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int t0 = ptq1_0_trit(bq, base + j*4 + 0);
-        const int t1 = ptq1_0_trit(bq, base + j*4 + 1);
-        const int t2 = ptq1_0_trit(bq, base + j*4 + 2);
-        const int t3 = ptq1_0_trit(bq, base + j*4 + 3);
-
-        // four signed int8 lanes, -1/0/1
-        const int qx = (t0 & 0xFF) | ((t1 & 0xFF) << 8) | ((t2 & 0xFF) << 16) | ((t3 & 0xFF) << 24);
-        const int u  = get_int_b4(bq8->qs, j);
-
-        sumi = ggml_cuda_dp4a(u, qx, sumi);
+    for (int m = 0; m < 16; ++m) {                 // qs[0..15]: element m + 16*t
+        uint32_t v = bq->qs[m];
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w = v * 3;
+            const int q = (int) (w >> 8) - 1;
+            v = w & 0xFF;
+            const int e = t*16 + m;
+            sumi[e >> 5] += q * (int) bq8_1[iqs + (e >> 5)].qs[e & 31];
+        }
     }
 
-    const float d8 = __low2float(bq8->ds);
-    return (float) bq->d * d8 * sumi;
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {                  // qs[16..23]: element 80 + 8*t + m
+        uint32_t v = bq->qs[16 + m];
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w = v * 3;
+            const int q = (int) (w >> 8) - 1;
+            v = w & 0xFF;
+            const int e = 80 + t*8 + m;
+            sumi[e >> 5] += q * (int) bq8_1[iqs + (e >> 5)].qs[e & 31];
+        }
+    }
+
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {                  // qh[0..1]: element 120 + 2*t + h
+        uint32_t v = bq->qh[h];
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const uint32_t w = v * 3;
+            const int q = (int) (w >> 8) - 1;
+            v = w & 0xFF;
+            const int e = 120 + t*2 + h;
+            sumi[e >> 5] += q * (int) bq8_1[iqs + (e >> 5)].qs[e & 31];
+        }
+    }
+
+    float acc = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        acc += __low2float(bq8_1[iqs + k].ds) * (float) sumi[k];
+    }
+    return (float) bq->d * acc;
 }
 
 static __device__ __forceinline__ float vec_dot_pq2_0_q8_1(
