@@ -85,7 +85,7 @@ def main() -> None:
     # DFly encoder: shared base projection + per-draft-layer fusion, then context_norm.
     # Note there is NO enc.output_norm (hidden_norm): DFly replaces it with context_norm.
     t("fc.weight", (n_embd, n_feat * n_embd))
-    t("layer_fusion.weight", (n_layer, n_feat))
+    t("layer_fusion", (n_layer, n_feat))
     t("context_norm.weight", (n_embd,))
 
     # TreeFlash predecessor correction (swiglu over [hidden ; prev-token embedding])

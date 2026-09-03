@@ -21,7 +21,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     // buffer and the embd batch that feeds it back are sized from n_embd_out(), so widening
     // it here is the whole host-side contract change. Detected from the fusion tensor rather
     // than a KV so a DFly export cannot load as plain DFlash.
-    if (ml.get_tensor_meta("layer_fusion.weight")) {
+    if (ml.get_tensor_meta("layer_fusion")) {
         hparams.n_embd_out_impl = hparams.n_layer() * hparams.n_embd;
         LLAMA_LOG_INFO("%s: DFly per-layer context fusion (n_layer = %u, n_embd_out = %u)\n",
                 __func__, hparams.n_layer(), hparams.n_embd_out());
@@ -128,7 +128,7 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     // AngelSpec DFly: per-draft-layer context fusion + TreeFlash predecessor correction.
     // Detected from the fusion tensor, and checked before the Markov head below so a
     // checkpoint carrying both is reported as such rather than as a missing tensor.
-    const bool is_dfly = ml->get_tensor_meta("layer_fusion.weight") != nullptr;
+    const bool is_dfly = ml->get_tensor_meta("layer_fusion") != nullptr;
 
     if (is_dfly && d2t) {
         throw std::runtime_error("dflash: DFly with a reduced draft vocabulary (d2t) is not supported. "
@@ -189,7 +189,7 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     if (is_dfly) {
         const int64_t n_ctx_feat = (int64_t) target_layer_ids.size();
 
-        dfly_layer_fusion = create_tensor(tn(LLM_TENSOR_DFLY_LAYER_FUSION, "weight"), { n_ctx_feat, n_layer }, 0);
+        dfly_layer_fusion = create_tensor(tn(LLM_TENSOR_DFLY_LAYER_FUSION), { n_ctx_feat, n_layer }, 0);
         dfly_ctx_norm     = create_tensor(tn(LLM_TENSOR_DFLY_CTX_NORM,     "weight"), { n_embd },             0);
 
         // TreeFlash predecessor correction. Optional in the reference
@@ -206,6 +206,10 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
             dfly_hc_down        = create_tensor(tn(LLM_TENSOR_DFLY_HC_DOWN,        "weight"), { n_ff_hc,  n_embd },    0);
 
             LLAMA_LOG_INFO("%s: DFly predecessor correction (n_ff = %lld)\n", __func__, (long long) n_ff_hc);
+            LLAMA_LOG_WARN("%s: DFly predecessor-correction CHAIN IS NOT ENABLED. It is still under "
+                    "development (nondeterministic uninitialised read; see the notes on this branch), "
+                    "so drafts are produced WITHOUT the correction and acceptance will be near zero. "
+                    "Set LLAMA_DFLY_CHAIN=1 to run it anyway.\n", __func__);
         } else {
             LLAMA_LOG_INFO("%s: DFly without predecessor correction\n", __func__);
         }
@@ -486,7 +490,8 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 // DSpark Markov head.
 //
 // Reference: _DflyDraftSampler.__call__ + DFlyHiddenStatesCorrection.forward.
-static void build_dfly_correction_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+static void build_dfly_correction_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens,
+        ggml_tensor * inp_embd_raw) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -513,6 +518,29 @@ static void build_dfly_correction_head(llm_graph_context & g, const llama_model 
         return;
     }
 
+    // Only a noise block carries a chain. The draft context also decodes ordinary batches
+    // (context staging before the K/V injection), and those have no anchor to condition on --
+    // their slot 0 is the caller's id_last, which is LLAMA_TOKEN_NULL until the first token is
+    // committed. Chaining one of those would read token embedding row -1. A block is
+    // [id_last, MASK, MASK, ...] per sequence, so check that shape before building anything.
+    if (g.ubatch.token == nullptr) {
+        return;
+    }
+
+    const llama_token mask_id = model.vocab.token_mask();
+
+    for (int64_t b = 0; b < n_blocks; ++b) {
+        const llama_token anchor = g.ubatch.token[b*block_drafts];
+        if (anchor < 0 || anchor >= (llama_token) model.vocab.n_tokens()) {
+            return;
+        }
+        for (int64_t i = 1; i < block_drafts; ++i) {
+            if (g.ubatch.token[b*block_drafts + i] != mask_id) {
+                return;
+            }
+        }
+    }
+
     // the target's head and embeddings when the draft ships none (shared via ctx_other)
     auto * output   = model.output;
     auto * output_s = model.output_s;
@@ -531,13 +559,15 @@ static void build_dfly_correction_head(llm_graph_context & g, const llama_model 
         }
     }
 
-    const size_t token_stride  = (size_t) block_drafts * tokens->nb[0];
+
     const size_t hidden_stride = (size_t) block_drafts * hidden->nb[1];
     const size_t base_stride   = (size_t) block_drafts * base->nb[1];
 
-    // anchor (committed) token of every block: token 0 of each block, a strided view
-    ggml_tensor * prev = ggml_view_2d(ctx0, tokens, 1, n_blocks, token_stride, 0);
-    prev = ggml_cont_1d(ctx0, prev, n_blocks);
+    // position 1 conditions on the block anchor: take its embedding from the rows already
+    // gathered by the decoder. prev stays null until the chain produces its first token.
+    ggml_tensor * prev      = nullptr;
+    ggml_tensor * prev_embd = ggml_cont(ctx0, ggml_view_2d(ctx0, inp_embd_raw, n_embd, n_blocks,
+                (size_t) block_drafts * inp_embd_raw->nb[1], 0));
 
     // the anchor slot is not predicted: pass its uncorrected logits through so the output
     // keeps one row per ubatch token
@@ -546,7 +576,10 @@ static void build_dfly_correction_head(llm_graph_context & g, const llama_model 
     for (int64_t i = 1; i < block_drafts; ++i) {
         // predecessor correction: delta = down(silu(gate(z)) * up(z)),
         //                         z = [rms(h_i); rms(embd(prev))]
-        ggml_tensor * prev_embd = ggml_get_rows(ctx0, tok_embd, prev); // [n_embd, n_blocks]
+        if (prev) {
+            // chained positions condition on the previously drafted token: an argmax, always in range
+            prev_embd = ggml_get_rows(ctx0, tok_embd, prev); // [n_embd, n_blocks]
+        }
 
         ggml_tensor * h_i = ggml_cont(ctx0, ggml_view_2d(ctx0, hidden, n_embd, n_blocks,
                     hidden_stride, i*hidden->nb[1]));
@@ -603,6 +636,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
+
 
     // KV cache injection
     if (ubatch.embd) {
@@ -702,6 +736,12 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
     cb(inpL, "inp_noise_embd", -1);
+
+    // the DFly chain conditions position 1 on the block anchor's embedding; reuse the rows
+    // gathered here instead of re-fetching by id, so the chain never indexes the embedding
+    // table with the caller's id_last (which is -1 before the first commit, and which a
+    // build-time check cannot catch once graphs start being reused across batches)
+    ggml_tensor * inp_embd_raw = inpL;
 
     // dspark GIDD log-SNR conditioning (LogSnrEmbed): added to the draft noise
     // embedding before the layer loop, matching the training reference. The
@@ -858,9 +898,10 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         build_dspark_markov_head(*this, model, inp_tokens);
     }
 
+
     // DFly: re-derive the draft logits through the chained predecessor correction
-    if (model.dfly_hc_down) {
-        build_dfly_correction_head(*this, model, inp_tokens);
+    if (model.dfly_hc_down && getenv("LLAMA_DFLY_CHAIN") != nullptr) {
+        build_dfly_correction_head(*this, model, inp_tokens, inp_embd_raw);
     }
 }
 
