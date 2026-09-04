@@ -1341,9 +1341,7 @@ UseGgmlGemm1:;
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        // an F16 src1 is converted straight to float below, so it is only valid when the
-        // wdata rows are floats. A quantized vec_dot_type would size them at about one
-        // byte per element and the conversion would run off the end of the buffer.
+        // F16 src1 converts straight to float, so wdata rows must be floats; a quantized vec_dot_type would overrun the buffer
         GGML_ASSERT(src1->type == GGML_TYPE_F32 ||
                     (src1->type == GGML_TYPE_F16 && vec_dot_type == GGML_TYPE_F32));
 
