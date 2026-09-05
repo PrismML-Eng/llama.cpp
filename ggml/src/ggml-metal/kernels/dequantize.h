@@ -754,39 +754,47 @@ void dequantize_iq4_xs(device const block_iq4_xs * xb, short il, thread type4x4 
 //   i <  160: qs[i%32]        digit i/32
 //   i <  240: qs[32 + (i-160)%16] digit (i-160)/16
 //   i <  256: qh[(i-240)%4]   digit (i-240)/4
-// A digit is recovered by multiplying the byte by 3^n modulo 256 and taking the
-// top of (q*3), which is the same trick the CPU reference uses.
-static inline float tq1_0_trit(uchar b, short n) {
-    const uchar pow3[5] = {1, 3, 9, 27, 81};
-    const uchar q  = (uchar) ((uint) b * (uint) pow3[n]);
-    const short xi = (short) ((((ushort) q) * 3) >> 8);
-    return (float) (xi - 1);
-}
-
+//
+// A packed byte is a base-3 fraction of 256: with u = b/256, digit n is
+//   g_{n+1} - 3*g_n,   g_k = floor(3^k * u)
+// and 3^k*b <= 61965 is exact in fp32, so this matches the integer reference bit
+// for bit while staying in the float pipe, which matters on an ISA that cannot
+// co-issue integer and floating-point work.
+//
+// The sixteen elements of one call also share a digit index. For il < 10 they are
+// sixteen consecutive bytes of the 32-byte qs region at digit il/2; for
+// 10 <= il < 15 they are sixteen consecutive bytes of the 16-byte region at digit
+// il-10; only il == 15 walks the qh tail, which packs four digits into four bytes.
+// Hoisting that turns the per-element modulo, divide and integer multiply-shift
+// into two loop-invariant constants and a floor.
 template <typename type4x4>
 void dequantize_tq1_0(device const block_tq1_0 * xb, short il, thread type4x4 & reg) {
-    device const uint8_t * qs = xb->qs;
-    device const uint8_t * qh = xb->qh;
+    const float pow3f[5] = {1.0f, 3.0f, 9.0f, 27.0f, 81.0f};
+
     const float d = xb->d;
 
     float4x4 reg_f;
 
-    const short base = il * 16;
-    for (short k = 0; k < 16; k++) {
-        const short i = base + k;
+    if (il < 15) {
+        device const uint8_t * p = xb->qs + (il < 10 ? (il & 1)*16 : 32);
 
-        float v;
-        if (i < 160) {
-            v = tq1_0_trit(qs[i % 32], i / 32);
-        } else if (i < 240) {
-            const short t = i - 160;
-            v = tq1_0_trit(qs[32 + (t % 16)], t / 16);
-        } else {
-            const short t = i - 240;
-            v = tq1_0_trit(qh[t % 4], t / 4);
+        const float c0 = pow3f[il < 10 ? (il >> 1) : (il - 10)];
+        const float c1 = 3.0f*c0;
+
+        for (short k = 0; k < 16; k++) {
+            const float u = (float) p[k] * (1.0f/256.0f);
+
+            reg_f[k/4][k%4] = d*(floor(c1*u) - 3.0f*floor(c0*u) - 1.0f);
         }
+    } else {
+        device const uint8_t * p = xb->qh;
 
-        reg_f[k/4][k%4] = d * v;
+        for (short k = 0; k < 16; k++) {
+            const float c0 = pow3f[k >> 2];
+            const float u  = (float) p[k & 3] * (1.0f/256.0f);
+
+            reg_f[k/4][k%4] = d*(floor(3.0f*c0*u) - 3.0f*floor(c0*u) - 1.0f);
+        }
     }
 
     reg = (type4x4) reg_f;
