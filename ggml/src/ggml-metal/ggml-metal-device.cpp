@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "ggml-metal-device.h"
 
 #include "ggml-metal-impl.h"
@@ -406,6 +407,59 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_sum_rows(ggml_me
     }
 
     res.c4  = is_c4;
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_q1_0_planes(ggml_metal_library_t lib) {
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_q1_0_build_planes");
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_q1_0_pc(ggml_metal_library_t lib, const ggml_tensor * op, int nr1) {
+    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+
+    char base[256];
+    char name[256];
+
+    const int nsg = N_SG_Q1_0;
+    const int nr0 = N_R0_Q1_0_PC;
+
+    const int16_t r2 = (int16_t) (ne12 / ne02);
+    const int16_t r3 = (int16_t) (ne13 / ne03);
+
+    snprintf(base, 256, "kernel_mul_mv_q1_0_f32_pc_nr1_%d", nr1);
+    snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d", base, nsg, ne12, r2, r3);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_int16(cv, nsg,            FC_MUL_MV + 0);
+        ggml_metal_cv_set_int16(cv, (int16_t) ne12, FC_MUL_MV + 2);
+        ggml_metal_cv_set_int16(cv, r2,             FC_MUL_MV + 3);
+        ggml_metal_cv_set_int16(cv, r3,             FC_MUL_MV + 4);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    res.nr0  = nr0;
+    res.nr1  = nr1;
+    res.nsg  = nsg;
+    res.smem = 0;
 
     return res;
 }
@@ -860,6 +914,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_Q1_0;
                 nr0 = N_R0_Q1_0;
+                // multi-column variants stream each weight block once per nr1 src1
+                // columns (spec-decode verify batches). GGML_METAL_Q1_0_NR1=1 disables,
+                // 2..4 forces a variant.
+                static const int nr1_env = getenv("GGML_METAL_Q1_0_NR1") ? atoi(getenv("GGML_METAL_Q1_0_NR1")) : 0;
+                if (nr1_env >= 2 && nr1_env <= 4) {
+                    nr1 = nr1_env;
+                } else if (nr1_env != 1 && ne11 == 3) {
+                    nr1 = 3;
+                } else if (nr1_env != 1 && ne11 >= 2) {
+                    nr1 = 2;
+                }
+                suffix = nr1 == 2 ? "_nr1_2" : nr1 == 3 ? "_nr1_3" : nr1 == 4 ? "_nr1_4" : "";
             } break;
         case GGML_TYPE_Q2_0:
             {
