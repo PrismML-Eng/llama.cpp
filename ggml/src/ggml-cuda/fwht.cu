@@ -73,6 +73,59 @@ __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, cons
     }
 }
 
+// Large-N path. The register kernel above keeps N/warp_size floats per thread, so it stops being
+// viable well before the arithmetic does: N=4096 would need 128 registers per thread and spill,
+// which is why the switch below used to end at 2048 and simply decline anything larger (the whole
+// op then fell back to CPU). Stage the row in shared memory instead and run all log2(N) butterfly
+// stages there. One row per block; every thread handles several butterflies per stage. Slower per
+// row than the register path, so it is used only where that path cannot go.
+#define FWHT_SMEM_THREADS 256
+
+template <int N, typename T, bool has_signs>
+__launch_bounds__(FWHT_SMEM_THREADS, 1)
+__global__ void fwht_cuda_smem(const T * src, float * dst, const int64_t n_rows, const float scale,
+                               const float * signs, const int n_blk) {
+    __shared__ float s[N];
+
+    const int64_t r = blockIdx.x;
+    if (r >= n_rows) {
+        return;
+    }
+
+    src += r * N;
+    dst += r * N;
+
+    const float * signs_row = has_signs ? signs + (r % n_blk) * N : nullptr;
+
+    ggml_cuda_pdl_sync();
+    for (int i = threadIdx.x; i < N; i += FWHT_SMEM_THREADS) {
+        float v = fwht_load(src[i]) * scale;
+        if (has_signs) {
+            v *= signs_row[i];
+        }
+        s[i] = v;
+    }
+    __syncthreads();
+
+    // Same butterfly and the same sign convention as the register path: the low element of a pair
+    // takes x + y, the high one x - y.
+#pragma unroll 1
+    for (int h = 1; h < N; h *= 2) {
+        for (int idx = threadIdx.x; idx < N / 2; idx += FWHT_SMEM_THREADS) {
+            const int j = ((idx / h) * 2 * h) + (idx % h);
+            const float x = s[j];
+            const float y = s[j + h];
+            s[j]     = x + y;
+            s[j + h] = x - y;
+        }
+        __syncthreads();
+    }
+
+    for (int i = threadIdx.x; i < N; i += FWHT_SMEM_THREADS) {
+        dst[i] = s[i];
+    }
+}
+
 template <typename T>
 static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float * dst_d,
                         const int n, const int64_t rows, const float scale,
@@ -102,6 +155,23 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
         FWHT_CASE(1024)
         FWHT_CASE(2048)
 #undef FWHT_CASE
+
+    // Beyond 2048 the register path spills, so these run the shared-memory kernel: one row per
+    // block, N floats of shared (16 KiB at 4096, 32 KiB at 8192 -- both inside the 48 KiB default).
+#define FWHT_SMEM_CASE(NN) \
+        case NN: { \
+            const dim3 g((unsigned) rows, 1, 1), b(FWHT_SMEM_THREADS, 1, 1); \
+            const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(g, b, 0, stream); \
+            if (signs) { \
+                ggml_cuda_kernel_launch(fwht_cuda_smem<NN, T, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk); \
+            } else { \
+                ggml_cuda_kernel_launch(fwht_cuda_smem<NN, T, false>, lp, src_d, dst_d, rows, scale, nullptr, 1); \
+            } \
+            return true; \
+        }
+        FWHT_SMEM_CASE(4096)
+        FWHT_SMEM_CASE(8192)
+#undef FWHT_SMEM_CASE
         default:
             return false;
     }
