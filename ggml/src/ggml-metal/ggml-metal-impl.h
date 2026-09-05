@@ -1204,6 +1204,11 @@ typedef struct {
     int32_t  len;
 } ggml_metal_kargs_argsort_merge;
 
+// Block widths at or above this run the threadgroup-staged FWHT kernel: the
+// register-resident one keeps N/32 values per thread, which stops fitting here.
+#define GGML_METAL_FWHT_TG_MIN_N 4096
+#define GGML_METAL_FWHT_TG_NT    256
+
 typedef struct {
     int32_t nrows;
 } ggml_metal_kargs_fwht;
