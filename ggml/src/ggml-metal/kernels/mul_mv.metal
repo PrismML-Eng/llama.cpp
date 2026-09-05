@@ -1022,6 +1022,33 @@ kernel void kernel_mul_mv_ptq1_0_f32(
     kernel_mul_mv_ptq1_0_f32_impl<N_R0_PTQ1_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
+// PQ2_0 dot against coefficients staged by the caller. A byte is a base-4 fraction of
+// 256: with u = b/256 and g_k = floor(4^k*u), exact in fp32, the floor chain peels the
+// fields from the top down, g_1 = t_3, g_2 - 4*g_1 = t_2, g_3 - 4*g_2 = t_1 and
+// b - 4*g_3 = t_0, because plain bit packing keeps field 0 in the low bits. Summing
+// t_n*y_n over the four fields therefore collapses to
+//   g_1*(y_3 - 4*y_2) + g_2*(y_2 - 4*y_1) + g_3*(y_1 - 4*y_0) + b*y_0
+// so the caller stages those coefficients in place of the raw y and this is three
+// floors and four fmas per byte with no integer work. The select chain it replaces
+// spent two ands, two bool tests and two selects per element, none of which this ISA
+// can co-issue with the float adds. sumy is subtracted once for the -1 offset.
+inline float pq2_0_dot_coeffs(device const block_pq2_0 * qb, float sumy, thread const float * c, int il) {
+    device const uint8_t * qs = qb->qs + (il / 4);
+
+    float acc = 0.f;
+
+    FOR_UNROLL (short j = 0; j < 4; j++) {
+        const float b = (float) qs[j];
+        const float u = b * (1.0f/256.0f);
+        acc += floor( 4.0f*u)*c[4*j + 0];
+        acc += floor(16.0f*u)*c[4*j + 1];
+        acc += floor(64.0f*u)*c[4*j + 2];
+        acc +=              b*c[4*j + 3];
+    }
+
+    return qb->d * (acc - sumy);
+}
+
 template<int nr0, typename args_t>
 void kernel_mul_mv_pq2_0_f32_impl(
         args_t args,
@@ -1065,15 +1092,24 @@ void kernel_mul_mv_pq2_0_f32_impl(
     device const float * yb = y + ix*QK_PQ2_0 + il;
 
     for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/8) {
+        // stage the 16 activations once as base-4 collapse coefficients, reused per row;
+        // the floor chain yields fields top down, so the coefficients pair y_3 with g_1
         float sumy = 0.f;
 
-        FOR_UNROLL (short i = 0; i < 16; i++) {
-            yl[i] = yb[i];
-            sumy += yb[i];
+        FOR_UNROLL (short j = 0; j < 4; j++) {
+            const float y0 = yb[4*j + 0];
+            const float y1 = yb[4*j + 1];
+            const float y2 = yb[4*j + 2];
+            const float y3 = yb[4*j + 3];
+            sumy += (y0 + y1) + (y2 + y3);
+            yl[4*j + 0] = y3 - 4.0f*y2;
+            yl[4*j + 1] = y2 - 4.0f*y1;
+            yl[4*j + 2] = y1 - 4.0f*y0;
+            yl[4*j + 3] = y0;
         }
 
         FOR_UNROLL (short row = 0; row < nr0; row++) {
-            sumf[row] += block_q_n_dot_y(ax[row] + ib, sumy, yl, il);
+            sumf[row] += pq2_0_dot_coeffs(ax[row] + ib, sumy, yl, il);
         }
 
         yb += QK_PQ2_0 * (N_SIMDWIDTH/8);
