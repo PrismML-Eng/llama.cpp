@@ -768,12 +768,15 @@ static constexpr std::initializer_list<std::array<int, 3>> rms_norm_mul_rope_vie
 };
 
 
-// FWHT block widths with a dedicated Vulkan pipeline. Widths above
-// GGML_VK_FWHT_MAX_SUBGROUP_N would keep n/subgroup_size values per invocation in
-// the register-resident shader, so those stage through shared memory instead.
-static constexpr uint32_t GGML_VK_FWHT_NUM_SIZES      = 8;
-static constexpr uint32_t GGML_VK_FWHT_MAX_SUBGROUP_N = 2048;
-static constexpr uint32_t GGML_VK_FWHT_ROWS           = 4;
+// FWHT block widths with a dedicated Vulkan pipeline. The subgroup shader pins its
+// block to the subgroup width, so it keeps n/subgroup_size values per invocation;
+// widths that push that past GGML_VK_FWHT_MAX_SUBGROUP_EL_W stage through shared
+// memory instead. The cutoff has to key on that ratio and not on n alone, because a
+// device reporting a narrow subgroup reaches the same register wall at a smaller n.
+static constexpr uint32_t GGML_VK_FWHT_NUM_SIZES         = 8;
+static constexpr uint32_t GGML_VK_FWHT_MAX_SUBGROUP_N    = 2048;
+static constexpr uint32_t GGML_VK_FWHT_MAX_SUBGROUP_EL_W = 64;
+static constexpr uint32_t GGML_VK_FWHT_ROWS              = 4;
 
 struct vk_device_struct {
     std::recursive_mutex mutex;
@@ -5791,8 +5794,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (can_use_fwht) {
         const bool use_subgroup = device->subgroup_basic && device->subgroup_shuffle;
         int idx = 0;
+        const uint32_t sg = std::max(device->subgroup_size, 1u);
         for (uint32_t n : {64, 128, 256, 512, 1024, 2048, 4096, 8192}) {
-            const bool wide = n > GGML_VK_FWHT_MAX_SUBGROUP_N;
+            const bool wide = n > GGML_VK_FWHT_MAX_SUBGROUP_N || n / sg > GGML_VK_FWHT_MAX_SUBGROUP_EL_W;
             if (use_subgroup && !wide) {
                 if (device->subgroup_size <= n) {
                     ggml_vk_create_pipeline(device, device->pipeline_fwht_f32[idx], "fwht_f32", fwht_f32_len, fwht_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
@@ -5804,7 +5808,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 }
             } else {
                 // wide blocks trade rows per workgroup for a smaller register block
-                const uint32_t block_size = wide ? std::min(n, 256u) : std::min(device->subgroup_size, n);
+                const uint32_t block_size = wide ? std::min(n, 256u) : std::min(sg, n);
                 const uint32_t rows       = wide ? 1u : GGML_VK_FWHT_ROWS;
                 if ((uint64_t)rows * n * sizeof(float) <= device->properties.limits.maxComputeSharedMemorySize &&
                     block_size * rows <= device->properties.limits.maxComputeWorkGroupInvocations) {
