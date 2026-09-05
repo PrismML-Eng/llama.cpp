@@ -9245,6 +9245,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fwht_signed(1024, 5120, 32));
     test_cases.emplace_back(new test_fwht_signed(1024, 6144, 7, GGML_TYPE_F16));
     test_cases.emplace_back(new test_fwht_signed(1024, 17408, 3));
+    // Block widths above the register path's reach, plus a couple below it as controls. 4096 and
+    // 8192 exercise the shared-memory kernel; before it existed the CUDA backend declined them and
+    // the op fell back, which cost both speed and (measurably) a little accuracy.
+    test_cases.emplace_back(new test_fwht_signed(512,  4096, 7));
+    test_cases.emplace_back(new test_fwht_signed(512,  8192, 3));
+    test_cases.emplace_back(new test_fwht_signed(2048, 4096, 7));
+    test_cases.emplace_back(new test_fwht_signed(2048, 8192, 3));
+    test_cases.emplace_back(new test_fwht_signed(4096, 4096, 7));
+    test_cases.emplace_back(new test_fwht_signed(4096, 8192, 3));
+    test_cases.emplace_back(new test_fwht_signed(4096, 8192, 1,  GGML_TYPE_F16));
+    test_cases.emplace_back(new test_fwht_signed(8192, 8192, 2));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 32)); // too small (N<64)
 
 #if 0
