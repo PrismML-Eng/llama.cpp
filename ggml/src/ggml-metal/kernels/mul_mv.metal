@@ -862,46 +862,48 @@ kernel void kernel_mul_mv_q2_0_f32(
 //   qs[2*it], qs[2*it+1]  -> elements n*16 + m        for n in 0..4
 //   qs[16 + it]           -> elements 80 + n*8 + it   for n in 0..4
 //   qh[it] (it < 2 only)  -> elements 120 + n*2 + it  for n in 0..3
-// Dot against y already staged in registers by the caller and reused across all nr0
-// rows. Trits come out of the byte by the base-3 remainder recurrence
-//   t = (v*3) >> 8,  v = (v*3) & 0xFF,  v starting at the byte
-// which is two integer ops per trit with no table and no pow3 lookup. A 256-entry
-// lookup was measurably worse here: it adds a dependent load per byte, and decode on
-// this kernel is instruction-bound, not bandwidth-bound. Verified against the
-// reference decode for all 256 bytes and all five positions.
-// Accumulates the raw 0/1/2 trit and subtracts the staged y sum once, so there is no
-// per-element offset correction.
+// Dot against coefficients already staged in registers by the caller and reused across
+// all nr0 rows. A packed byte is a base-3 fraction of 256: with u = b/256, trit n is
+//   t_n = g_{n+1} - 3*g_n,   g_k = floor(3^k * u)
+// and 3^k*b <= 61965 is exact in fp32, so the floors are exact and this matches the
+// integer recurrence bit for bit over all 256 bytes and all five positions. Summing
+// t_n*y_n over a byte's trits then collapses to
+//   sum_{k=1..4} g_k*(y_{k-1} - 3*y_k) + g_5*y_4
+// whose coefficients depend only on the activations, so the caller stages those in
+// place of the raw y. The inner loop is one floor and one fma per trit and never
+// leaves the float pipe, which matters because this ISA cannot co-issue integer and
+// floating-point work; the recurrence spent four integer ops and a convert per trit.
+// sumy is subtracted once for the -1 offset, exactly as before.
 inline float ptq1_0_dot_reg(device const block_ptq1_0 * qb, thread const float * yl, float sumy, short it) {
     float acc = 0.f;
-    short c = 0;
 
     FOR_UNROLL (short k = 0; k < 2; ++k) {
-        ushort v = qb->qs[2*it + k];
-        FOR_UNROLL (short n = 0; n < 5; ++n) {
-            const ushort w = v * 3;
-            acc += (float) (w >> 8) * yl[c++];
-            v = w & 0xFF;
-        }
+        const float u = (float) qb->qs[2*it + k] * (1.0f/256.0f);
+        thread const float * c = yl + 5*k;
+        acc += floor(  3.0f*u)*c[0];
+        acc += floor(  9.0f*u)*c[1];
+        acc += floor( 27.0f*u)*c[2];
+        acc += floor( 81.0f*u)*c[3];
+        acc += floor(243.0f*u)*c[4];
     }
 
     {
-        ushort v = qb->qs[16 + it];
-        FOR_UNROLL (short n = 0; n < 5; ++n) {
-            const ushort w = v * 3;
-            acc += (float) (w >> 8) * yl[c++];
-            v = w & 0xFF;
-        }
+        const float u = (float) qb->qs[16 + it] * (1.0f/256.0f);
+        thread const float * c = yl + 10;
+        acc += floor(  3.0f*u)*c[0];
+        acc += floor(  9.0f*u)*c[1];
+        acc += floor( 27.0f*u)*c[2];
+        acc += floor( 81.0f*u)*c[3];
+        acc += floor(243.0f*u)*c[4];
     }
 
-    // qh holds 8 elements; give every thread exactly one so all eight do 16 elements.
-    // Element 120+it sits at trit it>>1 of byte qh[it&1], so step the recurrence to it.
+    // qh holds 8 elements; every thread takes exactly one, trit it>>1 of byte qh[it&1].
+    // The single-trit form is two floors and replaces a lane-divergent loop that
+    // stepped the recurrence up to three times.
     {
-        ushort v = qb->qh[it & 1];
-        const short n = it >> 1;
-        for (short i = 0; i < n; ++i) {
-            v = (v * 3) & 0xFF;
-        }
-        acc += (float) ((v * 3) >> 8) * yl[c++];
+        const float u  = (float) qb->qh[it & 1] * (1.0f/256.0f);
+        const float p0 = yl[16];                      // 3^n for this thread's trit
+        acc += (floor(3.0f*p0*u) - 3.0f*floor(p0*u)) * yl[15];
     }
 
     return (acc - sumy) * (float) qb->d;
@@ -940,7 +942,8 @@ void kernel_mul_mv_ptq1_0_f32_impl(
         ax[row] = (device const block_ptq1_0 *) ((device char *) src0 + offset0);
     }
 
-    float yl[16];
+    // 15 collapse coefficients, the qh activation, and the qh trit's 3^n
+    float yl[17];
     float sumf[nr0] = {0.f};
 
     // eight threads cover one 128-weight block; each owns whole bytes, not a
@@ -950,28 +953,43 @@ void kernel_mul_mv_ptq1_0_f32_impl(
 
     device const float * yb = y + ix*QK_PTQ1_0;
 
+    {
+        const float pow3f[4] = {1.0f, 3.0f, 9.0f, 27.0f};
+        yl[16] = pow3f[it >> 1];
+    }
+
     for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/8) {
-        // stage this thread's y values once, then reuse them for every row
+        // stage this thread's activations once as collapse coefficients, then reuse
+        // them for every row: c[k-1] = y_{k-1} - 3*y_k for k = 1..4, c[4] = y_4
         float sumy = 0.f;
-        short c = 0;
 
         FOR_UNROLL (short k = 0; k < 2; ++k) {
             const short m = 2*it + k;
+            float y[5];
             FOR_UNROLL (short n = 0; n < 5; ++n) {
-                const float v = yb[n*16 + m];
-                yl[c++] = v;
-                sumy   += v;
+                y[n]  = yb[n*16 + m];
+                sumy += y[n];
             }
+            FOR_UNROLL (short n = 0; n < 4; ++n) {
+                yl[5*k + n] = y[n] - 3.0f*y[n+1];
+            }
+            yl[5*k + 4] = y[4];
         }
-        FOR_UNROLL (short n = 0; n < 5; ++n) {
-            const float v = yb[80 + n*8 + it];
-            yl[c++] = v;
-            sumy   += v;
+        {
+            float y[5];
+            FOR_UNROLL (short n = 0; n < 5; ++n) {
+                y[n]  = yb[80 + n*8 + it];
+                sumy += y[n];
+            }
+            FOR_UNROLL (short n = 0; n < 4; ++n) {
+                yl[10 + n] = y[n] - 3.0f*y[n+1];
+            }
+            yl[14] = y[4];
         }
         {
             const float v = yb[120 + it];
-            yl[c++] = v;
-            sumy   += v;
+            yl[15] = v;
+            sumy  += v;
         }
 
         FOR_UNROLL (short row = 0; row < nr0; row++) {
@@ -3834,6 +3852,7 @@ template [[host_name("kernel_mul_mv_id_q8_0_f32")]]    kernel kernel_mul_mv_id_t
 template [[host_name("kernel_mul_mv_id_q1_0_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q1_0_f32_impl<N_R0_Q1_0>>>;
 template [[host_name("kernel_mul_mv_id_q2_0_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_0_f32_impl<N_R0_Q2_0>>>;
 template [[host_name("kernel_mul_mv_id_pq2_0_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_pq2_0_f32_impl<N_R0_PQ2_0>>>;
+template [[host_name("kernel_mul_mv_id_ptq1_0_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_ptq1_0_f32_impl<N_R0_PTQ1_0>>>;
 template [[host_name("kernel_mul_mv_id_q4_0_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<mul_vec_q_n_f32_impl<block_q4_0, N_R0_Q4_0>>>;
 template [[host_name("kernel_mul_mv_id_q4_1_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<mul_vec_q_n_f32_impl<block_q4_1, N_R0_Q4_1>>>;
 template [[host_name("kernel_mul_mv_id_q5_0_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<mul_vec_q_n_f32_impl<block_q5_0, N_R0_Q5_0>>>;
