@@ -757,16 +757,9 @@ void dequantize_iq4_xs(device const block_iq4_xs * xb, short il, thread type4x4 
 //
 // A packed byte is a base-3 fraction of 256: with u = b/256, digit n is
 //   g_{n+1} - 3*g_n,   g_k = floor(3^k * u)
-// and 3^k*b <= 61965 is exact in fp32, so this matches the integer reference bit
-// for bit while staying in the float pipe, which matters on an ISA that cannot
-// co-issue integer and floating-point work.
-//
-// The sixteen elements of one call also share a digit index. For il < 10 they are
-// sixteen consecutive bytes of the 32-byte qs region at digit il/2; for
-// 10 <= il < 15 they are sixteen consecutive bytes of the 16-byte region at digit
-// il-10; only il == 15 walks the qh tail, which packs four digits into four bytes.
-// Hoisting that turns the per-element modulo, divide and integer multiply-shift
-// into two loop-invariant constants and a floor.
+// 3^k*b <= 61965 is exact in fp32, so this matches the integer reference bit for bit in the float pipe.
+// That matters on an ISA that cannot co-issue integer and floating-point work.
+// The sixteen elements of one call share a digit index, so their integer work hoists to two loop-invariant constants and a floor.
 template <typename type4x4>
 void dequantize_tq1_0(device const block_tq1_0 * xb, short il, thread type4x4 & reg) {
     const float pow3f[5] = {1.0f, 3.0f, 9.0f, 27.0f, 81.0f};

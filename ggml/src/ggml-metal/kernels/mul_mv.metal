@@ -3132,11 +3132,9 @@ void kernel_mul_mv_tq1_0_f32_impl(
 
     float sumf[nr0] = {0.f};
 
-    // qs[48] and qh[4] are contiguous, so a block's packed payload is a flat 52
-    // bytes. Lane l takes byte l and byte 32+l, which covers all 52 in two passes
-    // instead of the three (32 then 16 then 4 lanes busy) the region layout
-    // suggests: 81% of lanes busy rather than 54%. Lanes 20..31 have no second
-    // byte, so they get zero coefficients and a clamped index and add nothing.
+    // qs[48] and qh[4] are contiguous, so a block's packed payload is a flat 52 bytes.
+    // Lane l takes byte l and byte 32+l, covering all 52 in two passes instead of three: 81% of lanes busy rather than 54%.
+    // Lanes 20..31 have no second byte, so they get zero coefficients and a clamped index and add nothing.
     const short j1 = min((short) (32 + tiisg), (short) 51);
 
     for (int ib = 0; ib < nb; ++ib) {
@@ -3168,11 +3166,9 @@ void kernel_mul_mv_tq1_0_f32_impl(
         }
 
         {
-            // The qh tail carries 4 digits per byte rather than 5. Padding its fifth
-            // activation with zero makes the five-digit collapse reproduce the
-            // four-digit one exactly (the g_5 coefficient becomes 0 and the g_4 one
-            // becomes y_3), so both tails run the same code and the pass does not
-            // diverge. Lanes past the payload keep all-zero activations and add zero.
+            // The qh tail carries 4 digits per byte rather than 5, so its fifth activation is padded with zero.
+            // That reproduces the four-digit collapse exactly: the g_5 coefficient becomes 0 and the g_4 one becomes y_3, so both tails run the same code.
+            // Lanes past the payload keep all-zero activations and add zero.
             float y1[5] = { 0.f, 0.f, 0.f, 0.f, 0.f };
             if (tiisg < 16) {
                 FOR_UNROLL (short n = 0; n < 5; ++n) {
