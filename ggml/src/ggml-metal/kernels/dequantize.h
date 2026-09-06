@@ -205,27 +205,54 @@ inline float ptq1_0_elem(device const block_ptq1_0 * xb, int e) {
 
 template <typename type4x4>
 void dequantize_ptq1_0(device const block_ptq1_0 * xb, short il, thread type4x4 & reg) {
+    // A packed byte is a base-3 fraction of 256: with u = b/256, trit n is
+    //   g_{n+1} - 3*g_n,   g_k = floor(3^k * u)
+    // and 3^k*b <= 61965 is exact in fp32, so this matches the reference decode bit for
+    // bit while staying in the float pipe; the table walk cost a load, a shift, a mask, a
+    // subtract and a convert per element on an ISA that cannot co-issue integer work.
+    //
+    // The sixteen elements of a call are regular in il: il 0..4 are the 16-byte chunk at
+    // trit il; il 5 and 6 are the 8-byte chunk at trits 2(il-5) and 2(il-5)+1, each byte
+    // read once for both; il 7 is that chunk at trit 4 followed by the qh tail, which
+    // packs four trits into each of its two bytes.
+    const float pow3f[6] = {1.0f, 3.0f, 9.0f, 27.0f, 81.0f, 243.0f};
+
     const float d = xb->d;
 
     float4x4 reg_f;
 
-    // il 0..4 addresses the 16-byte chunk at a single trit index, so the pow3 factor
-    // and the branch hoist out and this becomes 16 plain byte loads. il 5..7 straddle
-    // trit indices, or reach into qh, and take the general accessor.
     if (il < 5) {
-        const short sh = 2*il;
         device const uchar * qs = xb->qs;
-        for (int i = 0; i < 4; i++) {
-            for (int j = 0; j < 4; j++) {
-                reg_f[i][j] = (float) ((int) ((ptq1_0_lut[qs[i*4 + j]] >> sh) & 3) - 1) * d;
-            }
+        const float c0 = pow3f[il];
+        const float c1 = 3.0f*c0;
+        for (short k = 0; k < 16; k++) {
+            const float u = (float) qs[k] * (1.0f/256.0f);
+            reg_f[k/4][k%4] = d*(floor(c1*u) - 3.0f*floor(c0*u) - 1.0f);
+        }
+    } else if (il < 7) {
+        device const uchar * qs = xb->qs + 16;
+        const float c0 = pow3f[2*(il - 5)];
+        const float c1 = 3.0f*c0;
+        const float c2 = 3.0f*c1;
+        for (short k = 0; k < 8; k++) {
+            const float u = (float) qs[k] * (1.0f/256.0f);
+            const float g0 = floor(c0*u);
+            const float g1 = floor(c1*u);
+            const float g2 = floor(c2*u);
+            reg_f[k/4][k%4]         = d*(g1 - 3.0f*g0 - 1.0f);
+            reg_f[(k+8)/4][(k+8)%4] = d*(g2 - 3.0f*g1 - 1.0f);
         }
     } else {
-        const int base = il * 16;
-        for (int i = 0; i < 4; i++) {
-            for (int j = 0; j < 4; j++) {
-                reg_f[i][j] = ptq1_0_elem(xb, base + i*4 + j) * d;
-            }
+        device const uchar * qs = xb->qs + 16;
+        for (short k = 0; k < 8; k++) {
+            const float u = (float) qs[k] * (1.0f/256.0f);
+            reg_f[k/4][k%4] = d*(floor(243.0f*u) - 3.0f*floor(81.0f*u) - 1.0f);
+        }
+        device const uchar * qh = xb->qh;
+        for (short k = 0; k < 8; k++) {
+            const float c0 = pow3f[k >> 1];
+            const float u  = (float) qh[k & 1] * (1.0f/256.0f);
+            reg_f[(k+8)/4][(k+8)%4] = d*(floor(3.0f*c0*u) - 3.0f*floor(c0*u) - 1.0f);
         }
     }
 
