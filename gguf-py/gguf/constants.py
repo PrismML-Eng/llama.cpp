@@ -1146,6 +1146,14 @@ class MODEL_TENSOR(IntEnum):
     DSPARK_MARKOV_W1       = auto()  # markov head: prev-token embed
     DSPARK_MARKOV_W2       = auto()  # markov head: bias projection
     DSPARK_CONF_PROJ       = auto()  # confidence head
+    # dfly
+    DFLY_LAYER_FUSION      = auto()  # per-draft-layer context mixing logits
+    DFLY_CTX_NORM          = auto()  # post-fusion context norm
+    DFLY_HC_HIDDEN_NORM    = auto()  # predecessor correction, hidden branch
+    DFLY_HC_EMBED_NORM     = auto()  # predecessor correction, embedding branch
+    DFLY_HC_GATE           = auto()
+    DFLY_HC_UP             = auto()
+    DFLY_HC_DOWN           = auto()
     # lfm2 audio
     A_ENC_NORM_CONV        = auto()
     A_ENC_LINEAR_POS       = auto()
@@ -1893,6 +1901,13 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
     MODEL_TENSOR.FC:                        "fc",
     MODEL_TENSOR.DSPARK_MARKOV_W1:          "markov_w1",
+    MODEL_TENSOR.DFLY_LAYER_FUSION:         "layer_fusion",
+    MODEL_TENSOR.DFLY_CTX_NORM:             "context_norm",
+    MODEL_TENSOR.DFLY_HC_HIDDEN_NORM:       "hidden_correction.hidden_norm",
+    MODEL_TENSOR.DFLY_HC_EMBED_NORM:        "hidden_correction.embed_norm",
+    MODEL_TENSOR.DFLY_HC_GATE:              "hidden_correction.gate",
+    MODEL_TENSOR.DFLY_HC_UP:                "hidden_correction.up",
+    MODEL_TENSOR.DFLY_HC_DOWN:              "hidden_correction.down",
     MODEL_TENSOR.DSPARK_MARKOV_W2:          "markov_w2",
     MODEL_TENSOR.DSPARK_CONF_PROJ:          "conf_proj",
     MODEL_TENSOR.D2T:                       "d2t",
@@ -4951,6 +4966,13 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.D2T,
         # optional DSpark heads
         MODEL_TENSOR.DSPARK_MARKOV_W1,
+        MODEL_TENSOR.DFLY_LAYER_FUSION,
+        MODEL_TENSOR.DFLY_CTX_NORM,
+        MODEL_TENSOR.DFLY_HC_HIDDEN_NORM,
+        MODEL_TENSOR.DFLY_HC_EMBED_NORM,
+        MODEL_TENSOR.DFLY_HC_GATE,
+        MODEL_TENSOR.DFLY_HC_UP,
+        MODEL_TENSOR.DFLY_HC_DOWN,
         MODEL_TENSOR.DSPARK_MARKOV_W2,
         MODEL_TENSOR.DSPARK_CONF_PROJ,
     ],

@@ -729,6 +729,129 @@ class DFlashModel(Qwen3Model):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+@ModelBase.register("Qwen3DFlyModel", "Qwen3DSparkDFlareV2Model")
+@ModelBase.example("AngelSlim/Qwen3-8B-DFly-Block8")
+class DFlyModel(DFlashModel):
+    # AngelSpec DFly = DFlash + (a) a per-DRAFT-layer fusion of the raw target-layer features
+    # on top of the shared context projection, and (b) a TreeFlash predecessor correction
+    # applied before the target head. There is no Markov/confidence head, so the runtime reads
+    # it with the DFlash draft reader (block rows 1..n-1), not the DSpark one.
+    model_arch = gguf.MODEL_ARCH.DFLASH
+
+    def __init__(self, dir_model, *args, **kwargs):
+        hparams = kwargs.pop("hparams", None)
+        if hparams is None:
+            hparams = ModelBase.load_hparams(dir_model, False)
+
+        # DFly carries target_layer_ids/mask_token_id flat; normalize to DFlash's nested schema
+        hparams.setdefault("dflash_config", {
+            k: hparams[k] for k in ("target_layer_ids", "mask_token_id") if k in hparams
+        })
+
+        super().__init__(dir_model, *args, hparams=hparams, **kwargs)
+
+        hp = self.hparams
+
+        # The published main-branch config of the reference checkpoint states a target depth and
+        # vocab that do not match the weights (80/120832 against the real 36/151936), which loads
+        # clean and then mis-projects. Refuse instead of converting a checkpoint that lies.
+        target_layers = hp.get("target_num_hidden_layers")
+        layer_ids     = hp.get("target_layer_ids") or []
+
+        # A declared depth cannot police itself: the reference config's 80 is self-consistent with
+        # capture ids up to 33 and still wrong. The target model is the only authoritative shape,
+        # so compare the declared target_* against it and bound the ids by the real depth.
+        real = self._target_shapes()
+        for cfg_key, hp_key in (("num_hidden_layers", "target_num_hidden_layers"),
+                                ("vocab_size",        "target_vocab_size"),
+                                ("hidden_size",       "target_hidden_size")):
+            declared = hp.get(hp_key)
+            if declared is not None and cfg_key in real and int(declared) != real[cfg_key]:
+                raise ValueError(
+                    f"DFly {hp_key} is {declared} but the target model reports "
+                    f"{cfg_key}={real[cfg_key]}. The config metadata does not describe the target "
+                    "-- pin a known-good revision (the reference checkpoint's is 5712926)."
+                )
+        if "num_hidden_layers" in real:
+            target_layers = real["num_hidden_layers"]
+
+        if target_layers and layer_ids and max(layer_ids) >= int(target_layers):
+            raise ValueError(
+                f"DFly target_layer_ids {layer_ids} exceed target_num_hidden_layers {target_layers}. "
+                "The config metadata does not describe the weights -- pin a known-good revision "
+                "(the reference checkpoint's is 5712926)."
+            )
+
+        if int(hp.get("target_hidden_size", hp["hidden_size"])) != int(hp["hidden_size"]):
+            raise ValueError(
+                "DFly residual fusion requires target_hidden_size == hidden_size, got "
+                f"{hp.get('target_hidden_size')} vs {hp['hidden_size']}."
+            )
+
+        if hp.get("markov_rank") or hp.get("enable_confidence_head"):
+            raise ValueError(
+                "DFly does not use the DSpark Markov/confidence head, but this config declares one. "
+                "A drafter reporting a Markov head is read one block row late by the runtime."
+            )
+
+        self._has_correction = bool(hp.get("enable_hidden_correction", True))
+        if self._has_correction:
+            correction_type = hp.get("hidden_correction_type", "swiglu")
+            if correction_type != "swiglu":
+                raise ValueError(f"unsupported hidden_correction_type {correction_type!r} (only 'swiglu')")
+
+        # slot 0 of a DFly block is the committed bonus anchor, not a prediction slot
+        self._sample_from_anchor = not bool(hp.get("dspark_bonus_anchor", True))
+
+    def _target_shapes(self) -> dict[str, int]:
+        """Shapes read from --target-model-dir, for the keys it declares. Empty when unavailable."""
+        if self.target_model_dir is None:
+            return {}  # set_vocab raises on this later; nothing authoritative to compare against
+        try:
+            with open(self.target_model_dir / "config.json", "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            return {}  # unreadable; set_vocab reads the same file and raises
+        if not isinstance(cfg, dict):
+            return {}
+        cfg = {**cfg, **(cfg.get("text_config") or {})}
+        shapes = {}
+        for k in ("num_hidden_layers", "vocab_size", "hidden_size"):
+            try:
+                shapes[k] = int(cfg[k])
+            except (KeyError, ValueError, TypeError):
+                continue  # one unusable value must not disable the other comparisons
+        return shapes
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_sample_from_anchor(self._sample_from_anchor)
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+        if self._has_correction and not self._seen_correction:
+            raise ValueError(
+                "config sets enable_hidden_correction but no hidden_correction.* weights were "
+                "found; the export is incomplete and would draft without the correction."
+            )
+
+    _seen_correction = False
+    _dropped_correction = False
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if "hidden_correction." in name:
+            # the runtime turns correction on from the presence of hidden_correction.down.weight,
+            # so shipping these while the config disables it silently re-enables the feature
+            if not self._has_correction:
+                if not self._dropped_correction:
+                    logger.info("DFly: enable_hidden_correction is false, dropping hidden_correction.* weights")
+                    self._dropped_correction = True
+                return
+            self._seen_correction = True
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
 @ModelBase.register(
     "Qwen3DSparkModel",
     "DSparkDraftModel",

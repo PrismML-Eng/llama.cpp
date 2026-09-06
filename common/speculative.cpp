@@ -430,7 +430,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
 
-    int32_t n_embd_dec = 0;       // draft hidden size
+    int32_t n_embd_dec = 0;       // draft context row width (n_embd_out: per-layer for DFly)
     int32_t n_embd_enc = 0;       // target_layer_ids_n * target_hidden_size
     int32_t n_embd_tgt = 0;       // target model hidden size
     int32_t n_layer_tgt = 0;      // target model layer count
@@ -473,7 +473,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         }
 
         n_embd_tgt = llama_model_n_embd(model_tgt);
-        n_embd_dec = llama_model_n_embd(model_dft);
+        n_embd_dec = llama_model_n_embd_out(model_dft);
         n_embd_enc = (int32_t) target_layer_ids_n * n_embd_tgt;
         n_layer_tgt = llama_model_n_layer(model_tgt);
 
@@ -916,7 +916,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
 
-    int32_t n_embd_dec = 0;  // draft hidden size
+    int32_t n_embd_dec = 0;  // draft context row width (n_embd_out: per-layer for DFly)
     int32_t n_embd_enc = 0;  // target_layer_ids_n * target_hidden_size
     int32_t n_embd_tgt = 0;  // target model hidden size
 
@@ -967,7 +967,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         n_embd_tgt    = llama_model_n_embd(model_tgt);
-        n_embd_dec    = llama_model_n_embd(model_dft);
+        n_embd_dec    = llama_model_n_embd_out(model_dft);
         n_embd_enc    = (int32_t) target_layer_ids_n * n_embd_tgt;
 
         // read the trained block size from the dflash.block_size metadata key
