@@ -49,6 +49,7 @@
 #define cublasStatus_t hipblasStatus_t
 #define cublasOperation_t hipblasOperation_t
 #define cudaDevAttrCooperativeLaunch hipDeviceAttributeCooperativeLaunch
+#define cudaDevAttrIntegrated                         hipDeviceAttributeIntegrated
 #define cudaDeviceCanAccessPeer hipDeviceCanAccessPeer
 #define cudaDeviceDisablePeerAccess hipDeviceDisablePeerAccess
 #define cudaDeviceEnablePeerAccess hipDeviceEnablePeerAccess
