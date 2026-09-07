@@ -1732,7 +1732,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                            case GGML_TYPE_Q1_0:
                            case GGML_TYPE_Q2_0:
                            case GGML_TYPE_PQ2_0:
-                           case GGML_TYPE_PTQ1_0:
+                           // no Metal quantize_ptq1_0: a CPY into PTQ1_0 falls back to the CPU
                            case GGML_TYPE_Q4_0:
                            case GGML_TYPE_Q4_1:
                            case GGML_TYPE_Q5_0:
