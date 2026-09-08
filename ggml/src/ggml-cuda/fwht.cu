@@ -1,6 +1,8 @@
 #include "common.cuh"
 #include "fwht.cuh"
 
+#include <cstdlib>
+
 template <typename T>
 __device__ __forceinline__ float fwht_load(const T value) {
     return value;
@@ -126,6 +128,98 @@ __global__ void fwht_cuda_smem(const T * src, float * dst, const int64_t n_rows,
     }
 }
 
+
+// Wide rows at small row counts (decode): one row per block instead of per warp. The warp kernel
+// keeps N/32 floats per lane and walks log2(N) stages serially on one warp, so at N=2048 a single
+// warp holds 64 registers and the rest of the GPU idles; the shared-memory kernel above pays two
+// __syncthreads per stage for all log2(N) stages. Here each of NT threads holds N/NT values: the
+// stages below the warp width use shuffles, the stages up to NT go through shared memory (three
+// exchanges for NT=256), and the stages above NT stay in registers.
+#define FWHT_BLOCK_THREADS 256
+
+template <int N, int NT, typename T, bool has_signs>
+__launch_bounds__(NT, 1)
+__global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows, const float scale,
+                                const float * signs, const int n_blk) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int NE        = N / NT;
+    static_assert(NE >= 1 && N % NT == 0 && NT % warp_size == 0, "bad FWHT block shape");
+
+    __shared__ float s[N];
+
+    const int64_t r = blockIdx.x;
+    if (r >= n_rows) {
+        return;
+    }
+
+    src += r * N;
+    dst += r * N;
+
+    const int tid  = threadIdx.x;
+    const int lane = tid % warp_size;
+
+    ggml_cuda_pdl_sync();
+    const float * signs_row = has_signs ? signs + (r % n_blk) * N : nullptr;
+
+    float reg[NE];
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        reg[i] = fwht_load(src[i * NT + tid]) * scale;
+        if (has_signs) {
+            reg[i] *= signs_row[i * NT + tid];
+        }
+    }
+
+    // stages within a warp: partner differs in the lane bits
+#pragma unroll
+    for (int h = 1; h < warp_size; h *= 2) {
+#pragma unroll
+        for (int j = 0; j < NE; j++) {
+            const float val  = reg[j];
+            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
+            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
+        }
+    }
+
+    // stages across warps: partner differs in the thread-index bits above the lane
+#pragma unroll
+    for (int h = warp_size; h < NT; h *= 2) {
+#pragma unroll
+        for (int j = 0; j < NE; j++) {
+            s[j * NT + tid] = reg[j];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int j = 0; j < NE; j++) {
+            const float val  = reg[j];
+            const float val2 = s[j * NT + (tid ^ h)];
+            reg[j] = (tid & h) == 0 ? val + val2 : val2 - val;
+        }
+        __syncthreads();
+    }
+
+    // stages above the block width: partner is another register of the same thread
+#pragma unroll
+    for (int h = NT; h < N; h *= 2) {
+        const int step = h / NT;
+#pragma unroll
+        for (int j = 0; j < NE; j += 2 * step) {
+#pragma unroll
+            for (int k = 0; k < step; k++) {
+                const float x = reg[j + k];
+                const float y = reg[j + k + step];
+                reg[j + k]        = x + y;
+                reg[j + k + step] = x - y;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        dst[i * NT + tid] = reg[i];
+    }
+}
+
 template <typename T>
 static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float * dst_d,
                         const int n, const int64_t rows, const float scale,
@@ -151,13 +245,13 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
         FWHT_CASE(64)
         FWHT_CASE(128)
         FWHT_CASE(256)
-        FWHT_CASE(512)
-        FWHT_CASE(1024)
-        FWHT_CASE(2048)
-#undef FWHT_CASE
-
-    // Beyond 2048 the register path spills, so these run the shared-memory kernel: one row per
-    // block, N floats of shared (16 KiB at 4096, 32 KiB at 8192 -- both inside the 48 KiB default).
+        default:
+            break;
+    }
+    // From 512 up, one block of FWHT_BLOCK_THREADS per row (fwht_cuda_block); the warp kernel
+    // serialised the whole transform on one warp and the shared-memory kernel synchronised every
+    // stage, and both were the largest single kernel of a decode step on the folded models.
+    // GGML_CUDA_FWHT_LEGACY=1 restores the previous kernels for A/B.
 #define FWHT_SMEM_CASE(NN) \
         case NN: { \
             const dim3 g((unsigned) rows, 1, 1), b(FWHT_SMEM_THREADS, 1, 1); \
@@ -169,9 +263,38 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
             } \
             return true; \
         }
-        FWHT_SMEM_CASE(4096)
-        FWHT_SMEM_CASE(8192)
+#define FWHT_BLOCK_CASE(NN) \
+        case NN: { \
+            const dim3 g((unsigned) rows, 1, 1), b(FWHT_BLOCK_THREADS, 1, 1); \
+            const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(g, b, 0, stream); \
+            if (signs) { \
+                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk); \
+            } else { \
+                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, false>, lp, src_d, dst_d, rows, scale, nullptr, 1); \
+            } \
+            return true; \
+        }
+    static const bool legacy = getenv("GGML_CUDA_FWHT_LEGACY") != nullptr;
+    if (legacy) {
+        switch (n) {
+            FWHT_CASE(512)
+            FWHT_CASE(1024)
+            FWHT_CASE(2048)
+            FWHT_SMEM_CASE(4096)
+            FWHT_SMEM_CASE(8192)
+            default:
+                return false;
+        }
+    }
+    switch (n) {
+        FWHT_BLOCK_CASE(512)
+        FWHT_BLOCK_CASE(1024)
+        FWHT_BLOCK_CASE(2048)
+        FWHT_BLOCK_CASE(4096)
+        FWHT_BLOCK_CASE(8192)
+#undef FWHT_CASE
 #undef FWHT_SMEM_CASE
+#undef FWHT_BLOCK_CASE
         default:
             return false;
     }
