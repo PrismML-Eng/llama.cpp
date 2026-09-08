@@ -4,6 +4,7 @@
 #include "mmid.cuh"
 
 #include <cstdint>
+#include <cstdlib>
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
@@ -325,7 +326,14 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 
 #if !defined(GGML_USE_HIP)
     if (type == GGML_TYPE_PTQ1_0) {
-        return ne11 <= MMQ_PTQ1_0_MAX_BATCH_SIZE;
+        // the fp16 dequantize + cuBLAS fallback is the source of PTQ1_0's extra error on CUDA, so
+        // the MMQ tile path runs at every batch by default; the env var is the A/B knob for
+        // deployments that prefer cuBLAS's ~7% at pp512 over the accuracy
+        static const int64_t max_batch = [] {
+            const char * s = getenv("GGML_CUDA_PTQ1_0_MMQ_MAX_BATCH");
+            return s ? (int64_t) atoll(s) : (int64_t) MMQ_PTQ1_0_MAX_BATCH_SIZE;
+        }();
+        return ne11 <= max_batch;
     }
 #endif
 

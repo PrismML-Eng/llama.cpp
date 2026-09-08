@@ -6,7 +6,7 @@
 #include <cstdint>
 
 #define MMQ_DP4A_MAX_BATCH_SIZE 64  // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
-#define MMQ_PTQ1_0_MAX_BATCH_SIZE 64
+#define MMQ_PTQ1_0_MAX_BATCH_SIZE (1 << 30)  // MMQ at every batch unless GGML_CUDA_PTQ1_0_MMQ_MAX_BATCH lowers it
 #define MMQ_ITER_K                256
 #define MMQ_ITER_K_FP4            512
 #define MMQ_NWARPS                8
