@@ -326,9 +326,8 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 
 #if !defined(GGML_USE_HIP)
     if (type == GGML_TYPE_PTQ1_0) {
-        // the fp16 dequantize + cuBLAS fallback is the source of PTQ1_0's extra error on CUDA, so
-        // the MMQ tile path runs at every batch by default; the env var is the A/B knob for
-        // deployments that prefer cuBLAS's ~7% at pp512 over the accuracy
+        // the fp16 dequantize plus cuBLAS fallback is the source of PTQ1_0's extra error on CUDA, so the MMQ tile path runs at every batch.
+        // GGML_CUDA_PTQ1_0_MMQ_MAX_BATCH caps it, for deployments that prefer the cuBLAS prefill throughput over the accuracy.
         static const int64_t max_batch = [] {
             const char * s = getenv("GGML_CUDA_PTQ1_0_MMQ_MAX_BATCH");
             return s ? (int64_t) atoll(s) : (int64_t) MMQ_PTQ1_0_MAX_BATCH_SIZE;
