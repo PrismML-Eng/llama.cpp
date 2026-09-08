@@ -1222,6 +1222,7 @@ typedef struct {
 
 typedef struct {
     int32_t nrows;
+    int32_t n_blk; // sign rows per activation row (K / N); 0 = no sign flip fused in
 } ggml_metal_kargs_fwht;
 
 typedef struct {
