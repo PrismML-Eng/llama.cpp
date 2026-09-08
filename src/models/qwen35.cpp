@@ -493,8 +493,20 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+    // q and k are adjacent head groups of the same width in the conv output, so one
+    // l2_norm over the joint view normalises both; q and k are then views into its result
+    ggml_tensor * qk_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, 2 * num_k_heads, n_seq_tokens, n_seqs,
+            ggml_row_size(conv_qkv_mix->type, head_k_dim),
+            nb1_qkv,
+            nb1_qkv * n_seq_tokens,
+            0);
+    qk_conv = ggml_l2_norm(ctx0, qk_conv, eps_norm);
+    cb(qk_conv, "qk_conv_l2", il);
+
+    q_conv = ggml_view_4d(ctx0, qk_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+            qk_conv->nb[1], qk_conv->nb[2], qk_conv->nb[3], 0);
+    k_conv = ggml_view_4d(ctx0, qk_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+            qk_conv->nb[1], qk_conv->nb[2], qk_conv->nb[3], num_k_heads * qk_conv->nb[1]);
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
