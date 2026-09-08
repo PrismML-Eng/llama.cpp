@@ -140,6 +140,31 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
+    // one pass over the devices for the per-layer path choices; ggml_backend_dev_type used to be a
+    // full cudaGetDeviceProperties per call, and this ran twice per recurrent layer
+    for (const auto & ldev : model.devices) {
+        if (ldev.dev == nullptr) {
+            continue;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ldev.dev);
+        const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+        if (reg_name == nullptr) {
+            gdn_state_rows_dev_ok = false;
+            gdn_raw_gates_dev_ok  = false;
+            break;
+        }
+        // integrated GPUs (e.g. unified-memory CUDA devices) report IGPU, not GPU
+        const bool is_gpu = ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                            ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
+        if (is_gpu && strcmp(reg_name, "MTL") != 0) {
+            gdn_state_rows_dev_ok = false;
+        }
+        if (strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "CUDA") != 0 &&
+            strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0 && strcmp(reg_name, "CPU") != 0) {
+            gdn_raw_gates_dev_ok = false;
+        }
+    }
+
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
@@ -377,21 +402,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // only where the fused op implements raw gates natively (CPU, Metal, CUDA/ROCm); other
     // backends would fall back to the CPU for the whole op, which costs more than the four launches
     static const bool raw_gates_disable = getenv("GGML_GDN_RAW_GATES_DISABLE") != nullptr;
-    bool raw_gates_dev_ok = true;
-    for (const auto & ldev : model.devices) {
-        if (ldev.dev == nullptr) {
-            continue;
-        }
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ldev.dev);
-        const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
-        if (reg_name == nullptr ||
-            (strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "CUDA") != 0 &&
-             strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0 && strcmp(reg_name, "CPU") != 0)) {
-            raw_gates_dev_ok = false;
-            break;
-        }
-    }
-    if (!raw_gates_disable && raw_gates_dev_ok &&
+    if (!raw_gates_disable && gdn_raw_gates_dev_ok &&
         model.layers[il].ssm_dt && model.layers[il].ssm_dt->type == GGML_TYPE_F32 &&
         model.layers[il].ssm_a  && model.layers[il].ssm_a->type  == GGML_TYPE_F32) {
         gdn_raw_beta    = beta_raw;
@@ -428,21 +439,6 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // the whole recurrent op to CPU -- keep the gathered form unless every
     // GPU device in the model is Metal.
     static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
-
-    bool gdn_state_rows_dev_ok = true;
-    for (const auto & ldev : model.devices) {
-        // integrated GPUs (e.g. unified-memory CUDA devices) report IGPU, not GPU
-        if (ldev.dev == nullptr || (ggml_backend_dev_type(ldev.dev) != GGML_BACKEND_DEVICE_TYPE_GPU &&
-                                    ggml_backend_dev_type(ldev.dev) != GGML_BACKEND_DEVICE_TYPE_IGPU)) {
-            continue;
-        }
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ldev.dev);
-        const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
-        if (reg_name == nullptr || strcmp(reg_name, "MTL") != 0) {
-            gdn_state_rows_dev_ok = false;
-            break;
-        }
-    }
 
     const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0;
 
