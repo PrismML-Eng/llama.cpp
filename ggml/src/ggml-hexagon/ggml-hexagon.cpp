@@ -4194,7 +4194,7 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_GATED_DELTA_NET:
             // rows-indexed state read (src[6]) not implemented here
-            supp = op->src[6] == NULL && ggml_hexagon_supported_gated_delta_net(sess, op);
+            supp = op->src[6] == NULL && ggml_get_op_params_i32(op, 1) == 0 && ggml_hexagon_supported_gated_delta_net(sess, op);
             break;
 
         case GGML_OP_CUMSUM:
