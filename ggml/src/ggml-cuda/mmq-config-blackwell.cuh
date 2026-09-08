@@ -35,3 +35,7 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
 
     return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
 }
+
+static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config_gb10(ggml_type type, int J, bool fallback) {
+    return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
+}
