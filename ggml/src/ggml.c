@@ -6423,6 +6423,24 @@ struct ggml_tensor * ggml_gated_delta_net_rows(
     return result;
 }
 
+void ggml_gated_delta_net_set_raw_gates(
+        struct ggml_tensor  * gdn,
+        struct ggml_tensor  * dt_bias,
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(gdn->op == GGML_OP_GATED_DELTA_NET);
+    GGML_ASSERT(gdn->src[3]->ne[0] == 1); // scalar gate, not KDA
+
+    const int64_t H = gdn->src[2]->ne[1];
+
+    GGML_ASSERT(dt_bias->type == GGML_TYPE_F32 && ggml_is_contiguous(dt_bias) && ggml_nelements(dt_bias) == H);
+    GGML_ASSERT(a->type       == GGML_TYPE_F32 && ggml_is_contiguous(a)       && ggml_nelements(a)       == H);
+
+    ggml_set_op_params_i32(gdn, 1, 1);
+
+    gdn->src[7] = dt_bias;
+    gdn->src[8] = a;
+}
+
 // ggml_lightning_indexer
 
 struct ggml_tensor * ggml_lightning_indexer(
