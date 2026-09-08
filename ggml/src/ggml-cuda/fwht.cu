@@ -129,12 +129,9 @@ __global__ void fwht_cuda_smem(const T * src, float * dst, const int64_t n_rows,
 }
 
 
-// Wide rows at small row counts (decode): one row per block instead of per warp. The warp kernel
-// keeps N/32 floats per lane and walks log2(N) stages serially on one warp, so at N=2048 a single
-// warp holds 64 registers and the rest of the GPU idles; the shared-memory kernel above pays two
-// __syncthreads per stage for all log2(N) stages. Here each of NT threads holds N/NT values: the
-// stages below the warp width use shuffles, the stages up to NT go through shared memory (three
-// exchanges for NT=256), and the stages above NT stay in registers.
+// Wide rows at small row counts (decode): one row per block instead of per warp.
+// The warp kernel serialises every stage on one warp, and the shared-memory kernel above synchronises on each stage.
+// Both leave most of the GPU idle at these shapes.
 #define FWHT_BLOCK_THREADS 256
 
 template <int N, int NT, typename T, bool has_signs>
@@ -248,10 +245,9 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
         default:
             break;
     }
-    // From 512 up, one block of FWHT_BLOCK_THREADS per row (fwht_cuda_block); the warp kernel
-    // serialised the whole transform on one warp and the shared-memory kernel synchronised every
-    // stage, and both were the largest single kernel of a decode step on the folded models.
-    // GGML_CUDA_FWHT_LEGACY=1 restores the previous kernels for A/B.
+    // From 512 up, one block of FWHT_BLOCK_THREADS per row (fwht_cuda_block).
+    // The older kernels were the largest single kernel of a decode step at these widths.
+    // GGML_CUDA_FWHT_LEGACY=1 restores them for A/B.
 #define FWHT_SMEM_CASE(NN) \
         case NN: { \
             const dim3 g((unsigned) rows, 1, 1), b(FWHT_SMEM_THREADS, 1, 1); \
