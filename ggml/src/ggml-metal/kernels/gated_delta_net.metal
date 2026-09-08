@@ -5,6 +5,7 @@ constant short FC_gated_delta_net_ne30 [[function_constant(FC_GATED_DELTA_NET + 
 constant short FC_gated_delta_net_K    [[function_constant(FC_GATED_DELTA_NET + 2)]];
 constant bool  FC_gated_delta_net_rows       [[function_constant(FC_GATED_DELTA_NET + 3)]];
 constant bool  FC_gated_delta_net_write_rows [[function_constant(FC_GATED_DELTA_NET_WRITE_ROWS)]];
+constant bool  FC_gated_delta_net_raw_gates  [[function_constant(FC_GATED_DELTA_NET_RAW_GATES)]];
 
 #if 1
 template<short NSG>
@@ -20,6 +21,8 @@ kernel void kernel_gated_delta_net_impl(
         device const char * write_rows,
         device       char * state_dst,
         device       char * dst,
+        device const char * raw_dt_bias,
+        device const char * raw_a,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]])  {
@@ -28,6 +31,7 @@ kernel void kernel_gated_delta_net_impl(
 #define K          FC_gated_delta_net_K
 #define HAS_ROWS   FC_gated_delta_net_rows
 #define WRITE_ROWS FC_gated_delta_net_write_rows
+#define RAW_GATES  FC_gated_delta_net_raw_gates
 
     const uint tx = tpitg.x;
     const uint ty = tpitg.y;
@@ -67,6 +71,11 @@ kernel void kernel_gated_delta_net_impl(
     device const float * b_ptr = (device const float *) (b) + (i23*args.ne22*args.ne21 + i21);
     device const float * g_ptr = (device const float *) (g) + (i23*args.ne22*args.ne21 + i21)*G;
 
+    // raw gates: beta -> sigmoid(beta), g -> a[h] * softplus(g + dt_bias[h]); same formulas
+    // as the unary kernels the graph used to run separately
+    const float rg_bias = RAW_GATES ? ((device const float *) raw_dt_bias)[i21] : 0.0f;
+    const float rg_a    = RAW_GATES ? ((device const float *) raw_a)[i21]       : 0.0f;
+
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
     // When n_tokens < K, only slots 0..n_tokens-1 are written; older slots are caller-owned.
 
@@ -81,7 +90,12 @@ kernel void kernel_gated_delta_net_impl(
         float s_k = 0.0f;
 
         if (G == 1) {
-            const float g_exp = exp(g_ptr[0]);
+            float g0 = g_ptr[0];
+            if (RAW_GATES) {
+                const float x = g0 + rg_bias;
+                g0 = rg_a * ((x > 20.0f) ? x : log(1.0f + exp(x)));
+            }
+            const float g_exp = exp(g0);
 
             FOR_UNROLL (short j = 0; j < NSG; j++) {
                 const short is = tx*NSG + j;
@@ -101,7 +115,12 @@ kernel void kernel_gated_delta_net_impl(
 
         s_k = simd_sum(s_k);
 
-        const float d = (v_ptr[i20] - s_k)*b_ptr[0];
+        float bt = b_ptr[0];
+        if (RAW_GATES) {
+            bt = 1.0f / (1.0f + exp(-bt));
+        }
+
+        const float d = (v_ptr[i20] - s_k)*bt;
 
         float y = 0.0f;
 

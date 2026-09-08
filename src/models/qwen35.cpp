@@ -140,6 +140,31 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
+    // one pass over the devices for the per-layer path choices; ggml_backend_dev_type used to be a
+    // full cudaGetDeviceProperties per call, and this ran twice per recurrent layer
+    for (const auto & ldev : model.devices) {
+        if (ldev.dev == nullptr) {
+            continue;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ldev.dev);
+        const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+        if (reg_name == nullptr) {
+            gdn_state_rows_dev_ok = false;
+            gdn_raw_gates_dev_ok  = false;
+            break;
+        }
+        // integrated GPUs (e.g. unified-memory CUDA devices) report IGPU, not GPU
+        const bool is_gpu = ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                            ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
+        if (is_gpu && strcmp(reg_name, "MTL") != 0) {
+            gdn_state_rows_dev_ok = false;
+        }
+        if (strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "CUDA") != 0 &&
+            strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0 && strcmp(reg_name, "CPU") != 0) {
+            gdn_raw_gates_dev_ok = false;
+        }
+    }
+
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
@@ -250,9 +275,9 @@ ggml_tensor * llama_model_qwen35::graph::build_norm_gated(
         ggml_tensor * gate,
         int           layer) {
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
-    ggml_tensor * gated_silu = ggml_silu(ctx0, gate);
 
-    return ggml_mul(ctx0, normalized, gated_silu);
+    // silu(gate) * normalized as one GLU op instead of a unary and a mul
+    return ggml_swiglu_split(ctx0, gate, normalized);
 }
 
 ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
@@ -363,12 +388,30 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
+    ggml_tensor * beta_raw = beta;
+
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
+
+    // the fused GDN op can apply sigmoid / softplus itself; hand it the raw projections and
+    // the activated nodes below only stay in the graph on paths that still need them
+    // only where the fused op implements raw gates natively (CPU, Metal, CUDA/ROCm); other
+    // backends would fall back to the CPU for the whole op, which costs more than the four launches
+    static const bool raw_gates_disable = getenv("GGML_GDN_RAW_GATES_DISABLE") != nullptr;
+    if (!raw_gates_disable && gdn_raw_gates_dev_ok &&
+        model.layers[il].ssm_dt && model.layers[il].ssm_dt->type == GGML_TYPE_F32 &&
+        model.layers[il].ssm_a  && model.layers[il].ssm_a->type  == GGML_TYPE_F32) {
+        gdn_raw_beta    = beta_raw;
+        gdn_raw_alpha   = ggml_reshape_4d(ctx0, alpha, 1, num_v_heads, n_seq_tokens, n_seqs);
+        gdn_raw_dt_bias = model.layers[il].ssm_dt;
+        gdn_raw_a       = model.layers[il].ssm_a;
+    } else {
+        gdn_raw_beta = gdn_raw_alpha = gdn_raw_dt_bias = gdn_raw_a = nullptr;
+    }
 
     ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
     ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
@@ -396,21 +439,6 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // the whole recurrent op to CPU -- keep the gathered form unless every
     // GPU device in the model is Metal.
     static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
-
-    bool gdn_state_rows_dev_ok = true;
-    for (const auto & ldev : model.devices) {
-        // integrated GPUs (e.g. unified-memory CUDA devices) report IGPU, not GPU
-        if (ldev.dev == nullptr || (ggml_backend_dev_type(ldev.dev) != GGML_BACKEND_DEVICE_TYPE_GPU &&
-                                    ggml_backend_dev_type(ldev.dev) != GGML_BACKEND_DEVICE_TYPE_IGPU)) {
-            continue;
-        }
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ldev.dev);
-        const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
-        if (reg_name == nullptr || strcmp(reg_name, "MTL") != 0) {
-            gdn_state_rows_dev_ok = false;
-            break;
-        }
-    }
 
     const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0;
 
@@ -461,8 +489,20 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+    // q and k are adjacent head groups of the same width in the conv output, so one
+    // l2_norm over the joint view normalises both; q and k are then views into its result
+    ggml_tensor * qk_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, 2 * num_k_heads, n_seq_tokens, n_seqs,
+            ggml_row_size(conv_qkv_mix->type, head_k_dim),
+            nb1_qkv,
+            nb1_qkv * n_seq_tokens,
+            0);
+    qk_conv = ggml_l2_norm(ctx0, qk_conv, eps_norm);
+    cb(qk_conv, "qk_conv_l2", il);
+
+    q_conv = ggml_view_4d(ctx0, qk_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+            qk_conv->nb[1], qk_conv->nb[2], qk_conv->nb[3], 0);
+    k_conv = ggml_view_4d(ctx0, qk_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+            qk_conv->nb[1], qk_conv->nb[2], qk_conv->nb[3], num_k_heads * qk_conv->nb[1]);
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);

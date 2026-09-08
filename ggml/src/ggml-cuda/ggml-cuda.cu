@@ -5097,12 +5097,13 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
 static enum ggml_backend_dev_type ggml_backend_cuda_device_get_type(ggml_backend_dev_t dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
 
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));
+    // A single attribute query, not cudaGetDeviceProperties: this is called on hot host
+    // paths (graph construction queries the device type per layer) and the full property
+    // read costs ~0.7 ms per call, the attribute read ~20 ns.
+    int integrated = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, ggml_cuda_get_physical_device(ctx->device)));
 
-    return prop.integrated
-        ? GGML_BACKEND_DEVICE_TYPE_IGPU
-        : GGML_BACKEND_DEVICE_TYPE_GPU;
+    return integrated ? GGML_BACKEND_DEVICE_TYPE_IGPU : GGML_BACKEND_DEVICE_TYPE_GPU;
 }
 
 static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
@@ -5238,6 +5239,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_Q2_0:
                     case GGML_TYPE_PQ2_0:
+                    case GGML_TYPE_PTQ1_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
@@ -5278,6 +5280,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_Q2_0:
                     case GGML_TYPE_PQ2_0:
+                    case GGML_TYPE_PTQ1_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:

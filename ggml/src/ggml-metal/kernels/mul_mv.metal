@@ -430,6 +430,346 @@ kernel void kernel_mul_mv_q1_0_f32(
     kernel_mul_mv_q1_0_f32_impl<N_R0_Q1_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
+// Q1_0 multi-column mat-vec: each q1_0 block is read once and dotted against nr1
+// src1 columns (the spec-decode verify batch, ne11 = k+1 rows). tpb threads
+// cooperate on one block, slice width SW = QK1_0/tpb. Register budget (M5 Pro):
+// keep nr1*SW <= 32 staged y values per thread.
+template<short SW>
+static inline float q1_0_dot_y_sw(thread const uint8_t * b, const float d, const float sumy, thread const float * yl) {
+    float acc = 0.0f;
+
+    FOR_UNROLL (short i = 0; i < SW; i++) {
+        acc += select(0.0f, yl[i], bool(b[i/8] & (1u << (i%8))));
+    }
+
+    return d * (2.0f * acc - sumy);
+}
+
+template<int nr0, int nr1, int tpb, typename args_t>
+void kernel_mul_mv_q1_0_f32_nc_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    const short SW  = QK1_0/tpb;
+
+    const int nb = args.ne00/QK1_0;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+    const int c0        = r1 * nr1;
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    device const block_q1_0 * ax[nr0];
+    for (int row = 0; row < nr0; ++row) {
+        const uint64_t offset0 = (first_row + row)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+        ax[row] = (device const block_q1_0 *) ((device char *) src0 + offset0);
+    }
+
+    float yl[nr1][SW];
+    float sumy[nr1];
+    float sumf[nr0][nr1];
+    FOR_UNROLL (short row = 0; row < nr0; row++) {
+        FOR_UNROLL (short c = 0; c < nr1; c++) {
+            sumf[row][c] = 0.f;
+        }
+    }
+
+    const short ix = (tiisg/tpb);      // block in flight
+    const short il = (tiisg%tpb)*SW;   // element offset within the block
+
+    device const float * yb[nr1];
+    FOR_UNROLL (short c = 0; c < nr1; c++) {
+        // tail columns are clamped (computed but not stored)
+        const int ic = min(c0 + c, args.ne11 - 1);
+        const uint64_t offset1 = (uint64_t)ic*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+        yb[c] = (device const float *) (src1 + offset1) + ix*QK1_0 + il;
+    }
+
+    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/tpb) {
+        FOR_UNROLL (short c = 0; c < nr1; c++) {
+            sumy[c] = 0.f;
+            FOR_UNROLL (short i = 0; i < SW; i++) {
+                yl[c][i] = yb[c][i];
+                sumy[c] += yb[c][i];
+            }
+        }
+
+        FOR_UNROLL (short row = 0; row < nr0; row++) {
+            device const block_q1_0 * qb = ax[row] + ib;
+            device const uint8_t    * qs = qb->qs + il/8;
+
+            uint8_t b[SW/8];
+            FOR_UNROLL (short i = 0; i < SW/8; i++) {
+                b[i] = qs[i];
+            }
+            const float d = qb->d;
+
+            FOR_UNROLL (short c = 0; c < nr1; c++) {
+                sumf[row][c] += q1_0_dot_y_sw<SW>(b, d, sumy[c], yl[c]);
+            }
+        }
+
+        FOR_UNROLL (short c = 0; c < nr1; c++) {
+            yb[c] += QK1_0 * (N_SIMDWIDTH/tpb);
+        }
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1;
+
+    for (short c = 0; c < nr1; c++) {
+        if (c0 + c >= args.ne11) {
+            break;
+        }
+        for (int row = 0; row < nr0; ++row) {
+            const float tot = simd_sum(sumf[row][c]);
+
+            if (tiisg == 0 && first_row + row < args.ne01) {
+                dst_f32[(uint64_t)(c0 + c)*args.ne0 + first_row + row] = tot;
+            }
+        }
+    }
+}
+
+[[host_name("kernel_mul_mv_q1_0_f32_nr1_2")]]
+kernel void kernel_mul_mv_q1_0_f32_nr1_2(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q1_0_f32_nc_impl<N_R0_Q1_0, 2, 8, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q1_0_f32_nr1_3")]]
+kernel void kernel_mul_mv_q1_0_f32_nr1_3(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q1_0_f32_nc_impl<N_R0_Q1_0, 3, 16, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q1_0_f32_nr1_4")]]
+kernel void kernel_mul_mv_q1_0_f32_nr1_4(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q1_0_f32_nc_impl<N_R0_Q1_0, 4, 16, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
+// ---------------------------------------------------------------------------
+// Q1_0 word-parallel (popcount) mat-vec for small verify batches.
+//
+// The select-per-weight kernels above are ALU-bound: a timing probe with the bit
+// test removed runs 1.7x faster at 4 rows, so the per-weight bit extraction, not
+// the weight read, is what costs. This path removes it. Activations are quantized
+// to int8 once per matmul (kernel_q1_0_build_planes) and stored as 8 bit-planes,
+// so 32 weights are consumed per AND+popcount pair:
+//
+//   sum_{bit=1} q = sum_b 2^b * popcount(w & plane_b) - 128*popcount(w)
+//   dot           = d * sy * (2*sum_{bit=1} q - sum q)
+//
+// Costs ~0.8 integer ops per weight per column against ~3 for select-per-weight.
+// The int8 activation step is the same numeric class as the CUDA MMVQ path but is
+// NOT free: gate on measured logit-KLD before enabling by default.
+// Opt-in via GGML_METAL_Q1_0_POPCNT=1.
+// ---------------------------------------------------------------------------
+
+// 32 threads: thread t builds word (t%4) of bit-plane (t/4) for one 128-element block.
+kernel void kernel_q1_0_build_planes(
+        constant ggml_metal_kargs_q1_0_planes & args,
+        device const char * src1,
+        device       uint * planes,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+    const int ib = tgpig.x;
+    const int c  = tgpig.y;
+
+    device const float * y = (device const float *) (src1 + (uint64_t)c*args.nb11) + (uint64_t)ib*QK1_0;
+
+    float amax = 0.0f;
+    for (short i = tiisg; i < QK1_0; i += 32) {
+        amax = max(amax, fabs(y[i]));
+    }
+    amax = simd_max(amax);
+
+    const float sy  = amax > 0.0f ? amax/127.0f : 1.0f;
+    const float isy = amax > 0.0f ? 127.0f/amax : 0.0f;
+
+    int sq = 0;
+    for (short i = tiisg; i < QK1_0; i += 32) {
+        sq += clamp((int) rint(y[i]*isy), -127, 127);
+    }
+    sq = simd_sum(sq);
+
+    const short b = tiisg / 4;   // bit plane
+    const short j = tiisg % 4;   // 32-element word
+
+    uint word = 0;
+    FOR_UNROLL (short i = 0; i < 32; i++) {
+        const int  q = clamp((int) rint(y[32*j + i]*isy), -127, 127);
+        const uint u = (uint) (q + 128);
+        word |= ((u >> b) & 1u) << i;
+    }
+
+    device uint * p = planes + (uint64_t)(c*args.nblk + ib)*Q1_0_PLANE_STRIDE;
+
+    p[b*4 + j] = word;
+
+    if (tiisg == 0) {
+        p[32] = as_type<uint>(sy);
+        p[33] = as_type<uint>((float) sq);
+    }
+}
+
+template<int nr0, int nr1, typename args_t>
+void kernel_mul_mv_q1_0_f32_pc_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const uint * planes,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    const int nb = args.ne00/QK1_0;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+    const int c0        = r1 * nr1;
+
+    device const block_q1_0 * ax[nr0];
+    for (int row = 0; row < nr0; ++row) {
+        ax[row] = (device const block_q1_0 *) ((device char *) src0 + (first_row + row)*args.nb01);
+    }
+
+    float sumf[nr0][nr1];
+    FOR_UNROLL (short row = 0; row < nr0; row++) {
+        FOR_UNROLL (short c = 0; c < nr1; c++) {
+            sumf[row][c] = 0.f;
+        }
+    }
+
+    for (int ib = tiisg; ib < nb; ib += N_SIMDWIDTH) {
+        uint  w  [nr0][4];
+        float d  [nr0];
+        int   pcw[nr0];
+
+        FOR_UNROLL (short row = 0; row < nr0; row++) {
+            device const block_q1_0 * qb = ax[row] + ib;
+            device const uint8_t    * qs = qb->qs;   // 2-byte aligned: assemble from bytes
+
+            int pc = 0;
+            FOR_UNROLL (short j = 0; j < 4; j++) {
+                const uint wj = (uint) qs[4*j + 0]        | ((uint) qs[4*j + 1] <<  8) |
+                              (((uint) qs[4*j + 2]) << 16) | ((uint) qs[4*j + 3] << 24);
+                w[row][j] = wj;
+                pc += popcount(wj);
+            }
+
+            d  [row] = qb->d;
+            pcw[row] = pc;
+        }
+
+        FOR_UNROLL (short c = 0; c < nr1; c++) {
+            // tail columns are clamped (computed but not stored)
+            const int ic = min(c0 + c, args.ne11 - 1);
+
+            device const uint * p = planes + (uint64_t)(ic*nb + ib)*Q1_0_PLANE_STRIDE;
+
+            uint pl[32];
+            FOR_UNROLL (short t = 0; t < 32; t++) {
+                pl[t] = p[t];
+            }
+
+            const float sy = as_type<float>(p[32]);
+            const float sq = as_type<float>(p[33]);
+
+            FOR_UNROLL (short row = 0; row < nr0; row++) {
+                uint tot = 0;
+
+                FOR_UNROLL (short b = 0; b < 8; b++) {
+                    const uint cnt = popcount(w[row][0] & pl[b*4 + 0])
+                                   + popcount(w[row][1] & pl[b*4 + 1])
+                                   + popcount(w[row][2] & pl[b*4 + 2])
+                                   + popcount(w[row][3] & pl[b*4 + 3]);
+                    tot += cnt << b;
+                }
+
+                const int sbit = (int) tot - 128*pcw[row];
+
+                sumf[row][c] += d[row]*sy*(2.0f*(float) sbit - sq);
+            }
+        }
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1;
+
+    for (short c = 0; c < nr1; c++) {
+        if (c0 + c >= args.ne11) {
+            break;
+        }
+        for (int row = 0; row < nr0; ++row) {
+            const float tot = simd_sum(sumf[row][c]);
+
+            if (tiisg == 0 && first_row + row < args.ne01) {
+                dst_f32[(uint64_t)(c0 + c)*args.ne0 + first_row + row] = tot;
+            }
+        }
+    }
+}
+
+[[host_name("kernel_mul_mv_q1_0_f32_pc_nr1_2")]]
+kernel void kernel_mul_mv_q1_0_f32_pc_nr1_2(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const uint * planes,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q1_0_f32_pc_impl<N_R0_Q1_0_PC, 2, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, planes, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q1_0_f32_pc_nr1_4")]]
+kernel void kernel_mul_mv_q1_0_f32_pc_nr1_4(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const uint * planes,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q1_0_f32_pc_impl<N_R0_Q1_0_PC, 4, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, planes, tgpig, tiisg, sgitg);
+}
+
 template<int nr0, typename args_t>
 void kernel_mul_mv_q2_0_f32_impl(
         args_t args,
@@ -473,15 +813,24 @@ void kernel_mul_mv_q2_0_f32_impl(
     device const float * yb = y + ix*QK2_0 + il;
 
     for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/4) {
+        // stage the 16 activations once as base-4 collapse coefficients, reused per row;
+        // the floor chain yields fields top down, so the coefficients pair y_3 with g_1
         float sumy = 0.f;
 
-        FOR_UNROLL (short i = 0; i < 16; i++) {
-            yl[i] = yb[i];
-            sumy += yb[i];
+        FOR_UNROLL (short j = 0; j < 4; j++) {
+            const float y0 = yb[4*j + 0];
+            const float y1 = yb[4*j + 1];
+            const float y2 = yb[4*j + 2];
+            const float y3 = yb[4*j + 3];
+            sumy += (y0 + y1) + (y2 + y3);
+            yl[4*j + 0] = y3 - 4.0f*y2;
+            yl[4*j + 1] = y2 - 4.0f*y1;
+            yl[4*j + 2] = y1 - 4.0f*y0;
+            yl[4*j + 3] = y0;
         }
 
         FOR_UNROLL (short row = 0; row < nr0; row++) {
-            sumf[row] += block_q_n_dot_y(ax[row] + ib, sumy, yl, il);
+            sumf[row] += q2_dot_coeffs(ax[row] + ib, sumy, yl, il);
         }
 
         yb += QK2_0 * (N_SIMDWIDTH/4);
@@ -508,6 +857,206 @@ kernel void kernel_mul_mv_q2_0_f32(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q2_0_f32_impl<N_R0_Q2_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
+// Byte-owning dot for PTQ1_0. The previous mapping gave each thread 16 contiguous
+// weights, which in base-3 layout means every thread reloads the same qs bytes for a
+// different trit index -- five times the byte traffic for the same 24 bytes. Here a
+// thread instead owns whole bytes and consumes all five trits of each one, so a block's
+// 26 bytes are loaded exactly once across the eight threads that cover it. The cost is
+// that the y reads become strided rather than contiguous, which is the cheaper side:
+// weight traffic is what decode is bound by.
+//
+// Byte ownership for thread it in 0..7, matching the CPU codec's element order:
+//   qs[2*it], qs[2*it+1]  -> elements n*16 + m        for n in 0..4
+//   qs[16 + it]           -> elements 80 + n*8 + it   for n in 0..4
+//   qh[it] (it < 2 only)  -> elements 120 + n*2 + it  for n in 0..3
+// Dot against coefficients already staged in registers by the caller and reused across
+// all nr0 rows. A packed byte is a base-3 fraction of 256: with u = b/256, trit n is
+//   t_n = g_{n+1} - 3*g_n,   g_k = floor(3^k * u)
+// and 3^k*b <= 61965 is exact in fp32, so the floors are exact and this matches the
+// integer recurrence bit for bit over all 256 bytes and all five positions. Summing
+// t_n*y_n over a byte's trits then collapses to
+//   sum_{k=1..4} g_k*(y_{k-1} - 3*y_k) + g_5*y_4
+// whose coefficients depend only on the activations, so the caller stages those in
+// place of the raw y. The inner loop is one floor and one fma per trit and never
+// leaves the float pipe, which matters because this ISA cannot co-issue integer and
+// floating-point work; the recurrence spent four integer ops and a convert per trit.
+// sumy is subtracted once for the -1 offset, exactly as before.
+inline float ptq1_0_dot_reg(device const block_ptq1_0 * qb, thread const float * yl, float sumy, short it) {
+    float acc = 0.f;
+
+    FOR_UNROLL (short k = 0; k < 2; ++k) {
+        const float u = (float) qb->qs[2*it + k] * (1.0f/256.0f);
+        thread const float * c = yl + 5*k;
+        acc += floor(  3.0f*u)*c[0];
+        acc += floor(  9.0f*u)*c[1];
+        acc += floor( 27.0f*u)*c[2];
+        acc += floor( 81.0f*u)*c[3];
+        acc += floor(243.0f*u)*c[4];
+    }
+
+    {
+        const float u = (float) qb->qs[16 + it] * (1.0f/256.0f);
+        thread const float * c = yl + 10;
+        acc += floor(  3.0f*u)*c[0];
+        acc += floor(  9.0f*u)*c[1];
+        acc += floor( 27.0f*u)*c[2];
+        acc += floor( 81.0f*u)*c[3];
+        acc += floor(243.0f*u)*c[4];
+    }
+
+    // qh holds 8 elements; every thread takes exactly one, trit it>>1 of byte qh[it&1].
+    // The single-trit form is two floors and replaces a lane-divergent loop that
+    // stepped the recurrence up to three times.
+    {
+        const float u  = (float) qb->qh[it & 1] * (1.0f/256.0f);
+        const float p0 = yl[16];                      // 3^n for this thread's trit
+        acc += (floor(3.0f*p0*u) - 3.0f*floor(p0*u)) * yl[15];
+    }
+
+    return (acc - sumy) * (float) qb->d;
+}
+
+template<int nr0, typename args_t>
+void kernel_mul_mv_ptq1_0_f32_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    const int nb = args.ne00/QK_PTQ1_0;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+
+    device const float * y = (device const float *) (src1 + offset1);
+
+    device const block_ptq1_0 * ax[nr0];
+    for (int row = 0; row < nr0; ++row) {
+        const uint64_t offset0 = (first_row + row)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+        ax[row] = (device const block_ptq1_0 *) ((device char *) src0 + offset0);
+    }
+
+    // 15 collapse coefficients, the qh activation, and the qh trit's 3^n
+    float yl[17];
+    float sumf[nr0] = {0.f};
+
+    // eight threads cover one 128-weight block; each owns whole bytes, not a
+    // contiguous element span, so the block's bytes are read once in total
+    const short ix = (tiisg/8);
+    const short it = (tiisg%8);
+
+    device const float * yb = y + ix*QK_PTQ1_0;
+
+    {
+        const float pow3f[4] = {1.0f, 3.0f, 9.0f, 27.0f};
+        yl[16] = pow3f[it >> 1];
+    }
+
+    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/8) {
+        // stage this thread's activations once as collapse coefficients, then reuse
+        // them for every row: c[k-1] = y_{k-1} - 3*y_k for k = 1..4, c[4] = y_4
+        float sumy = 0.f;
+
+        FOR_UNROLL (short k = 0; k < 2; ++k) {
+            const short m = 2*it + k;
+            float y[5];
+            FOR_UNROLL (short n = 0; n < 5; ++n) {
+                y[n]  = yb[n*16 + m];
+                sumy += y[n];
+            }
+            FOR_UNROLL (short n = 0; n < 4; ++n) {
+                yl[5*k + n] = y[n] - 3.0f*y[n+1];
+            }
+            yl[5*k + 4] = y[4];
+        }
+        {
+            float y[5];
+            FOR_UNROLL (short n = 0; n < 5; ++n) {
+                y[n]  = yb[80 + n*8 + it];
+                sumy += y[n];
+            }
+            FOR_UNROLL (short n = 0; n < 4; ++n) {
+                yl[10 + n] = y[n] - 3.0f*y[n+1];
+            }
+            yl[14] = y[4];
+        }
+        {
+            const float v = yb[120 + it];
+            yl[15] = v;
+            sumy  += v;
+        }
+
+        FOR_UNROLL (short row = 0; row < nr0; row++) {
+            sumf[row] += ptq1_0_dot_reg(ax[row] + ib, yl, sumy, it);
+        }
+
+        yb += QK_PTQ1_0 * (N_SIMDWIDTH/8);
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    for (int row = 0; row < nr0; ++row) {
+        const float tot = simd_sum(sumf[row]);
+
+        if (tiisg == 0 && first_row + row < args.ne01) {
+            dst_f32[first_row + row] = tot;
+        }
+    }
+}
+
+[[host_name("kernel_mul_mv_ptq1_0_f32")]]
+kernel void kernel_mul_mv_ptq1_0_f32(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_ptq1_0_f32_impl<N_R0_PTQ1_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
+// PQ2_0 and Q2_0 dot against coefficients staged by the caller (same codec, group 128 vs 64). A byte is a base-4 fraction of
+// 256: with u = b/256 and g_k = floor(4^k*u), exact in fp32, the floor chain peels the
+// fields from the top down, g_1 = t_3, g_2 - 4*g_1 = t_2, g_3 - 4*g_2 = t_1 and
+// b - 4*g_3 = t_0, because plain bit packing keeps field 0 in the low bits. Summing
+// t_n*y_n over the four fields therefore collapses to
+//   g_1*(y_3 - 4*y_2) + g_2*(y_2 - 4*y_1) + g_3*(y_1 - 4*y_0) + b*y_0
+// so the caller stages those coefficients in place of the raw y and this is three
+// floors and four fmas per byte with no integer work. The select chain it replaces
+// spent two ands, two bool tests and two selects per element, none of which this ISA
+// can co-issue with the float adds. sumy is subtracted once for the -1 offset.
+template <typename block_t>
+inline float q2_dot_coeffs(device const block_t * qb, float sumy, thread const float * c, int il) {
+    device const uint8_t * qs = qb->qs + (il / 4);
+
+    float acc = 0.f;
+
+    FOR_UNROLL (short j = 0; j < 4; j++) {
+        const float b = (float) qs[j];
+        const float u = b * (1.0f/256.0f);
+        acc += floor( 4.0f*u)*c[4*j + 0];
+        acc += floor(16.0f*u)*c[4*j + 1];
+        acc += floor(64.0f*u)*c[4*j + 2];
+        acc +=              b*c[4*j + 3];
+    }
+
+    return qb->d * (acc - sumy);
 }
 
 template<int nr0, typename args_t>
@@ -553,15 +1102,24 @@ void kernel_mul_mv_pq2_0_f32_impl(
     device const float * yb = y + ix*QK_PQ2_0 + il;
 
     for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/8) {
+        // stage the 16 activations once as base-4 collapse coefficients, reused per row;
+        // the floor chain yields fields top down, so the coefficients pair y_3 with g_1
         float sumy = 0.f;
 
-        FOR_UNROLL (short i = 0; i < 16; i++) {
-            yl[i] = yb[i];
-            sumy += yb[i];
+        FOR_UNROLL (short j = 0; j < 4; j++) {
+            const float y0 = yb[4*j + 0];
+            const float y1 = yb[4*j + 1];
+            const float y2 = yb[4*j + 2];
+            const float y3 = yb[4*j + 3];
+            sumy += (y0 + y1) + (y2 + y3);
+            yl[4*j + 0] = y3 - 4.0f*y2;
+            yl[4*j + 1] = y2 - 4.0f*y1;
+            yl[4*j + 2] = y1 - 4.0f*y0;
+            yl[4*j + 3] = y0;
         }
 
         FOR_UNROLL (short row = 0; row < nr0; row++) {
-            sumf[row] += block_q_n_dot_y(ax[row] + ib, sumy, yl, il);
+            sumf[row] += q2_dot_coeffs(ax[row] + ib, sumy, yl, il);
         }
 
         yb += QK_PQ2_0 * (N_SIMDWIDTH/8);
@@ -995,6 +1553,10 @@ template [[host_name("kernel_mul_mv_ext_q2_0_f32_r1_5")]]   kernel mul_mv_ext_q4
 template [[host_name("kernel_mul_mv_ext_pq2_0_f32_r1_2")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_pq2_0,  128, dequantize_pq2_0_t4>;
 template [[host_name("kernel_mul_mv_ext_pq2_0_f32_r1_3")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_pq2_0,  128, dequantize_pq2_0_t4>;
 template [[host_name("kernel_mul_mv_ext_pq2_0_f32_r1_4")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_pq2_0,  128, dequantize_pq2_0_t4>;
+template [[host_name("kernel_mul_mv_ext_ptq1_0_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_ptq1_0, 128, dequantize_ptq1_0_t4>;
+template [[host_name("kernel_mul_mv_ext_ptq1_0_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_ptq1_0, 128, dequantize_ptq1_0_t4>;
+template [[host_name("kernel_mul_mv_ext_ptq1_0_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_ptq1_0, 128, dequantize_ptq1_0_t4>;
+template [[host_name("kernel_mul_mv_ext_ptq1_0_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_ptq1_0, 128, dequantize_ptq1_0_t4>;
 template [[host_name("kernel_mul_mv_ext_pq2_0_f32_r1_5")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_pq2_0,  128, dequantize_pq2_0_t4>;
 
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_2")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_q4_0,   32, dequantize_q4_0_t4>;
@@ -3336,6 +3898,7 @@ template [[host_name("kernel_mul_mv_id_q8_0_f32")]]    kernel kernel_mul_mv_id_t
 template [[host_name("kernel_mul_mv_id_q1_0_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q1_0_f32_impl<N_R0_Q1_0>>>;
 template [[host_name("kernel_mul_mv_id_q2_0_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_0_f32_impl<N_R0_Q2_0>>>;
 template [[host_name("kernel_mul_mv_id_pq2_0_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_pq2_0_f32_impl<N_R0_PQ2_0>>>;
+template [[host_name("kernel_mul_mv_id_ptq1_0_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_ptq1_0_f32_impl<N_R0_PTQ1_0>>>;
 template [[host_name("kernel_mul_mv_id_q4_0_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<mul_vec_q_n_f32_impl<block_q4_0, N_R0_Q4_0>>>;
 template [[host_name("kernel_mul_mv_id_q4_1_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<mul_vec_q_n_f32_impl<block_q4_1, N_R0_Q4_1>>>;
 template [[host_name("kernel_mul_mv_id_q5_0_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<mul_vec_q_n_f32_impl<block_q5_0, N_R0_Q5_0>>>;

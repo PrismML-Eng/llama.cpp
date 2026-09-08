@@ -24,11 +24,18 @@
 #define N_R0_Q1_0 8
 #define N_SG_Q1_0 2
 
+// Q1_0 word-parallel (popcount) verify path: rows per simdgroup, and the uint32
+// stride of one activation bit-plane record (8 planes x 4 words + scale + sum + pad).
+#define N_R0_Q1_0_PC 4
+#define Q1_0_PLANE_STRIDE 36
+
 #define N_R0_Q2_0 8
 #define N_SG_Q2_0 2
 
 #define N_R0_PQ2_0 8
 #define N_SG_PQ2_0 2
+#define N_R0_PTQ1_0 4
+#define N_SG_PTQ1_0 1
 
 #define N_R0_Q4_0 4
 #define N_SG_Q4_0 2
@@ -103,6 +110,7 @@
 #define FC_MUL_MM                      700
 #define FC_ROPE                        800
 #define FC_SSM_CONV                    900
+#define FC_SSM_CONV_SILU               (FC_SSM_CONV + 1)
 #define FC_SOLVE_TRI                   1000
 #define FC_COUNT_EQUAL                 1100
 #define FC_UNARY                       1200
@@ -111,6 +119,7 @@
 #define FC_UPSCALE                     1500
 #define FC_GATED_DELTA_NET             1600
 #define FC_GATED_DELTA_NET_WRITE_ROWS  (FC_GATED_DELTA_NET + 4)
+#define FC_GATED_DELTA_NET_RAW_GATES   (FC_GATED_DELTA_NET + 5)
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -502,6 +511,12 @@ typedef struct {
     int16_t  r2;
     int16_t  r3;
 } ggml_metal_kargs_mul_mv;
+
+typedef struct {
+    int32_t  nblk;
+    int32_t  ne11;
+    uint64_t nb11;
+} ggml_metal_kargs_q1_0_planes;
 
 typedef struct {
     int32_t  ne00;
@@ -1202,8 +1217,14 @@ typedef struct {
     int32_t  len;
 } ggml_metal_kargs_argsort_merge;
 
+// Block widths at or above this run the threadgroup-staged FWHT kernel: the
+// register-resident one keeps N/32 values per thread, which stops fitting here.
+#define GGML_METAL_FWHT_TG_MIN_N 512
+#define GGML_METAL_FWHT_TG_NT    256
+
 typedef struct {
     int32_t nrows;
+    int32_t n_blk; // sign rows per activation row (K / N); 0 = no sign flip fused in
 } ggml_metal_kargs_fwht;
 
 typedef struct {

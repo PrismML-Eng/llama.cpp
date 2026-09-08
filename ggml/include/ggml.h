@@ -433,7 +433,8 @@ extern "C" {
         // Prism-private Q2_0 at group size 128 (upstream Q2_0 is group 64). High id so it
         // slots above upstream types; type_traits is sized to COUNT (143) with 43..141 unused.
         GGML_TYPE_PQ2_0 = 142,
-        GGML_TYPE_COUNT   = 143,
+        GGML_TYPE_PTQ1_0 = 143, // Prism-private ternary, group 128
+        GGML_TYPE_COUNT   = 144,
     };
 
     // precision
@@ -479,6 +480,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
         GGML_FTYPE_MOSTLY_PQ2_0 = 128, // except 1d tensors (Prism-private group-128 Q2_0)
+        GGML_FTYPE_MOSTLY_PTQ1_0 = 129, // except 1d tensors (Prism-private group-128 ternary)
     };
 
     // available tensor operations:
@@ -2617,6 +2619,14 @@ extern "C" {
             struct ggml_tensor  * states,
             struct ggml_tensor  * rows,
             int                   n_snap_slots);
+
+    // fold the per-head gate activations into a gated_delta_net op (scalar gate only):
+    //   beta -> sigmoid(beta),  g -> a[h] * softplus(g + dt_bias[h])
+    // dt_bias and a are F32 with H_v elements; removes four elementwise ops per layer
+    GGML_API void ggml_gated_delta_net_set_raw_gates(
+            struct ggml_tensor  * gdn,
+            struct ggml_tensor  * dt_bias,
+            struct ggml_tensor  * a);
 
     // DSA lightning indexer
     //

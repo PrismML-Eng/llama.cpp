@@ -1078,6 +1078,10 @@ struct llm_graph_context {
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
 
+    // Transforms shared by folded weights on the same activation. Key is (input, rotation);
+    // both must match. Valid for one graph build only.
+    mutable std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hadamard_memo;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;

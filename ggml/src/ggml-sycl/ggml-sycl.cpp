@@ -6303,8 +6303,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_OPT_STEP_SGD:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            // rows-indexed state read (src[6]) not implemented here
-            return op->src[6] == NULL;
+            // rows-indexed state read (src[6]) and raw gates (op_params[1]) not implemented here
+            return op->src[6] == NULL && ggml_get_op_params_i32(op, 1) == 0;
         case GGML_OP_SSM_CONV:
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 &&
