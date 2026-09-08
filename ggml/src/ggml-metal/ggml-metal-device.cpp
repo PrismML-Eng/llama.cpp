@@ -582,7 +582,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(ggml_metal_library_t lib, const ggml_tensor * op, bool silu) {
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
 
@@ -599,17 +599,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(ggml_me
     }
 
     snprintf(base, 256, "kernel_ssm_conv_%s_%s%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type), suffix);
-    snprintf(name, 256, "%s", base);
+    snprintf(name, 256, "%s_silu=%d", base, silu ? 1 : 0);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
-        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_bool(cv, silu, FC_SSM_CONV_SILU);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
     }
 
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched(ggml_metal_library_t lib, const ggml_tensor * op, int ssm_conv_bs) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched(ggml_metal_library_t lib, const ggml_tensor * op, int ssm_conv_bs, bool silu) {
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
 
@@ -625,13 +631,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched
     }
 
     snprintf(base, 256, "kernel_ssm_conv_%s_%s_batched%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type), suffix);
-    snprintf(name, 256, "%s_ssm_conv_bs=%d", base, ssm_conv_bs);
+    snprintf(name, 256, "%s_ssm_conv_bs=%d_silu=%d", base, ssm_conv_bs, silu ? 1 : 0);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
 
         ggml_metal_cv_set_int16(cv, ssm_conv_bs, FC_SSM_CONV + 0);
+        ggml_metal_cv_set_bool (cv, silu,        FC_SSM_CONV_SILU);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -717,7 +724,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
     // the 2D cache view. K is op param 0 in both variants.
     const int K = ggml_get_op_params_i32(op, 0);
     // rows mode: src[6] holds per-seq cache row indices for the state read
-    const bool has_rows = op->src[6] != NULL;
+    const bool has_rows  = op->src[6] != NULL;
+    const bool raw_gates = ggml_get_op_params_i32(op, 1) != 0;
 
     const int nsg = op->src[2]->ne[0]/32;
 
@@ -726,7 +734,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
     GGML_ASSERT(ne20 % 32 == 0);
 
     snprintf(base, 256, "kernel_gated_delta_net_%s_%d", ggml_type_name(op->src[0]->type), nsg);
-    snprintf(name, 256, "%s_ne20=%d_ne30=%d_K=%d_rows=%d_write_rows=%d", base, ne20, ne30, K, has_rows ? 1 : 0, write_rows ? 1 : 0);
+    snprintf(name, 256, "%s_ne20=%d_ne30=%d_K=%d_rows=%d_write_rows=%d_raw=%d", base, ne20, ne30, K, has_rows ? 1 : 0, write_rows ? 1 : 0, raw_gates ? 1 : 0);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -737,6 +745,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
         ggml_metal_cv_set_int16(cv, K,    FC_GATED_DELTA_NET + 2);
         ggml_metal_cv_set_bool (cv, has_rows,   FC_GATED_DELTA_NET + 3);
         ggml_metal_cv_set_bool (cv, write_rows, FC_GATED_DELTA_NET_WRITE_ROWS);
+        ggml_metal_cv_set_bool (cv, raw_gates,  FC_GATED_DELTA_NET_RAW_GATES);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 

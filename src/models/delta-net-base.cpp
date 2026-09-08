@@ -399,7 +399,12 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
     // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
-    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
+    const bool raw = gdn_raw_beta && gdn_raw_alpha && gdn_raw_dt_bias && gdn_raw_a;
+
+    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, raw ? gdn_raw_alpha : g, raw ? gdn_raw_beta : b, s, /*K=*/1);
+    if (raw) {
+        ggml_gated_delta_net_set_raw_gates(result, gdn_raw_dt_bias, gdn_raw_a);
+    }
     if (n_tokens == 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
     } else {
@@ -568,14 +573,21 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
+    const bool raw = gdn_raw_beta && gdn_raw_alpha && gdn_raw_dt_bias && gdn_raw_a;
+    ggml_tensor * gg = raw ? gdn_raw_alpha : g;
+    ggml_tensor * bb = raw ? gdn_raw_beta  : b;
+
     ggml_tensor * gdn_out;
     if (state_rows) {
         // rows mode: the fused op reads each seq's live state directly from the
         // 2D cache view at row state_rows[seq] -- no gather
-        gdn_out = ggml_gated_delta_net_rows(ctx0, q, k, v, g, b, s, state_rows, (int) K);
+        gdn_out = ggml_gated_delta_net_rows(ctx0, q, k, v, gg, bb, s, state_rows, (int) K);
     } else {
         // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
-        gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+        gdn_out = ggml_gated_delta_net(ctx0, q, k, v, gg, bb, s, K);
+    }
+    if (raw) {
+        ggml_gated_delta_net_set_raw_gates(gdn_out, gdn_raw_dt_bias, gdn_raw_a);
     }
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
