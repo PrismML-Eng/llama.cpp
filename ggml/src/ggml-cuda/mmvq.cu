@@ -681,7 +681,7 @@ static __global__ void mul_mat_vec_q(
             if (kbx_prefetch < blocks_per_row_x && tid % (qi/vdr) == 0) {
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
-#if defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
                     const block_t * prefetch_ptr = (const block_t *) vx +
                         kbx_offset + i*stride_row_x + kbx_prefetch;
                     asm volatile("prefetch.global.L2 [%0];" :: "l"(__cvta_generic_to_global(prefetch_ptr)));
