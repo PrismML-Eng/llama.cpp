@@ -1000,7 +1000,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
                         const int hint = linear % hints_per_row;
                         const char * next = reinterpret_cast<const char *>(reinterpret_cast<const block_q1_0 *>(x) +
                             offset_x + row*stride_row_x + kb0_next) + hint*hint_stride;
-#if defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
                         asm volatile("prefetch.global.L2 [%0];" :: "l"(__cvta_generic_to_global(next)));
 #endif
                     }
