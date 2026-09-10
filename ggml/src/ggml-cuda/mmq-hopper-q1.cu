@@ -1,14 +1,6 @@
 // Hopper (sm_90a) wgmma MMQ path for Q1_0: dequant-in-SMEM + int8 wgmma with exact per-block scaling.
-// Active by default in builds configured with GGML_CUDA_HOPPER_Q1; set GGML_HOPPER_Q1_DISABLE to
-// fall back to the standard MMQ path. Dispatched only when M,N,K % 128 == 0 and cc >= 900 (Hopper
-// only: not Ada, not Blackwell); every other shape falls through to standard MMQ.
-//
-// Activations are quantized fp32 -> int8 with a per-128-K absmax scale, coarser than q8_1's
-// per-32, so this path is NOT bit-identical to standard MMQ. The deviation has been measured
-// against the same build with the path disabled, using a same-path control to establish the
-// floor: it is small, the tail is bounded, and only a small fraction of tokens change their
-// argmax. Figures are recorded in the internal notes. If you need bit-exact output, set
-// GGML_HOPPER_Q1_DISABLE.
+// Active by default when built with GGML_CUDA_HOPPER_Q1; set GGML_HOPPER_Q1_DISABLE for standard MMQ.
+// Not bit-identical to standard MMQ: activations use a per-128-K int8 absmax scale, coarser than q8_1's per-32.
 
 #include "common.cuh"
 
@@ -457,7 +449,8 @@ bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context & ctx,
     const int64_t K = src0->ne[0], N = src0->ne[1], M = src1->ne[1];
     const bool    is_q1 = src0->type == GGML_TYPE_Q1_0;
     const bool    is_q2 = src0->type == GGML_TYPE_PQ2_0;
-    if (cc < 900 || cc >= GGML_CUDA_CC_BLACKWELL ||  // sm_90a wgmma only: not Ada, not Blackwell (no wgmma; needs the tcgen05 path)  // 900 = Hopper; no GGML_CUDA_CC_HOPPER macro in this tree
+    // sm_90a wgmma only; Blackwell spans CC 1000-1200 and needs the tcgen05 path
+    if (cc < GGML_CUDA_CC_HOPPER || cc >= 1000 ||
         (!is_q1 && !is_q2) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
         src1->ne[2] * src1->ne[3] != 1 || src0->ne[2] * src0->ne[3] != 1 || (M % 128) || (N % 128) || (K % 128) ||
         !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
