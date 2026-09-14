@@ -2416,9 +2416,10 @@ common_speculative_init_result::common_speculative_init_result(
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
-    // note: for small models maybe we can set this to the maximum possible draft from all speculative types
-    //       the extra memory for small models is likely negligible?
-    cparams.n_rs_seq  = 0;
+    // the draft context must reserve the same per-sequence recurrent-state slots as the target.
+    // leaving this at 0 makes common_context_can_seq_rm() classify the context as FULL, so
+    // llama_memory_seq_rm() silently fails on it and stale positions are retained.
+    cparams.n_rs_seq  = params.speculative.need_n_rs_seq();
     cparams.ctx_other = ctx_tgt;
 
     std::string model_path;
