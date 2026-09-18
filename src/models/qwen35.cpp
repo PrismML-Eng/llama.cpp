@@ -495,9 +495,15 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // only with the fused_gdn_* probes on), so the A/B stays bit-identical
     const bool fused_ok = cparams.n_rs_seq > 0 || (n_seq_tokens == 1 ? cparams.fused_gdn_ar : cparams.fused_gdn_ch);
 
-    // Stage 7A gate: in-place only without speculation (K == 1)
+    // GGML_GDN_INPLACE_K1_ONLY=1 restricts the in-place path to K == 1 (no
+    // speculation); by default the MTP speculative mode (K = n_rs_seq + 1) takes
+    // it too: slot 0 is updated in place, slots 1..K-1 are written straight into
+    // the snapshot planes of the same cell, and a pending rollback reads plane
+    // rs_idx of the same cell (rows_in != rows_out: copy-then-in-place).
+    static const bool gdn_inplace_k1_only_env = getenv("GGML_GDN_INPLACE_K1_ONLY") != nullptr;
+
     const bool gdn_state_inplace    = gdn_state_rows_env && gdn_state_inplace_dev_ok && inp->rs_inplace && fused_ok &&
-                                      cparams.n_rs_seq == 0;
+                                      (cparams.n_rs_seq == 0 || !gdn_inplace_k1_only_env);
     const bool gdn_state_rows_metal = gdn_state_rows_env && gdn_state_rows_dev_ok && !gdn_state_inplace_dev_ok &&
                                       cparams.n_rs_seq > 0;
     const bool gdn_state_rows       = gdn_state_inplace || gdn_state_rows_metal;
