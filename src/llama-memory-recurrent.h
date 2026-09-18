@@ -173,6 +173,14 @@ public:
 
     int32_t s_copy(int i) const;
 
+    // true when the GDN op may update this ubatch's cache rows in place: not the
+    // full (reserve) context, the cell range is exactly the ubatch (n == n_seqs)
+    // and every cell reads its own state (src0 == own index; a pending rollback
+    // still reads a plane of the same cell). Side-effect free on purpose: unlike
+    // s_copy() it never consumes the per-seq rollback index, so it can be
+    // evaluated at graph build and again in can_reuse.
+    bool rs_inplace_ok(uint32_t n_seqs) const;
+
 private:
     const llama_memory_status status;
 

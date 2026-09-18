@@ -539,7 +539,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor *        b,
         ggml_tensor *        s,
         int                  il,
-        ggml_tensor *        state_rows) {
+        ggml_tensor *        state_rows,
+        bool                 state_inplace) {
     const auto * mctx_cur   = inp->mctx;
     const auto   kv_head    = mctx_cur->get_head();
     const uint32_t mem_size = mctx_cur->get_size();
@@ -553,7 +554,49 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const bool keep = cparams.n_rs_seq > 0;
 
-    GGML_ASSERT(state_rows == nullptr || keep); // rows mode is a ring-path optimization
+    GGML_ASSERT(state_rows == nullptr || keep || state_inplace); // Metal rows mode is a ring-path optimization
+    GGML_ASSERT(!state_inplace || state_rows != nullptr);
+
+    if (state_inplace) {
+        // in-place mode (CPU): the cache-writing op reads each seq's state at
+        // cache row state_rows[seq] (rows_in = inp->s_copy_main: the live row, or
+        // the rollback plane of the same cell), updates the live row
+        // write_rows[seq] in place and writes snapshot slots 1..min(T, K)-1
+        // straight into cache rows write_rows[slot*n_seqs + seq] -- the same
+        // rows the SET_ROWS / strided cpy below would have written. The result
+        // carries the attention scores only: no gather, no dst state planes, no
+        // write-back copy. Same float instruction sequence on the same inputs as
+        // the paths below, so the outputs and the resulting cache rows are
+        // bit-identical (tests/test-gdn-inplace.cpp).
+        const int64_t K = cparams.n_rs_seq + 1;
+
+        const bool raw = gdn_raw_beta && gdn_raw_alpha && gdn_raw_dt_bias && gdn_raw_a;
+        ggml_tensor * gg = raw ? gdn_raw_alpha : g;
+        ggml_tensor * bb = raw ? gdn_raw_beta  : b;
+
+        ggml_tensor * write_rows = build_rs_write_rows(inp, K, n_seq_tokens, n_seqs);
+
+        ggml_tensor * gdn_out = ggml_gated_delta_net_cache(ctx0, q, k, v, gg, bb, s, state_rows, write_rows,
+                (int) K, (int) mem_size);
+        if (raw) {
+            ggml_gated_delta_net_set_raw_gates(gdn_out, gdn_raw_dt_bias, gdn_raw_a);
+        }
+        if (n_seq_tokens > 1) {
+            res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+        } else {
+            res->add_fused_node({LLM_FUSED_OP_GDN_AR, gdn_out, il});
+        }
+
+        ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
+            S_v, H_v, n_seq_tokens, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, S_v * H_v),
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+            0);
+        cb(output, "attn_output", il);
+
+        return output;
+    }
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
