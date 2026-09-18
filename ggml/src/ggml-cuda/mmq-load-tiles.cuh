@@ -220,10 +220,15 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         for (int j = 0; j < 4; ++j) {
             const int q  = qxi[j];
 
+#if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
+            const int qx = q2_0_symbols4_hip((uint32_t) q & 0xFFu);
+            const int qy = q2_0_symbols4_hip(((uint32_t) q >> 8) & 0xFFu);
+#else
             const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
             const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
             const int qx = __byte_perm(qe, qo, 0x5140);
             const int qy = __byte_perm(qe, qo, 0x7362);
+#endif // defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
             x_qs[i*sram_stride           + dst_offset + j*2+0] = qx;
