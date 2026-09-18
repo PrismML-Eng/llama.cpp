@@ -9285,6 +9285,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
 
+    // MMVQ at ncols_dst 2..5 (multi-column vec_dot and Ampere rows per block), opt-in
+    if (getenv("GGML_QWEN38_REUSE_TEST") != nullptr) {
+        for (ggml_type type_a : {GGML_TYPE_Q5_0, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+            for (int64_t n : {2, 3, 4, 5}) {
+                for (int64_t k : {256, 512, 1024, 1280}) {
+                    test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, n, k, {1, 1}, {1, 1}));
+                }
+                // row count not a multiple of rows per block
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 517, n, 1024, {1, 1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 517, n, 1024, {2, 3}, {1, 1}));
+            }
+        }
+    }
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 1*256, { 1,  1}, {1, 1}));
@@ -10017,6 +10031,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (int nb : { 32, 64, }) {
                 for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, }) {
                     test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                }
+            }
+        }
+    }
+
+    // q8_0 KV decode with head size 256 and GQA > 4 (fused q8_0 MMA path on Ampere), opt-in
+    if (getenv("GGML_QWEN38_FA_Q8_0_TEST") != nullptr) {
+        for (int nr2 : { 6, 8 }) {
+            for (int kv : { 512, 1024, 4096, 1000 }) {
+                for (int nb : { 1, 2, 3, 4, 5 }) {
+                    for (bool sinks : { false, true }) {
+                        for (float logit_softcap : { 0.0f, 10.0f }) {
+                            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {nr2, 1}, kv, nb, true, sinks, 0.0f, logit_softcap, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+                        }
+                    }
                 }
             }
         }

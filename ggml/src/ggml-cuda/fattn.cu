@@ -567,9 +567,80 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// GGML_CUDA_FA_Q8_0_MMA=0 disables the fused q8_0 KV decode path
+static bool ggml_cuda_fattn_q8_0_mma_enabled() {
+    static const bool value = [] {
+        const char * env = getenv("GGML_CUDA_FA_Q8_0_MMA");
+        return env == nullptr || env[0] != '0';
+    }();
+    return value;
+}
+
+// smallest ncols1 for single-token queries, 2 by default because the padded (2,8) kernel fills its blocks better
+static int ggml_cuda_fattn_q8_0_mma_ncols1_min() {
+    static const int value = [] {
+        const char * env = getenv("GGML_CUDA_FA_Q8_0_MMA_NCOLS1_MIN");
+        return env != nullptr && env[0] == '1' ? 1 : 2;
+    }();
+    return value;
+}
+
+// Decode with q8_0 K and V: the kernel reads the quantized cache and packs the GQA heads (ncols2 = 8),
+// the generic path would first convert the whole cache to f16.
+static bool ggml_cuda_flash_attn_ext_mma_q8_0(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * KQV  = dst;
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    // only tuned and tested on Ampere
+    const bool is_ampere = GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_ADA_LOVELACE;
+    if (!ggml_cuda_fattn_q8_0_mma_enabled() || !turing_mma_available(cc) || !is_ampere) {
+        return false;
+    }
+    if (K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q8_0 || Q->ne[0] != 256 || V->ne[0] != 256 || Q->ne[1] > 5) {
+        return false;
+    }
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+    if (!mask || max_bias != 0.0f || K->ne[1] % FATTN_KQ_STRIDE != 0 || Q->ne[2] / K->ne[2] <= 4) {
+        return false;
+    }
+
+    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+    if (V_is_K_view) {
+        return false;
+    }
+
+    // the raw rows are staged with 16 byte copies
+    for (const ggml_tensor * t : {K, V}) {
+        if (t->nb[1] % 16 != 0 || t->nb[2] % 16 != 0 || t->nb[3] % 16 != 0 || ((uintptr_t) t->data) % 16 != 0) {
+            return false;
+        }
+    }
+
+    if (Q->ne[1] == 1 && ggml_cuda_fattn_q8_0_mma_ncols1_min() == 1) {
+        ggml_cuda_flash_attn_ext_mma_q8_0_case<256, 256, 1, 8>(ctx, dst);
+    } else if (Q->ne[1] <= 2) {
+        ggml_cuda_flash_attn_ext_mma_q8_0_case<256, 256, 2, 8>(ctx, dst);
+    } else if (Q->ne[1] <= 4) {
+        ggml_cuda_flash_attn_ext_mma_q8_0_case<256, 256, 4, 8>(ctx, dst);
+    } else {
+        ggml_cuda_flash_attn_ext_mma_q8_0_case<256, 256, 8, 8>(ctx, dst);
+    }
+    return true;
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    if (kernel != BEST_FATTN_KERNEL_NONE && ggml_cuda_flash_attn_ext_mma_q8_0(ctx, dst)) {
+        return;
+    }
+    switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
