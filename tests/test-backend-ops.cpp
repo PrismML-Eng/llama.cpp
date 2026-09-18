@@ -10331,6 +10331,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Bonsai 2 27B PQ2_0 decode GEMV shapes at 1..5 columns, opt-in
+    if (getenv("GGML_BONSAI_PERF") != nullptr) {
+        const std::array<std::array<int64_t, 2>, 7> mk = {{
+            {17408, 5120}, {12288, 5120}, {10240, 5120}, {6144, 5120}, {1024, 5120}, {5120, 17408}, {5120, 6144},
+        }};
+        for (const auto & s : mk) {
+            for (int64_t n : {1, 2, 3, 4, 5}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, s[0], n, s[1], {1, 1}, {1, 1}));
+            }
+        }
+        return test_cases;
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
