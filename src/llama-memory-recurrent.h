@@ -26,7 +26,7 @@ public:
                      uint32_t   n_rs_seq,
         const layer_filter_cb & filter);
 
-    ~llama_memory_recurrent() = default;
+    ~llama_memory_recurrent();
 
     //
     // llama_memory_i
@@ -120,6 +120,18 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    // host RS buffers backed by an anonymous private mmap (kernel zero pages,
+    // resident only where written) and wrapped with
+    // ggml_backend_cpu_buffer_from_ptr, which does not own the memory: unmapped
+    // in the destructor after the buffers are freed. Empty when
+    // LLAMA_RS_EAGER_ZERO=1 or on non-Linux hosts (eager alloc + memset).
+    struct rs_mmap_region {
+        ggml_backend_buffer_t buf;
+        void *                ptr;
+        size_t                size;
+    };
+    std::vector<rs_mmap_region> mmaps;
 
     size_t total_size() const;
 

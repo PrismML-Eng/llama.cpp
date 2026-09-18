@@ -1,5 +1,6 @@
 #include "llama-memory-recurrent.h"
 
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -8,14 +9,65 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <stdexcept>
 
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
+
 //
 // llama_memory_recurrent
 //
+
+#ifdef __linux__
+// One anonymous, private mapping for every tensor of ctx, placed exactly as
+// ggml_backend_alloc_ctx_tensors_from_buft would place them (same padded sizes,
+// same alignment, same order) but wrapped with ggml_backend_cpu_buffer_from_ptr,
+// which does not own the memory: the caller munmaps it after the buffer is
+// freed. Returns nullptr (and touches nothing) when the mapping cannot be made.
+static ggml_backend_buffer_t rs_alloc_lazy_zero_host_buffer(
+        ggml_context * ctx, ggml_backend_buffer_type_t buft, void ** ptr_out, size_t * size_out) {
+    const size_t size = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft);
+    if (size == 0) {
+        return nullptr;
+    }
+
+    void * ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ptr == MAP_FAILED) {
+        LLAMA_LOG_WARN("%s: anonymous mmap of %zu bytes failed (%s), falling back to the eager clear\n",
+                __func__, size, strerror(errno));
+        return nullptr;
+    }
+
+    // mmap returns page-aligned memory, which satisfies the CPU buffer alignment
+    ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    if (!buf) {
+        munmap(ptr, size);
+        return nullptr;
+    }
+
+    ggml_tallocr talloc = ggml_tallocr_new(buf);
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->data == nullptr && t->view_src == nullptr) {
+            if (ggml_tallocr_alloc(&talloc, t) != GGML_STATUS_SUCCESS) {
+                ggml_backend_buffer_free(buf);
+                munmap(ptr, size);
+                return nullptr;
+            }
+        }
+    }
+
+    *ptr_out  = ptr;
+    *size_out = size;
+
+    return buf;
+}
+#endif
 
 llama_memory_recurrent::llama_memory_recurrent(
         const llama_model & model,
@@ -106,13 +158,62 @@ llama_memory_recurrent::llama_memory_recurrent(
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
+    //
+    // Host (CPU) buffers, Linux: by default the whole RS buffer is one anonymous
+    // private mmap (rs_alloc_lazy_zero_host_buffer) and is NOT memset. The
+    // kernel hands out zero pages on first touch, so the "no NaN padding"
+    // guarantee of the eager clear holds without making every cell of every
+    // snapshot plane resident at construction: the buffer is
+    // mem_size*(1+n_rs_seq) rows per layer, so --parallel 16 with n_rs_seq = 2
+    // pinned ~4.7 GiB of the 15 GiB here (evicting the mmap'd weights that
+    // decode streams on every token) while one active slot needs ~0.3 GiB.
+    // Residency now follows the cells that were actually written.
+    //
+    // Why skipping the memset is exact -- every row the graph ever reads is
+    // zero by construction or was written before it is read:
+    //  - a fresh sequence reads the rs_z row, which the graph zeroes in place
+    //    (ggml_scale_inplace by 0 in build_rs / build_rs_cache_view) before any
+    //    consumer reads it; 0 * (a kernel zero page) == 0 either way;
+    //  - every other main row is src0 = src of a used cell (find_slot), i.e. a
+    //    row written by an earlier step's write-back / in-place update, by the
+    //    extra-row relocation, or by state_read_data;
+    //  - a rollback read of snapshot plane r (1 <= r <= n_rs_seq) only happens
+    //    after a ubatch of that sequence wrote slot r of the same cell: seq_rm
+    //    only accepts rollback <= n_rs_seq, split_equal keeps the trailing
+    //    n_rs_seq + 1 tokens of a sequence in one ubatch and the op writes slots
+    //    0..min(T, K)-1, so the plane was written before it is read;
+    //  - the alignment padding between tensors is never read.
+    // clear(true) drops the pages with madvise(MADV_DONTNEED) instead of a
+    // memset (a private anonymous mapping then reads back as zero).
+    // LLAMA_RS_EAGER_ZERO=1 restores the eager alloc + memset path.
+#ifdef __linux__
+    static const bool rs_eager_zero = getenv("LLAMA_RS_EAGER_ZERO") != nullptr;
+#endif
+
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
-        if (!buf) {
-            throw std::runtime_error("failed to allocate buffer for rs cache");
+        ggml_backend_buffer_t buf  = nullptr;
+        bool                  lazy = false;
+
+#ifdef __linux__
+        if (!rs_eager_zero && buft == ggml_backend_cpu_buffer_type()) {
+            void * ptr  = nullptr;
+            size_t size = 0;
+            buf = rs_alloc_lazy_zero_host_buffer(ctx.get(), buft, &ptr, &size);
+            if (buf) {
+                mmaps.push_back({ buf, ptr, size });
+                lazy = true;
+            }
         }
-        ggml_backend_buffer_clear(buf, 0);
-        LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+#endif
+        if (!buf) {
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+            if (!buf) {
+                throw std::runtime_error("failed to allocate buffer for rs cache");
+            }
+            ggml_backend_buffer_clear(buf, 0);
+        }
+        LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB%s\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0,
+                lazy ? " (anonymous mmap, lazily zeroed)" : "");
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
@@ -125,6 +226,17 @@ llama_memory_recurrent::llama_memory_recurrent(
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f));
     }
+}
+
+llama_memory_recurrent::~llama_memory_recurrent() {
+    // the from_ptr buffers do not own their memory: free them first, then unmap
+    ctxs_bufs.clear();
+#ifdef __linux__
+    for (const auto & m : mmaps) {
+        munmap(m.ptr, m.size);
+    }
+#endif
+    mmaps.clear();
 }
 
 void llama_memory_recurrent::clear(bool data) {
@@ -140,7 +252,20 @@ void llama_memory_recurrent::clear(bool data) {
 
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
-            ggml_backend_buffer_clear(buf.get(), 0);
+            bool dropped = false;
+#ifdef __linux__
+            for (const auto & m : mmaps) {
+                if (m.buf == buf.get()) {
+                    // drop the pages instead of memset: a private anonymous
+                    // mapping reads back as zero and stays non-resident
+                    dropped = madvise(m.ptr, m.size, MADV_DONTNEED) == 0;
+                    break;
+                }
+            }
+#endif
+            if (!dropped) {
+                ggml_backend_buffer_clear(buf.get(), 0);
+            }
         }
     }
 
