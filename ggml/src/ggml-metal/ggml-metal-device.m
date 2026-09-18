@@ -26,6 +26,9 @@
 static const NSInteger MTLGPUFamilyMetal3_GGML = 5001;
 static const NSInteger MTLGPUFamilyMetal4_GGML = 5002;
 
+// MTLLanguageVersion4_0 is not present in older SDKs
+static const NSUInteger MTLLanguageVersion4_0_GGML = 4 << 16;
+
 #if !GGML_METAL_EMBED_LIBRARY
 // Here to assist with NSBundle Path Hack
 @interface GGMLMetalClass : NSObject
@@ -275,6 +278,21 @@ static NSString * ggml_metal_library_flatten_source(NSString * path_source, NSEr
 
 // Compile all per-kind libraries in parallel. `source_for_kind` returns the MSL
 // source for a kind (the helper takes ownership and releases it), or nil with
+// the tensor API headers (<metal_tensor>, MetalPerformancePrimitives) are only
+// exposed to the shader compiler at Metal language version 4.0. When the
+// language version is left unset, the runtime picks a default from the SDK the
+// binary was linked against, so a binary built with a pre-26 SDK fails the
+// tensor API probe at runtime on M5/A19 devices (error compiling source) even
+// though the OS supports it. Request 4.0 explicitly whenever the device has
+// the tensor API (Metal4 family, which implies an OS that accepts 4.0).
+static void ggml_metal_compile_options_set_lang(MTLCompileOptions * options, bool has_tensor) {
+    if (!has_tensor) {
+        return;
+    }
+
+    options.languageVersion = (MTLLanguageVersion) MTLLanguageVersion4_0_GGML;
+}
+
 // *err set on failure. On success the objs[] slots are populated and the routing
 // index is built; on any failure every error is logged and false is returned
 // (the caller is responsible for freeing `res`).
@@ -312,6 +330,7 @@ static bool ggml_metal_library_compile_all(
             @autoreleasepool {
                 MTLCompileOptions * options = [MTLCompileOptions new];
                 options.preprocessorMacros = prep;
+                ggml_metal_compile_options_set_lang(options, ggml_metal_device_get_props(res->dev)->has_tensor);
 
                 lib = [device newLibraryWithSource:src options:options error:&error];
 
@@ -556,6 +575,7 @@ ggml_metal_library_t ggml_metal_library_init_from_source(ggml_metal_device_t dev
 
         MTLCompileOptions * options = [MTLCompileOptions new];
         options.preprocessorMacros = prep;
+        ggml_metal_compile_options_set_lang(options, ggml_metal_device_get_props(dev)->has_tensor);
 
         library = [device newLibraryWithSource:src options:options error:&error];
         if (error) {
