@@ -104,6 +104,43 @@ static __device__ __forceinline__ void vec_dot_iq4_xs_q8_1_multi(
     }
 }
 
+// Same as above for PQ2_0 (group 128, iqs selects one 32-element chunk), the ops per column match vec_dot_pq2_0_q8_1.
+template<int ncols_dst>
+static __device__ __forceinline__ void vec_dot_pq2_0_q8_1_multi(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ y,
+        const int stride_col_y, const int kby, const int kbx, const int iqs,
+        float (&dots)[ncols_dst]) {
+    const block_pq2_0 * bq2_0 = (const block_pq2_0 *) vbq + kbx;
+    const int16_t * qs = (const int16_t *) bq2_0->qs + iqs * 4;
+
+    int sumi[ncols_dst];
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+        sumi[col] = 0;
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int q  = qs[j];
+        const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
+        const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
+        const int qx = __byte_perm(qe, qo, 0x5140);
+        const int qy = __byte_perm(qe, qo, 0x7362);
+#pragma unroll
+        for (int col = 0; col < ncols_dst; ++col) {
+            const block_q8_1 * bq8 = y + col*stride_col_y + kby + iqs;
+            sumi[col] = ggml_cuda_dp4a(get_int_b4(bq8->qs, j*2 + 0), qx, sumi[col]);
+            sumi[col] = ggml_cuda_dp4a(get_int_b4(bq8->qs, j*2 + 1), qy, sumi[col]);
+        }
+    }
+
+    const float d2 = bq2_0->d;
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+        const float d8 = __low2float((y + col*stride_col_y + kby + iqs)->ds);
+        dots[col] = d2 * d8 * sumi[col];
+    }
+}
+
 // Same as above for Q5_0, the ops per column match vec_dot_q5_0_q8_1_impl.
 template<int ncols_dst>
 static __device__ __forceinline__ void vec_dot_q5_0_q8_1_multi(
@@ -819,12 +856,14 @@ static __global__ void mul_mat_vec_q(
             // x block quant index when casting the quants to int
             const int kqs = vdr * (tid % (qi/vdr));
 
-        if constexpr (reuse_weights && (type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q5_0)) {
+        if constexpr (reuse_weights && (type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_PQ2_0)) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 float dots[ncols_dst];
                 if constexpr (type == GGML_TYPE_IQ4_XS) {
                     vec_dot_iq4_xs_q8_1_multi<ncols_dst>(vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
+                } else if constexpr (type == GGML_TYPE_PQ2_0) {
+                    vec_dot_pq2_0_q8_1_multi<ncols_dst>(vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
                 } else {
                     vec_dot_q5_0_q8_1_multi<ncols_dst>(vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
                 }
@@ -1081,7 +1120,7 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    if constexpr ((type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q5_0) && c_ncols_dst >= 2 && c_ncols_dst <= 5) {
+    if constexpr ((type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_PQ2_0) && c_ncols_dst >= 2 && c_ncols_dst <= 5) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         if (get_device_table_id(cc) == MMVQ_PARAMETERS_AMPERE && ggml_cuda_mmvq_reuse_enabled()) {
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, false, small_k, halve_iters, true>, launch_params,

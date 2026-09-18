@@ -9287,7 +9287,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // MMVQ at ncols_dst 2..5 (multi-column vec_dot and Ampere rows per block), opt-in
     if (getenv("GGML_QWEN38_REUSE_TEST") != nullptr) {
-        for (ggml_type type_a : {GGML_TYPE_Q5_0, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+        for (ggml_type type_a : {GGML_TYPE_Q5_0, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_PQ2_0}) {
             for (int64_t n : {2, 3, 4, 5}) {
                 for (int64_t k : {256, 512, 1024, 1280}) {
                     test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, n, k, {1, 1}, {1, 1}));
