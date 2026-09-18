@@ -5393,6 +5393,14 @@ static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buff
 
 static void ggml_backend_cpu_repack_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor,
                                                        void * data, size_t offset, size_t size) {
+    auto tensor_traits = (const ggml::cpu::repack::tensor_traits_base *) tensor->extra;
+    if (tensor_traits != nullptr) {
+        // Repacked tensors use an optimized layout that is not equivalent to
+        // the public GGML tensor layout. Do not expose those bytes as if they
+        // were the original tensor; an inverse transform is required first.
+        GGML_ABORT("%s: reading repacked tensor %s is not supported\n", __func__, tensor->name);
+    }
+
     memcpy(data, (const char *) tensor->data + offset, size);
 
     GGML_UNUSED(buffer);
