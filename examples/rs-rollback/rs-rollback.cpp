@@ -1,16 +1,25 @@
-// Correctness harness for the recurrent-state snapshot ring (n_rs_seq > 0).
+// Correctness harness for the recurrent-state snapshot planes (n_rs_seq > 0).
 //
-// A forward-only generation never reads the snapshot slots back, so it cannot
+// A forward-only generation never reads the snapshot planes back, so it cannot
 // catch a bad snapshot write. This does:
 //
 //   pass A (reference): greedily generate N tokens straight through.
-//   pass B (rollback):  generate the same N tokens, but every S tokens
-//                       over-generate by R, then llama_memory_seq_rm() those R
-//                       positions away and re-generate them.
+//   pass B (rollback):  generate the same N tokens, but every S accepted tokens
+//                       decode the next accepted token together with R draft
+//                       tokens as ONE ubatch (the server's verify shape), then
+//                       llama_memory_seq_rm() the R draft positions away.
 //
 // Pass B only lands on the same tokens if the state restored from the snapshot
-// ring is exactly the state that produced them the first time. Any error in the
+// plane is exactly the state after the accepted token. Any error in the
 // conv-window or SSM snapshot write shows up as a token mismatch.
+//
+// The rollback stays inside the verify ubatch on purpose: a ubatch snapshots the
+// state after each of its last min(T, K) - 1 tokens and never the state it
+// started from, so a rollback across single-token steps is refused. Right after
+// a rollback step the accepted token's logits come from an (R + 1)-token ubatch
+// instead of a single-token one; a mismatch exactly there can in rare near-tie
+// cases be matmul rounding rather than a snapshot bug -- the first-mismatch
+// index tells.
 #include "llama.h"
 
 #include <cstdio>
@@ -39,7 +48,7 @@ int main(int argc, char ** argv) {
     int         n_predict = 128;
     int         stride    = 16;  // roll back every `stride` accepted tokens
     int         rewind    = 4;   // how many tokens to discard and re-generate
-    int         n_rs_seq  = 8;   // snapshot ring depth; must be >= rewind + 1
+    int         n_rs_seq  = 8;   // snapshot planes per seq; must be >= rewind
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) {
@@ -98,49 +107,54 @@ int main(int argc, char ** argv) {
         }
         int n_pos = n_prompt;
 
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+
         int since = 0;
         while ((int) out.size() < n_predict) {
             llama_token tok = greedy(ctx, vocab);
             out.push_back(tok);
-
-            batch = llama_batch_get_one(&tok, 1);
-            if (llama_decode(ctx, batch)) {
-                fprintf(stderr, "decode failed\n");
-                return false;
-            }
-            n_pos++;
             since++;
 
             if (with_rollback && since >= stride && (int) out.size() + rewind < n_predict) {
                 n_rollbacks++;
-                // over-generate `rewind` tokens, then throw them away
-                for (int r = 0; r < rewind; r++) {
-                    llama_token t = greedy(ctx, vocab);
-                    batch         = llama_batch_get_one(&t, 1);
-                    if (llama_decode(ctx, batch)) {
-                        fprintf(stderr, "decode(draft) failed\n");
-                        return false;
-                    }
-                    n_pos++;
+                // Verify-style step: decode the accepted token together with `rewind`
+                // draft tokens as ONE ubatch (logits for the accepted token's row only),
+                // then drop the drafts. A ubatch snapshots the state after each of its
+                // last min(T, K) - 1 tokens and never the state it started from, so with
+                // T = rewind + 1 a rollback of `rewind` positions is the largest this
+                // ubatch supports and lands on the state after the accepted token --
+                // needs n_rs_seq >= rewind. The drafts' content is irrelevant.
+                llama_batch vb = llama_batch_init(rewind + 1, 0, 1);
+                for (int r = 0; r <= rewind; r++) {
+                    vb.token[r]     = r == 0 ? tok : (llama_token) ((tok + 7*r + 1) % n_vocab);
+                    vb.pos[r]       = n_pos + r;
+                    vb.n_seq_id[r]  = 1;
+                    vb.seq_id[r][0] = 0;
+                    vb.logits[r]    = r == 0;
                 }
-                // Drop the drafts AND the last accepted token in one go, then
-                // re-decode the accepted token so the logits are valid again.
-                // This forces the state to be restored from a snapshot taken
-                // (rewind + 1) steps back -- needs n_rs_seq >= rewind + 1.
-                const llama_pos keep = n_pos - rewind - 1;
+                vb.n_tokens = rewind + 1;
+                const bool ok_verify = llama_decode(ctx, vb) == 0;
+                llama_batch_free(vb);
+                if (!ok_verify) {
+                    fprintf(stderr, "decode(verify) failed\n");
+                    return false;
+                }
+
+                const llama_pos keep = n_pos + 1;
                 if (!llama_memory_seq_rm(mem, 0, keep, -1)) {
-                    fprintf(stderr, "ROLLBACK REFUSED: keep=%d n_pos=%d rewind=%d\n", keep, n_pos, rewind);
+                    fprintf(stderr, "ROLLBACK REFUSED: keep=%d n_pos=%d rewind=%d\n", keep, n_pos + rewind + 1, rewind);
                     return false;
                 }
                 n_pos = keep;
-
-                batch = llama_batch_get_one(&out.back(), 1);
+                since = 0;
+                // the next greedy() reads the accepted token's logits, the batch's only output row
+            } else {
+                batch = llama_batch_get_one(&tok, 1);
                 if (llama_decode(ctx, batch)) {
-                    fprintf(stderr, "decode(replay) failed\n");
+                    fprintf(stderr, "decode failed\n");
                     return false;
                 }
                 n_pos++;
-                since = 0;
             }
         }
         llama_free(ctx);
