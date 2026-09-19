@@ -3151,7 +3151,14 @@ common_speculative_init_result::common_speculative_init_result(
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
-    // n_rs_seq stays as common_context_params_to_llama set it: the draft context needs the same rollback window as the target, with n_rs_seq == 0 its seq_rm fails silently on partial acceptance and keeps stale positions
+    // no rollback snapshot planes in the draft context: every drafter decodes its draft one token per
+    // step (or drives a plain KV cache), and a recurrent memory snapshots only the tokens of a
+    // sequence's last micro-batch (see llama_memory_seq_rm), so the partial removal of a draft can
+    // never be honoured from a snapshot -- with planes it used to read a stale one; without them
+    // common_context_can_seq_rm classifies a recurrent drafter as FULL and the server /
+    // speculative-simple take the checkpoint path, the only correct one. A KV-cache drafter is
+    // classified PART as before; the target keeps its window (common_context_params_to_llama)
+    cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
 
     std::string model_path;

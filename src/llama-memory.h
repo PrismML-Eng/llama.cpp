@@ -108,6 +108,11 @@ struct llama_memory_i {
     virtual void clear(bool data) = 0;
 
     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
+
+    // number of rollback snapshot planes the memory may write for / roll back on this sequence
+    // (see llama_memory_seq_rs_snapshots); memories without recurrent state return false
+    virtual bool seq_rs_snapshots(llama_seq_id /*seq_id*/, uint32_t /*n_snap*/) { return false; }
+
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
     virtual void seq_keep(llama_seq_id seq_id) = 0;
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;

@@ -84,6 +84,10 @@ struct llm_build_delta_net_base : public llm_graph_context {
     // live state directly at cache row state_rows[seq] (inp->s_copy_main) --
     // no gathered scratch; the snapshot write becomes a SET_ROWS the Metal
     // backend can fold into the fused op's epilogue.
+    // state_inplace (CPU only, requires state_rows): the cache-writing op
+    // ggml_gated_delta_net_cache updates the live rows in place and writes the
+    // snapshot slots straight into the cache -- no dst state planes, no SET_ROWS,
+    // no write-back cpy. Only valid on ubatches with inp->rs_inplace.
     // set per layer before build_recurrent_attn: the fused GDN op then receives the
     // pre-activation beta / alpha and folds sigmoid / softplus into its prologue
     // (ggml_gated_delta_net_set_raw_gates); the non-fused paths keep the activated g / b
@@ -102,7 +106,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        b,
             ggml_tensor *        s,
             int                  il,
-            ggml_tensor *        state_rows = nullptr);
+            ggml_tensor *        state_rows = nullptr,
+            bool                 state_inplace = false);
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {
@@ -2267,8 +2272,9 @@ struct llama_model_qwen35 : public llama_model_base {
         graph(const llama_model & model, const llm_graph_params & params);
 
         // device-dependent path choices, scanned once per graph build (not per layer)
-        bool gdn_state_rows_dev_ok = true; // every GPU device is Metal: fused GDN may read state rows in place
-        bool gdn_raw_gates_dev_ok  = true; // every device is CPU/Metal/CUDA/ROCm/MUSA: fused GDN takes raw gates
+        bool gdn_state_rows_dev_ok    = true; // every GPU device is Metal: fused GDN may read state rows in place
+        bool gdn_state_inplace_dev_ok = true; // no GPU/IGPU device at all: the in-place (cache-writing) GDN is CPU-only
+        bool gdn_raw_gates_dev_ok     = true; // every device is CPU/Metal/CUDA/ROCm/MUSA: fused GDN takes raw gates
     private:
         ggml_tensor * build_layer_attn(
         llm_graph_input_attn_kv * inp_attn,

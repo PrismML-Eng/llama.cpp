@@ -1,5 +1,6 @@
 #include "llama-memory-recurrent.h"
 
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -8,14 +9,65 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <stdexcept>
 
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
+
 //
 // llama_memory_recurrent
 //
+
+#ifdef __linux__
+// One anonymous, private mapping for every tensor of ctx, placed exactly as
+// ggml_backend_alloc_ctx_tensors_from_buft would place them (same padded sizes,
+// same alignment, same order) but wrapped with ggml_backend_cpu_buffer_from_ptr,
+// which does not own the memory: the caller munmaps it after the buffer is
+// freed. Returns nullptr (and touches nothing) when the mapping cannot be made.
+static ggml_backend_buffer_t rs_alloc_lazy_zero_host_buffer(
+        ggml_context * ctx, ggml_backend_buffer_type_t buft, void ** ptr_out, size_t * size_out) {
+    const size_t size = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft);
+    if (size == 0) {
+        return nullptr;
+    }
+
+    void * ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ptr == MAP_FAILED) {
+        LLAMA_LOG_WARN("%s: anonymous mmap of %zu bytes failed (%s), falling back to the eager clear\n",
+                __func__, size, strerror(errno));
+        return nullptr;
+    }
+
+    // mmap returns page-aligned memory, which satisfies the CPU buffer alignment
+    ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    if (!buf) {
+        munmap(ptr, size);
+        return nullptr;
+    }
+
+    ggml_tallocr talloc = ggml_tallocr_new(buf);
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->data == nullptr && t->view_src == nullptr) {
+            if (ggml_tallocr_alloc(&talloc, t) != GGML_STATUS_SUCCESS) {
+                ggml_backend_buffer_free(buf);
+                munmap(ptr, size);
+                return nullptr;
+            }
+        }
+    }
+
+    *ptr_out  = ptr;
+    *size_out = size;
+
+    return buf;
+}
+#endif
 
 llama_memory_recurrent::llama_memory_recurrent(
         const llama_model & model,
@@ -34,6 +86,8 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
+    rs_n_snap.assign(n_seq_max, n_rs_seq); // every seq keeps all planes unless the API lowers its budget
+    rs_n_valid.assign(n_seq_max, 0);
 
     cells.clear();
     cells.resize(mem_size);
@@ -106,13 +160,62 @@ llama_memory_recurrent::llama_memory_recurrent(
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
+    //
+    // Host (CPU) buffers, Linux: by default the whole RS buffer is one anonymous
+    // private mmap (rs_alloc_lazy_zero_host_buffer) and is NOT memset. The
+    // kernel hands out zero pages on first touch, so the "no NaN padding"
+    // guarantee of the eager clear holds without making every cell of every
+    // snapshot plane resident at construction: the buffer is
+    // mem_size*(1+n_rs_seq) rows per layer, so --parallel 16 with n_rs_seq = 2
+    // pinned ~4.7 GiB of the 15 GiB here (evicting the mmap'd weights that
+    // decode streams on every token) while one active slot needs ~0.3 GiB.
+    // Residency now follows the cells that were actually written.
+    //
+    // Why skipping the memset is exact -- every row the graph ever reads is
+    // zero by construction or was written before it is read:
+    //  - a fresh sequence reads the rs_z row, which the graph zeroes in place
+    //    (ggml_scale_inplace by 0 in build_rs / build_rs_cache_view) before any
+    //    consumer reads it; 0 * (a kernel zero page) == 0 either way;
+    //  - every other main row is src0 = src of a used cell (find_slot), i.e. a
+    //    row written by an earlier step's write-back / in-place update, by the
+    //    extra-row relocation, or by state_read_data;
+    //  - a rollback read of snapshot plane r (1 <= r <= n_rs_seq) only happens
+    //    after a ubatch of that sequence wrote slot r of the same cell: seq_rm
+    //    only accepts rollback <= n_rs_seq, split_equal keeps the trailing
+    //    n_rs_seq + 1 tokens of a sequence in one ubatch and the op writes slots
+    //    0..min(T, K)-1, so the plane was written before it is read;
+    //  - the alignment padding between tensors is never read.
+    // clear(true) drops the pages with madvise(MADV_DONTNEED) instead of a
+    // memset (a private anonymous mapping then reads back as zero).
+    // LLAMA_RS_EAGER_ZERO=1 restores the eager alloc + memset path.
+#ifdef __linux__
+    static const bool rs_eager_zero = getenv("LLAMA_RS_EAGER_ZERO") != nullptr;
+#endif
+
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
-        if (!buf) {
-            throw std::runtime_error("failed to allocate buffer for rs cache");
+        ggml_backend_buffer_t buf  = nullptr;
+        bool                  lazy = false;
+
+#ifdef __linux__
+        if (!rs_eager_zero && buft == ggml_backend_cpu_buffer_type()) {
+            void * ptr  = nullptr;
+            size_t size = 0;
+            buf = rs_alloc_lazy_zero_host_buffer(ctx.get(), buft, &ptr, &size);
+            if (buf) {
+                mmaps.push_back({ buf, ptr, size });
+                lazy = true;
+            }
         }
-        ggml_backend_buffer_clear(buf, 0);
-        LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+#endif
+        if (!buf) {
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+            if (!buf) {
+                throw std::runtime_error("failed to allocate buffer for rs cache");
+            }
+            ggml_backend_buffer_clear(buf, 0);
+        }
+        LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB%s\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0,
+                lazy ? " (anonymous mmap, lazily zeroed)" : "");
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
@@ -125,6 +228,17 @@ llama_memory_recurrent::llama_memory_recurrent(
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f));
     }
+}
+
+llama_memory_recurrent::~llama_memory_recurrent() {
+    // the from_ptr buffers do not own their memory: free them first, then unmap
+    ctxs_bufs.clear();
+#ifdef __linux__
+    for (const auto & m : mmaps) {
+        munmap(m.ptr, m.size);
+    }
+#endif
+    mmaps.clear();
 }
 
 void llama_memory_recurrent::clear(bool data) {
@@ -140,11 +254,25 @@ void llama_memory_recurrent::clear(bool data) {
 
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
-            ggml_backend_buffer_clear(buf.get(), 0);
+            bool dropped = false;
+#ifdef __linux__
+            for (const auto & m : mmaps) {
+                if (m.buf == buf.get()) {
+                    // drop the pages instead of memset: a private anonymous
+                    // mapping reads back as zero and stays non-resident
+                    dropped = madvise(m.ptr, m.size, MADV_DONTNEED) == 0;
+                    break;
+                }
+            }
+#endif
+            if (!dropped) {
+                ggml_backend_buffer_clear(buf.get(), 0);
+            }
         }
     }
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+    std::fill(rs_n_valid.begin(), rs_n_valid.end(), 0);
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -166,6 +294,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
     if (rm_all) {
         set_rs_idx(seq_id, 0);
+        set_rs_n_valid(seq_id, 0);
     }
 
     // models like Mamba or RWKV can't have a state partially erased at the end
@@ -179,12 +308,16 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         if (tail_id >= 0) {
             auto & cell = cells[tail_id];
 
-            // partial rollback via per-token snapshot index (bounded by n_rs_seq)
+            // partial rollback via per-token snapshot index, bounded by the seq's snapshot budget
+            // (rs_n_snap[seq_id] <= n_rs_seq; a budget of 0 refuses like a memory with n_rs_seq == 0)
+            // and by the planes its last ubatch actually wrote (rs_n_valid: beyond it a plane holds
+            // the state of an older ubatch, so reading it would not be a rollback)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
-                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                if (!pending && rollback >= 1 &&
+                        rollback <= (llama_pos) rs_n_snap[seq_id] && rollback <= (llama_pos) rs_n_valid[seq_id]) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
                     return true;
@@ -269,6 +402,13 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             cell_src.seq_id.insert(seq_id_dst);
             tail_dst.tail = tail_src.tail;
         }
+    }
+
+    // until its first ubatch the destination reads the source cell's planes (src0), so it inherits
+    // what the source's last ubatch wrote
+    if (seq_id_src >= 0 && seq_id_dst >= 0 &&
+            (size_t) seq_id_src < rs_n_valid.size() && (size_t) seq_id_dst < rs_n_valid.size()) {
+        rs_n_valid[seq_id_dst] = rs_n_valid[seq_id_src];
     }
 }
 
@@ -404,6 +544,38 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     GGML_ASSERT(idx <= n_rs_seq);
 
     rs_idx[seq_id] = idx;
+}
+
+bool llama_memory_recurrent::seq_rs_snapshots(llama_seq_id seq_id, uint32_t n_snap) {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+        LLAMA_LOG_ERROR("%s: invalid seq_id (%d) - larger than n_seq_max (%d)\n", __func__, seq_id, n_seq_max);
+        return false;
+    }
+
+    if (n_snap > n_rs_seq) {
+        LLAMA_LOG_ERROR("%s: snapshot budget (%u) larger than n_rs_seq (%u)\n", __func__, n_snap, n_rs_seq);
+        return false;
+    }
+
+    assert(n_seq_max == rs_n_snap.size());
+
+    rs_n_snap[seq_id] = n_snap;
+
+    return true;
+}
+
+void llama_memory_recurrent::set_rs_n_valid(llama_seq_id seq_id, uint32_t n) {
+    if (seq_id < 0) {
+        std::fill(rs_n_valid.begin(), rs_n_valid.end(), n);
+        return;
+    }
+
+    assert(n_seq_max == rs_n_valid.size());
+
+    GGML_ASSERT((uint32_t) seq_id < n_seq_max);
+    GGML_ASSERT(n <= n_rs_seq);
+
+    rs_n_valid[seq_id] = n;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
@@ -849,6 +1021,7 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
 
     if (n_rs_seq != 0) {
         set_rs_idx(seq_id, 0);
+        set_rs_n_valid(seq_id, 0); // a restored cell holds plane 0 only
     }
 }
 
@@ -1212,7 +1385,23 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
-    mem->find_slot(ubatches[i_next]);
+    const auto & ubatch = ubatches[i_next];
+
+    mem->find_slot(ubatch);
+
+    // once the graph ran, planes 1..n_valid of every seq in the ubatch hold the states 1..n_valid
+    // tokens back (min(T, K) planes are written, K = 1 + get_n_snap()). Recorded here rather than
+    // in find_slot because prepare() dry-runs find_slot for every ubatch
+    if (mem->n_rs_seq > 0) {
+        const uint32_t n_valid = std::min<uint32_t>(ubatch.n_seq_tokens, 1 + get_n_snap()) - 1;
+
+        for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+            const uint32_t i = s*ubatch.n_seq_tokens;
+            for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                mem->set_rs_n_valid(ubatch.seq_id[i][j], n_valid);
+            }
+        }
+    }
 
     return true;
 }
@@ -1269,4 +1458,61 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         }
     }
     return (int32_t)(idx * mem->size) + src0;
+}
+
+bool llama_memory_recurrent_context::rs_inplace_ok(uint32_t n_seqs) const {
+    // the reserve context spans the whole cache (head = 0, n_rs = size)
+    if (is_full) {
+        return false;
+    }
+
+    // the extra relocation range [head + n_seqs, head + n_rs) must be empty
+    if (mem->n != n_seqs) {
+        return false;
+    }
+
+    // every ubatch cell must read its own state. After find_slot this holds for
+    // every cell that already owned its state (src0 = src = own index) and for
+    // the one-fresh-seq case where rs_z is the seq's own cell (the graph zeroes
+    // that row before the op reads it). It fails on a seq_cp fan-out, on a cell
+    // reorder and when two fresh seqs share rs_z -- those ubatches take the
+    // gathered path.
+    for (uint32_t i = 0; i < n_seqs; ++i) {
+        const uint32_t cell_idx = mem->head + i;
+        if (mem->cells[cell_idx].src0 != (int32_t) cell_idx) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+uint32_t llama_memory_recurrent_context::get_n_snap() const {
+    // no snapshot planes at all (n_rs_seq == 0): K = 1 regardless of the budgets
+    if (mem->n_rs_seq == 0) {
+        return 0;
+    }
+
+    // the reserve context sizes the compute buffers: keep the largest graph
+    if (is_full || ubatches.empty()) {
+        return mem->n_rs_seq;
+    }
+
+    // ubatches[i_next] is the ubatch apply() -> find_slot just placed; for an equal_seqs ubatch the
+    // seq ids of sequence set s are those of its first token
+    const auto & ubatch = ubatches[i_next];
+
+    uint32_t res = 0;
+
+    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+        const uint32_t i = s*ubatch.n_seq_tokens;
+        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+            const llama_seq_id seq_id = ubatch.seq_id[i][j];
+            if (seq_id >= 0 && (size_t) seq_id < mem->rs_n_snap.size()) {
+                res = std::max(res, mem->rs_n_snap[seq_id]);
+            }
+        }
+    }
+
+    return res;
 }
