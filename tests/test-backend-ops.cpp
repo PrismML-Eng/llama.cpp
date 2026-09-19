@@ -9374,6 +9374,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int k : { 5120, 8192, 8320, 17408 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 16, 1, k, {1, 1}, {1, 1}));
+    }
+
     // BF16 is absent from base_types: add the 3 standard non-contig permutations explicitly
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16,  1, 256, {2, 3}, {1, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16,  1, 256, {2, 3}, {1, 1}, {0, 1, 3, 2}));
