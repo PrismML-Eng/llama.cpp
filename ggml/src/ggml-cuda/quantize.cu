@@ -52,9 +52,15 @@ static __device__ __forceinline__ float nvfp4_native_scale_error(
 #endif // CUDART_VERSION >= 12080
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
-// pt: write the planar-transposed layout consumed by the PTQ1_0 mat-vec path
-// (see mmvq-ptq1_0.cuh) instead of block_q8_1; same quantization, same bytes per row
-template <bool pt>
+// layout (ggml_cuda_q8_1_layout):
+//   AOS      plain block_q8_1, float input sum in ds.y
+//   SOA_ISUM warp-transposed layout (ggml_cuda_ptq1_q8_word) with the exact integer sum of the
+//            quantized values bit-cast into ds.y; the 1-column PTQ1_0 vec-dot folds the digit bias
+//            {0,1,2} -> {-1,0,+1} into one subtraction per 32-block instead of a SIMD byte
+//            subtract per 4 weights (bit-identical to the biased path)
+//   PT       planar-transposed layout consumed by the 2-8 column PTQ1_0 mat-vec path
+//            (see mmvq-ptq1_0.cuh); same quantization, same bytes per row as block_q8_1
+template <ggml_cuda_q8_1_layout layout>
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
         const float * x_ptr, void * vy_ptr,
@@ -96,7 +102,7 @@ static __global__ void quantize_q8_1(
     const float  d = amax / 127.0f;
     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
 
-    if constexpr (pt) {
+    if constexpr (layout == GGML_CUDA_Q8_1_PT) {
         const int64_t row_cont = (i3*ne2.z + i2) * ne1 + i1;
         char * ycol = (char *) vy + row_cont * (ne0 * 9 / 8); // same row stride as block_q8_1
         const int64_t nblk = ne0 / QK_PTQ1_0;
@@ -110,6 +116,23 @@ static __global__ void quantize_q8_1(
 
         half2 * ds = (half2 *) (ycol + 8*nblk*16) + kb*4 + e / QK8_1;
         *ds = make_half2(d, sum);
+        return;
+    }
+    if constexpr (layout == GGML_CUDA_Q8_1_SOA_ISUM) {
+        // Warp-transposed layout (see ggml_cuda_ptq1_q8_word); ne0 is padded to GGML_CUDA_PTQ1_K_PAD.
+        int isum = q;
+        isum = warp_reduce_sum<QK8_1>(isum);
+        int32_t *     yw       = (int32_t *) vy;
+        const int64_t col      = i_cont / ne0;
+        const int64_t col_base = col * (ne0 / QK8_1) * (int64_t) (sizeof(block_q8_1) / 4);
+        const int     ib_col   = (int) (i0 / QK8_1);
+        ((int8_t *) (yw + col_base + ggml_cuda_ptq1_q8_word(ib_col, iqs / 4)))[iqs % 4] = q;
+        if (iqs > 0) {
+            return;
+        }
+        // |isum| <= 32*127 fits int16; keep the raw bits in the half slot.
+        const half2 ds = make_half2(__float2half(d), __short_as_half((short) isum));
+        yw[col_base + ggml_cuda_ptq1_q8_word(ib_col, 8)] = *reinterpret_cast<const int32_t *>(&ds);
         return;
     }
 
@@ -657,7 +680,7 @@ void quantize_mmq_q8_1_rms_cuda(
 }
 
 void quantize_row_q8_1_cuda(
-        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const float * x, const int32_t * ids, void * vy, const ggml_cuda_q8_1_layout layout,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
     GGML_ASSERT(!ids);
@@ -669,12 +692,19 @@ void quantize_row_q8_1_cuda(
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
-    if (ptq1_0_pt_enabled() && type_src0 == GGML_TYPE_PTQ1_0) {
-        GGML_ASSERT(ne0 % QK_PTQ1_0 == 0);
-        ggml_cuda_kernel_launch(quantize_q8_1<true>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
-        return;
+    switch (layout) {
+        case GGML_CUDA_Q8_1_PT:
+            GGML_ASSERT(ne0 % QK_PTQ1_0 == 0);
+            ggml_cuda_kernel_launch(quantize_q8_1<GGML_CUDA_Q8_1_PT>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+            break;
+        case GGML_CUDA_Q8_1_SOA_ISUM:
+            GGML_ASSERT(ne0 % GGML_CUDA_PTQ1_K_PAD == 0);
+            ggml_cuda_kernel_launch(quantize_q8_1<GGML_CUDA_Q8_1_SOA_ISUM>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+            break;
+        default:
+            ggml_cuda_kernel_launch(quantize_q8_1<GGML_CUDA_Q8_1_AOS>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+            break;
     }
-    ggml_cuda_kernel_launch(quantize_q8_1<false>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
 }
 
 void quantize_mmq_q8_1_cuda(

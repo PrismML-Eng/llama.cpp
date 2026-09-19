@@ -16,9 +16,11 @@ typedef void (*quantize_cuda_t)(
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
+// layout: see ggml_cuda_q8_1_layout_for() in common.cuh. The caller must pass the same layout the
+// consuming mat-vec kernel expects for (type_src0, ncols_dst, ids).
 void quantize_row_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy,
-        ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        ggml_cuda_q8_1_layout layout, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
 void quantize_mmq_q8_1_cuda(
