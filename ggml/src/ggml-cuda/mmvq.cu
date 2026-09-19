@@ -1059,6 +1059,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
     GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
 
+#if !defined(GGML_USE_HIP)
+    if constexpr (type == GGML_TYPE_PTQ1_0) {
+        // plain 2D PTQ1_0 mat-vec: dedicated kernel with full lane utilization, see mmvq-ptq1_0.cuh
+        if (!ids && mul_mat_vec_ptq1_0_pt_switch(vx, vy, fusion, dst, ncols_x, nrows_x, ncols_dst,
+                                                 stride_row_x, stride_col_y, stride_col_dst,
+                                                 nchannels_dst, nsamples_dst, stream)) {
+            return;
+        }
+    }
+#endif
+
     const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
     const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
     const uint3 sample_ratio_fd  = init_fastdiv_values(nsamples_dst  / nsamples_x);
