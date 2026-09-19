@@ -232,6 +232,30 @@ struct block_ptq1_0
 #define A_TYPE block_ptq1_0
 #endif
 
+// PQ2_0: Prism Q2_0 at group 128 (same 2-bit codec, one fp16 scale per 128).
+#define QUANT_K_PQ2_0 128
+#define QUANT_R_PQ2_0 1
+
+struct block_pq2_0
+{
+    float16_t d;
+    uint8_t qs[QUANT_K_PQ2_0 / 4];
+};
+
+struct block_pq2_0_packed16
+{
+    float16_t d;
+    uint16_t qs[QUANT_K_PQ2_0 / 8];
+};
+
+#if defined(DATA_A_PQ2_0)
+#define QUANT_K QUANT_K_PQ2_0
+#define QUANT_R QUANT_R_PQ2_0
+#define QUANT_AUXF 1
+#define A_TYPE block_pq2_0
+#define A_TYPE_PACKED16 block_pq2_0_packed16
+#endif
+
 #define QUANT_K_Q2_0 64
 #define QUANT_R_Q2_0 1
 
