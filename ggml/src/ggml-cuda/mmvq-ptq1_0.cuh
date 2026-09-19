@@ -24,9 +24,16 @@
 #pragma once
 
 #include "common.cuh"
+#include "unary.cuh"
 #include "vecdotq.cuh"
 
 #define PTQ1_0_PT_PLANES 9
+
+// dedicated 2D kernel geometry, see mul_mat_vec_ptq1_0_pt below
+#define PTQ1_0_PT_THREADS      128
+#define PTQ1_0_PT_MAX_ROWS     16
+#define PTQ1_0_PT_MAX_COLS     8    // equals MMVQ_MAX_BATCH_SIZE, checked in mmvq.cu
+#define PTQ1_0_PT_SMEM_FLOATS  4096 // 16 KiB of partial sums per weight matrix, dynamic
 
 // the PT path is CUDA only; HIP keeps the block_q8_1 layout and the old vec_dot
 static constexpr __host__ __device__ bool ptq1_0_pt_enabled() {
@@ -110,7 +117,7 @@ static __device__ __forceinline__ void ptq1_0_pt_block_dot(
             const float d8 = __low2float(((const half2 *) &dsraw[j])[k]);
 #pragma unroll
             for (int i = 0; i < nrows; ++i) {
-                acc[j][i] += d8 * (float) sumi[j][i];
+                acc[j][i] = __fmaf_rn(d8, (float) sumi[j][i], acc[j][i]); // one FFMA in every instantiation
                 sumi[j][i] = 0;
             }
         }
@@ -218,7 +225,218 @@ static __device__ __forceinline__ void ptq1_0_pt_block_dot(
     for (int j = 0; j < ncols; ++j) {
 #pragma unroll
         for (int i = 0; i < nrows; ++i) {
-            result[j][i] = (float) bq[i]->d * acc[j][i];
+            result[j][i] = __fmul_rn((float) bq[i]->d, acc[j][i]);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Dedicated PTQ1_0 mat-vec for plain 2D MUL_MAT (no batch dims, no expert ids).
+//
+// The generic mmvq kernel gives every thread of a 128-thread block one
+// 128-weight K block of the same row, so a K = 5120 projection (40 blocks per
+// row) keeps 40 of 128 threads busy and K = 17408 (136 blocks) keeps 53%. Here
+// the work items are (row group, K block) pairs of `rows_per_cta` rows
+// flattened into one index space, with rows_per_cta chosen on the host so that
+// the items fill whole 128-thread iterations where possible. A thread handles
+// ROWS adjacent rows per item so that each activation piece it loads serves
+// ROWS rows. Each thread writes one fp32 partial per (row, column, K block) to
+// shared memory and one warp per (row, column) sums them in a fixed order
+// (lane-strided sequential, then a butterfly). That order depends only on the
+// weight shape, so the result for a column is the same bits for every column
+// count.
+// ---------------------------------------------------------------------------
+
+// rows_per_cta: fill whole 128-thread iterations where possible, within the shared memory budget
+static __host__ int ptq1_0_pt_rows_per_cta(const int blocks_per_row, const int ncols_dst, const int nrows_x, const int rows_per_item) {
+    int rmax = PTQ1_0_PT_SMEM_FLOATS / (ncols_dst * blocks_per_row);
+    rmax = rmax < rows_per_item ? rows_per_item : (rmax > PTQ1_0_PT_MAX_ROWS ? PTQ1_0_PT_MAX_ROWS : rmax);
+    rmax -= rmax % rows_per_item;
+    int best = rows_per_item;
+    double best_util = 0.0;
+    for (int r = rows_per_item; r <= rmax; r += rows_per_item) {
+        const int items = (r / rows_per_item) * blocks_per_row;
+        const int iters = (items + PTQ1_0_PT_THREADS - 1) / PTQ1_0_PT_THREADS;
+        const double util = (double) items / (double) (iters * PTQ1_0_PT_THREADS);
+        if (util > best_util + 1e-9) {
+            best_util = util;
+            best = r;
+        }
+        if (util > 0.999) {
+            break;
+        }
+    }
+    GGML_UNUSED(nrows_x);
+    return best;
+}
+
+template <int ncols, int ROWS, bool has_fusion, bool has_gate>
+__launch_bounds__(PTQ1_0_PT_THREADS, (ncols <= 2 ? 4 : (ncols <= 4 ? 3 : 2)))
+static __global__ void mul_mat_vec_ptq1_0_pt(
+        const void * GGML_CUDA_RESTRICT vx, const void * GGML_CUDA_RESTRICT vy, const ggml_cuda_mm_fusion_args_device fusion,
+        float * GGML_CUDA_RESTRICT dst,
+        const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
+        const int rows_per_cta, const uint3 bpr_fd) {
+    extern __shared__ float partials_dyn[];
+    float * partials = partials_dyn;                                       // [ncols][rows_per_cta][bpr]
+    [[maybe_unused]] float * partials_gate = partials_dyn + ncols*rows_per_cta*(ncols_x / QK_PTQ1_0);
+
+    const int bpr  = ncols_x / QK_PTQ1_0;      // K blocks per row
+    const int nblk = ptq1_0_pt_nblk(ncols_x);  // plane stride of the PT layout
+    const int row0 = rows_per_cta * blockIdx.x;
+    const int tid  = threadIdx.x;
+
+    const char * ycol[ncols];
+#pragma unroll
+    for (int j = 0; j < ncols; ++j) {
+        ycol[j] = (const char *) ((const block_q8_1 *) vy + j*stride_col_y);
+    }
+
+    const int n_items = (rows_per_cta / ROWS) * bpr;
+    for (int idx = tid; idx < n_items; idx += PTQ1_0_PT_THREADS) {
+        const int rg  = fastdiv((uint32_t) idx, bpr_fd); // row group within the CTA
+        const int kbx = idx - rg*bpr;
+
+        const block_ptq1_0 * bq[ROWS];
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            int row = row0 + rg*ROWS + i;
+            row = row < nrows_x ? row : nrows_x - 1; // clamp the tail, that result is not written
+            bq[i] = (const block_ptq1_0 *) vx + (int64_t) row*stride_row_x + kbx;
+        }
+        float dots[ncols][ROWS];
+        ptq1_0_pt_block_dot<ncols, ROWS>(bq, ycol, kbx, nblk, dots);
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+                partials[(j*rows_per_cta + rg*ROWS + i)*bpr + kbx] = dots[j][i];
+            }
+        }
+        if constexpr (has_gate) {
+            const block_ptq1_0 * bg[ROWS];
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+                int row = row0 + rg*ROWS + i;
+                row = row < nrows_x ? row : nrows_x - 1;
+                bg[i] = (const block_ptq1_0 *) fusion.gate + (int64_t) row*stride_row_x + kbx;
+            }
+            ptq1_0_pt_block_dot<ncols, ROWS>(bg, ycol, kbx, nblk, dots);
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+#pragma unroll
+                for (int i = 0; i < ROWS; ++i) {
+                    partials_gate[(j*rows_per_cta + rg*ROWS + i)*bpr + kbx] = dots[j][i];
+                }
+            }
+        }
+    }
+
+    __syncthreads();
+
+    // one warp per (row, column), lane-strided sequential sum then butterfly: a fixed order
+    const int warp = tid / WARP_SIZE;
+    const int lane = tid % WARP_SIZE;
+    for (int w = warp; w < rows_per_cta*ncols; w += PTQ1_0_PT_THREADS / WARP_SIZE) {
+        const int j = w / rows_per_cta;
+        const int r = w - j*rows_per_cta;
+        const int row = row0 + r;
+
+        float sum = 0.0f;
+        [[maybe_unused]] float sum_gate = 0.0f;
+        for (int kbx = lane; kbx < bpr; kbx += WARP_SIZE) {
+            sum += partials[(j*rows_per_cta + r)*bpr + kbx];
+            if constexpr (has_gate) {
+                sum_gate += partials_gate[(j*rows_per_cta + r)*bpr + kbx];
+            }
+        }
+        sum = warp_reduce_sum<WARP_SIZE>(sum);
+        if constexpr (has_gate) {
+            sum_gate = warp_reduce_sum<WARP_SIZE>(sum_gate);
+        }
+
+        if (lane == 0 && row < nrows_x) {
+            float result = sum;
+            if constexpr (has_fusion) {
+                if (fusion.x_bias) {
+                    result += ((const float *) fusion.x_bias)[j*stride_col_dst + row];
+                }
+                if constexpr (has_gate) {
+                    float gate_value = sum_gate;
+                    if (fusion.gate_bias) {
+                        gate_value += ((const float *) fusion.gate_bias)[j*stride_col_dst + row];
+                    }
+                    switch (fusion.glu_op) {
+                        case GGML_GLU_OP_SWIGLU:
+                            result *= ggml_cuda_op_silu_single(gate_value);
+                            break;
+                        case GGML_GLU_OP_GEGLU:
+                            result *= ggml_cuda_op_gelu_single(gate_value);
+                            break;
+                        case GGML_GLU_OP_SWIGLU_OAI:
+                            result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                            break;
+                        default:
+                            result = result * gate_value;
+                            break;
+                    }
+                }
+            }
+            dst[j*stride_col_dst + row] = result;
+        }
+    }
+}
+
+template <int ncols>
+static void mul_mat_vec_ptq1_0_pt_launch(
+        const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
+        cudaStream_t stream) {
+    constexpr int ROWS = ncols <= 4 ? 4 : 2; // rows per work item: independent blocks per thread for latency hiding, activation reuse across rows; 8 spills
+    const int bpr = ncols_x / QK_PTQ1_0;
+    const int rows_per_cta = ptq1_0_pt_rows_per_cta(bpr, ncols, nrows_x, ROWS);
+    const uint3 bpr_fd = init_fastdiv_values((uint32_t) bpr);
+    const dim3 block_nums((nrows_x + rows_per_cta - 1) / rows_per_cta, 1, 1);
+    const dim3 block_dims(PTQ1_0_PT_THREADS, 1, 1);
+
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const size_t smem = (size_t) ncols * rows_per_cta * bpr * sizeof(float) * (fusion.gate != nullptr ? 2 : 1);
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, smem, stream);
+    if (has_fusion) {
+        GGML_ASSERT(ncols == 1 && "fusion only supported for ncols_dst=1");
+        if (fusion.gate != nullptr) {
+            ggml_cuda_kernel_launch(mul_mat_vec_ptq1_0_pt<ncols, ROWS, true, true>, lp,
+                vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, rows_per_cta, bpr_fd);
+        } else {
+            ggml_cuda_kernel_launch(mul_mat_vec_ptq1_0_pt<ncols, ROWS, true, false>, lp,
+                vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, rows_per_cta, bpr_fd);
+        }
+        return;
+    }
+    ggml_cuda_kernel_launch(mul_mat_vec_ptq1_0_pt<ncols, ROWS, false, false>, lp,
+        vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, rows_per_cta, bpr_fd);
+}
+
+// true when the dedicated kernel handles this call (plain 2D, K a multiple of 128, up to 8 columns)
+static bool mul_mat_vec_ptq1_0_pt_switch(
+        const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const int ncols_x, const int nrows_x, const int ncols_dst,
+        const int stride_row_x, const int stride_col_y, const int stride_col_dst,
+        const int nchannels_dst, const int nsamples_dst, cudaStream_t stream) {
+    if (!ptq1_0_pt_enabled() || nchannels_dst != 1 || nsamples_dst != 1 || ncols_x % QK_PTQ1_0 != 0 ||
+        ncols_dst < 1 || ncols_dst > PTQ1_0_PT_MAX_COLS || 2 * (ncols_x / QK_PTQ1_0) * ncols_dst > PTQ1_0_PT_SMEM_FLOATS) {
+        return false;
+    }
+    switch (ncols_dst) {
+        case 1: mul_mat_vec_ptq1_0_pt_launch<1>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+        case 2: mul_mat_vec_ptq1_0_pt_launch<2>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+        case 3: mul_mat_vec_ptq1_0_pt_launch<3>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+        case 4: mul_mat_vec_ptq1_0_pt_launch<4>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+        case 5: mul_mat_vec_ptq1_0_pt_launch<5>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+        case 6: mul_mat_vec_ptq1_0_pt_launch<6>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+        case 7: mul_mat_vec_ptq1_0_pt_launch<7>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+        case 8: mul_mat_vec_ptq1_0_pt_launch<8>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+        default: return false;
+    }
+    return true;
 }
