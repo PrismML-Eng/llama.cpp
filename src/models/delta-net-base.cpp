@@ -481,7 +481,12 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
-    if (cparams.n_rs_seq == 0) {
+    // snapshot planes of this ubatch: K = 1 + the rollback budget of its seqs
+    // (n_rs_seq + 1 when a drafting seq is present, 1 for a ubatch of opted-out
+    // seqs and for a memory without snapshots -- the graph the no-spec context builds)
+    const int64_t K = 1 + (int64_t) inp->rs_n_snap;
+
+    if (K == 1) {
         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
         const int64_t s_slot = 0;
 
@@ -503,8 +508,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         // [TAG_RECURRENT_ROLLBACK_SPLITS]
         // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
         //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
-
-        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+        //   (K <= n_rs_seq + 1, so the guarantee covers every budget)
 
         for (int64_t t = 1; t <= K; ++t) {
             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
@@ -552,7 +556,13 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t n_seqs       = v->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
-    const bool keep = cparams.n_rs_seq > 0;
+    // snapshot planes of this ubatch (see build_conv_state): every state write
+    // path below derives its plane count from K, so a ubatch of opted-out seqs
+    // (K == 1) touches plane 0 only -- also on the prompt ubatch and on the
+    // gathered transition path
+    const int64_t K = 1 + (int64_t) inp->rs_n_snap;
+
+    const bool keep = K > 1;
 
     GGML_ASSERT(state_rows == nullptr || keep || state_inplace); // Metal rows mode is a ring-path optimization
     GGML_ASSERT(!state_inplace || state_rows != nullptr);
@@ -567,9 +577,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         // carries the attention scores only: no gather, no dst state planes, no
         // write-back copy. Same float instruction sequence on the same inputs as
         // the paths below, so the outputs and the resulting cache rows are
-        // bit-identical (tests/test-gdn-inplace.cpp).
-        const int64_t K = cparams.n_rs_seq + 1;
-
+        // bit-identical (tests/test-gdn-inplace.cpp). With K == 1 the kernel
+        // writes no snapshot rows at all.
         const bool raw = gdn_raw_beta && gdn_raw_alpha && gdn_raw_dt_bias && gdn_raw_a;
         ggml_tensor * gg = raw ? gdn_raw_alpha : g;
         ggml_tensor * bb = raw ? gdn_raw_beta  : b;
@@ -614,7 +623,6 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     }
 
     const int64_t D = S_v * S_v * H_v;
-    const int64_t K = cparams.n_rs_seq + 1;
 
     const bool raw = gdn_raw_beta && gdn_raw_alpha && gdn_raw_dt_bias && gdn_raw_a;
     ggml_tensor * gg = raw ? gdn_raw_alpha : g;

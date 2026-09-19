@@ -490,10 +490,17 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     //    in supports_op, which would silently move the whole recurrent op to CPU.
     static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
 
+    // snapshot planes of this ubatch: K = n_rs_seq + 1 when a drafting seq is in
+    // it, 1 for a ubatch of opted-out seqs (llama_memory_seq_rs_snapshots) and
+    // for a context without snapshots. Keyed on K rather than cparams.n_rs_seq
+    // so an opted-out ubatch builds node for node the graph the no-spec context
+    // builds (single conv-state copy, plane 0 only, fused gates by the probes).
+    const int64_t K = 1 + (int64_t) inp->rs_n_snap;
+
     // the in-place op always runs the fused kernel: only take it where the legacy
     // path runs the fused kernel too (the ring path always does; the K == 1 path
     // only with the fused_gdn_* probes on), so the A/B stays bit-identical
-    const bool fused_ok = cparams.n_rs_seq > 0 || (n_seq_tokens == 1 ? cparams.fused_gdn_ar : cparams.fused_gdn_ch);
+    const bool fused_ok = K > 1 || (n_seq_tokens == 1 ? cparams.fused_gdn_ar : cparams.fused_gdn_ch);
 
     // GGML_GDN_INPLACE_K1_ONLY=1 restricts the in-place path to K == 1 (no
     // speculation); by default the MTP speculative mode (K = n_rs_seq + 1) takes
@@ -503,9 +510,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     static const bool gdn_inplace_k1_only_env = getenv("GGML_GDN_INPLACE_K1_ONLY") != nullptr;
 
     const bool gdn_state_inplace    = gdn_state_rows_env && gdn_state_inplace_dev_ok && inp->rs_inplace && fused_ok &&
-                                      (cparams.n_rs_seq == 0 || !gdn_inplace_k1_only_env);
+                                      (K == 1 || !gdn_inplace_k1_only_env);
     const bool gdn_state_rows_metal = gdn_state_rows_env && gdn_state_rows_dev_ok && !gdn_state_inplace_dev_ok &&
-                                      cparams.n_rs_seq > 0;
+                                      K > 1;
     const bool gdn_state_rows       = gdn_state_inplace || gdn_state_rows_metal;
 
     ggml_tensor * state;

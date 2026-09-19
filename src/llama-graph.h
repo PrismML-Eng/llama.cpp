@@ -350,6 +350,12 @@ public:
     // update the cache rows in place (rs_inplace_ok); part of the reuse key
     bool rs_inplace = false;
 
+    // rollback snapshot planes of this graph's ubatch: the GDN paths write
+    // K = rs_n_snap + 1 state planes per seq (get_n_snap). Part of the reuse
+    // key: at T = 1 the s_write_rows length is the same for every K while the
+    // op params, the conv-state copies and the fused-gate choice differ
+    uint32_t rs_n_snap = 0;
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse

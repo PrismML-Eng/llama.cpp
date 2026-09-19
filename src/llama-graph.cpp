@@ -422,6 +422,10 @@ bool llm_graph_input_rs::can_reuse_rs(const llama_memory_recurrent_context * mct
     // was already updated by apply() -> find_slot before can_reuse runs
     res &= rs_inplace == mctx_cur->rs_inplace_ok(params.ubatch.n_seqs);
 
+    // the snapshot plane count K = rs_n_snap + 1 is baked into the op params
+    // (and the s_write_rows check above cannot see it at T = 1)
+    res &= rs_n_snap == mctx_cur->get_n_snap();
+
     return res;
 }
 
@@ -3579,6 +3583,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->rs_z = mctx_cur->get_rs_z();
 
     inp->rs_inplace = mctx_cur->rs_inplace_ok(n_seqs);
+    inp->rs_n_snap  = mctx_cur->get_n_snap();
 
     return inp;
 }
