@@ -20,6 +20,20 @@
 // the same cell), raw gates on/off, H_k == H_v and H_k == H_v/2, 1 and 4
 // threads. KDA (vector gate) off, as in the qwen35 graph.
 //
+// Two extra families cover the per-sequence snapshot budget
+// (llama_memory_seq_rs_snapshots), where a ubatch of opted-out seqs runs with
+// K = 1 while the cache still holds n_rs_seq + 1 planes:
+//
+//   - K = 1 with rows_in in plane r in {1, 2} of a (r + 1)-plane cache: an
+//     opted-out request launched on a slot that inherited a pending rollback
+//     index from a previous drafting request. C must read plane r and write
+//     plane 0 only, byte for byte like A and B.
+//   - T = 1 cross-K: on identical inputs and a 3-plane cache, C with K = 1 and
+//     C with K = 3 must leave byte-identical scores and cache -- a T = 1
+//     ubatch writes plane 0 only, so an opted-out seq sharing a T = 1 ubatch
+//     with a drafting seq (K = 3, the mixed step with an empty draft) gets
+//     exactly the K = 1 result.
+//
 // CPU only; runs on tiny synthetic shapes (S_v = 32, H_v = 4) and needs no
 // model.
 
@@ -41,6 +55,7 @@ struct gdn_case {
     int64_t T;
     int64_t n_seqs;
     int64_t K;
+    int64_t n_planes;  // planes allocated in the cache (>= K and > r_in; the memory holds n_rs_seq + 1 whatever K is)
     int64_t mem_size;
     int64_t head;
     int64_t r_in;      // plane read for every seq: rows_in[i] = r_in*mem_size + head + i
@@ -66,7 +81,7 @@ static gdn_inputs make_inputs(const gdn_case & c, uint32_t seed) {
     };
 
     const int64_t D      = c.S_v * c.S_v * c.H_v;
-    const int64_t n_rows = c.mem_size * c.K;
+    const int64_t n_rows = c.mem_size * c.n_planes;
 
     gdn_inputs in;
     fill(in.q,    c.S_v * c.H_k * c.T * c.n_seqs, -1.0f, 1.0f);
@@ -109,14 +124,14 @@ struct gdn_tensors {
     ggml_tensor * beta;
     ggml_tensor * dt_bias;
     ggml_tensor * a;
-    ggml_tensor * cache;     // 2D [D, mem_size*K]
+    ggml_tensor * cache;     // 2D [D, mem_size*n_planes]
     ggml_tensor * rows_in;   // I32 [n_seqs]
     ggml_tensor * rows_out;  // I64 [min(T,K)*n_seqs]
 };
 
 static gdn_tensors make_tensors(ggml_context * ctx, const gdn_case & c, const gdn_inputs & in) {
     const int64_t D      = c.S_v * c.S_v * c.H_v;
-    const int64_t n_rows = c.mem_size * c.K;
+    const int64_t n_rows = c.mem_size * c.n_planes;
 
     gdn_tensors t;
     t.q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, c.S_v, c.H_k, c.T, c.n_seqs);
@@ -126,7 +141,7 @@ static gdn_tensors make_tensors(ggml_context * ctx, const gdn_case & c, const gd
     t.beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1,     c.H_v, c.T, c.n_seqs);
     t.dt_bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c.H_v);
     t.a       = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c.H_v);
-    t.cache   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_rows);
+    t.cache   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_rows); // 2D [D, mem_size*n_planes]
     t.rows_in  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, c.n_seqs);
     t.rows_out = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, (int64_t) in.rows_out.size());
 
@@ -314,6 +329,60 @@ static size_t count_diff(const std::vector<uint8_t> & a, const std::vector<uint8
     return n;
 }
 
+// the in-place op must have changed the live rows (the check is not vacuous)
+static bool cache_touched(const gdn_inputs & in, const path_result & r) {
+    std::vector<uint8_t> cache0((const uint8_t *) in.cache.data(),
+                                (const uint8_t *) in.cache.data() + in.cache.size() * sizeof(float));
+    return count_diff(r.cache, cache0) != 0;
+}
+
+// C vs A and B on one input set
+static bool run_abc(const gdn_case & c, const gdn_inputs & in, const char * tag) {
+    const path_result A = run_gathered(c, in);
+    const path_result B = run_rows(c, in);
+    const path_result C = run_inplace(c, in);
+
+    const size_t d_attn_A  = count_diff(C.attn,  A.attn);
+    const size_t d_attn_B  = count_diff(C.attn,  B.attn);
+    const size_t d_cache_A = count_diff(C.cache, A.cache);
+    const size_t d_cache_B = count_diff(C.cache, B.cache);
+
+    const bool touched = cache_touched(in, C);
+
+    const bool ok = d_attn_A == 0 && d_attn_B == 0 && d_cache_A == 0 && d_cache_B == 0 && touched;
+
+    printf("%sK=%lld T=%lld n_seqs=%lld r_in=%lld raw=%d H_k=%lld nth=%d : attn diff A/B = %zu/%zu, "
+           "cache diff A/B = %zu/%zu, cache touched = %d -> %s\n",
+           tag, (long long) c.K, (long long) c.T, (long long) c.n_seqs, (long long) c.r_in, (int) c.raw_gates,
+           (long long) c.H_k, c.n_threads,
+           d_attn_A, d_attn_B, d_cache_A, d_cache_B, (int) touched, ok ? "OK" : "FAIL");
+
+    return ok;
+}
+
+// C with K = 1 vs C with K = 3 on one input set (T = 1, 3-plane cache)
+static bool run_cross_k(const gdn_case & c1, const gdn_inputs & in) {
+    gdn_case c3 = c1;
+    c3.K = 3;
+
+    const path_result C1 = run_inplace(c1, in);
+    const path_result C3 = run_inplace(c3, in);
+
+    const size_t d_attn  = count_diff(C3.attn,  C1.attn);
+    const size_t d_cache = count_diff(C3.cache, C1.cache);
+
+    const bool touched = cache_touched(in, C1);
+
+    const bool ok = d_attn == 0 && d_cache == 0 && touched;
+
+    printf("[cross-K T=1] K=1 vs K=3 n_seqs=%lld r_in=%lld raw=%d H_k=%lld nth=%d : attn diff = %zu, "
+           "cache diff = %zu, cache touched = %d -> %s\n",
+           (long long) c1.n_seqs, (long long) c1.r_in, (int) c1.raw_gates, (long long) c1.H_k, c1.n_threads,
+           d_attn, d_cache, (int) touched, ok ? "OK" : "FAIL");
+
+    return ok;
+}
+
 int main() {
     const int64_t S_v = 32;
     const int64_t H_v = 4;
@@ -336,6 +405,7 @@ int main() {
         c.T         = T;
         c.n_seqs    = n_seqs;
         c.K         = K;
+        c.n_planes  = K;
         c.mem_size  = n_seqs + 3; // cells before and after the ubatch stay untouched
         c.head      = 2;
         c.r_in      = r_in;
@@ -344,30 +414,75 @@ int main() {
 
         const gdn_inputs in = make_inputs(c, seed++);
 
-        const path_result A = run_gathered(c, in);
-        const path_result B = run_rows(c, in);
-        const path_result C = run_inplace(c, in);
-
-        const size_t d_attn_A  = count_diff(C.attn,  A.attn);
-        const size_t d_attn_B  = count_diff(C.attn,  B.attn);
-        const size_t d_cache_A = count_diff(C.cache, A.cache);
-        const size_t d_cache_B = count_diff(C.cache, B.cache);
-
-        // the check is not vacuous: the in-place op must have changed the live rows
-        std::vector<uint8_t> cache0((const uint8_t *) in.cache.data(),
-                                    (const uint8_t *) in.cache.data() + in.cache.size() * sizeof(float));
-        const bool touched = count_diff(C.cache, cache0) != 0;
-
-        const bool ok = d_attn_A == 0 && d_attn_B == 0 && d_cache_A == 0 && d_cache_B == 0 && touched;
-
-        printf("K=%lld T=%lld n_seqs=%lld r_in=%lld raw=%d H_k=%lld nth=%d : attn diff A/B = %zu/%zu, "
-               "cache diff A/B = %zu/%zu, cache touched = %d -> %s\n",
-               (long long) K, (long long) T, (long long) n_seqs, (long long) r_in, raw, (long long) H_k, n_threads,
-               d_attn_A, d_attn_B, d_cache_A, d_cache_B, (int) touched, ok ? "OK" : "FAIL");
+        const bool ok = run_abc(c, in, "");
 
         n_cases  += 1;
         n_failed += !ok;
     }}}}}}}
+
+    // K = 1 reading a pending rollback plane r in {1, 2} of an (r + 1)-plane cache:
+    // an opted-out request (budget 0 -> K = 1) launched on a slot whose seq still
+    // carries rs_idx from a previous drafting request (the new prompt extends the
+    // cached one, so no reset). Plane r must be read and plane 0 alone written.
+    for (int64_t T : { (int64_t) 1, (int64_t) 3 }) {
+    for (int64_t n_seqs : { (int64_t) 1, (int64_t) 4, (int64_t) 8 }) {
+    for (int64_t r_in : { (int64_t) 1, (int64_t) 2 }) {
+    for (int raw = 0; raw < 2; ++raw) {
+    for (int64_t H_k : { H_v, H_v / 2 }) {
+    for (int n_threads : { 1, 4 }) {
+        gdn_case c;
+        c.S_v       = S_v;
+        c.H_v       = H_v;
+        c.H_k       = H_k;
+        c.T         = T;
+        c.n_seqs    = n_seqs;
+        c.K         = 1;
+        c.n_planes  = std::max<int64_t>(c.K, r_in + 1);
+        c.mem_size  = n_seqs + 3;
+        c.head      = 2;
+        c.r_in      = r_in;
+        c.raw_gates = raw != 0;
+        c.n_threads = n_threads;
+
+        const gdn_inputs in = make_inputs(c, seed++);
+
+        const bool ok = run_abc(c, in, "[K=1 rollback read] ");
+
+        n_cases  += 1;
+        n_failed += !ok;
+    }}}}}}
+
+    // T = 1 cross-K on a 3-plane cache: the mixed T = 1 ubatch (a drafting seq with
+    // an empty draft next to opted-out seqs) runs with K = 3 and must leave every
+    // seq exactly what K = 1 would have: scores and the whole cache byte-identical.
+    // r_in in {0, 1, 2} covers the steady state and the pending-rollback read.
+    for (int64_t n_seqs : { (int64_t) 1, (int64_t) 4, (int64_t) 8 }) {
+    for (int64_t r_in : { (int64_t) 0, (int64_t) 1, (int64_t) 2 }) {
+    for (int raw = 0; raw < 2; ++raw) {
+    for (int64_t H_k : { H_v, H_v / 2 }) {
+    for (int n_threads : { 1, 4 }) {
+        gdn_case c;
+        c.S_v       = S_v;
+        c.H_v       = H_v;
+        c.H_k       = H_k;
+        c.T         = 1;
+        c.n_seqs    = n_seqs;
+        c.K         = 1;
+        c.n_planes  = 3;
+        c.mem_size  = n_seqs + 3;
+        c.head      = 2;
+        c.r_in      = r_in;
+        c.raw_gates = raw != 0;
+        c.n_threads = n_threads;
+
+        // T = 1: rows_out holds min(T, K)*n_seqs = n_seqs rows for K = 1 and K = 3 alike
+        const gdn_inputs in = make_inputs(c, seed++);
+
+        const bool ok = run_cross_k(c, in);
+
+        n_cases  += 1;
+        n_failed += !ok;
+    }}}}}
 
     printf("%d cases, %d failed\n", n_cases, n_failed);
 
