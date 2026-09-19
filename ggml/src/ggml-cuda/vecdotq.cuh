@@ -899,30 +899,53 @@ static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(const void * __restr
 #if defined(GGML_USE_HIP)
     const block_ptq1_0 * bq      = (const block_ptq1_0 *) vbq + kbx;
     int                  sumi[4] = { 0, 0, 0, 0 };
+    int                  sumu[4] = { 0, 0, 0, 0 };
+
+    // Four packed bytes advance in the low bytes of 16-bit lanes, so one
+    // 32-bit multiply steps four trit streams at once (3*255 < 2^16, no
+    // cross-lane carry). Digits come out as {0,1,2}; the -1 folds into the
+    // activation sums, which a per-byte subtract cannot do borrow-free.
+    // NB: __builtin_amdgcn_perm picks sel bit2=0 from the SECOND arg, the
+    // opposite of CUDA __byte_perm, so the operands are swapped vs _multi.
+    const uint32_t * qs32 = (const uint32_t *) bq->qs;
 
 #    pragma unroll
-    for (int m = 0; m < 16; ++m) {
-        uint32_t v = bq->qs[m];
+    for (int w = 0; w < 4; ++w) {
+        const uint32_t packed = qs32[w];
+        uint32_t v_lo = __builtin_amdgcn_perm(0, packed, 0x0C010C00); // [b0,0,b1,0]
+        uint32_t v_hi = __builtin_amdgcn_perm(0, packed, 0x0C030C02); // [b2,0,b3,0]
+
 #    pragma unroll
         for (int t = 0; t < 5; ++t) {
-            const uint32_t w = v * 3;
-            const int      q = (int) (w >> 8) - 1;
-            v                = w & 0xFF;
-            const int e      = t * 16 + m;
-            sumi[e >> 5] += q * (int) bq8_1[iqs + (e >> 5)].qs[e & 31];
+            const uint32_t w_lo = v_lo * 3u;
+            const uint32_t w_hi = v_hi * 3u;
+            v_lo = w_lo & 0x00FF00FFu;
+            v_hi = w_hi & 0x00FF00FFu;
+            const int e = t * 16 + 4 * w;
+            const int u = get_int_b4(bq8_1[iqs + (e >> 5)].qs, (e & 31) >> 2);
+            const int q = (int) __builtin_amdgcn_perm(w_hi, w_lo, 0x07050301);
+            sumi[e >> 5] += ggml_cuda_dp4a(q, u, 0);
+            sumu[e >> 5] += ggml_cuda_dp4a(0x01010101, u, 0);
         }
     }
 
 #    pragma unroll
-    for (int m = 0; m < 8; ++m) {
-        uint32_t v = bq->qs[16 + m];
+    for (int w = 0; w < 2; ++w) {
+        const uint32_t packed = qs32[4 + w];
+        uint32_t v_lo = __builtin_amdgcn_perm(0, packed, 0x0C010C00);
+        uint32_t v_hi = __builtin_amdgcn_perm(0, packed, 0x0C030C02);
+
 #    pragma unroll
         for (int t = 0; t < 5; ++t) {
-            const uint32_t w = v * 3;
-            const int      q = (int) (w >> 8) - 1;
-            v                = w & 0xFF;
-            const int e      = 80 + t * 8 + m;
-            sumi[e >> 5] += q * (int) bq8_1[iqs + (e >> 5)].qs[e & 31];
+            const uint32_t w_lo = v_lo * 3u;
+            const uint32_t w_hi = v_hi * 3u;
+            v_lo = w_lo & 0x00FF00FFu;
+            v_hi = w_hi & 0x00FF00FFu;
+            const int e = 80 + t * 8 + 4 * w;
+            const int u = get_int_b4(bq8_1[iqs + (e >> 5)].qs, (e & 31) >> 2);
+            const int q = (int) __builtin_amdgcn_perm(w_hi, w_lo, 0x07050301);
+            sumi[e >> 5] += ggml_cuda_dp4a(q, u, 0);
+            sumu[e >> 5] += ggml_cuda_dp4a(0x01010101, u, 0);
         }
     }
 
@@ -932,17 +955,19 @@ static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(const void * __restr
 #    pragma unroll
         for (int t = 0; t < 4; ++t) {
             const uint32_t w = v * 3;
-            const int      q = (int) (w >> 8) - 1;
+            const int      q = (int) (w >> 8);
             v                = w & 0xFF;
             const int e      = 120 + t * 2 + h;
-            sumi[e >> 5] += q * (int) bq8_1[iqs + (e >> 5)].qs[e & 31];
+            const int a      = (int) bq8_1[iqs + (e >> 5)].qs[e & 31];
+            sumi[e >> 5] += q * a;
+            sumu[e >> 5] += a;
         }
     }
 
     float acc = 0.0f;
 #    pragma unroll
     for (int k = 0; k < 4; ++k) {
-        acc += __low2float(bq8_1[iqs + k].ds) * (float) sumi[k];
+        acc += __low2float(bq8_1[iqs + k].ds) * (float) (sumi[k] - sumu[k]);
     }
     return (float) bq->d * acc;
 #else
