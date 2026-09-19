@@ -149,13 +149,18 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ldev.dev);
         const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
         if (reg_name == nullptr) {
-            gdn_state_rows_dev_ok = false;
-            gdn_raw_gates_dev_ok  = false;
+            gdn_state_rows_dev_ok    = false;
+            gdn_state_inplace_dev_ok = false;
+            gdn_raw_gates_dev_ok     = false;
             break;
         }
         // integrated GPUs (e.g. unified-memory CUDA devices) report IGPU, not GPU
         const bool is_gpu = ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
                             ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
+        if (is_gpu) {
+            // the cache-writing GDN op mutates one of its sources; only the CPU backend implements it
+            gdn_state_inplace_dev_ok = false;
+        }
         if (is_gpu && strcmp(reg_name, "MTL") != 0) {
             gdn_state_rows_dev_ok = false;
         }
@@ -472,18 +477,40 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     // ring path: read per-seq live state directly from the cache inside the
     // fused GDN op (rows mode) instead of a gather per layer.
-    // GGML_GDN_STATE_GATHER=1 restores the legacy gathered path (A/B).
-    // rows mode (the src[6] variant) is implemented on CPU and Metal only;
-    // other GPU backends reject it in supports_op, which would silently move
-    // the whole recurrent op to CPU -- keep the gathered form unless every
-    // GPU device in the model is Metal.
+    // GGML_GDN_STATE_GATHER=1 restores the legacy gathered path (A/B) for both
+    // rows modes below.
+    //  - in-place (CPU only, ggml_gated_delta_net_cache): the op updates the
+    //    cache rows themselves -- no gather, no dst state planes, no write-back.
+    //    Taken on every ubatch whose sequences all read their own cell
+    //    (inp->rs_inplace); transition ubatches (a seq joins / leaves / is
+    //    copied / reordered) fall back to the gathered path, which is exact and
+    //    ordering-safe. Part of the graph reuse key (can_reuse_rs).
+    //  - Metal rows + SET_ROWS (the src[6] variant, ring path only): kept for
+    //    machines whose GPU devices are all Metal; other GPU backends reject it
+    //    in supports_op, which would silently move the whole recurrent op to CPU.
     static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
 
-    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0;
+    // the in-place op always runs the fused kernel: only take it where the legacy
+    // path runs the fused kernel too (the ring path always does; the K == 1 path
+    // only with the fused_gdn_* probes on), so the A/B stays bit-identical
+    const bool fused_ok = cparams.n_rs_seq > 0 || (n_seq_tokens == 1 ? cparams.fused_gdn_ar : cparams.fused_gdn_ch);
+
+    // GGML_GDN_INPLACE_K1_ONLY=1 restricts the in-place path to K == 1 (no
+    // speculation); by default the MTP speculative mode (K = n_rs_seq + 1) takes
+    // it too: slot 0 is updated in place, slots 1..K-1 are written straight into
+    // the snapshot planes of the same cell, and a pending rollback reads plane
+    // rs_idx of the same cell (rows_in != rows_out: copy-then-in-place).
+    static const bool gdn_inplace_k1_only_env = getenv("GGML_GDN_INPLACE_K1_ONLY") != nullptr;
+
+    const bool gdn_state_inplace    = gdn_state_rows_env && gdn_state_inplace_dev_ok && inp->rs_inplace && fused_ok &&
+                                      (cparams.n_rs_seq == 0 || !gdn_inplace_k1_only_env);
+    const bool gdn_state_rows_metal = gdn_state_rows_env && gdn_state_rows_dev_ok && !gdn_state_inplace_dev_ok &&
+                                      cparams.n_rs_seq > 0;
+    const bool gdn_state_rows       = gdn_state_inplace || gdn_state_rows_metal;
 
     ggml_tensor * state;
     if (gdn_state_rows) {
-        state = build_rs_cache_view(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state = build_rs_cache_view(inp, ssm_states_all, hparams.n_embd_s(), n_seqs, gdn_state_inplace);
         cb(state, "state_cache_view", il);
     } else {
         state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
@@ -560,7 +587,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(v_conv, "v_conv_predelta", il);
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il,
-            gdn_state_rows ? inp->s_copy_main : nullptr);
+            gdn_state_rows ? inp->s_copy_main : nullptr, gdn_state_inplace);
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);

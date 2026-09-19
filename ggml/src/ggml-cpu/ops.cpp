@@ -10819,11 +10819,26 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     const int64_t state_seq_stride = src_rows ? 0 : (int64_t) (src_state->nb[3] / sizeof(float));
     const int64_t state_row_size   = src_rows ? (int64_t) (src_state->nb[1] / sizeof(float)) : 0;
 
-    const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
+    // cache-write mode (op_params[2], ggml_gated_delta_net_cache): the live state is
+    // updated in place in cache row rows_out[seq] and snapshot slots 1..K-1 are
+    // written straight into cache rows rows_out[slot*n_seqs + seq]; the result holds
+    // the attention scores only (state_out_base is unused in this mode).
+    const bool      cache_write = ggml_get_op_params_i32(dst, 2) != 0;
+    GGML_ASSERT(!cache_write || state_rows_idx != nullptr);
+    const int64_t * rows_out = cache_write ? (const int64_t *) dst->src[9]->data : nullptr;
+    float *         cache    = cache_write ? (float *) src_state->data : nullptr;
+    const int64_t   mem_size = cache_write ? ggml_get_op_params_i32(dst, 3) : 1;
+
+    // the legacy K > 1 path stages the state through a per-thread scratch; the
+    // cache-write path never does (it computes on the cache row itself).
+    // ggml-cpu.c (graph plan work size) mirrors this expression.
+    const bool use_state_work = K > 1 && !cache_write;
+
+    const int64_t per_thread = S_v + (use_state_work ? S_v * S_v : 0);
     const int ith = params->ith;
 
     float * delta       = (float *)params->wdata + ith * per_thread + CACHE_LINE_SIZE_F32;
-    float * state_work  = K > 1 ? (delta + S_v) : nullptr;
+    float * state_work  = use_state_work ? (delta + S_v) : nullptr;
 
     // output layout: [attn_scores | new_states]
     // attn_scores: S_v * H * n_tokens * n_seqs    floats
@@ -10855,19 +10870,34 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         const int64_t iq3 = iv3 / rq3;
         const int64_t ik3 = iv3 / rk3;
 
-        // For K=1, write directly to the single output slot to avoid an extra memcpy at the end.
-        // For K>1, work in scratch and copy out per-token when the slot is in range.
-        float * s_out = (K > 1)
-            ? state_work
-            : state_out_base + (iv3 * H + iv1) * S_v * S_v;
-
-        // copy input state into the working buffer and operate in-place.
-        // scratch mode: state layout [S_v, S_v, H, n_seqs], seq iv3 starts at
-        // iv3 * state_seq_stride. rows mode: cache row state_rows_idx[iv3].
+        // input state: scratch mode: state layout [S_v, S_v, H, n_seqs], seq iv3
+        // starts at iv3 * state_seq_stride. rows mode: cache row state_rows_idx[iv3].
         const float * s_in = state_rows_idx
             ? state_in_base + (int64_t) state_rows_idx[iv3] * state_row_size + iv1 * S_v * S_v
             : state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
-        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+
+        float * s_out;
+        if (cache_write) {
+            // operate directly on the live cache row rows_out[iv3]. rows_in[iv3] is
+            // either that same row (steady state: no copy at all) or another plane
+            // of the same cell (pending rollback / freshly zeroed cell): copy it in
+            // first -- distinct rows, so plain memcpy is safe.
+            const int64_t row_out = rows_out[iv3];
+            GGML_ASSERT(row_out % mem_size == (int64_t) state_rows_idx[iv3] % mem_size);
+            s_out = cache + row_out * state_row_size + iv1 * S_v * S_v;
+            if (s_out != s_in) {
+                memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+            }
+        } else {
+            // For K=1, write directly to the single output slot to avoid an extra memcpy at the end.
+            // For K>1, work in scratch and copy out per-token when the slot is in range.
+            s_out = (K > 1)
+                ? state_work
+                : state_out_base + (iv3 * H + iv1) * S_v * S_v;
+
+            // copy input state into the working buffer and operate in-place.
+            memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        }
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
@@ -10924,7 +10954,20 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
             attn_data += S_v * H; // advance to next token
 
-            if (K > 1) {
+            if (cache_write) {
+                // snapshot slot s (state s tokens back) -> cache row rows_out[s*n_seqs + seq].
+                // slot 0 is s_out itself (already in place). slot <= n_tokens-1 and
+                // slot < K keep the index below min(n_tokens, K)*n_seqs. Within this
+                // unit the rollback source plane was fully copied into s_out before
+                // the token loop, so overwriting it here is read-before-write safe.
+                if (K > 1) {
+                    const int64_t slot = n_tokens - 1 - t;
+                    if (slot >= 1 && slot < K) {
+                        float * snap = cache + rows_out[slot * n_seqs + iv3] * state_row_size + iv1 * S_v * S_v;
+                        memcpy(snap, s_out, S_v * S_v * sizeof(float));
+                    }
+                }
+            } else if (K > 1) {
                 const int64_t target_slot = n_tokens - 1 - t;
                 if (target_slot >= 0 && target_slot < K) {
                     float * curr_state_o = state_out_base + target_slot * state_size_per_snap +

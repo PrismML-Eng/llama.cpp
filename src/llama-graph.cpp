@@ -417,6 +417,11 @@ bool llm_graph_input_rs::can_reuse_rs(const llama_memory_recurrent_context * mct
     res &= head == mctx_cur->get_head();
     res &= rs_z == mctx_cur->get_rs_z();
 
+    // a graph built for the in-place GDN path must not be reused by a ubatch
+    // whose cells were reordered / freshly zeroed (and vice versa); the memory
+    // was already updated by apply() -> find_slot before can_reuse runs
+    res &= rs_inplace == mctx_cur->rs_inplace_ok(params.ubatch.n_seqs);
+
     return res;
 }
 
@@ -3573,6 +3578,8 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
 
+    inp->rs_inplace = mctx_cur->rs_inplace_ok(n_seqs);
+
     return inp;
 }
 
@@ -3601,28 +3608,38 @@ ggml_tensor * llm_graph_context::build_rs_cache_view(
         llm_graph_input_rs * inp,
         ggml_tensor * s,
             int32_t   state_size,
-            int32_t   n_seqs) const {
+            int32_t   n_seqs,
+               bool   inplace) const {
     const auto * kv_state = inp->mctx;
 
     const uint32_t n_rs     = kv_state->get_n_rs();
     const uint32_t rs_head  = kv_state->get_head();
     const  int32_t rs_zero  = kv_state->get_rs_z();
 
+    // the in-place consumer mutates the cache rows of the ubatch: it is only
+    // entered when every main row is the identity and the extra range below is
+    // empty (rs_inplace_ok), which makes the ordering hazard described next
+    // unreachable for it
+    GGML_ASSERT(!inplace || (inp->rs_inplace && n_rs == (uint32_t) n_seqs));
+
     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
 
     // same cache hygiene as build_rs, minus the main gather (the consumer reads
     // per-seq rows via inp->s_copy_main directly, inside the GDN op).
     //
-    // KNOWN LIMITATION (tracked follow-up): build_rs gathers the main rows
-    // BEFORE this extra relocation, so an overlapping main row is read before
-    // being overwritten. rows mode defers the main read into the consumer, and
-    // s_copy() maps a main row to an arbitrary cache slot (idx*size + src0),
-    // which can fall inside the extra destination [rs_head+n_seqs, rs_head+n_rs)
-    // during a cache reorder -- so this relocation could clobber a main row the
-    // consumer will later read. Not reachable on the current single-sequence
-    // decode path, but it is a real multi-sequence hazard; the correct fix is
-    // to order the relocation AFTER the GDN read (build_rs's read-before-write
-    // ordering), which is a graph-dependency refactor left as follow-up.
+    // KNOWN LIMITATION of the Metal rows mode (tracked follow-up): build_rs
+    // gathers the main rows BEFORE this extra relocation, so an overlapping main
+    // row is read before being overwritten. rows mode defers the main read into
+    // the consumer, and s_copy() maps a main row to an arbitrary cache slot
+    // (idx*size + src0), which can fall inside the extra destination
+    // [rs_head+n_seqs, rs_head+n_rs) during a cache reorder -- so this relocation
+    // could clobber a main row the consumer will later read. The CPU in-place
+    // mode never enters this function with a non-empty extra range (see the
+    // assert above; transition ubatches take the gathered build_rs path), so the
+    // hazard only remains for the Metal rows + SET_ROWS mode on a cache reorder;
+    // the correct fix there is to order the relocation AFTER the GDN read
+    // (build_rs's read-before-write ordering), a graph-dependency refactor left
+    // as follow-up.
     ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
     ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
 
