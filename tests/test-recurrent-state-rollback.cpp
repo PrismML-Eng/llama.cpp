@@ -17,10 +17,11 @@ static llama_context * make_ctx(const common_params & params, llama_model * mode
     return llama_init_from_model(model, cparams);
 }
 
-static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count) {
+// decode tokens[0, count) at positions [pos0, pos0 + count) of seq 0 as one batch, logits for the last
+static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count, llama_pos pos0 = 0) {
     llama_batch batch = llama_batch_init(count, 0, 1);
-    for (uint32_t pos = 0; pos < count; ++pos) {
-        common_batch_add(batch, tokens[pos], pos, { 0 }, pos + 1 == count);
+    for (uint32_t i = 0; i < count; ++i) {
+        common_batch_add(batch, tokens[i], pos0 + (llama_pos) i, { 0 }, i + 1 == count);
     }
     const bool ok = llama_decode(ctx, batch) == 0;
     llama_batch_free(batch);
@@ -39,14 +40,22 @@ static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos) {
 // per-seq token count exceeds n_ubatch: each seq's replay spans several
 // ubatches while its rollback restore is still pending. Compared against a
 // reference context that never advanced past the rollback point and decodes
-// the identical replay batch.
+// the identical replay batch. The reference is restored from each seq's
+// checkpoint taken at the rollback point, so both contexts start the replay
+// from bit-identical bytes and differ only in how the memory reads them
+// (pending snapshot plane vs plane 0). A forward-only reference could not be
+// compared bitwise: an honest rollback target always sits inside a multi-token
+// ubatch of ctx_roll (a ubatch snapshots the state after each of its last
+// min(T, K) - 1 tokens, never the state it started from), and the CPU matmul
+// kernels depend on the ubatch size.
 static bool test_multi_seq_split_replay(const common_params & params, llama_model * model, const int n_vocab) {
     constexpr uint32_t  n_seqs     = 2;
     constexpr uint32_t  n_ubatch   = 16;
     constexpr uint32_t  n_prompt   = 19;
     constexpr uint32_t  n_rollback = 3;
     constexpr uint32_t  n_replay   = 40; // > n_ubatch so each seq spans multiple ubatches
-    constexpr llama_pos p0         = n_prompt - n_rollback;
+    constexpr llama_pos p0         = n_prompt - n_rollback; // replay start; the rollback lands on the state after p0 - 1
+    constexpr llama_pos p_tail     = p0 - 1;                // the last pre-rollback ubatch [p_tail, n_prompt) has n_rollback + 1 tokens
 
     const auto make_ctx_multi = [&]() {
         auto cparams = common_context_params_to_llama(params);
@@ -83,18 +92,21 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
 
     bool ok = true;
 
-    // both contexts decode the identical [0, p0) prefill; only ctx_roll decodes
-    // the tail, which is then rolled back so its restore is pending at replay
+    // ctx_roll decodes [0, p_tail) and then [p_tail, n_prompt) as one ubatch of
+    // n_rollback + 1 tokens, rolled back by n_rollback -- the largest rollback
+    // that ubatch supports: plane n_rollback is the state after position p_tail,
+    // and the restore is pending at replay. ctx_ref receives that same state
+    // through a checkpoint (state_write resolves the pending plane into a plain
+    // plane-0 state)
     for (uint32_t s = 0; s < n_seqs && ok; ++s) {
         llama_batch batch = llama_batch_init(n_prompt, 0, 1);
-        for (llama_pos pos = 0; pos < (llama_pos) p0; ++pos) {
+        for (llama_pos pos = 0; pos < p_tail; ++pos) {
             common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
         }
         ok = ok && llama_decode(ctx_roll, batch) == 0;
-        ok = ok && llama_decode(ctx_ref,  batch) == 0;
 
         common_batch_clear(batch);
-        for (llama_pos pos = p0; pos < (llama_pos) n_prompt; ++pos) {
+        for (llama_pos pos = p_tail; pos < (llama_pos) n_prompt; ++pos) {
             common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
         }
         ok = ok && llama_decode(ctx_roll, batch) == 0;
@@ -104,6 +116,12 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
 
         // a second partial removal while one is pending must be refused
         ok = ok && !llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, p0 - 1, -1);
+
+        if (ok) {
+            common_prompt_checkpoint ckpt;
+            ckpt.update_tgt(ctx_roll, (llama_seq_id) s, 0);
+            ckpt.load_tgt(ctx_ref, (llama_seq_id) s, 0);
+        }
     }
     if (!ok) {
         fprintf(stderr, "%s : multi-seq prefill/rollback failed\n", __func__);
@@ -274,7 +292,9 @@ int main(int argc, char ** argv) {
     const uint32_t  n_tokens     = tokens.size();
     const llama_pos rollback_pos = (llama_pos) n_tokens - n_rollback;
 
-    // Decode the full prompt on the source, then roll back three positions.
+    // Decode the full prompt on the source as one ubatch (n_ubatch >= n_tokens), then roll back
+    // three positions: a ubatch snapshots the state after each of its last min(T, K) - 1 tokens,
+    // so plane 3 holds the state after position rollback_pos - 1.
     // Replaying them crosses DSV4's ratio-4 compressor boundary.
     // Rollback leaves the recurrent memory in a snapshot state (rs_idx != 0).
     if (!decode_tokens(ctx_src, tokens, n_tokens)) {
@@ -292,12 +312,14 @@ int main(int argc, char ** argv) {
     ckpt.load_tgt(ctx_dst, 0, 0);
 
     constexpr float eps = 1e-5f;
-    std::vector<std::vector<float>> logits_src_replay(n_rollback);
-    const auto replay_and_compare = [&](const char * mode) {
+    // replay toks[0, n_rollback) one token at a time at positions [pos0, pos0 + n_rollback) on both
+    // contexts and compare the logits; logits_out (optional) keeps the source logits of each step
+    const auto replay_and_compare = [&](const char * mode, const std::vector<llama_token> & toks, llama_pos pos0,
+                                        std::vector<std::vector<float>> * logits_out) {
         for (uint32_t i = 0; i < n_rollback; ++i) {
-            const llama_pos pos = rollback_pos + i;
-            if (!decode_one(ctx_src, tokens[pos], pos) ||
-                !decode_one(ctx_dst, tokens[pos], pos)) {
+            const llama_pos pos = pos0 + (llama_pos) i;
+            if (!decode_one(ctx_src, toks[i], pos) ||
+                !decode_one(ctx_dst, toks[i], pos)) {
                 fprintf(stderr, "%s : %s replay failed at position %d\n", __func__, mode, pos);
                 return false;
             }
@@ -309,7 +331,9 @@ int main(int argc, char ** argv) {
                 return false;
             }
 
-            logits_src_replay[i].assign(logits_src, logits_src + n_vocab);
+            if (logits_out != nullptr) {
+                (*logits_out)[i].assign(logits_src, logits_src + n_vocab);
+            }
             for (int token = 0; token < n_vocab; ++token) {
                 if (std::fabs(logits_src[token] - logits_dst[token]) > eps) {
                     fprintf(stderr, "%s : %s logits mismatch at position %d, token %d (%g != %g)\n",
@@ -320,12 +344,35 @@ int main(int argc, char ** argv) {
         }
         return true;
     };
-    if (!replay_and_compare("full")) {
+
+    std::vector<std::vector<float>> logits_src_replay(n_rollback);
+    const std::vector<llama_token> toks_replay(tokens.begin() + rollback_pos, tokens.end());
+    if (!replay_and_compare("full", toks_replay, rollback_pos, &logits_src_replay)) {
         return 1;
     }
 
-    if (!llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos, -1) ||
-        !llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos, -1)) {
+    // Partial-flags checkpoint of a pending rollback. The three single-token replays above wrote
+    // plane 0 only: a ubatch snapshots the state after each of its last min(T, K) - 1 tokens and
+    // never the state it started from, so rolling those positions back again would have to read
+    // planes an older ubatch wrote, and llama_memory_seq_rm refuses that. Extend both sequences
+    // with the same n_rollback + 1 tokens in ONE ubatch instead and roll back n_rollback, the
+    // largest rollback that ubatch supports: plane n_rollback is the state after its first token.
+    // The replay of positions ext_pos + 1 .. ext_pos + n_rollback again crosses DSV4's ratio-4
+    // compressor boundary (n_tokens = n_rs_seq + 1 = 9, n_rollback = 3).
+    const llama_pos ext_pos = (llama_pos) n_tokens;
+    const uint32_t  n_ext   = n_rollback + 1;
+    std::vector<llama_token> ext(n_ext);
+    for (uint32_t i = 0; i < n_ext; ++i) {
+        ext[i] = tokens[(1 + i) % n_tokens];
+    }
+    if (!decode_tokens(ctx_src, ext, n_ext, ext_pos) || !decode_tokens(ctx_dst, ext, n_ext, ext_pos)) {
+        fprintf(stderr, "%s : extension decode failed\n", __func__);
+        return 1;
+    }
+
+    const llama_pos rollback_pos_ext = ext_pos + 1;
+    if (!llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos_ext, -1) ||
+        !llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos_ext, -1)) {
         fprintf(stderr, "%s : partial rollback failed\n", __func__);
         return 1;
     }
@@ -335,7 +382,8 @@ int main(int argc, char ** argv) {
     ckpt_partial.update_tgt(ctx_src, 0, partial_flags);
     ckpt_partial.load_tgt(ctx_dst, 0, partial_flags);
 
-    if (!replay_and_compare("partial")) {
+    const std::vector<llama_token> toks_ext(ext.begin() + 1, ext.end());
+    if (!replay_and_compare("partial", toks_ext, rollback_pos_ext, nullptr)) {
         return 1;
     }
 
