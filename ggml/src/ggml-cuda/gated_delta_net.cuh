@@ -7,6 +7,8 @@ struct ggml_cuda_gated_delta_net_fused_cache {
     int64_t slot_stride; // between rollback slots (0 when K==1)
 };
 
+// The fused recurrent-state gather (ggml_cuda_gated_delta_net_gather, common.cuh) is looked up in
+// ctx.gdn_gathers() by node pointer; the graph evaluator registers it when it skips the GET_ROWS.
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
