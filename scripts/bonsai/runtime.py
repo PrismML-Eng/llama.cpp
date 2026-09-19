@@ -14,6 +14,14 @@ def environment():
     env["PATH"] = os.pathsep.join(map(str, [venv / "Scripts", sdk / "bin", sdk / "lib/llvm/bin"])) + os.pathsep + env["PATH"]
     env["HIP_VISIBLE_DEVICES"] = env.get("BONSAI_HIP_DEVICE", "1")
     env.pop("GGML_VK_VISIBLE_DEVICES", None)
+    for name in (
+        "LLAMA_ARG_SPEC_DRAFT_MODEL",
+        "LLAMA_ARG_SPEC_TYPE",
+        "LLAMA_ARG_N_GPU_LAYERS_DRAFT",
+        "LLAMA_ARG_SPEC_DRAFT_N_MAX",
+        "BONSAI_SPECULATIVE",
+    ):
+        env.pop(name, None)
     return env
 
 

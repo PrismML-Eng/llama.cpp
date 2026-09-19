@@ -9,7 +9,7 @@ import time
 from runtime import environment
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("--build", default="build-hip-baseline")
+parser.add_argument("--build", default="build-hip-original")
 parser.add_argument("--label", required=True)
 parser.add_argument("--threads", default="8")
 parser.add_argument("--ubatch", default="512")

@@ -10,7 +10,7 @@ import urllib.request
 from runtime import environment
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("--build", default="build-hip-baseline")
+parser.add_argument("--build", default="build-hip-original")
 parser.add_argument("--port", type=int, default=8081)
 parser.add_argument("--context", type=int, default=32768)
 parser.add_argument("--batch", type=int, default=2048)
@@ -47,17 +47,28 @@ with (out / "server.stdout.log").open("w") as stdout, (out / "server.stderr.log"
 record = {"pid": process.pid, "command": command, "port": args.port, "label": args.label}
 (out / "server.json").write_text(json.dumps(record, indent=2))
 print(json.dumps(record), flush=True)
-for _ in range(180):
+
+
+def stop_process(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+deadline = time.monotonic() + 180
+while time.monotonic() < deadline:
     if process.poll() is not None:
         raise SystemExit(f"Server exited {process.returncode}; inspect {out}")
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{args.port}/health", timeout=2) as response:
+        with urllib.request.urlopen(f"http://127.0.0.1:{args.port}/health", timeout=0.5) as response:
             if response.status == 200:
                 print("Server healthy", flush=True)
                 break
     except (OSError, ValueError):
-        pass
-    time.sleep(1)
+        time.sleep(0.5)
 else:
-    process.terminate()
+    stop_process(process)
     raise SystemExit(f"Server startup timed out; inspect {out}")
