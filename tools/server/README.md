@@ -596,6 +596,8 @@ These words will not be included in the completion, so make sure to add them to 
 
 `lora`: A list of LoRA adapters to be applied to this specific request. Each object in the list must contain `id` and `scale` fields. For example: `[{"id": 0, "scale": 0.5}, {"id": 1, "scale": 1.1}]`. If a LoRA adapter is not specified in the list, its scale will default to `0.0`. Please note that requests with different LoRA configurations will not be batched together, which may result in performance degradation.
 
+`speculative.n_max`: Maximum number of tokens to draft for this request when the server runs a draft-model based speculative decoding method (e.g. `--spec-type draft-mtp`). `0` disables drafting for the request: the slot adds one token per step, decodes in one ubatch together with the other non-drafting slots and keeps a single recurrent-state plane (no rollback snapshots). `0 < n_max < --spec-draft-n-max` truncates the draft; larger values have no effect (the draft stops at the server-wide limit). `LLAMA_SERVER_SPEC_MULTISLOT=0` in the server environment restores the previous policy (the field is ignored and every slot drafts). Default: the server `--spec-draft-n-max`
+
 **Response format**
 
 - Note: In streaming mode (`stream`), only `content`, `tokens` and `stop` will be returned until end of completion. Responses are sent using the [Server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html) standard. Note: the browser's `EventSource` interface cannot be used due to its lack of `POST` request support.
