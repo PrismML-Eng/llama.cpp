@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <clocale>
+#include <chrono>
 #include <exception>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
@@ -233,6 +234,27 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
+    // public endpoint: graceful stop for external supervisors. Signal-based
+    // stops (CTRL_BREAK) can wedge HIP/driver cleanup on Windows, leaving an
+    // unkillable process that holds its port and GPU memory; this route runs
+    // the same handler as SIGINT but lets the caller verify a real exit.
+    // Respond first, then trigger from a detached thread: stopping the HTTP
+    // server from inside a handler thread would deadlock the response.
+    ctx_http.post("/shutdown", [](const server_http_req &) {
+        auto res = std::make_unique<server_http_res>();
+        res->status = 200;
+        res->data = safe_json_to_str({
+            {"ok", true},
+            {"message", "shutting down"},
+        });
+        std::thread([]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            if (shutdown_handler) {
+                shutdown_handler(0);
+            }
+        }).detach();
+        return res;
+    });
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
