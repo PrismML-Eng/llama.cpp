@@ -1461,3 +1461,36 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
     assert(k % QK_K == 0);
     quantize_iq4_xs(x, y, 1, k, NULL);
 }
+
+// PQ2_0 x Q8_K reference dot (tier 2, 2026-09-18): one activation scale per 256 elements instead of per 32, so a
+// 128-weight block's integer dot can be accumulated in one int32 and scaled once. Scalar reference for the x86
+// kernel's tolerance test; also the non-x86 fallback. Two PQ2_0 blocks map onto one Q8_K block (halves).
+void ggml_vec_dot_pq2_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_K == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_pq2_0 * GGML_RESTRICT x = vx;
+    const block_q8_K  * GGML_RESTRICT y = vy;
+    const int nb = n / QK_PQ2_0;
+
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const block_q8_K * GGML_RESTRICT yb = &y[i >> 1];
+        const int8_t * GGML_RESTRICT q8 = yb->qs + 128 * (i & 1);
+        int sumi = 0;
+        for (int k = 0; k < 4; k++) {
+            for (int b = 0; b < 8; b++) {
+                const uint8_t byte = x[i].qs[8 * k + b];
+                for (int j = 0; j < 4; j++) {
+                    sumi += (((byte >> (2 * j)) & 3) - 1) * q8[32 * k + 4 * b + j];
+                }
+            }
+        }
+        sumf += (GGML_CPU_FP16_TO_FP32(x[i].d) * yb->d) * (float) sumi;
+    }
+    *s = sumf;
+}

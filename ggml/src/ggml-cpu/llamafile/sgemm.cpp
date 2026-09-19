@@ -56,6 +56,8 @@
 
 #include <array>
 #include <type_traits>
+#include <cstdlib>
+#include <cstring>
 
 #ifdef _MSC_VER
 #define NOINLINE __declspec(noinline)
@@ -3772,6 +3774,265 @@ class tinyBLAS_PPC {
 #endif
 } // namespace
 
+// ---- PQ2_0 x Q8_K tiled GEMM (tier 2, 2026-09-18). Same tiling as tinyBLAS_PQ2_AVX; with a single activation
+// scale per 256 the per-(row,col) work per 128 weights collapses to 4 dpbusd + sub + cvt + fmadd, the activation
+// permute and sum(y) are shared across RM rows, the unpacked codes across RN columns. Per-block float op and the
+// final reduction match ggml_vec_dot_pq2_0_q8_K exactly, so the batched and single-token paths agree bit-for-bit.
+#if defined(__AVX2__)
+static inline float pq2_hsum(__m256 x);   // defined with the tier-1 class below
+static inline __m256i pq2k_sg_dpbusd(__m256i acc, __m256i u, __m256i s) {
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    return _mm256_dpbusd_epi32(acc, u, s);
+#elif defined(__AVXVNNI__)
+    return _mm256_dpbusd_avx_epi32(acc, u, s);
+#else
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(u, s), _mm256_set1_epi16(1)));
+#endif
+}
+#include <vector>
+class tinyBLAS_PQ2K_AVX {
+  public:
+    tinyBLAS_PQ2K_AVX(int64_t k, const block_pq2_0 *A, int64_t lda, const block_q8_K *B, int64_t ldb, float *C, int64_t ldc, int ith, int nth,
+                      const struct ggml_compute_params *params = nullptr)
+        : A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth), params(params) {}
+    void matmul(int64_t m, int64_t n) { prep(n); mnpack(0, m, 0, n); }
+  private:
+    // Staging (2026-09-19): the permute of every 32-byte Q8_K group into code order and the lane-wise sum(y) of
+    // every 128-weight block depend only on (column, block), but the first tile recomputed both inside every row
+    // tile (m/RM times per matmul; perf: 91% of a 64-token batch was this kernel, ~1/3 of it that redundancy).
+    // Each thread now stages all n columns once per call into a thread-local buffer: per (column, PQ2 block)
+    // 4 x 32 permuted bytes followed by the 8 x int32 lane sums. Same integer sums in the same lanes, so the
+    // float accumulation order is unchanged and results stay bit-identical to ggml_vec_dot_pq2_0_q8_K.
+    static constexpr int64_t BP_BLOCK = 160;
+    const uint8_t *Bp = nullptr;
+    void prep(int64_t n) {
+        static thread_local std::vector<uint8_t> buf;
+        const size_t need = (size_t) n * (size_t) k * BP_BLOCK + 64;
+        if (buf.size() < need) buf.resize(need);
+        uint8_t *base = (uint8_t *) (((uintptr_t) buf.data() + 31) & ~(uintptr_t) 31);
+        const __m256i ones_8  = _mm256_set1_epi8(1);
+        const __m256i qy_shuf = _mm256_setr_epi8(0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15, 0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15);
+        const __m256i qy_perm = _mm256_setr_epi32(0,4,1,5,2,6,3,7);
+        for (int64_t j = 0; j < n; ++j) {
+            for (int64_t l = 0; l < k; ++l) {
+                const int8_t *q8 = B[ldb * j + (l >> 1)].qs + 128 * (int) (l & 1);
+                uint8_t *dst = base + ((size_t) j * (size_t) k + (size_t) l) * BP_BLOCK;
+                __m256i sumq = _mm256_setzero_si256();
+                for (int s = 0; s < 4; ++s) {
+                    const __m256i qy  = _mm256_loadu_si256((const __m256i *) (q8 + 32 * s));
+                    const __m256i qyp = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(qy, qy_shuf), qy_perm);
+                    _mm256_store_si256((__m256i *) (dst + 32 * s), qyp);
+                    sumq = pq2k_sg_dpbusd(sumq, ones_8, qyp);
+                }
+                _mm256_store_si256((__m256i *) (dst + 128), sumq);
+            }
+        }
+        Bp = base;
+    }
+    void mnpack(int64_t m0, int64_t m, int64_t n0, int64_t n) {
+        int64_t mc, nc, mp, np;
+        // (RM=1,RN=8 measured L2-bound: 128 B of staged activations per (row,col) block vs 64 B for RM=2 — N=64
+        // went 88 -> 103 ms/token. Wide-and-two-rows stays the tile for every n.)
+        // Wide tiles first: 3-4 token columns share one weight pass (RM=2 keeps it at 15 ymm). n=2 keeps RM=4.
+        switch ((MIN(m - m0, 4) << 4) | MIN(n - n0, 4)) {
+        case 0x44: case 0x34: case 0x24: mc = 2; nc = 4; gemm<2, 4>(m0, m, n0, n); break;
+        case 0x43: case 0x33: case 0x23: mc = 2; nc = 3; gemm<2, 3>(m0, m, n0, n); break;
+        case 0x14: mc = 1; nc = 4; gemm<1, 4>(m0, m, n0, n); break;
+        case 0x13: mc = 1; nc = 3; gemm<1, 3>(m0, m, n0, n); break;
+        case 0x42: mc = 4; nc = 2; gemm<4, 2>(m0, m, n0, n); break;
+        case 0x41: mc = 4; nc = 1; gemm<4, 1>(m0, m, n0, n); break;
+        case 0x32: mc = 3; nc = 2; gemm<3, 2>(m0, m, n0, n); break;
+        case 0x31: mc = 3; nc = 1; gemm<3, 1>(m0, m, n0, n); break;
+        case 0x22: mc = 2; nc = 2; gemm<2, 2>(m0, m, n0, n); break;
+        case 0x21: mc = 2; nc = 1; gemm<2, 1>(m0, m, n0, n); break;
+        case 0x12: mc = 1; nc = 2; gemm<1, 2>(m0, m, n0, n); break;
+        case 0x11: mc = 1; nc = 1; gemm<1, 1>(m0, m, n0, n); break;
+        default: return;
+        }
+        mp = m0 + (m - m0) / mc * mc;
+        np = n0 + (n - n0) / nc * nc;
+        mnpack(mp, m, n0, np);
+        mnpack(m0, m, np, n);
+    }
+    template <int RM, int RN>
+    NOINLINE void gemm(int64_t m0, int64_t m, int64_t n0, int64_t n) {
+        const int64_t ytiles = (m - m0) / RM;
+        const int64_t xtiles = (n - n0) / RN;
+        // A job is one row tile with ALL its column tiles, so every weight row streams from DRAM exactly once
+        // whichever thread takes it. With several threads and enough work the row tiles are claimed from the
+        // threadpool's shared counter (same pattern as the fp32 path above): this loop is compute-bound for
+        // n >= 4 and P-/E-cores run it at different speeds, so a static split left the P-cores idle at the end
+        // (-t 10 static: 101 ms/token vs 70 with -t 6).
+        const bool dynamic = nth > 1 && params != nullptr && xtiles * ytiles >= 64;
+        int64_t start, end;
+        if (dynamic) {
+            if (ith == 0) ggml_threadpool_chunk_set(params->threadpool, nth);
+            ggml_barrier(params->threadpool);
+            start = ith; end = ytiles;
+        } else {
+            const int64_t duty = (ytiles + nth - 1) / nth;
+            start = duty * ith; end = start + duty; if (end > ytiles) end = ytiles;
+        }
+        const __m256i shifts  = _mm256_setr_epi64x(0, 2, 4, 6);
+        const __m256i mask3   = _mm256_set1_epi8(3);
+        // Claims come in runs of CH row tiles to keep the shared counter off the hot path (ytiles is 2.5k-8.7k here).
+        constexpr int64_t CH = 8;
+        if (dynamic) { start = (int64_t) ith * CH; }
+        for (int64_t y0 = start; y0 < end; y0 = dynamic ? ggml_threadpool_chunk_add(params->threadpool, 1) * CH : end) {
+          const int64_t y1 = dynamic ? MIN(y0 + CH, end) : end;
+          for (int64_t yt = y0; yt < y1; ++yt) {
+            const int64_t ii = m0 + yt * RM;
+            for (int64_t xt = 0; xt < xtiles; ++xt) {
+            const int64_t jj = n0 + xt * RN;
+            const uint8_t *bp[RN];
+            for (int j = 0; j < RN; ++j) bp[j] = Bp + (size_t) (jj + j) * (size_t) k * BP_BLOCK;
+            __m256 Cv[RN][RM] = {};
+            for (int64_t l = 0; l < k; ++l) {           // k = number of PQ2_0 blocks per row
+                const int64_t lk = l >> 1;              // Q8_K block index
+                const size_t  lo = (size_t) l * BP_BLOCK;
+                __m256i acc[RN][RM];
+                for (int j = 0; j < RN; ++j) for (int i = 0; i < RM; ++i) acc[j][i] = _mm256_setzero_si256();
+                for (int s = 0; s < 4; ++s) {
+                    __m256i codes[RM];
+                    for (int i = 0; i < RM; ++i) {
+                        int64_t xq; memcpy(&xq, &A[lda * (ii + i) + l].qs[s * 8], sizeof(xq));
+                        codes[i] = _mm256_and_si256(_mm256_srlv_epi64(_mm256_set1_epi64x(xq), shifts), mask3);
+                    }
+                    for (int j = 0; j < RN; ++j) {
+                        const __m256i qyp = _mm256_load_si256((const __m256i *) (bp[j] + lo + 32 * s));
+                        for (int i = 0; i < RM; ++i) acc[j][i] = pq2k_sg_dpbusd(acc[j][i], codes[i], qyp);
+                    }
+                }
+                for (int i = 0; i < RM; ++i) {
+                    const float da = unhalf(A[lda * (ii + i) + l].d);
+                    for (int j = 0; j < RN; ++j) {
+                        const __m256i sumq = _mm256_load_si256((const __m256i *) (bp[j] + lo + 128));
+                        const __m256 sc = _mm256_set1_ps(da * B[ldb * (jj + j) + lk].d);
+                        Cv[j][i] = _mm256_fmadd_ps(sc, _mm256_cvtepi32_ps(_mm256_sub_epi32(acc[j][i], sumq)), Cv[j][i]);
+                    }
+                }
+            }
+            for (int j = 0; j < RN; ++j)
+                for (int i = 0; i < RM; ++i)
+                    C[ldc * (jj + j) + (ii + i)] = pq2_hsum(Cv[j][i]);
+            }
+          }
+        }
+        if (dynamic) ggml_barrier(params->threadpool);
+    }
+    const block_pq2_0 *const A;
+    const block_q8_K  *const B;
+    float *const C;
+    const int64_t k, lda, ldb, ldc;
+    const int ith, nth;
+    const struct ggml_compute_params *const params;
+};
+#endif // __AVX2__
+
+// ---- PQ2_0 (PrismML 2-bit ternary, group 128) x Q8_0 tiled GEMM for AVX2 / AVX-VNNI. Added 2026-09-18. ----
+// The vec_dot path re-unpacks every 128-weight block once PER TOKEN, so for a batch of n tokens (speculative
+// verify, prompt eval) unpack dominates: measured batch cost was a flat 168 ms/token regardless of n. This tile
+// unpacks a block once per row and reuses it across RN token columns, and computes the activation permute and
+// the sum(y) term once per column and reuses them across RM rows. Per (row, col) the float accumulation order
+// and the horizontal reduction are the SAME as ggml_vec_dot_pq2_0_q8_0, so results are bit-identical to the
+// vec_dot path. PQ2_SGEMM=0 in the environment disables this case (A/B and exactness checks).
+#if defined(__AVX2__)
+static inline __m256i pq2_dpbusd(__m256i u, __m256i s) {
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    return _mm256_dpbusd_epi32(_mm256_setzero_si256(), u, s);
+#elif defined(__AVXVNNI__)
+    return _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), u, s);
+#else
+    return _mm256_madd_epi16(_mm256_maddubs_epi16(u, s), _mm256_set1_epi16(1));
+#endif
+}
+static inline float pq2_hsum(__m256 x) { // identical reduction order to hsum_float_8 in arch/x86/quants.c
+    __m128 res = _mm256_extractf128_ps(x, 1);
+    res = _mm_add_ps(res, _mm256_castps256_ps128(x));
+    res = _mm_add_ps(res, _mm_movehl_ps(res, res));
+    res = _mm_add_ss(res, _mm_movehdup_ps(res));
+    return _mm_cvtss_f32(res);
+}
+class tinyBLAS_PQ2_AVX {
+  public:
+    tinyBLAS_PQ2_AVX(int64_t k, const block_pq2_0 *A, int64_t lda, const block_q8_0 *B, int64_t ldb, float *C, int64_t ldc, int ith, int nth)
+        : A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth) {}
+    void matmul(int64_t m, int64_t n) { mnpack(0, m, 0, n); }
+  private:
+    void mnpack(int64_t m0, int64_t m, int64_t n0, int64_t n) {
+        int64_t mc, nc, mp, np;
+        switch ((MIN(m - m0, 4) << 4) | MIN(n - n0, 2)) {
+        case 0x42: mc = 4; nc = 2; gemm<4, 2>(m0, m, n0, n); break;
+        case 0x41: mc = 4; nc = 1; gemm<4, 1>(m0, m, n0, n); break;
+        case 0x32: mc = 3; nc = 2; gemm<3, 2>(m0, m, n0, n); break;
+        case 0x31: mc = 3; nc = 1; gemm<3, 1>(m0, m, n0, n); break;
+        case 0x22: mc = 2; nc = 2; gemm<2, 2>(m0, m, n0, n); break;
+        case 0x21: mc = 2; nc = 1; gemm<2, 1>(m0, m, n0, n); break;
+        case 0x12: mc = 1; nc = 2; gemm<1, 2>(m0, m, n0, n); break;
+        case 0x11: mc = 1; nc = 1; gemm<1, 1>(m0, m, n0, n); break;
+        default: return;
+        }
+        mp = m0 + (m - m0) / mc * mc;
+        np = n0 + (n - n0) / nc * nc;
+        mnpack(mp, m, n0, np);
+        mnpack(m0, m, np, n);
+    }
+    template <int RM, int RN>
+    NOINLINE void gemm(int64_t m0, int64_t m, int64_t n0, int64_t n) {
+        const int64_t ytiles = (m - m0) / RM;
+        const int64_t xtiles = (n - n0) / RN;
+        const int64_t tiles = xtiles * ytiles;
+        const int64_t duty = (tiles + nth - 1) / nth;
+        const int64_t start = duty * ith;
+        int64_t end = start + duty;
+        if (end > tiles) end = tiles;
+        const __m256i shifts  = _mm256_setr_epi64x(0, 2, 4, 6);
+        const __m256i mask3   = _mm256_set1_epi8(3);
+        const __m256i ones_8  = _mm256_set1_epi8(1);
+        const __m256i qy_shuf = _mm256_setr_epi8(0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15, 0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15);
+        const __m256i qy_perm = _mm256_setr_epi32(0,4,1,5,2,6,3,7);
+        for (int64_t job = start; job < end; ++job) {
+            const int64_t ii = m0 + job / xtiles * RM;
+            const int64_t jj = n0 + job % xtiles * RN;
+            __m256 Cv[RN][RM] = {};
+            for (int64_t l = 0; l < k; ++l) {
+                __m256 blk[RN][RM] = {};
+                for (int s = 0; s < 4; ++s) {
+                    __m256i codes[RM];
+                    for (int i = 0; i < RM; ++i) {
+                        int64_t xq; memcpy(&xq, &A[lda * (ii + i) + l].qs[s * 8], sizeof(xq));
+                        codes[i] = _mm256_and_si256(_mm256_srlv_epi64(_mm256_set1_epi64x(xq), shifts), mask3);
+                    }
+                    for (int j = 0; j < RN; ++j) {
+                        const block_q8_0 *yb = &B[ldb * (jj + j) + 4 * l + s];
+                        const __m256i qy  = _mm256_loadu_si256((const __m256i *) yb->qs);
+                        const __m256i qyp = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(qy, qy_shuf), qy_perm);
+                        const __m256i sy  = pq2_dpbusd(ones_8, qyp);
+                        const __m256  db  = _mm256_set1_ps(unhalf(yb->d));
+                        for (int i = 0; i < RM; ++i) {
+                            const __m256i s32 = _mm256_sub_epi32(pq2_dpbusd(codes[i], qyp), sy);
+                            blk[j][i] = _mm256_fmadd_ps(db, _mm256_cvtepi32_ps(s32), blk[j][i]);
+                        }
+                    }
+                }
+                for (int i = 0; i < RM; ++i) {
+                    const __m256 da = _mm256_set1_ps(unhalf(A[lda * (ii + i) + l].d));
+                    for (int j = 0; j < RN; ++j) Cv[j][i] = _mm256_fmadd_ps(da, blk[j][i], Cv[j][i]);
+                }
+            }
+            for (int j = 0; j < RN; ++j)
+                for (int i = 0; i < RM; ++i)
+                    C[ldc * (jj + j) + (ii + i)] = pq2_hsum(Cv[j][i]);
+        }
+    }
+    const block_pq2_0 *const A;
+    const block_q8_0  *const B;
+    float *const C;
+    const int64_t k, lda, ldb, ldc;
+    const int ith, nth;
+};
+#endif // __AVX2__
+
 /**
  * Performs optimized matrix multiplication on CPU.
  *
@@ -4038,6 +4299,24 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
         return false;
     }
 
+    case GGML_TYPE_PQ2_0: {
+#if defined(__AVX2__)
+        { static int off = -1; if (off < 0) { const char * e = getenv("PQ2_SGEMM"); off = (e && e[0] == '0') ? 1 : 0; } if (off) return false; }
+        if (Btype == GGML_TYPE_Q8_K) {
+            tinyBLAS_PQ2K_AVX tb{ k, (const block_pq2_0 *)A, lda, (const block_q8_K *)B, ldb, (float *)C, ldc, params->ith, params->nth, params };
+            tb.matmul(m, n);
+            return true;
+        }
+        if (Btype == GGML_TYPE_Q8_0) {
+            tinyBLAS_PQ2_AVX tb{ k, (const block_pq2_0 *)A, lda, (const block_q8_0 *)B, ldb, (float *)C, ldc, params->ith, params->nth };
+            tb.matmul(m, n);
+            return true;
+        }
+        return false;
+#else
+        return false;
+#endif
+    }
     case GGML_TYPE_Q8_0: {
         if (Btype != GGML_TYPE_Q8_0)
            return false;
