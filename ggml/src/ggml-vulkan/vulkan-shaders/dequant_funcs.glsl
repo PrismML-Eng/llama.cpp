@@ -129,14 +129,39 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 #if defined(DATA_A_PTQ1_0)
 #include "ptq1_0.glsl"
 
+// FADI-OPT: any 4-aligned group shares one exponent n and reads consecutive bytes, so one branch + vector multiply decodes it.
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     return vec2(ptq1_0_trit(ib, a_offset, iqs), ptq1_0_trit(ib, a_offset, iqs + 1u));
 }
 vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
-    return vec4(ptq1_0_trit(ib, a_offset, iqs),
-                ptq1_0_trit(ib, a_offset, iqs + 1u),
-                ptq1_0_trit(ib, a_offset, iqs + 2u),
-                ptq1_0_trit(ib, a_offset, iqs + 3u));
+    uvec4 v;
+    if (iqs < 120u) {
+        uint base;
+        uint n;
+        if (iqs < 80u) {
+            base = iqs & 15u;
+            n    = iqs >> 4u;
+        } else {
+            const uint t = iqs - 80u;
+            base = 16u + (t & 7u);
+            n    = t >> 3u;
+        }
+        const uint m = POW3_MOD256[n & 63u];
+        v = uvec4(uint(data_a[a_offset + ib].qs[base    ]),
+                  uint(data_a[a_offset + ib].qs[base + 1u]),
+                  uint(data_a[a_offset + ib].qs[base + 2u]),
+                  uint(data_a[a_offset + ib].qs[base + 3u])) * m & 0xFFu;
+    } else {
+        const uint t  = iqs - 120u;          // 0 or 4
+        const uint n0 = t >> 1u;             // shared exponent for elements 0,1
+        const uint b0 = uint(data_a[a_offset + ib].qh[0]);
+        const uint b1 = uint(data_a[a_offset + ib].qh[1]);
+        v = uvec4((b0 * POW3_MOD256[n0     & 63u]) & 0xFFu,
+                  (b1 * POW3_MOD256[n0     & 63u]) & 0xFFu,
+                  (b0 * POW3_MOD256[(n0+1u) & 63u]) & 0xFFu,
+                  (b1 * POW3_MOD256[(n0+1u) & 63u]) & 0xFFu);
+    }
+    return vec4((v * 3u) >> 8u) - 1.0f;
 }
 #endif
 

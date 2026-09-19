@@ -1054,6 +1054,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_fwht_f32[GGML_VK_FWHT_NUM_SIZES];
     vk_pipeline pipeline_fwht_f16[GGML_VK_FWHT_NUM_SIZES];
+    // FADI-FUSION: dedicated signed variants (3 descriptors, signs buffer bound)
+    vk_pipeline pipeline_fwht_signed_f32[GGML_VK_FWHT_NUM_SIZES];
+    vk_pipeline pipeline_fwht_signed_f16[GGML_VK_FWHT_NUM_SIZES];
     // rows a workgroup covers, chosen per width when the pipeline is built
     uint32_t fwht_rows_per_wg[GGML_VK_FWHT_NUM_SIZES] = {};
     vk_pipeline pipeline_cumsum_f32;
@@ -1415,6 +1418,7 @@ struct vk_op_fwht_push_constants {
     uint32_t src_offset;
     uint32_t dst_offset;
     float scale;
+    uint32_t n_blk; // FADI-FUSION: sign blocks in the optional signs buffer (0 = off)
 };
 
 struct vk_op_count_experts_push_constants {
@@ -2399,6 +2403,10 @@ struct ggml_backend_vk_context {
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
     int num_additional_fused_ops {};
+    // FADI-FUSION: the hinted MUL_MAT whose transform was already emitted by the
+    // fused MUL_FWHT dispatch — ggml_vk_mul_mat must skip it (no-op) instead of
+    // running a second FWHT into the same destination.
+    ggml_tensor * fwht_mm_done {};
     // Bitmask of which fused ops need to write an intermediate value to memory.
     // Bit 'i' means nodes[start_of_fusion + i] writes to memory.
     // If there's no fusion, bit 0 is still set.
@@ -5804,6 +5812,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     if (device->fp16) {
                         ggml_vk_create_pipeline(device, device->pipeline_fwht_f16[idx], "fwht_f16", fwht_f16_len, fwht_f16_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
                     }
+                    // FADI-FUSION: signed twins for the MUL(signs)+FWHT fusion
+                    ggml_vk_create_pipeline(device, device->pipeline_fwht_signed_f32[idx], "fwht_signed_f32", fwht_signed_f32_len, fwht_signed_f32_data, "main", 3, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
+                    if (device->fp16) {
+                        ggml_vk_create_pipeline(device, device->pipeline_fwht_signed_f16[idx], "fwht_signed_f16", fwht_signed_f16_len, fwht_signed_f16_data, "main", 3, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
+                    }
                     device->fwht_rows_per_wg[idx] = GGML_VK_FWHT_ROWS;
                 }
             } else {
@@ -5815,6 +5828,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     ggml_vk_create_pipeline(device, device->pipeline_fwht_f32[idx], "fwht_shmem_f32", fwht_shmem_f32_len, fwht_shmem_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n, rows }, 1);
                     if (device->fp16) {
                         ggml_vk_create_pipeline(device, device->pipeline_fwht_f16[idx], "fwht_shmem_f16", fwht_shmem_f16_len, fwht_shmem_f16_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n, rows }, 1);
+                    }
+                    // FADI-FUSION: signed twins for the MUL(signs)+FWHT fusion
+                    ggml_vk_create_pipeline(device, device->pipeline_fwht_signed_f32[idx], "fwht_signed_shmem_f32", fwht_signed_shmem_f32_len, fwht_signed_shmem_f32_data, "main", 3, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n, rows }, 1);
+                    if (device->fp16) {
+                        ggml_vk_create_pipeline(device, device->pipeline_fwht_signed_f16[idx], "fwht_signed_shmem_f16", fwht_signed_shmem_f16_len, fwht_signed_shmem_f16_data, "main", 3, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n, rows }, 1);
                     }
                     device->fwht_rows_per_wg[idx] = rows;
                 }
@@ -10048,13 +10066,94 @@ static bool ggml_vk_can_use_fwht(const ggml_backend_vk_context * ctx, const ggml
     return true;
 }
 
-static void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src, ggml_tensor * dst) {
-    const int idx = ggml_vk_fwht_pipeline_idx(src->ne[0]);
-    vk_pipeline pipeline = src->type == GGML_TYPE_F16 ? ctx->device->pipeline_fwht_f16[idx] : ctx->device->pipeline_fwht_f32[idx];
+static bool ggml_vk_can_fuse_mul_fwht(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, int * mm_dist = nullptr) {
+    // FADI-FUSION: pattern is MUL(x, signs) ... RESHAPE ... FWHT-hinted MUL_MAT.
+    // Reshape/view ops between them are "empty" — they appear in cgraph->nodes but
+    // are skipped by the scheduler, so scan forward over them to the real MUL_MAT.
+    // Mirrors ggml_metal_op_can_fuse_fwht_signed.
+    const ggml_tensor * mul = cgraph->nodes[node_idx];
+    if (mul->op != GGML_OP_MUL) {
+        return false;
+    }
+    int j = node_idx + 1;
+    int dist = 0;
+    const ggml_tensor * mm = nullptr;
+    int steps = 0;
+    while (j < cgraph->n_nodes && steps < 8) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (!ggml_op_is_empty(n->op)) {
+            if (n->op == GGML_OP_MUL_MAT) {
+                mm = n;
+                dist = j - node_idx;
+            }
+            break;
+        }
+        ++j;
+        ++steps;
+    }
+    if (mm == nullptr) {
+        return false;
+    }
+    if (ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD) {
+        return false;
+    }
+    // the hinted matmul's reshape source must be this MUL
+    const ggml_tensor * reshape = mm->src[1];
+    if (reshape == nullptr || reshape->op != GGML_OP_RESHAPE || reshape->src[0] != mul) {
+        return false;
+    }
+    // MUL must have single use
+    if (!ggml_node_has_n_uses(cgraph, node_idx, 1)) {
+        return false;
+    }
+    // x carries the activation shape, signs is the broadcast [K] vector
+    const ggml_tensor * x     = ggml_are_same_shape(mul, mul->src[0]) ? mul->src[0] : mul->src[1];
+    const ggml_tensor * signs = (x == mul->src[0]) ? mul->src[1] : mul->src[0];
+    const int64_t n = mm->src[0]->ne[0];
+    const int fwht_idx = ggml_vk_fwht_pipeline_idx(n);
+    // The signed pipeline must exist (some devices leave FWHT pipelines null)
+    // and the signs tensor must bind at offset 0: the shader indexes data_s from
+    // zero, so a view whose buffer offset is not representable without rounding
+    // down (allow_misalign) would silently read the preceding tensor's data.
+    const bool signed_pipeline_exists =
+        fwht_idx >= 0 &&
+        (x->type == GGML_TYPE_F16 ? ctx->device->pipeline_fwht_signed_f16[fwht_idx]
+                                  : ctx->device->pipeline_fwht_signed_f32[fwht_idx]) != nullptr;
+    const bool signs_aligned = get_misalign_bytes(ctx, signs) == 0;
+    const bool ok = signed_pipeline_exists &&
+        signs->type == GGML_TYPE_F32 &&
+        signs->ne[1] == 1 && signs->ne[2] == 1 && signs->ne[3] == 1 &&
+        (x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16) &&
+        mul->type == x->type &&
+        ggml_is_contiguous(x) && ggml_is_contiguous(signs) &&
+        signs->ne[0] == x->ne[0] && signs->ne[0] % n == 0 &&
+        signs_aligned;
+    if (ok && mm_dist != nullptr) {
+        *mm_dist = dist;
+    }
+    return ok;
+}
+
+static void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src, ggml_tensor * dst, const ggml_tensor * signs = nullptr, const int64_t fwht_n = 0) {
+    // FADI-FUSION: fwht_n overrides the transform width. For the fused path the
+    // activation may be a flat concat of n_blk transform-sized rows (e.g. 5120 =
+    // 40 x 128); the width comes from the hinted matmul (mm->src[0]->ne[0]), NOT
+    // src->ne[0], which would give an unsupported size and a negative pipeline idx.
+    const int64_t n_eff = fwht_n > 0 ? fwht_n : src->ne[0];
+    const int idx = ggml_vk_fwht_pipeline_idx(n_eff);
+    // FADI-FUSION: signs != nullptr -> dedicated signed pipeline (3 descriptors).
+    // Base pipelines stay untouched at 2 descriptors for all non-fused users.
+    vk_pipeline pipeline;
+    if (signs != nullptr) {
+        pipeline = src->type == GGML_TYPE_F16 ? ctx->device->pipeline_fwht_signed_f16[idx] : ctx->device->pipeline_fwht_signed_f32[idx];
+        GGML_ASSERT(pipeline != nullptr);
+    } else {
+        pipeline = src->type == GGML_TYPE_F16 ? ctx->device->pipeline_fwht_f16[idx] : ctx->device->pipeline_fwht_f32[idx];
+    }
 
     const uint32_t rows_per_workgroup = ctx->device->fwht_rows_per_wg[idx];
     GGML_ASSERT(rows_per_workgroup > 0);
-    const uint32_t n_rows = (uint32_t)ggml_nrows(src);
+    const uint32_t n_rows = (uint32_t)(ggml_nelements(src) / n_eff);
     const uint32_t max_workgroups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
 
     const uint32_t total_workgroups = CEIL_DIV(n_rows, rows_per_workgroup);
@@ -10063,16 +10162,23 @@ static void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, cons
 
     const vk_subbuffer src_buf = ggml_vk_tensor_subbuffer(ctx, src, true);
     const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
+    const uint32_t n_blk = signs ? (uint32_t)(signs->ne[0] / n_eff) : 0u;
 
     vk_op_fwht_push_constants pc = {
         n_rows,
         0,
         0,
-        1.0f / std::sqrt((float)src->ne[0]),
+        1.0f / std::sqrt((float)n_eff),
+        n_blk,
     };
     init_pushconst_tensor_offsets(ctx, pc, src, nullptr, nullptr, nullptr, dst);
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, { workgroups_x, 1, 1 });
+    if (signs != nullptr) {
+        const vk_subbuffer signs_buf = ggml_vk_tensor_subbuffer(ctx, signs, true);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf, signs_buf }, pc, { workgroups_x, 1, 1 });
+    } else {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, { workgroups_x, 1, 1 });
+    }
 }
 
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -10109,7 +10215,10 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
             m_offset += cur_M_size;
         }
     } else if (ggml_vk_can_use_fwht(ctx, src1, dst)) {
-        ggml_vk_fwht(ctx, subctx, src1, dst);
+        // FADI-FUSION: if a fused MUL_FWHT already emitted this transform, skip.
+        if (ctx->fwht_mm_done != dst) {
+            ggml_vk_fwht(ctx, subctx, src1, dst);
+        }
     } else if (src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && dst->ne[1] == 1 &&
         // detect 0213 permutation, and batch size of 1
         src0->nb[0] <= src0->nb[2] &&
@@ -15537,10 +15646,46 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_MUL:
-        if (ctx->num_additional_fused_ops) {
-            ggml_vk_snake_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
-        } else {
-            ggml_vk_mul(ctx, compute_ctx, src0, src1, node);
+        {
+            // FADI-FUSION (MUL_FWHT): signed FWHT — apply the Hadamard sign vector
+            // inside the transform and write straight into the hinted matmul's dst.
+            // Use the FULL matcher (not a loose scan): it validates width, shapes,
+            // contiguity — a loose scan here previously hijacked unrelated fusions
+            // and read pipeline_fwht_signed_*[-1] for unsupported widths.
+            const bool is_mul_fwht = ctx->num_additional_fused_ops > 0 &&
+                ggml_vk_can_fuse_mul_fwht(ctx, cgraph, node_idx);
+            if (is_mul_fwht) {
+                // re-locate the hinted matmul for the destination pointer
+                const ggml_tensor * mm = nullptr;
+                int j = node_idx + 1, steps = 0;
+                while (j < cgraph->n_nodes && steps < 8) {
+                    const ggml_tensor * n = cgraph->nodes[j];
+                    if (!ggml_op_is_empty(n->op)) {
+                        if (n->op == GGML_OP_MUL_MAT &&
+                            ggml_get_op_params_i32(n, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+                            mm = n;
+                        }
+                        break;
+                    }
+                    ++j;
+                    ++steps;
+                }
+                if (mm != nullptr) {
+                    const ggml_tensor * x     = ggml_are_same_shape(node, src0) ? src0 : src1;
+                    const ggml_tensor * signs = (x == src0) ? src1 : src0;
+                    ggml_tensor * mm_nc = const_cast<ggml_tensor *>(mm);
+                    // transform width comes from the hinted matmul (validated by the matcher),
+                    // NOT from x->ne[0] which may be a flat concat of many transforms
+                    ggml_vk_fwht(ctx, compute_ctx, x, mm_nc, signs, mm->src[0]->ne[0]);
+                    ctx->fwht_mm_done = mm_nc; // mark: don't re-emit when the hinted MUL_MAT is visited
+                    break;
+                }
+            }
+            if (ctx->num_additional_fused_ops) {
+                ggml_vk_snake_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
+            } else {
+                ggml_vk_mul(ctx, compute_ctx, src0, src1, node);
+            }
         }
 
         break;
@@ -17293,12 +17438,22 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
         const char *fusion_string {};
+        int mm_fwht_dist = 0;
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
             if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+            } else if (ggml_vk_can_fuse_mul_fwht(ctx, cgraph, i, &mm_fwht_dist)) {
+                // FADI-FUSION: MUL(x, signs) feeding the FWHT-hinted MUL_MAT — apply the
+                // sign vector inside the FWHT kernel instead of a separate elementwise launch.
+                // mm_fwht_dist counts the empty reshape/view ops between the MUL and the
+                // matmul; every covered position must be accounted for so the framework
+                // tracks the real matmul destination.
+                ctx->num_additional_fused_ops = mm_fwht_dist;
+                fusion_string = "MUL_FWHT";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ADD_ADD";

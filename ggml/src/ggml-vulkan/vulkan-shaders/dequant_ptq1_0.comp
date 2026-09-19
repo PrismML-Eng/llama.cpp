@@ -10,6 +10,10 @@ layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
 // One invocation per 8 elements: 16 invocations cover a 128-weight block. Element
 // order follows the CPU codec (16-byte qs chunk, 8-byte qs chunk, then qh), so the
 // index maths lives in one place rather than being reproduced per shader.
+// FADI-OPT: table-lookup form of the trit recurrence; n is at most 4 in every
+// region, so five powers suffice and the serial multiply loop collapses to one lookup.
+const uint PTQ_POW3_MOD256[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
 float ptq1_0_trit_l(uint ib, uint e) {
     uint b;
     uint n;
@@ -26,10 +30,7 @@ float ptq1_0_trit_l(uint ib, uint e) {
         n = t >> 1u;
     }
 
-    uint v = b;
-    for (uint i = 0u; i < n; ++i) {
-        v = (v * 3u) & 0xFFu;
-    }
+    const uint v = (b * PTQ_POW3_MOD256[n]) & 0xFFu;
     return float(int((v * 3u) >> 8u) - 1);
 }
 
