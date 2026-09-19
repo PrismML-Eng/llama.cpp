@@ -1167,6 +1167,12 @@ struct llm_graph_context {
               ggml_tensor * ids,
               ggml_tensor * w_s = nullptr) const;
 
+    // read rows of a token-embedding table; a Hadamard-latent table gets the
+    // inverse transform so the result is in the primal basis
+    ggml_tensor * build_embd_rows(
+              ggml_tensor * tok_embd,
+              ggml_tensor * ids) const;
+
     ggml_tensor * build_norm(
              ggml_tensor * cur,
              ggml_tensor * mw,
