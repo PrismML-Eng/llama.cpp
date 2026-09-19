@@ -85,6 +85,15 @@ public:
     // seq_rm accepts for it. Defaults to n_rs_seq; only the API changes it (not seq_rm/clear/state_read)
     std::vector<uint32_t> rs_n_snap;
 
+    // per-seq count of snapshot planes actually written by the seq's last ubatch: planes
+    // 1..rs_n_valid hold the states 1..rs_n_valid tokens back from cell.pos, an older ubatch
+    // left whatever lies beyond. The largest partial rollback seq_rm can honour without reading
+    // a stale plane. Recorded when a ubatch is applied (min(T, K) - 1), copied by seq_cp,
+    // 0 after rm_all / clear / state_read
+    std::vector<uint32_t> rs_n_valid;
+
+    void set_rs_n_valid(llama_seq_id seq_id, uint32_t n); // seq_id < 0: every seq
+
     // computed before each graph build
     uint32_t n = 0;
 

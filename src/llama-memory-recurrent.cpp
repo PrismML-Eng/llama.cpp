@@ -87,6 +87,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
     rs_n_snap.assign(n_seq_max, n_rs_seq); // every seq keeps all planes unless the API lowers its budget
+    rs_n_valid.assign(n_seq_max, 0);
 
     cells.clear();
     cells.resize(mem_size);
@@ -271,6 +272,7 @@ void llama_memory_recurrent::clear(bool data) {
     }
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+    std::fill(rs_n_valid.begin(), rs_n_valid.end(), 0);
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -292,6 +294,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
     if (rm_all) {
         set_rs_idx(seq_id, 0);
+        set_rs_n_valid(seq_id, 0);
     }
 
     // models like Mamba or RWKV can't have a state partially erased at the end
@@ -307,11 +310,14 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 
             // partial rollback via per-token snapshot index, bounded by the seq's snapshot budget
             // (rs_n_snap[seq_id] <= n_rs_seq; a budget of 0 refuses like a memory with n_rs_seq == 0)
+            // and by the planes its last ubatch actually wrote (rs_n_valid: beyond it a plane holds
+            // the state of an older ubatch, so reading it would not be a rollback)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
-                if (!pending && rollback >= 1 && rollback <= (llama_pos) rs_n_snap[seq_id]) {
+                if (!pending && rollback >= 1 &&
+                        rollback <= (llama_pos) rs_n_snap[seq_id] && rollback <= (llama_pos) rs_n_valid[seq_id]) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
                     return true;
@@ -396,6 +402,13 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             cell_src.seq_id.insert(seq_id_dst);
             tail_dst.tail = tail_src.tail;
         }
+    }
+
+    // until its first ubatch the destination reads the source cell's planes (src0), so it inherits
+    // what the source's last ubatch wrote
+    if (seq_id_src >= 0 && seq_id_dst >= 0 &&
+            (size_t) seq_id_src < rs_n_valid.size() && (size_t) seq_id_dst < rs_n_valid.size()) {
+        rs_n_valid[seq_id_dst] = rs_n_valid[seq_id_src];
     }
 }
 
@@ -549,6 +562,20 @@ bool llama_memory_recurrent::seq_rs_snapshots(llama_seq_id seq_id, uint32_t n_sn
     rs_n_snap[seq_id] = n_snap;
 
     return true;
+}
+
+void llama_memory_recurrent::set_rs_n_valid(llama_seq_id seq_id, uint32_t n) {
+    if (seq_id < 0) {
+        std::fill(rs_n_valid.begin(), rs_n_valid.end(), n);
+        return;
+    }
+
+    assert(n_seq_max == rs_n_valid.size());
+
+    GGML_ASSERT((uint32_t) seq_id < n_seq_max);
+    GGML_ASSERT(n <= n_rs_seq);
+
+    rs_n_valid[seq_id] = n;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
@@ -994,6 +1021,7 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
 
     if (n_rs_seq != 0) {
         set_rs_idx(seq_id, 0);
+        set_rs_n_valid(seq_id, 0); // a restored cell holds plane 0 only
     }
 }
 
@@ -1357,7 +1385,23 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
-    mem->find_slot(ubatches[i_next]);
+    const auto & ubatch = ubatches[i_next];
+
+    mem->find_slot(ubatch);
+
+    // once the graph ran, planes 1..n_valid of every seq in the ubatch hold the states 1..n_valid
+    // tokens back (min(T, K) planes are written, K = 1 + get_n_snap()). Recorded here rather than
+    // in find_slot because prepare() dry-runs find_slot for every ubatch
+    if (mem->n_rs_seq > 0) {
+        const uint32_t n_valid = std::min<uint32_t>(ubatch.n_seq_tokens, 1 + get_n_snap()) - 1;
+
+        for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+            const uint32_t i = s*ubatch.n_seq_tokens;
+            for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                mem->set_rs_n_valid(ubatch.seq_id[i][j], n_valid);
+            }
+        }
+    }
 
     return true;
 }
