@@ -1758,6 +1758,13 @@ private:
 
             slot.spec_enabled = slot.can_speculate() && (!spec_multislot || n_max_req != 0);
             slot.spec_n_max   = spec_multislot ? n_max_req : -1;
+
+            // rollback snapshot budget of the slot's sequence (recurrent memories; a no-op for the
+            // others): every plane for a drafting slot (K = n_rs_seq + 1, the unchanged graph), none
+            // for an opted-out slot (K = 1: plane 0 only, the graph the no-spec server builds). Set
+            // before the slot's first ubatch. The MTP draft context holds a plain KV cache, so the
+            // call goes to ctx_tgt only.
+            llama_memory_seq_rs_snapshots(llama_get_memory(ctx_tgt), slot.id, slot.spec_enabled ? llama_n_rs_seq(ctx_tgt) : 0);
         }
 
         slot.state = slot.task->is_child()
