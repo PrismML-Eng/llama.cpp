@@ -44,6 +44,7 @@ public:
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+    bool seq_rs_snapshots(llama_seq_id seq_id, uint32_t n_snap) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
@@ -77,6 +78,12 @@ public:
     std::vector<uint32_t> rs_idx;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+
+    // per-seq rollback snapshot budget in [0, n_rs_seq] (llama_memory_seq_rs_snapshots): the number
+    // of snapshot planes a ubatch may write for the seq -- the graph writes K = 1 + the max over the
+    // ubatch's seqs (llama_memory_recurrent_context::get_n_snap) -- and the largest partial rollback
+    // seq_rm accepts for it. Defaults to n_rs_seq; only the API changes it (not seq_rm/clear/state_read)
+    std::vector<uint32_t> rs_n_snap;
 
     // computed before each graph build
     uint32_t n = 0;
@@ -192,6 +199,13 @@ public:
     // s_copy() it never consumes the per-seq rollback index, so it can be
     // evaluated at graph build and again in can_reuse.
     bool rs_inplace_ok(uint32_t n_seqs) const;
+
+    // rollback snapshot planes of the current ubatch: the GDN paths write K = 1 + get_n_snap()
+    // state planes per seq. It is the max of the per-seq budgets (mem->rs_n_snap) over the
+    // ubatch's seqs, n_rs_seq for the full (reserve) context so the compute buffers fit the
+    // largest graph, and 0 when the memory keeps no snapshots. Side-effect free (same rule as
+    // rs_inplace_ok): evaluated at graph build and again in can_reuse (part of the reuse key).
+    uint32_t get_n_snap() const;
 
 private:
     const llama_memory_status status;

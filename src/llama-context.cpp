@@ -4232,6 +4232,17 @@ bool llama_memory_seq_rm(
     return mem->seq_rm(seq_id, p0, p1);
 }
 
+bool llama_memory_seq_rs_snapshots(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+              uint32_t n_snap) {
+    if (!mem) {
+        return false;
+    }
+
+    return mem->seq_rs_snapshots(seq_id, n_snap);
+}
+
 void llama_memory_seq_cp(
         llama_memory_t mem,
           llama_seq_id seq_id_src,

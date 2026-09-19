@@ -757,6 +757,16 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // Set the number of recurrent-state rollback snapshot planes (0..llama_n_rs_seq) that the memory
+    // may write for and roll back on the specified sequence. Default: llama_n_rs_seq (every plane).
+    // A sequence with budget 0 keeps a single state plane; partial removals of its tail (see
+    // llama_memory_seq_rm) are refused, exactly as with a context created with n_rs_seq = 0.
+    // Returns false if the memory has no recurrent state or the arguments are out of range
+    LLAMA_API bool llama_memory_seq_rs_snapshots(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                  uint32_t n_snap);
+
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)

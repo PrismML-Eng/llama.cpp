@@ -86,6 +86,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
+    rs_n_snap.assign(n_seq_max, n_rs_seq); // every seq keeps all planes unless the API lowers its budget
 
     cells.clear();
     cells.resize(mem_size);
@@ -304,12 +305,13 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         if (tail_id >= 0) {
             auto & cell = cells[tail_id];
 
-            // partial rollback via per-token snapshot index (bounded by n_rs_seq)
+            // partial rollback via per-token snapshot index, bounded by the seq's snapshot budget
+            // (rs_n_snap[seq_id] <= n_rs_seq; a budget of 0 refuses like a memory with n_rs_seq == 0)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
-                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                if (!pending && rollback >= 1 && rollback <= (llama_pos) rs_n_snap[seq_id]) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
                     return true;
@@ -529,6 +531,24 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     GGML_ASSERT(idx <= n_rs_seq);
 
     rs_idx[seq_id] = idx;
+}
+
+bool llama_memory_recurrent::seq_rs_snapshots(llama_seq_id seq_id, uint32_t n_snap) {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+        LLAMA_LOG_ERROR("%s: invalid seq_id (%d) - larger than n_seq_max (%d)\n", __func__, seq_id, n_seq_max);
+        return false;
+    }
+
+    if (n_snap > n_rs_seq) {
+        LLAMA_LOG_ERROR("%s: snapshot budget (%u) larger than n_rs_seq (%u)\n", __func__, n_snap, n_rs_seq);
+        return false;
+    }
+
+    assert(n_seq_max == rs_n_snap.size());
+
+    rs_n_snap[seq_id] = n_snap;
+
+    return true;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
@@ -1421,4 +1441,34 @@ bool llama_memory_recurrent_context::rs_inplace_ok(uint32_t n_seqs) const {
     }
 
     return true;
+}
+
+uint32_t llama_memory_recurrent_context::get_n_snap() const {
+    // no snapshot planes at all (n_rs_seq == 0): K = 1 regardless of the budgets
+    if (mem->n_rs_seq == 0) {
+        return 0;
+    }
+
+    // the reserve context sizes the compute buffers: keep the largest graph
+    if (is_full || ubatches.empty()) {
+        return mem->n_rs_seq;
+    }
+
+    // ubatches[i_next] is the ubatch apply() -> find_slot just placed; for an equal_seqs ubatch the
+    // seq ids of sequence set s are those of its first token
+    const auto & ubatch = ubatches[i_next];
+
+    uint32_t res = 0;
+
+    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+        const uint32_t i = s*ubatch.n_seq_tokens;
+        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+            const llama_seq_id seq_id = ubatch.seq_id[i][j];
+            if (seq_id >= 0 && (size_t) seq_id < mem->rs_n_snap.size()) {
+                res = std::max(res, mem->rs_n_snap[seq_id]);
+            }
+        }
+    }
+
+    return res;
 }
