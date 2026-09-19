@@ -2971,7 +2971,18 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_count,
                                                  const int *         out_nodes,
                                                  const int           out_count,
-                                                 const bool          is_topk_moe = false) {
+                                                 const bool          is_topk_moe = false,
+                                                 const bool          allow_exact_alias = false) {
+    // An exact alias is a destination that shares the base pointer, type and
+    // contiguous layout of a source, i.e. element k of the destination is
+    // element k of the source. Fusions whose kernels are elementwise within the
+    // unit they parallelize over can opt into accepting those; a partial
+    // overlap is still rejected for everyone.
+    auto is_exact_alias = [&](const ggml_tensor * a, const ggml_tensor * b) {
+        return allow_exact_alias && a->data == b->data && a->type == b->type &&
+               ggml_are_same_shape(a, b) && ggml_is_contiguous(a) && ggml_is_contiguous(b);
+    };
+
     auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
         const int64_t a_start = (int64_t) a->data;
         const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
@@ -3007,7 +3018,7 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                     continue;
                 }
 
-                if (nodes_overlap(dst, src)) {
+                if (nodes_overlap(dst, src) && !is_exact_alias(dst, src)) {
                     bool found = false;
 
                     for (int k = node_idx; k < j; ++k) {
@@ -3359,13 +3370,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // Preserve the residual sum for later graph consumers while normalizing it
     // in the same launch. This removes a full read of the residual tensor.
+    //
+    // add_rms_norm_f32 uses no architecture-specific instructions, so this runs
+    // on every NVIDIA device rather than GB10 only. It is elementwise within a
+    // row -- each thread reads a[col] and b[col] before writing sum[col], and
+    // block_reduce synchronizes the block before dst[col] is written -- so the
+    // in-place residual add and the norm output reusing an input buffer are
+    // both safe, hence allow_exact_alias below.
     if (node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes) {
         ggml_tensor * rms_norm = cgraph->nodes[i + 1];
         ggml_tensor * mul = cgraph->nodes[i + 2];
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const ggml_op ops[] = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
         const int out_nodes[] = { i, i + 2 };
-        if (cc == GGML_CUDA_CC_DGX_SPARK && rms_norm->op == GGML_OP_RMS_NORM &&
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && rms_norm->op == GGML_OP_RMS_NORM &&
                 mul->op == GGML_OP_MUL && (mul->src[0] == rms_norm || mul->src[1] == rms_norm) &&
                 rms_norm->src[0] == node && node->src[0] && node->src[1] &&
                 node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 &&
@@ -3375,10 +3393,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_is_contiguous(node->src[1]) && ggml_is_contiguous(node) &&
                 ggml_is_contiguous(rms_norm) && ggml_is_contiguous(mul) &&
                 ggml_can_fuse_subgraph(cgraph, i, 3, ops, out_nodes, 2) &&
-                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 2)) {
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 2, false, true)) {
             const ggml_tensor * weight = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
             if (weight && weight->type == GGML_TYPE_F32 && ggml_is_contiguous(weight) &&
-                    weight->ne[0] == node->ne[0] && ggml_nrows(weight) == 1) {
+                    weight->ne[0] == node->ne[0] && ggml_nrows(weight) == 1 &&
+                    // the norm weight is broadcast over rows, so it must not be written to
+                    weight->data != node->data && weight->data != mul->data) {
                 ggml_cuda_op_add_rms_norm_fused(*cuda_ctx, node, rms_norm, mul);
                 return 2;
             }
