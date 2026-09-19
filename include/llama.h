@@ -751,6 +751,14 @@ extern "C" {
     // seq_id < 0 : match any sequence [TAG_LLAMA_SEQ_ID_NEG]
     // p0 < 0     : [0,  p1]
     // p1 < 0     : [p0, inf)
+    // Recurrent memory with rollback snapshots (n_rs_seq > 0): removing the tail [p0, inf) of a
+    // sequence is honoured as a rollback of n = pos_max - p0 + 1 positions only when
+    // 1 <= n <= min(T - 1, n_snap), where T is the token count of the sequence's last micro-batch
+    // and n_snap its snapshot budget (llama_memory_seq_rs_snapshots, default n_rs_seq): a micro-batch
+    // snapshots the state after each of its last min(T, n_rs_seq + 1) - 1 tokens and never the state
+    // it started from, so a rollback across earlier micro-batches (e.g. N single-token decodes, then
+    // N positions back) is refused rather than read from a stale plane. The rollback stays pending
+    // until the sequence's next decode consumes it; a second partial removal before that is refused
     LLAMA_API bool llama_memory_seq_rm(
             llama_memory_t mem,
               llama_seq_id seq_id,
