@@ -1,6 +1,21 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 
+// Columns per warp for the S_v == 128, non-KDA kernel. The host launch geometry and the compiled
+// kernel must agree, so both derive it from this one predicate: the kernel passes __CUDA_ARCH__,
+// the host passes the highest compiled arch the device will actually run
+// (ggml_cuda_highest_compiled_arch(cc)), not the raw runtime capability. NVIDIA Ampere and newer
+// take 4 columns (tuned on GB10, a straight win on consumer Ampere/Ada too); HIP and MUSA keep 1,
+// whatever their capability values (which carry vendor offsets above GGML_CUDA_CC_AMPERE) say.
+static constexpr __host__ __device__ int gdn_cols_per_warp(int arch, int S_v, bool KDA) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    (void) arch; (void) S_v; (void) KDA;
+    return 1;
+#else
+    return GGML_CUDA_CC_IS_NVIDIA(arch) && arch >= GGML_CUDA_CC_AMPERE && S_v == 128 && !KDA ? 4 : 1;
+#endif
+}
+
 static __global__ void gdn_precompute_exp(const float * g, float * g_exp, int64_t n) {
     for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n;
          i += (int64_t) blockDim.x*gridDim.x) {
@@ -44,10 +59,10 @@ gated_delta_net_cuda(const float * q,
     const uint32_t sequence = blockIdx.y;
     // Each warp owns one or more columns, using warp-level primitives to reduce across rows.
     const int      lane     = threadIdx.x;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
-    constexpr int cols_per_warp = S_v == 128 && !KDA ? 4 : 1;
+#if defined(__CUDA_ARCH__)
+    constexpr int cols_per_warp = gdn_cols_per_warp(__CUDA_ARCH__, S_v, KDA);
 #else
-    constexpr int cols_per_warp = 1;
+    constexpr int cols_per_warp = 1; // host pass only; never executed
 #endif
     const int      col      = (blockIdx.z * blockDim.y + threadIdx.y) * cols_per_warp;
 
@@ -217,7 +232,10 @@ static void launch_gated_delta_net(
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int num_warps = 4;
-    const int cols_per_warp = cc == GGML_CUDA_CC_DGX_SPARK && S_v == 128 && !KDA ? 4 : 1;
+    // The recurrence is serial over tokens, so prefill lives or dies on this kernel's per-step
+    // efficiency (RTX 4070, Bonsai 2 27B: pp2048 1220 -> 1297 t/s, decode unchanged). Must match
+    // the kernel's compile-time choice: same predicate, fed the arch that was compiled for this cc.
+    const int cols_per_warp = GGML_CUDA_CC_IS_NVIDIA(cc) ? gdn_cols_per_warp(ggml_cuda_highest_compiled_arch(cc), S_v, KDA) : 1;
     dim3      grid_dims(H, n_seqs, (S_v + num_warps * cols_per_warp - 1) / (num_warps * cols_per_warp));
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
