@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mmvq-ptq1_0.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -296,7 +297,9 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     }
 #if !defined(GGML_USE_HIP)
     if (type == GGML_TYPE_PTQ1_0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) {
-        return ne11 <= 7;
+        // the PT mat-vec path shares the weight decode across columns and stays
+        // ahead of the MMQ tile path up to the full mmvq batch
+        return ne11 <= MMVQ_MAX_BATCH_SIZE;
     }
 #endif
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
@@ -404,6 +407,12 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 }
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
+    if (ptq1_0_pt_enabled() && type == GGML_TYPE_PTQ1_0 &&
+        (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_TURING)) {
+        // one K partition for every column count, so the fp32 sums of a column
+        // do not depend on how many columns share the launch (batch invariance)
+        return ncols_dst <= MMVQ_MAX_BATCH_SIZE ? 4 : 1;
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
@@ -534,7 +543,11 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+    if (ptq1_0_pt_enabled() && type == GGML_TYPE_PTQ1_0 &&
+        (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_TURING)) {
+        return ptq1_0_pt_rows_per_block(ncols_dst);
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
@@ -573,7 +586,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -716,28 +729,49 @@ static __global__ void mul_mat_vec_q(
             const int kqs = vdr * (tid % (qi/vdr));
 
 #if !defined(GGML_USE_HIP)
-        if constexpr (type == GGML_TYPE_PTQ1_0 && ncols_dst > 1 && ncols_dst <= 3) {
+        if constexpr (type == GGML_TYPE_PTQ1_0) {
+            // activations arrive in the PT layout (see mmvq-ptq1_0.cuh): every
+            // column count runs this same code, one thread per 128-weight block
+            const int nblk = ptq1_0_pt_nblk(ncols_x);
+            const char * ycol[ncols_dst];
+#    pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                ycol[j] = (const char *) (y + j*stride_col_y);
+            }
+            const block_ptq1_0 * bq[rows_per_cuda_block];
 #    pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                float dots[ncols_dst];
-                vec_dot_ptq1_0_q8_1_multi<ncols_dst>(vx, &y[kby], kbx_offset + i * stride_row_x + kbx, kqs,
-                                                     stride_col_y, dots);
+                bq[i] = (const block_ptq1_0 *) vx + kbx_offset + i*stride_row_x + kbx;
+            }
+            float dots[ncols_dst][rows_per_cuda_block];
+            ptq1_0_pt_block_dot<ncols_dst, rows_per_cuda_block>(bq, ycol, kbx, nblk, dots);
 #    pragma unroll
-                for (int j = 0; j < ncols_dst; ++j) {
-                    tmp[j][i] += dots[j];
+            for (int j = 0; j < ncols_dst; ++j) {
+#    pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp[j][i] += dots[j][i];
                 }
+            }
 
-                if constexpr (has_fusion) {
-                    if constexpr (has_gate) {
-                        vec_dot_ptq1_0_q8_1_multi<ncols_dst>(vgate, &y[kby], kbx_offset + i * stride_row_x + kbx, kqs,
-                                                             stride_col_y, dots);
+            if constexpr (has_fusion) {
+                if constexpr (has_gate) {
+                    const block_ptq1_0 * bg[rows_per_cuda_block];
 #    pragma unroll
-                        for (int j = 0; j < ncols_dst; ++j) {
-                            tmp_gate[j][i] += dots[j];
+                    for (int i = 0; i < rows_per_cuda_block; ++i) {
+                        bg[i] = (const block_ptq1_0 *) vgate + kbx_offset + i*stride_row_x + kbx;
+                    }
+                    ptq1_0_pt_block_dot<ncols_dst, rows_per_cuda_block>(bg, ycol, kbx, nblk, dots);
+#    pragma unroll
+                    for (int j = 0; j < ncols_dst; ++j) {
+#    pragma unroll
+                        for (int i = 0; i < rows_per_cuda_block; ++i) {
+                            tmp_gate[j][i] += dots[j][i];
                         }
                     }
                 }
             }
+            GGML_UNUSED(kqs);
+            GGML_UNUSED(kby);
         } else
 #endif
         {
@@ -897,9 +931,31 @@ static __global__ void mul_mat_vec_q_moe(
         const int kby = kbx * (qk/QK8_1);
         const int kqs = vdr * (threadIdx.x % (qi/vdr));
 
+#if !defined(GGML_USE_HIP)
+        if constexpr (type == GGML_TYPE_PTQ1_0) {
+            // PT activation layout, see mmvq-ptq1_0.cuh
+            const int nblk = ptq1_0_pt_nblk(ncols_x);
+            const char * ycol[1] = { (const char *) y };
+            const block_ptq1_0 * bq[c_rows_per_block];
 #pragma unroll
-        for (int i = 0; i < c_rows_per_block; ++i) {
-            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            for (int i = 0; i < c_rows_per_block; ++i) {
+                bq[i] = (const block_ptq1_0 *) vx + kbx_offset + i*stride_row_x + kbx;
+            }
+            float dots[1][c_rows_per_block];
+            ptq1_0_pt_block_dot<1, c_rows_per_block>(bq, ycol, kbx, nblk, dots);
+#pragma unroll
+            for (int i = 0; i < c_rows_per_block; ++i) {
+                tmp[i] += dots[0][i];
+            }
+            GGML_UNUSED(kqs);
+            GGML_UNUSED(kby);
+        } else
+#endif
+        {
+#pragma unroll
+            for (int i = 0; i < c_rows_per_block; ++i) {
+                tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            }
         }
     }
 
@@ -922,7 +978,7 @@ static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
