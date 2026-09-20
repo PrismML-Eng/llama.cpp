@@ -1,6 +1,9 @@
 #version 450
 
 #extension GL_EXT_control_flow_attributes : require
+#if STATE_BF16
+#extension GL_EXT_shader_16bit_storage : require
+#endif
 #extension GL_KHR_shader_subgroup_basic : enable
 #if USE_SUBGROUP_CLUSTERED
 #extension GL_KHR_shader_subgroup_clustered : enable
@@ -39,7 +42,16 @@ layout(binding = 1) readonly  buffer KBuf     { FLOAT_TYPE data_k[];     };
 layout(binding = 2) readonly  buffer VBuf     { FLOAT_TYPE data_v[];     };
 layout(binding = 3) readonly  buffer GBuf     { FLOAT_TYPE data_g[];     };
 layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
+#if STATE_BF16
+layout(binding = 5) readonly buffer StateBuf { uint16_t data_state_h[]; };
+// idx is in logical element units; uint16_t elements advance 2 bytes each, matching bf16 stride
+float state_load(uint idx) { return uintBitsToFloat(uint(data_state_h[idx]) << 16); }
+#else
 layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
+#endif
+#if USE_STATE_ROWS
+layout(binding = 7) readonly buffer StateRowsBuf { int data_state_rows[]; };
+#endif
 layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
@@ -102,15 +114,26 @@ void main() {
     const uint iq3 = seq_id / rq3;
 
     const uint state_size = S_V * S_V;
+#if USE_STATE_ROWS
+    // rows mode: state is a 2D cache view [D, n_rows]; row for this seq comes
+    // from the index buffer; row size (in floats) is H*state_size.
+    const uint row = uint(data_state_rows[seq_id]);
+    const uint state_in_base = row * H * state_size + head_id * state_size;
+#else
     // input state holds s0 only [S_v, S_v, H, n_seqs]: per-seq stride is H*D.
     const uint state_in_base       = (seq_id * H + head_id) * state_size;
+#endif
     // output state layout per slot: same per-(seq,head) offset as the single-slot case.
     const uint state_out_base      = (seq_id * H + head_id) * state_size;
     const uint state_size_per_snap = state_size * H * n_seqs;
 
     FLOAT_TYPE s_shard[ROWS_PER_LANE];
     [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+#if STATE_BF16
+        s_shard[r] = FLOAT_TYPE(state_load(state_in_base + col * S_V + r * LANES_PER_COLUMN + lane));
+#else
         s_shard[r] = FLOAT_TYPE(data_state[state_in_base + col * S_V + r * LANES_PER_COLUMN + lane]);
+#endif
     }
 
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.

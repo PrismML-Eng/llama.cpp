@@ -6387,7 +6387,7 @@ struct ggml_tensor * ggml_gated_delta_net_rows(
     GGML_ASSERT(v->type == GGML_TYPE_F32);
     GGML_ASSERT(g->type == GGML_TYPE_F32);
     GGML_ASSERT(beta->type == GGML_TYPE_F32);
-    GGML_ASSERT(states->type == GGML_TYPE_F32);
+    GGML_ASSERT(states->type == GGML_TYPE_F32 || states->type == GGML_TYPE_BF16);
     GGML_ASSERT(rows->type == GGML_TYPE_I32);
 
     const int64_t S_v      = v->ne[0];

@@ -904,7 +904,6 @@ void process_shaders() {
     string_to_spv("scale_f32", "scale.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     string_to_spv("scale_bf16", "scale.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"FLOAT_TYPE", "float"}});
 
-
     string_to_spv("pad_f32", "pad.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("pad_reflect_1d_f32", "pad_reflect_1d.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
 
@@ -1043,11 +1042,6 @@ void process_shaders() {
     string_to_spv("fwht_shmem_f32", "fwht.comp", {{"FWHT_SHMEM", "1"}});
     string_to_spv("fwht_f16", "fwht.comp", {{"FWHT_F16", "1"}});
     string_to_spv("fwht_shmem_f16", "fwht.comp", {{"FWHT_F16", "1"}, {"FWHT_SHMEM", "1"}});
-    // FADI-FUSION: signed variants fold the Hadamard sign MUL into the transform load
-    string_to_spv("fwht_signed_f32", "fwht.comp", {{"FWHT_SIGNED", "1"}});
-    string_to_spv("fwht_signed_shmem_f32", "fwht.comp", {{"FWHT_SIGNED", "1"}, {"FWHT_SHMEM", "1"}});
-    string_to_spv("fwht_signed_f16", "fwht.comp", {{"FWHT_SIGNED", "1"}, {"FWHT_F16", "1"}});
-    string_to_spv("fwht_signed_shmem_f16", "fwht.comp", {{"FWHT_SIGNED", "1"}, {"FWHT_F16", "1"}, {"FWHT_SHMEM", "1"}});
     string_to_spv("count_equal_i32", "count_equal.comp", merge_maps(base_dict, {{"A_TYPE", "int"}, {"B_TYPE", "int"}, {"D_TYPE", "int"}}));
     string_to_spv("cumsum_f32", "cumsum.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cumsum_multipass1_f32", "cumsum_multipass1.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
@@ -1089,6 +1083,12 @@ void process_shaders() {
     string_to_spv("gated_delta_net_f32", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "1"}}));
     string_to_spv("gated_delta_net_f32_nocluster", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "0"}}));
     string_to_spv("gated_delta_net_f32_shmem", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}}));
+    string_to_spv("gated_delta_net_rows_f32", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "1"}, {"USE_STATE_ROWS", "1"}}));
+    string_to_spv("gated_delta_net_rows_f32_nocluster", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"USE_STATE_ROWS", "1"}}));
+    string_to_spv("gated_delta_net_rows_f32_shmem", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"USE_STATE_ROWS", "1"}}));
+    string_to_spv("gated_delta_net_rows_bf16state_f32", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "1"}, {"USE_STATE_ROWS", "1"}, {"STATE_BF16", "1"}}));
+    string_to_spv("gated_delta_net_rows_bf16state_f32_nocluster", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"USE_STATE_ROWS", "1"}, {"STATE_BF16", "1"}}));
+    string_to_spv("gated_delta_net_rows_bf16state_f32_shmem", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"USE_STATE_ROWS", "1"}, {"STATE_BF16", "1"}}));
 
     string_to_spv("opt_step_adamw_f32", "opt_step_adamw.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
     string_to_spv("opt_step_sgd_f32", "opt_step_sgd.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));

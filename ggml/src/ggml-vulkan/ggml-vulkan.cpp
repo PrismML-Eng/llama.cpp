@@ -1055,9 +1055,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_fwht_f32[GGML_VK_FWHT_NUM_SIZES];
     vk_pipeline pipeline_fwht_f16[GGML_VK_FWHT_NUM_SIZES];
-    // FADI-FUSION: dedicated signed variants (3 descriptors, signs buffer bound)
-    vk_pipeline pipeline_fwht_signed_f32[GGML_VK_FWHT_NUM_SIZES];
-    vk_pipeline pipeline_fwht_signed_f16[GGML_VK_FWHT_NUM_SIZES];
     // rows a workgroup covers, chosen per width when the pipeline is built
     uint32_t fwht_rows_per_wg[GGML_VK_FWHT_NUM_SIZES] = {};
     vk_pipeline pipeline_cumsum_f32;
@@ -1085,6 +1082,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_gated_linear_attn_f32;
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
+    vk_pipeline pipeline_gated_delta_net_rows[4][2];
+    vk_pipeline pipeline_gated_delta_net_rows_bf16state[4][2];
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -1419,7 +1418,6 @@ struct vk_op_fwht_push_constants {
     uint32_t src_offset;
     uint32_t dst_offset;
     float scale;
-    uint32_t n_blk; // FADI-FUSION: sign blocks in the optional signs buffer (0 = off)
 };
 
 struct vk_op_count_experts_push_constants {
@@ -2404,10 +2402,6 @@ struct ggml_backend_vk_context {
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
     int num_additional_fused_ops {};
-    // FADI-FUSION: the hinted MUL_MAT whose transform was already emitted by the
-    // fused MUL_FWHT dispatch — ggml_vk_mul_mat must skip it (no-op) instead of
-    // running a second FWHT into the same destination.
-    ggml_tensor * fwht_mm_done {};
     // Bitmask of which fused ops need to write an intermediate value to memory.
     // Bit 'i' means nodes[start_of_fusion + i] writes to memory.
     // If there's no fusion, bit 0 is still set.
@@ -5225,12 +5219,18 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     uint32_t rm_kq = 2;
     uint32_t rm_stdq_int = 1;
     uint32_t rm_kq_int = 1;
+    uint32_t rm_stdq_ptq = 1;
     auto const &rm_iq_int = [](uint32_t i) { return i == 0 ? 8u : 4u; };
     if (device->vendor_id == VK_VENDOR_ID_AMD) {
         if (device->architecture == AMD_GCN) {
             rm_stdq = 2;
             rm_kq = 4;
             rm_stdq_int = 4;
+        }
+        // FADI-OPT: PTQ1_0's dedicated kernel loads the B vector once per
+        // (row, block-group); two rows per workgroup halves the B traffic.
+        if (device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA2) {
+            rm_stdq_ptq = 1;
         }
     } else if (device->vendor_id == VK_VENDOR_ID_INTEL) {
         rm_stdq = 2;
@@ -5304,7 +5304,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f16_f32",  arr_dmmv_f16_f16_f32_len[reduc],  arr_dmmv_f16_f16_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_BF16][i], "mul_mat_vec_bf16_f16_f32", arr_dmmv_bf16_f16_f32_len[reduc], arr_dmmv_bf16_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q1_0][i], "mul_mat_vec_q1_0_f16_f32", arr_dmmv_q1_0_f16_f32_len[reduc], arr_dmmv_q1_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_PTQ1_0][i], "mul_mat_vec_ptq1_0_f16_f32", arr_dmmv_ptq1_0_f16_f32_len[reduc], arr_dmmv_ptq1_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_PTQ1_0][i], "mul_mat_vec_ptq1_0_f16_f32", arr_dmmv_ptq1_0_f16_f32_len[reduc], arr_dmmv_ptq1_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {4, 1, 1}, {wg_size_subgroup, 4, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_f16_f32", arr_dmmv_q2_0_f16_f32_len[reduc], arr_dmmv_q2_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_f16_f32", arr_dmmv_q4_0_f16_f32_len[reduc], arr_dmmv_q4_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q4_1][i], "mul_mat_vec_q4_1_f16_f32", arr_dmmv_q4_1_f16_f32_len[reduc], arr_dmmv_q4_1_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
@@ -5360,7 +5360,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_F16 ], "mul_mat_vec_id_f16_f32",        arr_dmmv_id_f16_f32_f32_len[reduc],     arr_dmmv_id_f16_f32_f32_data[reduc],     "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2, 1, 1}, {wg_size_subgroup, 2}, 1, false, use_subgroups, force_subgroup_size);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_BF16], "mul_mat_vec_id_bf16_f32",       arr_dmmv_id_bf16_f32_f32_len[reduc],    arr_dmmv_id_bf16_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2, 1, 1}, {wg_size_subgroup, 2}, 1, false, use_subgroups, force_subgroup_size);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q1_0], "mul_mat_vec_id_q1_0_f32",       arr_dmmv_id_q1_0_f32_f32_len[reduc],    arr_dmmv_id_q1_0_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq}, 1, true, use_subgroups, force_subgroup_size);
-        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_PTQ1_0], "mul_mat_vec_id_ptq1_0_f32",       arr_dmmv_id_ptq1_0_f32_f32_len[reduc],    arr_dmmv_id_ptq1_0_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq}, 1, true, use_subgroups, force_subgroup_size);
+        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_PTQ1_0], "mul_mat_vec_id_ptq1_0_f32",       arr_dmmv_id_ptq1_0_f32_f32_len[reduc],    arr_dmmv_id_ptq1_0_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq_ptq, 1, 1}, {wg_size_subgroup, 2*rm_stdq_ptq}, 1, true, use_subgroups, force_subgroup_size);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q2_0], "mul_mat_vec_id_q2_0_f32",       arr_dmmv_id_q2_0_f32_f32_len[reduc],    arr_dmmv_id_q2_0_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq}, 1, true, use_subgroups, force_subgroup_size);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q4_0], "mul_mat_vec_id_q4_0_f32",       arr_dmmv_id_q4_0_f32_f32_len[reduc],    arr_dmmv_id_q4_0_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq}, 1, true, use_subgroups, force_subgroup_size);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q4_1], "mul_mat_vec_id_q4_1_f32",       arr_dmmv_id_q4_1_f32_f32_len[reduc],    arr_dmmv_id_q4_1_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq}, 1, true, use_subgroups, force_subgroup_size);
@@ -5659,7 +5659,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_upscale_bilinear_antialias_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_scale_f32, "scale_f32", scale_f32_len, scale_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
-ggml_vk_create_pipeline(device, device->pipeline_scale_bf16, "scale_bf16", scale_bf16_len, scale_bf16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_scale_bf16, "scale_bf16", scale_bf16_len, scale_bf16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_log[0], "log_f32", log_f32_len, log_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_log[1], "log_f16", log_f16_len, log_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
@@ -5814,11 +5814,6 @@ ggml_vk_create_pipeline(device, device->pipeline_scale_bf16, "scale_bf16", scale
                     if (device->fp16) {
                         ggml_vk_create_pipeline(device, device->pipeline_fwht_f16[idx], "fwht_f16", fwht_f16_len, fwht_f16_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
                     }
-                    // FADI-FUSION: signed twins for the MUL(signs)+FWHT fusion
-                    ggml_vk_create_pipeline(device, device->pipeline_fwht_signed_f32[idx], "fwht_signed_f32", fwht_signed_f32_len, fwht_signed_f32_data, "main", 3, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
-                    if (device->fp16) {
-                        ggml_vk_create_pipeline(device, device->pipeline_fwht_signed_f16[idx], "fwht_signed_f16", fwht_signed_f16_len, fwht_signed_f16_data, "main", 3, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
-                    }
                     device->fwht_rows_per_wg[idx] = GGML_VK_FWHT_ROWS;
                 }
             } else {
@@ -5830,11 +5825,6 @@ ggml_vk_create_pipeline(device, device->pipeline_scale_bf16, "scale_bf16", scale
                     ggml_vk_create_pipeline(device, device->pipeline_fwht_f32[idx], "fwht_shmem_f32", fwht_shmem_f32_len, fwht_shmem_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n, rows }, 1);
                     if (device->fp16) {
                         ggml_vk_create_pipeline(device, device->pipeline_fwht_f16[idx], "fwht_shmem_f16", fwht_shmem_f16_len, fwht_shmem_f16_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n, rows }, 1);
-                    }
-                    // FADI-FUSION: signed twins for the MUL(signs)+FWHT fusion
-                    ggml_vk_create_pipeline(device, device->pipeline_fwht_signed_f32[idx], "fwht_signed_shmem_f32", fwht_signed_shmem_f32_len, fwht_signed_shmem_f32_data, "main", 3, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n, rows }, 1);
-                    if (device->fp16) {
-                        ggml_vk_create_pipeline(device, device->pipeline_fwht_signed_f16[idx], "fwht_signed_shmem_f16", fwht_signed_shmem_f16_len, fwht_signed_shmem_f16_data, "main", 3, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n, rows }, 1);
                     }
                     device->fwht_rows_per_wg[idx] = rows;
                 }
@@ -5961,6 +5951,24 @@ ggml_vk_create_pipeline(device, device->pipeline_scale_bf16, "scale_bf16", scale
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
+            }
+            size_t gdnr_len; const void * gdnr_data;
+            if (use_clustered_reduce)      { gdnr_len = gated_delta_net_rows_f32_len;          gdnr_data = (const void *)gated_delta_net_rows_f32_data; }
+            else if (use_subgroup_reduce)  { gdnr_len = gated_delta_net_rows_f32_nocluster_len; gdnr_data = (const void *)gated_delta_net_rows_f32_nocluster_data; }
+            else                           { gdnr_len = gated_delta_net_rows_f32_shmem_len;      gdnr_data = (const void *)gated_delta_net_rows_f32_shmem_data; }
+            for (uint32_t kda = 0; kda < 2; kda++) {
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_rows[si][kda],
+                    gdn_names[si][kda], gdnr_len, gdnr_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
+                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
+            }
+            size_t gdnrb_len; const void * gdnrb_data;
+            if (use_clustered_reduce)      { gdnrb_len = gated_delta_net_rows_bf16state_f32_len;          gdnrb_data = (const void *)gated_delta_net_rows_bf16state_f32_data; }
+            else if (use_subgroup_reduce)  { gdnrb_len = gated_delta_net_rows_bf16state_f32_nocluster_len; gdnrb_data = (const void *)gated_delta_net_rows_bf16state_f32_nocluster_data; }
+            else                           { gdnrb_len = gated_delta_net_rows_bf16state_f32_shmem_len;      gdnrb_data = (const void *)gated_delta_net_rows_bf16state_f32_shmem_data; }
+            for (uint32_t kda = 0; kda < 2; kda++) {
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_rows_bf16state[si][kda],
+                    gdn_names[si][kda], gdnrb_len, gdnrb_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
             }
         }
@@ -10068,94 +10076,13 @@ static bool ggml_vk_can_use_fwht(const ggml_backend_vk_context * ctx, const ggml
     return true;
 }
 
-static bool ggml_vk_can_fuse_mul_fwht(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, int * mm_dist = nullptr) {
-    // FADI-FUSION: pattern is MUL(x, signs) ... RESHAPE ... FWHT-hinted MUL_MAT.
-    // Reshape/view ops between them are "empty" — they appear in cgraph->nodes but
-    // are skipped by the scheduler, so scan forward over them to the real MUL_MAT.
-    // Mirrors ggml_metal_op_can_fuse_fwht_signed.
-    const ggml_tensor * mul = cgraph->nodes[node_idx];
-    if (mul->op != GGML_OP_MUL) {
-        return false;
-    }
-    int j = node_idx + 1;
-    int dist = 0;
-    const ggml_tensor * mm = nullptr;
-    int steps = 0;
-    while (j < cgraph->n_nodes && steps < 8) {
-        const ggml_tensor * n = cgraph->nodes[j];
-        if (!ggml_op_is_empty(n->op)) {
-            if (n->op == GGML_OP_MUL_MAT) {
-                mm = n;
-                dist = j - node_idx;
-            }
-            break;
-        }
-        ++j;
-        ++steps;
-    }
-    if (mm == nullptr) {
-        return false;
-    }
-    if (ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD) {
-        return false;
-    }
-    // the hinted matmul's reshape source must be this MUL
-    const ggml_tensor * reshape = mm->src[1];
-    if (reshape == nullptr || reshape->op != GGML_OP_RESHAPE || reshape->src[0] != mul) {
-        return false;
-    }
-    // MUL must have single use
-    if (!ggml_node_has_n_uses(cgraph, node_idx, 1)) {
-        return false;
-    }
-    // x carries the activation shape, signs is the broadcast [K] vector
-    const ggml_tensor * x     = ggml_are_same_shape(mul, mul->src[0]) ? mul->src[0] : mul->src[1];
-    const ggml_tensor * signs = (x == mul->src[0]) ? mul->src[1] : mul->src[0];
-    const int64_t n = mm->src[0]->ne[0];
-    const int fwht_idx = ggml_vk_fwht_pipeline_idx(n);
-    // The signed pipeline must exist (some devices leave FWHT pipelines null)
-    // and the signs tensor must bind at offset 0: the shader indexes data_s from
-    // zero, so a view whose buffer offset is not representable without rounding
-    // down (allow_misalign) would silently read the preceding tensor's data.
-    const bool signed_pipeline_exists =
-        fwht_idx >= 0 &&
-        (x->type == GGML_TYPE_F16 ? ctx->device->pipeline_fwht_signed_f16[fwht_idx]
-                                  : ctx->device->pipeline_fwht_signed_f32[fwht_idx]) != nullptr;
-    const bool signs_aligned = get_misalign_bytes(ctx, signs) == 0;
-    const bool ok = signed_pipeline_exists &&
-        signs->type == GGML_TYPE_F32 &&
-        signs->ne[1] == 1 && signs->ne[2] == 1 && signs->ne[3] == 1 &&
-        (x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16) &&
-        mul->type == x->type &&
-        ggml_is_contiguous(x) && ggml_is_contiguous(signs) &&
-        signs->ne[0] == x->ne[0] && signs->ne[0] % n == 0 &&
-        signs_aligned;
-    if (ok && mm_dist != nullptr) {
-        *mm_dist = dist;
-    }
-    return ok;
-}
-
-static void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src, ggml_tensor * dst, const ggml_tensor * signs = nullptr, const int64_t fwht_n = 0) {
-    // FADI-FUSION: fwht_n overrides the transform width. For the fused path the
-    // activation may be a flat concat of n_blk transform-sized rows (e.g. 5120 =
-    // 40 x 128); the width comes from the hinted matmul (mm->src[0]->ne[0]), NOT
-    // src->ne[0], which would give an unsupported size and a negative pipeline idx.
-    const int64_t n_eff = fwht_n > 0 ? fwht_n : src->ne[0];
-    const int idx = ggml_vk_fwht_pipeline_idx(n_eff);
-    // FADI-FUSION: signs != nullptr -> dedicated signed pipeline (3 descriptors).
-    // Base pipelines stay untouched at 2 descriptors for all non-fused users.
-    vk_pipeline pipeline;
-    if (signs != nullptr) {
-        pipeline = src->type == GGML_TYPE_F16 ? ctx->device->pipeline_fwht_signed_f16[idx] : ctx->device->pipeline_fwht_signed_f32[idx];
-        GGML_ASSERT(pipeline != nullptr);
-    } else {
-        pipeline = src->type == GGML_TYPE_F16 ? ctx->device->pipeline_fwht_f16[idx] : ctx->device->pipeline_fwht_f32[idx];
-    }
+static void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src, ggml_tensor * dst) {
+    const int idx = ggml_vk_fwht_pipeline_idx(src->ne[0]);
+    vk_pipeline pipeline = src->type == GGML_TYPE_F16 ? ctx->device->pipeline_fwht_f16[idx] : ctx->device->pipeline_fwht_f32[idx];
 
     const uint32_t rows_per_workgroup = ctx->device->fwht_rows_per_wg[idx];
     GGML_ASSERT(rows_per_workgroup > 0);
-    const uint32_t n_rows = (uint32_t)(ggml_nelements(src) / n_eff);
+    const uint32_t n_rows = (uint32_t)ggml_nrows(src);
     const uint32_t max_workgroups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
 
     const uint32_t total_workgroups = CEIL_DIV(n_rows, rows_per_workgroup);
@@ -10164,23 +10091,16 @@ static void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, cons
 
     const vk_subbuffer src_buf = ggml_vk_tensor_subbuffer(ctx, src, true);
     const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
-    const uint32_t n_blk = signs ? (uint32_t)(signs->ne[0] / n_eff) : 0u;
 
     vk_op_fwht_push_constants pc = {
         n_rows,
         0,
         0,
-        1.0f / std::sqrt((float)n_eff),
-        n_blk,
+        1.0f / std::sqrt((float)src->ne[0]),
     };
     init_pushconst_tensor_offsets(ctx, pc, src, nullptr, nullptr, nullptr, dst);
 
-    if (signs != nullptr) {
-        const vk_subbuffer signs_buf = ggml_vk_tensor_subbuffer(ctx, signs, true);
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf, signs_buf }, pc, { workgroups_x, 1, 1 });
-    } else {
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, { workgroups_x, 1, 1 });
-    }
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, { workgroups_x, 1, 1 });
 }
 
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -10217,10 +10137,7 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
             m_offset += cur_M_size;
         }
     } else if (ggml_vk_can_use_fwht(ctx, src1, dst)) {
-        // FADI-FUSION: if a fused MUL_FWHT already emitted this transform, skip.
-        if (ctx->fwht_mm_done != dst) {
-            ggml_vk_fwht(ctx, subctx, src1, dst);
-        }
+        ggml_vk_fwht(ctx, subctx, src1, dst);
     } else if (src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && dst->ne[1] == 1 &&
         // detect 0213 permutation, and batch size of 1
         src0->nb[0] <= src0->nb[2] &&
@@ -11862,6 +11779,22 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_GATED_DELTA_NET:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            if (dst->src[6] != nullptr) {
+                const uint32_t S_v = dst->src[2]->ne[0];
+                const uint32_t kda = (dst->src[3]->ne[0] == (int64_t)S_v) ? 1 : 0;
+                uint32_t si;
+                switch (S_v) {
+                    case 16:  si = 0; break;
+                    case 32:  si = 1; break;
+                    case 64:  si = 2; break;
+                    case 128: si = 3; break;
+                    default: return nullptr;
+                }
+                if (dst->src[5]->type == GGML_TYPE_BF16) {
+                    return ctx->device->pipeline_gated_delta_net_rows_bf16state[si][kda];
+                }
+                return ctx->device->pipeline_gated_delta_net_rows[si][kda];
+            }
             const uint32_t S_v = dst->src[2]->ne[0];
             const uint32_t kda = (dst->src[3]->ne[0] == (int64_t)S_v) ? 1 : 0;
             uint32_t si;
@@ -12962,6 +12895,12 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     for (int i = 0; i < 6; i++) {
         src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
     }
+    // rows mode: extra index buffer at binding 7 (dst->src[6])
+    const bool gdn_rows = dst->src[6] != nullptr;
+    vk_subbuffer rows_buf = {};
+    if (gdn_rows) {
+        rows_buf = ggml_vk_tensor_subbuffer(ctx, dst->src[6]);
+    }
 
     const uint32_t sq1 = (uint32_t)(src_q->nb[1] / sizeof(float));
     const uint32_t sq2 = (uint32_t)(src_q->nb[2] / sizeof(float));
@@ -12987,9 +12926,15 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         K
     };
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
-        pc, { H, n_seqs, S_v });
+    if (gdn_rows) {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, rows_buf},
+            pc, { H, n_seqs, S_v });
+    } else {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+            pc, { H, n_seqs, S_v });
+    }
 }
 
 static void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -15651,46 +15596,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_MUL:
-        {
-            // FADI-FUSION (MUL_FWHT): signed FWHT — apply the Hadamard sign vector
-            // inside the transform and write straight into the hinted matmul's dst.
-            // Use the FULL matcher (not a loose scan): it validates width, shapes,
-            // contiguity — a loose scan here previously hijacked unrelated fusions
-            // and read pipeline_fwht_signed_*[-1] for unsupported widths.
-            const bool is_mul_fwht = ctx->num_additional_fused_ops > 0 &&
-                ggml_vk_can_fuse_mul_fwht(ctx, cgraph, node_idx);
-            if (is_mul_fwht) {
-                // re-locate the hinted matmul for the destination pointer
-                const ggml_tensor * mm = nullptr;
-                int j = node_idx + 1, steps = 0;
-                while (j < cgraph->n_nodes && steps < 8) {
-                    const ggml_tensor * n = cgraph->nodes[j];
-                    if (!ggml_op_is_empty(n->op)) {
-                        if (n->op == GGML_OP_MUL_MAT &&
-                            ggml_get_op_params_i32(n, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
-                            mm = n;
-                        }
-                        break;
-                    }
-                    ++j;
-                    ++steps;
-                }
-                if (mm != nullptr) {
-                    const ggml_tensor * x     = ggml_are_same_shape(node, src0) ? src0 : src1;
-                    const ggml_tensor * signs = (x == src0) ? src1 : src0;
-                    ggml_tensor * mm_nc = const_cast<ggml_tensor *>(mm);
-                    // transform width comes from the hinted matmul (validated by the matcher),
-                    // NOT from x->ne[0] which may be a flat concat of many transforms
-                    ggml_vk_fwht(ctx, compute_ctx, x, mm_nc, signs, mm->src[0]->ne[0]);
-                    ctx->fwht_mm_done = mm_nc; // mark: don't re-emit when the hinted MUL_MAT is visited
-                    break;
-                }
-            }
-            if (ctx->num_additional_fused_ops) {
-                ggml_vk_snake_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
-            } else {
-                ggml_vk_mul(ctx, compute_ctx, src0, src1, node);
-            }
+        if (ctx->num_additional_fused_ops) {
+            ggml_vk_snake_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_mul(ctx, compute_ctx, src0, src1, node);
         }
 
         break;
@@ -17380,6 +17289,17 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
     }
     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+    // Debug/testing knob: absolute flops-per-submit override (0 = default heuristic).
+    // Lets coarser submissions be evaluated on submit-overhead-bound devices.
+    {
+        const char * GGML_VK_FLOPS_PER_SUBMIT_env = getenv("GGML_VK_FLOPS_PER_SUBMIT");
+        if (GGML_VK_FLOPS_PER_SUBMIT_env != nullptr) {
+            uint64_t v = std::stoull(GGML_VK_FLOPS_PER_SUBMIT_env);
+            if (v > 0) {
+                flops_per_submit = v;
+            }
+        }
+    }
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
@@ -17443,22 +17363,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
         const char *fusion_string {};
-        int mm_fwht_dist = 0;
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
             if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
-            } else if (ggml_vk_can_fuse_mul_fwht(ctx, cgraph, i, &mm_fwht_dist)) {
-                // FADI-FUSION: MUL(x, signs) feeding the FWHT-hinted MUL_MAT — apply the
-                // sign vector inside the FWHT kernel instead of a separate elementwise launch.
-                // mm_fwht_dist counts the empty reshape/view ops between the MUL and the
-                // matmul; every covered position must be accounted for so the framework
-                // tracks the real matmul destination.
-                ctx->num_additional_fused_ops = mm_fwht_dist;
-                fusion_string = "MUL_FWHT";
-                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ADD_ADD";
@@ -18772,15 +18682,22 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && op->src[0]->ne[0] == 64;
         case GGML_OP_GATED_DELTA_NET:
             {
-                // rows-indexed state read (src[6]) not implemented on Vulkan yet
-                if (op->src[6] != nullptr) {
+                // rows-indexed state read (src[6]) requires an int32 index tensor
+                if (op->src[6] != nullptr && op->src[6]->type != GGML_TYPE_I32) {
+                    return false;
+                }
+                if (op->src[6] != nullptr && op->src[5]->type != GGML_TYPE_F32 && op->src[5]->type != GGML_TYPE_BF16) {
                     return false;
                 }
                 const uint32_t S_v = op->src[2]->ne[0];
                 if (S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) {
                     return false;
                 }
+                const bool state_bf16 = op->src[5]->type == GGML_TYPE_BF16;
                 for (int i = 0; i < 6; i++) {
+                    if (i == 5 && state_bf16) {
+                        continue; // bf16 state handled by the dedicated rows pipeline
+                    }
                     if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32) {
                         return false;
                     }
