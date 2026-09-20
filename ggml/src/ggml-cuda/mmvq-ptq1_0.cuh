@@ -273,10 +273,16 @@ static __host__ int ptq1_0_pt_rows_per_cta(const int blocks_per_row, const int n
 template <int ncols, int ROWS, bool has_fusion, bool has_gate>
 __launch_bounds__(PTQ1_0_PT_THREADS, (ncols <= 2 ? 4 : (ncols <= 4 ? 3 : 2)))
 static __global__ void mul_mat_vec_ptq1_0_pt(
-        const void * GGML_CUDA_RESTRICT vx, const void * GGML_CUDA_RESTRICT vy, const ggml_cuda_mm_fusion_args_device fusion,
-        float * GGML_CUDA_RESTRICT dst,
+        const void * vx_ptr, const void * vy_ptr, const ggml_cuda_mm_fusion_args_device fusion,
+        float * dst_ptr,
         const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
         const int rows_per_cta, const uint3 bpr_fd) {
+    // GGML_CUDA_RESTRICT stays off the formal parameters: it expands differently in the host pass and in
+    // the Hopper-or-newer device pass with PDL, and the generated host stub then fails to match the
+    // template. Same pattern as mul_mat_vec_q.
+    const void * GGML_CUDA_RESTRICT vx  = vx_ptr;
+    const void * GGML_CUDA_RESTRICT vy  = vy_ptr;
+    float      * GGML_CUDA_RESTRICT dst = dst_ptr;
     extern __shared__ float partials_dyn[];
     float * partials = partials_dyn;                                       // [ncols][rows_per_cta][bpr]
     [[maybe_unused]] float * partials_gate = partials_dyn + ncols*rows_per_cta*(ncols_x / QK_PTQ1_0);
