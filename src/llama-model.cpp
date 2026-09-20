@@ -2771,6 +2771,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
                     } else {
+                        // bf16 SSM state pools: recurrence is bandwidth-bound on these;
+                        // bf16 halves the traffic. Opt-in via env until kernels are audited.
+                        const bool bf16_ssm_state = getenv("LLAMA_SSM_BF16_STATE") != nullptr;
+                        const bool bf16_ssm_conv  = getenv("LLAMA_SSM_BF16_CONV") != nullptr;
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
@@ -2780,8 +2784,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_pad        */ 1,
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
-                            /* recurrent_type_k  */ GGML_TYPE_F32,
-                            /* recurrent_type_v  */ GGML_TYPE_F32,
+                            /* recurrent_type_k  */ bf16_ssm_conv ? GGML_TYPE_BF16 : GGML_TYPE_F32,
+                            /* recurrent_type_v  */ bf16_ssm_state ? GGML_TYPE_BF16 : GGML_TYPE_F32,
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
