@@ -1,4 +1,4 @@
-#include "ggml-cuda.h"
+﻿#include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
@@ -2752,6 +2752,180 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
 // GDN kernel reads. In-graph the gather kernel is ~8 us/layer and its dirty output sits in L2 until
 // the FFN weight stream evicts it, which made the gate/up GEMVs in GDN layers ~15% slower than the
 // identical GEMVs in attention layers. When the gathered temp has no other consumer, skip the
+// A Hadamard rotation of an activation ([MUL signs, RESHAPE,] MUL_MAT with GGML_HINT_SRC0_IS_HADAMARD)
+// whose every use is a PTQ1_0 mat-vec on the mmvq path does not need to exist in F32: each of those
+// mat-vecs quantizes it to q8_1 straight away, so the transform kernel quantizes as it goes and writes
+// the q8_1 rows (in the layout the mat-vecs expect) into its own output buffer; the mat-vecs then skip
+// their quantize launch (ggml_cuda_fwht_q8). On Bonsai 2 that removes ~390 launches per decode step.
+// The check walks every later node, so any other use of the output (or of a view of it) keeps the
+// plain transform, and use counts guard against consumers outside this graph. Returns the number of
+// nodes consumed (3 or 1) or 0 to fall through. GGML_CUDA_FWHT_FUSION=0 disables it.
+static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+    static const bool disabled = getenv("GGML_CUDA_FWHT_FUSION") != nullptr &&
+                                 atoi(getenv("GGML_CUDA_FWHT_FUSION")) == 0;
+    if (disabled) {
+        return 0;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_TURING) {
+        return 0; // the PTQ1_0 mmvq predicate below is only meaningful there
+    }
+
+    const ggml_tensor * x     = nullptr;
+    const ggml_tensor * signs = nullptr;
+    ggml_tensor *       mm    = nullptr;
+    int consumed = 0;
+    int i_mm     = -1;
+
+    if (ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { node_idx + 2 })) {
+        const ggml_tensor * mul     = cgraph->nodes[node_idx];
+        const ggml_tensor * reshape = cgraph->nodes[node_idx + 1];
+        mm    = cgraph->nodes[node_idx + 2];
+        x     = mul->src[0];
+        signs = mul->src[1];
+        const bool pattern_ok = ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+            mm->src[1] == reshape && reshape->src[0] == mul &&
+            signs->ne[1] == 1 && signs->ne[2] == 1 && signs->ne[3] == 1 &&
+            signs->type == GGML_TYPE_F32 && mul->type == x->type &&
+            ggml_is_contiguous(x) && ggml_is_contiguous(signs) &&
+            signs->ne[0] == x->ne[0] && signs->ne[0] % mm->src[0]->ne[0] == 0;
+        if (!pattern_ok) {
+            return 0;
+        }
+        consumed = 3;
+        i_mm     = node_idx + 2;
+    } else {
+        mm = cgraph->nodes[node_idx];
+        if (mm->op != GGML_OP_MUL_MAT || ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD) {
+            return 0;
+        }
+        x = mm->src[1];
+        if (!ggml_is_contiguous(x) || !ggml_are_same_shape(x, mm)) {
+            return 0;
+        }
+        consumed = 1;
+        i_mm     = node_idx;
+    }
+
+    const int n = (int) mm->src[0]->ne[0];
+    if (mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm) || (mm->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            (x->type != GGML_TYPE_F32 && x->type != GGML_TYPE_F16) || ggml_nelements(mm) != ggml_nelements(x)) {
+        return 0;
+    }
+
+    // The fused kernel reads x (and signs) in the same launch that writes its output. The separate transform
+    // and quantize launches never needed those apart, and ggml-alloc does hand mm the block of x when x is a
+    // reshape view (no in-place reuse through a view parent, so the viewed tensor is released at the MUL and
+    // mm takes it two nodes later - the output-projection input on every Bonsai layer). Blocks storing q8_1
+    // rows early would then overwrite f32 input other blocks have not loaded yet: sporadic garbage that on a
+    // hybrid model lands in the recurrent state and poisons the rest of the sequence. In that case the rows
+    // go to a pool block held until the next graph evaluation instead of mm's buffer.
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * a1 = a0 + ggml_nbytes(a);
+        const char * b0 = (const char *) b->data;
+        const char * b1 = b0 + ggml_nbytes(b);
+        return a0 < b1 && b0 < a1;
+    };
+    const bool out_aliases_in = overlaps(x, mm) || (signs && overlaps(signs, mm));
+
+    // every use of the transform output (directly or through a reshape view of the whole tensor)
+    // must be src1 of a PTQ1_0 MUL_MAT that ggml_cuda_mul_mat routes to ggml_cuda_mul_mat_vec_q.
+    // The consumers' src1 shape [K, ncols] is what gets quantized (x is only known to be
+    // contiguous with the same element count; in the unsigned pattern it is the [n, rows] reshape).
+    const ggml_tensor * aliases[8] = { mm };
+    int     n_aliases     = 1;
+    int     uses_expected = ggml_node_get_use_count(cgraph, i_mm);
+    int     uses_found    = 0;
+    int64_t K             = 0;
+    int64_t ncols         = 0;
+    int64_t ne0_padded    = 0;
+    ggml_cuda_q8_1_layout layout = GGML_CUDA_Q8_1_AOS;
+    for (int j = i_mm + 1; j < cgraph->n_nodes; ++j) {
+        ggml_tensor * t = cgraph->nodes[j];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = t->src[s];
+            if (!src) {
+                continue;
+            }
+            bool is_alias = false;
+            for (int a = 0; a < n_aliases; ++a) {
+                if (src == aliases[a]) {
+                    is_alias = true;
+                    break;
+                }
+            }
+            if (!is_alias) {
+                continue;
+            }
+            uses_found++;
+            if (t->op == GGML_OP_RESHAPE && t->view_src == mm && t->data == mm->data &&
+                    ggml_nelements(t) == ggml_nelements(mm) && ggml_is_contiguous(t)) {
+                if (n_aliases == 8) {
+                    return 0;
+                }
+                aliases[n_aliases++] = t;
+                uses_expected += ggml_node_get_use_count(cgraph, j);
+                continue;
+            }
+            if (t->op != GGML_OP_MUL_MAT || s != 1 || !t->src[0] || t->src[0]->type != GGML_TYPE_PTQ1_0 ||
+                    ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
+                    t->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) ||
+                    src->ne[2] != 1 || src->ne[3] != 1 ||
+                    (K != 0 && (src->ne[0] != K || src->ne[1] != ncols)) ||
+                    !ggml_cuda_should_use_mmvq(GGML_TYPE_PTQ1_0, cc, src->ne[1])) {
+                return 0;
+            }
+            K     = src->ne[0];
+            ncols = src->ne[1];
+            // ggml_cuda_mul_mat sends a padded compute-buffer view to cuBLAS instead
+            const ggml_tensor * w = t->src[0];
+            if (ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                    ggml_nbytes(w) != ggml_backend_buffer_get_alloc_size(w->buffer, w) && w->view_src) {
+                return 0;
+            }
+        }
+    }
+    if (uses_found == 0 || uses_found != uses_expected || K == 0) {
+        return 0;
+    }
+    if (K % n != 0 || !ggml_cuda_fwht_quantize_supported(n, K) || (signs && signs->ne[0] != K)) {
+        return 0;
+    }
+
+    // same (type, ncols, ids) -> layout and padding as ggml_cuda_mul_mat_vec_q
+    layout     = ggml_cuda_q8_1_layout_host(GGML_TYPE_PTQ1_0, (int) ncols, false);
+    ne0_padded = GGML_PAD(K, MATRIX_ROW_PADDING);
+    if (layout == GGML_CUDA_Q8_1_SOA_ISUM) {
+        ne0_padded = GGML_PAD(ne0_padded, GGML_CUDA_PTQ1_K_PAD);
+    }
+    if (ne0_padded % n != 0) {
+        return 0; // the fused quantizer writes pad blocks in transform-width units
+    }
+    const size_t q8_bytes = (size_t) (ncols * ne0_padded) * sizeof(block_q8_1) / QK8_1;
+    void * out = mm->data;
+    if (out_aliases_in) {
+        auto blk = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_bytes);
+        out = blk->get();
+        ctx.fwht_q8().held.push_back(std::move(blk));
+    } else if ((int64_t) q8_bytes > (int64_t) ggml_nbytes(mm)) {
+        return 0; // the quantized rows must fit in the F32 output allocation
+    }
+
+    fwht_quantize_row_q8_1_cuda(x->data, x->type, signs ? (const float *) signs->data : nullptr, n,
+                                out, layout, K, ne0_padded, ncols, ctx.stream());
+
+    ggml_cuda_fwht_q8 e;
+    e.layout = layout;
+    e.ne0    = ne0_padded;
+    e.ncols  = ncols;
+    e.data   = out;
+    for (int a = 0; a < n_aliases; ++a) {
+        ctx.fwht_q8().set(aliases[a], e);
+    }
+    return consumed;
+}
+
 // GET_ROWS and let the kernel index the cache row directly. Single-sequence only: with several
 // sequences a gathered row may alias a row another sequence writes in the same op.
 // GGML_CUDA_GDN_GATHER_FUSION=0 disables it. The registration lives in the evaluating context
@@ -4345,6 +4519,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             cuda_ctx->gdn_gathers().reset();
+            cuda_ctx->fwht_q8().reset();
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -4392,6 +4567,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (node->op == GGML_OP_GET_ROWS && !is_concurrent_event_active &&
                         ggml_cuda_try_gdn_gather_skip(*cuda_ctx, cgraph, i)) {
                     continue;
+                }
+
+                // Hadamard rotation that quantizes its own output; its PTQ1_0 mat-vecs skip quantize
+                if ((node->op == GGML_OP_MUL || node->op == GGML_OP_MUL_MAT) && !is_concurrent_event_active) {
+                    const int consumed = ggml_cuda_try_fwht_q8(*cuda_ctx, cgraph, i);
+                    if (consumed > 0) {
+                        i += consumed - 1;
+                        continue;
+                    }
                 }
 
                 // The normalized pre-attention residual is consumed only by a

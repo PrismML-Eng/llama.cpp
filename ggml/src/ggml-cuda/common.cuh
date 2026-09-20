@@ -1565,6 +1565,44 @@ struct ggml_cuda_gdn_gather_context {
     }
 };
 
+// A Hadamard transform (MUL_MAT with GGML_HINT_SRC0_IS_HADAMARD, optionally preceded by the sign
+// flip) whose only consumers are PTQ1_0 mat-vecs writes the q8_1-quantized activation into its own
+// output buffer instead of the F32 result (the quantized rows are 9/8 bytes per element, so they
+// fit in the F32 allocation), and the mat-vecs skip their quantize launch. The output buffer's
+// lifetime is exactly the consumers' lifetime, so nothing about allocation changes. Keyed by tensor
+// identity (the transform output and every reshape view of it that a mat-vec consumes), never by
+// data pointer: ggml-alloc recycles a dead output's block for later tensors in the same graph, and a
+// later PTQ1_0 mat-vec whose src1 landed there must not mistake its F32 rows for q8_1. Valid for one
+// graph evaluation.
+struct ggml_cuda_fwht_q8 {
+    ggml_cuda_q8_1_layout layout = GGML_CUDA_Q8_1_AOS;
+    int64_t               ne0    = 0;       // padded row width the quantizer wrote (what the mat-vec expects)
+    int64_t               ncols  = 0;       // rows quantized (src1->ne[1] of every consumer)
+    const void *          data   = nullptr; // the q8_1 rows: the transform's own output buffer, or a pool block
+                                            // held for the rest of the graph when that buffer aliases the input
+};
+
+struct ggml_cuda_fwht_q8_context {
+    std::unordered_map<const ggml_tensor *, ggml_cuda_fwht_q8> entries;
+    std::vector<std::unique_ptr<ggml_cuda_pool_alloc<char>>> held; // released at reset(), newest first (VMM pool is LIFO)
+
+    void reset() {
+        entries.clear();
+        while (!held.empty()) {
+            held.pop_back();
+        }
+    }
+
+    void set(const ggml_tensor * out, const ggml_cuda_fwht_q8 & e) {
+        entries[out] = e;
+    }
+
+    const ggml_cuda_fwht_q8 * find(const ggml_tensor * out) const {
+        const auto it = entries.find(out);
+        return it == entries.end() ? nullptr : &it->second;
+    }
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1636,6 +1674,7 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_stream_context concurrent_stream_context;
     ggml_cuda_gdn_gather_context gdn_gather_context;
+    ggml_cuda_fwht_q8_context    fwht_q8_context;
 
     ~ggml_backend_cuda_context();
 
@@ -1652,6 +1691,8 @@ struct ggml_backend_cuda_context {
     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
 
     ggml_cuda_gdn_gather_context & gdn_gathers() { return gdn_gather_context; }
+
+    ggml_cuda_fwht_q8_context & fwht_q8() { return fwht_q8_context; }
 
     cublasHandle_t cublas_handle() {
         if (cublas_handles[device][curr_stream_no] == nullptr) {

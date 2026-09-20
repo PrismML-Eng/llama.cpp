@@ -1659,8 +1659,19 @@ void ggml_cuda_mul_mat_vec_q(
         // Warp-transposed q8 layout needs whole 32-K-block groups per column.
         ne10_padded = GGML_PAD(ne10_padded, GGML_CUDA_PTQ1_K_PAD);
     }
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    // src1 may be a Hadamard transform output whose producer already wrote the q8_1 rows in this
+    // exact layout (ggml_cuda_fwht_q8, into src1's buffer or a held pool block); nothing to quantize.
+    const ggml_cuda_fwht_q8 * pre_q8 = ids ? nullptr : ctx.fwht_q8().find(src1);
+    if (pre_q8) {
+        GGML_ASSERT(pre_q8->layout == y_layout && pre_q8->ne0 == ne10_padded && pre_q8->ncols == ne11 && ne12 == 1 && ne13 == 1);
+    }
+
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    const char * src1_q8_1_d = nullptr;
+    if (pre_q8) {
+        src1_q8_1_d = (const char *) pre_q8->data;
+    } else {
+        src1_q8_1_d = src1_q8_1.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
@@ -1690,7 +1701,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
