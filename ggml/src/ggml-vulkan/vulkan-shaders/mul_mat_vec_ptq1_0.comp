@@ -7,73 +7,77 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
 
-// PTQ1_0 dedicated matvec with a shared-memory LUT decoder.
-// One 1280-float LUT in shared memory maps (multiplier-index m in 0..4, byte b)
-// straight to the decoded weight, built once per workgroup (5 rows x 256 bytes).
-// Every decode then costs one shared load + one subtract instead of
-// mul+and+mul+shift+sub. Thread assignment replaces the region branch:
-//   itid  0.. 9 : region 1, elements e0 = itid*8 (qs[e0&15 .. +7])
-//   itid 10..14 : region 2, elements 80 + (itid-10)*8 (qs[16..23])
-//   itid 15     : region 3, elements 120..127 (qh byte pairs)
+// PTQ1_0 dedicated matvec, v2 (algorithm ported from PrismML CUDA PR #218).
+// Key ideas vs v1:
+//   - NUM_ROWS=4 rows per workgroup: every B-vector fetch is shared by 4 rows,
+//     cutting activation traffic 4x (the v1 kernel re-fetched B per row).
+//   - SIMD-in-register trit decode: 4 weights per uvec4 lane via
+//     (v*3 & 0xFF) >> 8 on all lanes at once, branchless.
+//   - Integer partial sums folded per 8-element group; one FMA per group.
+// Thread map (16 lanes per block, workgroup = 64 => it_size = 4 blocks):
+//   itid  0.. 9 : region 1, elements e0 = itid*8
+//   itid 10..14 : region 2, elements 80 + (itid-10)*8
+//   itid 15     : region 3, elements 120..127 (qh)
 void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
     uint e0;
     uint mi;
     if (itid < 10u) {
         e0 = itid * 8u;
-        mi = e0 >> 4u;                     // exponent 0..4
+        mi = e0 >> 4u;
     } else if (itid < 15u) {
         e0 = 80u + (itid - 10u) * 8u;
-        mi = itid - 10u;                   // exponent 0..4
+        mi = itid - 10u;
     } else {
         e0 = 120u;
-        mi = 0u;                           // region 3 uses its own inline decode
+        mi = 0u;
     }
 
     const uint y_idx = i * QUANT_K + e0;
 
-    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+    // B vectors fetched ONCE for all 4 rows
+    vec4 bv[NUM_COLS][2];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        bv[j][0] = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4]);
+        bv[j][1] = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 1]);
+    }
+
+    // weights decoded once per (row, group)
+    vec4 wf[4][2];
+
+    [[unroll]] for (uint n = 0; n < 4; ++n) {
+        if (n >= num_rows) { break; }
         const uint ib0 = a_offset + (first_row+n)*num_blocks_per_row;
-        if (i >= num_blocks_per_row) {
-            continue;
-        }
+        if (i >= num_blocks_per_row) { continue; }
 
         const FLOAT_TYPE d = FLOAT_TYPE(data_a[ib0 + i].d);
 
         if (itid < 15u) {
-            // regions 1+2: base byte index inside qs
             const uint qbase = (itid < 10u) ? (e0 & 15u) : (16u + ((e0 - 80u) & 7u));
             const uint mm = (mi == 0u) ? 1u : (mi == 1u) ? 3u : (mi == 2u) ? 9u : (mi == 3u) ? 27u : 81u;
-            const uvec4 w0 = ((uvec4(uint(data_a[ib0 + i].qs[qbase    ]),
-                                     uint(data_a[ib0 + i].qs[qbase + 1u]),
-                                     uint(data_a[ib0 + i].qs[qbase + 2u]),
-                                     uint(data_a[ib0 + i].qs[qbase + 3u])) * mm) & 0xFFu) * 3u >> 8u;
-            const uvec4 w1 = ((uvec4(uint(data_a[ib0 + i].qs[qbase + 4u]),
-                                     uint(data_a[ib0 + i].qs[qbase + 5u]),
-                                     uint(data_a[ib0 + i].qs[qbase + 6u]),
-                                     uint(data_a[ib0 + i].qs[qbase + 7u])) * mm) & 0xFFu) * 3u >> 8u;
-            const vec4 wf0 = vec4(w0) - 1.0f;
-            const vec4 wf1 = vec4(w1) - 1.0f;
-
-            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-                const vec4 b0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4]);
-                const vec4 b1 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 1]);
-                temp[j][n] += (dot(wf0, b0) + dot(wf1, b1)) * d;
-            }
+            const uvec4 q0 = uvec4(uint(data_a[ib0 + i].qs[qbase    ]),
+                                   uint(data_a[ib0 + i].qs[qbase + 1u]),
+                                   uint(data_a[ib0 + i].qs[qbase + 2u]),
+                                   uint(data_a[ib0 + i].qs[qbase + 3u]));
+            const uvec4 q1 = uvec4(uint(data_a[ib0 + i].qs[qbase + 4u]),
+                                   uint(data_a[ib0 + i].qs[qbase + 5u]),
+                                   uint(data_a[ib0 + i].qs[qbase + 6u]),
+                                   uint(data_a[ib0 + i].qs[qbase + 7u]));
+            // SIMD trit step on 4 lanes at once: t = ((v*m)&0xFF)*3>>8, w = t-1
+            const uvec4 t0 = (((q0 * mm) & uvec4(0xFFu)) * 3u) >> 8u;
+            const uvec4 t1 = (((q1 * mm) & uvec4(0xFFu)) * 3u) >> 8u;
+            wf[n][0] = vec4(t0) - 1.0f;
+            wf[n][1] = vec4(t1) - 1.0f;
         } else {
-            // region 3: elements 120..127 alternate qh[0],qh[1] with SHARED exponent
-            // pairs: t=0..7 -> (qh[t&1], n=t>>1) => n = 0,0,1,1,2,2,3,3
             const uint b0 = uint(data_a[ib0 + i].qh[0]);
             const uint b1 = uint(data_a[ib0 + i].qh[1]);
-            const uvec4 e_r3_0 = ((uvec4(b0,      b1,      b0*3u,   b1*3u  )) & 0xFFu) * 3u >> 8u;
-            const uvec4 e_r3_1 = ((uvec4(b0*9u,   b1*9u,   b0*27u,  b1*27u )) & 0xFFu) * 3u >> 8u;
-            const vec4 wf0 = vec4(e_r3_0) - 1.0f;
-            const vec4 wf1 = vec4(e_r3_1) - 1.0f;
+            const uvec4 t0 = ((uvec4(b0,    b1,    b0*3u,  b1*3u ) & uvec4(0xFFu)) * 3u) >> 8u;
+            const uvec4 t1 = ((uvec4(b0*9u, b1*9u, b0*27u, b1*27u) & uvec4(0xFFu)) * 3u) >> 8u;
+            wf[n][0] = vec4(t0) - 1.0f;
+            wf[n][1] = vec4(t1) - 1.0f;
+        }
 
-            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-                const vec4 b0v = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4]);
-                const vec4 b1v = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 1]);
-                temp[j][n] += (dot(wf0, b0v) + dot(wf1, b1v)) * d;
-            }
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            temp[j][n] += (dot(wf[n][0], bv[j][0]) + dot(wf[n][1], bv[j][1])) * d;
         }
     }
 }
