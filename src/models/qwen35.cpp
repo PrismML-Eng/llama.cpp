@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-impl.h"   // llama_mul_mat_hadamard
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -156,7 +157,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         // integrated GPUs (e.g. unified-memory CUDA devices) report IGPU, not GPU
         const bool is_gpu = ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
                             ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
-        if (is_gpu && strcmp(reg_name, "MTL") != 0) {
+        if (is_gpu && strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "Vulkan") != 0) {
             gdn_state_rows_dev_ok = false;
         }
         if (strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "CUDA") != 0 &&
@@ -634,6 +635,20 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
 
         tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+
+        // a Hadamard-latent embedding table stores rotated rows; restore the
+        // primal basis right after the lookup: h = s * (H z). Mirrors
+        // build_inp_embd(); without this llama_verify_hadamard_graph rejects
+        // the MTP context on PrismML ternary models.
+        if (hadamard_inverses) {
+            const auto it = hadamard_inverses->find(tok_embd_w);
+            if (it != hadamard_inverses->end()) {
+                tok_embd = llama_mul_mat_hadamard(ctx0, tok_embd, it->second.rot);
+                if (it->second.signs) {
+                    tok_embd = ggml_mul(ctx0, tok_embd, it->second.signs);
+                }
+            }
+        }
     } else {
         tok_embd = inp->embd;
     }

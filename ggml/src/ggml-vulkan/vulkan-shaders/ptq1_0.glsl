@@ -12,6 +12,10 @@
 // elements t*16+j, then an 8-byte chunk carrying 80 + t*8 + (j-16), then qh at four
 // trits per byte carrying 120 + t*2 + h. Trits come out by the base-3 remainder
 // recurrence t = (v*3)>>8, v = (v*3)&0xFF.
+
+// FADI-OPT: every region derives n <= 4, so five powers replace the serial recurrence loop.
+const uint POW3_MOD256[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
 float ptq1_0_trit(uint ib, uint a_offset, uint e) {
     uint b;
     uint n;
@@ -28,10 +32,7 @@ float ptq1_0_trit(uint ib, uint a_offset, uint e) {
         n = t >> 1u;
     }
 
-    uint v = b;
-    for (uint i = 0u; i < n; ++i) {
-        v = (v * 3u) & 0xFFu;
-    }
+    const uint v = (b * POW3_MOD256[n]) & 0xFFu;
     return float(int((v * 3u) >> 8u) - 1);
 }
 

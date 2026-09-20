@@ -21,6 +21,7 @@ layout(push_constant) uniform parameter
     uint src_offset;
     uint dst_offset;
     float scale;
+    uint n_blk; // FADI-FUSION: >0 = apply per-row Hadamard sign block while loading
 };
 
 layout(binding = 0, std430) readonly buffer A {
@@ -31,6 +32,10 @@ layout(binding = 0, std430) readonly buffer A {
 #endif
 };
 layout(binding = 1, std430) writeonly buffer D { float data_d[]; };
+// FADI-FUSION: sign vector [N*n_blk] for the fused MUL(signs)+FWHT variant only
+#ifdef FWHT_SIGNED
+layout(binding = 2, std430) readonly buffer S { float data_s[]; };
+#endif
 
 const uint EL_W = N / BLOCK_SIZE;
 
@@ -62,9 +67,17 @@ void main() {
 
         float reg[EL_W];
 
+        // FADI-FUSION: fold the Hadamard sign-flip MUL into the transform load.
+        // Only the FWHT_SIGNED variant has data_s bound; others compile this away.
         [[unroll]]
         for (uint i = 0; i < EL_W; ++i) {
-            reg[i] = row < n_rows ? float(data_a[src_offset + row_offset + i * BLOCK_SIZE + tid]) * scale : 0.0;
+            float v = row < n_rows ? float(data_a[src_offset + row_offset + i * BLOCK_SIZE + tid]) : 0.0;
+#ifdef FWHT_SIGNED
+            if (n_blk > 0u) {
+                v *= data_s[(row % n_blk) * N + i * BLOCK_SIZE + tid];
+            }
+#endif
+            reg[i] = v * scale;
         }
 
 #ifdef FWHT_SHMEM
