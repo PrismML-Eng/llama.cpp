@@ -5373,6 +5373,12 @@ static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buff
     GGML_ASSERT(size == ggml_nbytes(tensor));
 
     auto tensor_traits = (ggml::cpu::repack::tensor_traits_base *) tensor->extra;
+    if (tensor_traits == nullptr) {
+        // No optimal repacker for this tensor (e.g. ne[1] not divisible by 4):
+        // fall back to a plain copy so the generic kernels can use it as-is.
+        memcpy(tensor->data, data, size);
+        return;
+    }
     auto OK            = tensor_traits->repack(tensor, data, size);
 
     GGML_ASSERT(OK == 0);
@@ -5409,6 +5415,22 @@ static size_t ggml_backend_cpu_repack_buffer_type_get_alignment(ggml_backend_buf
 namespace ggml::cpu::repack {
 class extra_buffer_type : ggml::cpu::extra_buffer_type {
     bool supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) override {
+        // Tensors in the repack buffer without a matching repacker (see
+        // ggml_repack_get_optimal_repack_type) keep their original unpacked
+        // layout -- set_tensor stores them verbatim -- so any op on them is
+        // handled by the generic CPU kernels.
+        bool any_src_repacked = false;
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            if (op->src[i] && op->src[i]->buffer &&
+                op->src[i]->buffer->buft == ggml_backend_cpu_repack_buffer_type() &&
+                ggml_repack_get_optimal_repack_type(op->src[i])) {
+                any_src_repacked = true;
+                break;
+            }
+        }
+        if (!any_src_repacked) {
+            return true;
+        }
         if (    op->op == GGML_OP_MUL_MAT &&
                 op->src[0]->buffer &&
                 (ggml_n_dims(op->src[0]) == 2) &&
