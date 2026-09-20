@@ -174,8 +174,10 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 // ---------------------------------------------------------------------------------------------------------
 
 // GGML_CUDA_BATCH_INVARIANT=1: prefer kernels whose per-column arithmetic does not depend on the
-// number of columns in the batch (1 to 8), so that a token decoded alone and a token verified
-// inside a speculative batch see the same logits bit for bit. Costs some throughput at 2 to 8 columns.
+// number of columns in the batch, so that a token decoded alone and a token verified inside a
+// speculative batch see the same logits bit for bit. Whole-model invariance is established for
+// batches of 1 to 4 columns; 5 to 8 columns agree with each other but can differ from 1 to 4.
+// Costs some throughput at 2 to 8 columns.
 static inline bool ggml_cuda_batch_invariant() {
     static const bool enabled = getenv("GGML_CUDA_BATCH_INVARIANT") != nullptr;
     return enabled;

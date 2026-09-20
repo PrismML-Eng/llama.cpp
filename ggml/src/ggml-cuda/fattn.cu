@@ -460,8 +460,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {
-            // batch-invariant mode: the same (vector) kernel for 1 to 8 queries, so a token verified in a
-            // speculative batch attends with the same arithmetic as a token decoded alone
+            // batch-invariant mode: the same (vector) kernel for up to 8 queries, so a token verified in a
+            // speculative batch attends with the same arithmetic as a token decoded alone (the whole-model
+            // guarantee is 1 to 4 queries, see ggml_cuda_batch_invariant)
             if (ggml_cuda_batch_invariant() && Q->ne[1] <= 8 && Q->ne[3] == 1) {
                 return BEST_FATTN_KERNEL_VEC;
             }
