@@ -1586,6 +1586,12 @@ struct ggml_cuda_fwht_q8_context {
     std::unordered_map<const ggml_tensor *, ggml_cuda_fwht_q8> entries;
     std::vector<std::unique_ptr<ggml_cuda_pool_alloc<char>>> held; // released at reset(), newest first (VMM pool is LIFO)
 
+    // the implicit destructor would release `held` oldest first, which the VMM pool asserts on. The
+    // owning context also calls reset() before its pools go away (this member is declared before them).
+    ~ggml_cuda_fwht_q8_context() {
+        reset();
+    }
+
     void reset() {
         entries.clear();
         while (!held.empty()) {
