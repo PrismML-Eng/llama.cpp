@@ -310,6 +310,77 @@ void ggml_quantize_mat_q8_K_4x8_generic(const float * GGML_RESTRICT x, void * GG
     }
 }
 
+// Q8_0 activations with one scale shared by the four 32-wide blocks of each
+// 128-wide group (matching QK1_0). Layout is plain block_q8_0 / block_q8_0x4, so
+// every existing Q1_0 kernel keeps working; kernels that know about the shared
+// scale (x86 AVX2) can accumulate a whole 128-group in integers and convert once.
+// Precision is that of Q8_K (256-group scales), which llama.cpp uses for all
+// K-quant dot products.
+void ggml_quantize_row_q8_0_g128(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(QK1_0 == 4 * QK8_0);
+    assert(k % QK1_0 == 0);
+    const int ng = k / QK1_0;
+
+    block_q8_0 * GGML_RESTRICT y = (block_q8_0 *) vy;
+
+    for (int g = 0; g < ng; g++) {
+        const float * xg = x + g * QK1_0;
+        float amax = 0.0f;
+        for (int j = 0; j < QK1_0; j++) {
+            amax = MAX(amax, fabsf(xg[j]));
+        }
+        const float d  = amax / ((1 << 7) - 1);
+        const float id = d ? 1.0f / d : 0.0f;
+        const ggml_half dh = GGML_CPU_FP32_TO_FP16(d);
+
+        for (int b = 0; b < 4; b++) {
+            block_q8_0 * yb = y + 4 * g + b;
+            yb->d = dh;
+            for (int j = 0; j < QK8_0; j++) {
+                yb->qs[j] = (int8_t) roundf(xg[b * QK8_0 + j] * id);
+            }
+        }
+    }
+}
+
+// Four rows, 8-byte interleave (block_q8_0x4 as consumed by the *_4x8 kernels),
+// one scale per row per 128-wide group.
+void ggml_quantize_mat_q8_0_4x8_g128(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(QK1_0 == 4 * QK8_0);
+    assert(k % QK1_0 == 0);
+    const int ng = k / QK1_0;
+
+    block_q8_0x4 * GGML_RESTRICT y = (block_q8_0x4 *) vy;
+
+    for (int g = 0; g < ng; g++) {
+        float     id[4];
+        ggml_half dh[4];
+        for (int m = 0; m < 4; m++) {
+            const float * xg = x + m * k + g * QK1_0;
+            float amax = 0.0f;
+            for (int j = 0; j < QK1_0; j++) {
+                amax = MAX(amax, fabsf(xg[j]));
+            }
+            const float d = amax / ((1 << 7) - 1);
+            id[m] = d ? 1.0f / d : 0.0f;
+            dh[m] = GGML_CPU_FP32_TO_FP16(d);
+        }
+
+        for (int b = 0; b < 4; b++) {
+            block_q8_0x4 * yb = y + 4 * g + b;
+            for (int m = 0; m < 4; m++) {
+                yb->d[m] = dh[m];
+                const float * xr = x + m * k + g * QK1_0 + b * QK8_0;
+                for (int c = 0; c < 4; c++) {         // 8-value chunks
+                    for (int p = 0; p < 8; p++) {
+                        yb->qs[c * 32 + m * 8 + p] = (int8_t) roundf(xr[c * 8 + p] * id[m]);
+                    }
+                }
+            }
+        }
+    }
+}
+
 } // extern "C"
 
 template <int64_t INTER_SIZE, ggml_type PARAM_TYPE>
@@ -352,6 +423,29 @@ template <> void ggml_quantize_mat_t<1, GGML_TYPE_Q8_K>(const float * GGML_RESTR
     ggml_quantize_mat_q8_K_4x1(x, vy, n_per_row);
 }
 #endif
+
+// Activation quantization used by the repack mul_mat paths. Q1_0 (4x8) gets the
+// shared-per-128 scale variant so that its kernels can amortize the int->float
+// conversion over a whole QK1_0 block; everything else keeps the type's from_float.
+template <typename BLOC_TYPE, int64_t INTER_SIZE, ggml_type PARAM_TYPE>
+static inline void ggml_repack_quantize_row(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t n) {
+    ggml_get_type_traits_cpu(PARAM_TYPE)->from_float(x, vy, n);
+}
+
+template <> inline void ggml_repack_quantize_row<block_q1_0, 8, GGML_TYPE_Q8_0>(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t n) {
+    ggml_quantize_row_q8_0_g128(x, vy, n);
+}
+
+template <typename BLOC_TYPE, int64_t INTER_SIZE, ggml_type PARAM_TYPE>
+static inline void ggml_repack_quantize_mat(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t nrow, int64_t n_per_row) {
+    ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>(x, vy, nrow, n_per_row);
+}
+
+template <> inline void ggml_repack_quantize_mat<block_q1_0, 8, GGML_TYPE_Q8_0>(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t nrow, int64_t n_per_row) {
+    assert(nrow == 4);
+    UNUSED(nrow);
+    ggml_quantize_mat_q8_0_4x8_g128(x, vy, n_per_row);
+}
 
 template <int M, int N>
 static void ggml_gemv_q6_K_NxM_q8_K_generic_impl(int                        n,
@@ -4896,8 +4990,6 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         assert(params->wsize >= nbw2 * ne12);
 
-        const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
-
         // INFO: Quantization is done in planes to avoid extra complexity in chunking.
         // Flattening dimensions not multiple of INTER_SIZE would require extra handling depending on how
         // the planes are broadcast.
@@ -4906,13 +4998,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             char * wdata_ptr = wdata + i12 * nbw2;
 
             for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4) {
-                ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>((float *) (data_ptr + i11 * nb11),
-                                                            (void *) (wdata_ptr + i11 * nbw1), 4, ne10);
+                ggml_repack_quantize_mat<BLOC_TYPE, INTER_SIZE, PARAM_TYPE>((float *) (data_ptr + i11 * nb11),
+                                                                            (void *) (wdata_ptr + i11 * nbw1), 4, ne10);
             }
 
             const int64_t i11_processed = ne11 - ne11 % 4;
             for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
-                from_float((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
+                ggml_repack_quantize_row<BLOC_TYPE, INTER_SIZE, PARAM_TYPE>((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
             }
         }
 
@@ -5002,8 +5094,6 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int ith = params->ith;
         const int nth = params->nth;
 
-        const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
-
         // we don't support permuted src0 or src1
         GGML_ASSERT(nb00 == ggml_type_size(src0->type));
         GGML_ASSERT(nb10 == ggml_type_size(src1->type));
@@ -5048,9 +5138,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // src1: float32 => param type
         for (int64_t i12 = 0; i12 < ne12; ++i12) {
             for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
-                from_float((float *)((char *) src1->data + i12 * nb12 + i11 * nb11),
-                           (void *)               (wdata + i12 * nbw2 + i11 * nbw1),
-                           ne10);
+                ggml_repack_quantize_row<BLOC_TYPE, INTER_SIZE, PARAM_TYPE>((float *)((char *) src1->data + i12 * nb12 + i11 * nb11),
+                                                                            (void *)               (wdata + i12 * nbw2 + i11 * nbw1),
+                                                                            ne10);
             }
         }
 
@@ -5335,6 +5425,12 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
         }
     } else if (cur->type == GGML_TYPE_Q1_0) {
         if (ggml_cpu_has_avx512() && ggml_cpu_has_avx512_vnni()) {
+            if (cur->ne[1] % 4 == 0) {
+                return &q1_0_4x8_q8_0;
+            }
+        }
+        if (ggml_cpu_has_avx2()) {
+            // AVX2 (optionally AVX-VNNI) 4x8 kernels in arch/x86/repack.cpp
             if (cur->ne[1] % 4 == 0) {
                 return &q1_0_4x8_q8_0;
             }

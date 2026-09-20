@@ -6452,8 +6452,89 @@ static inline void __q2_0_expand_x4(const uint8_t * qs, __m512i * w01, __m512i *
 }
 #endif // AVX512 VNNI
 
+
+#if defined(__AVX2__)
+// ---------------------------------------------------------------------------
+// Q1_0 x Q8_0, AVX2 (+ AVX-VNNI / AVX512-VL VNNI when available)
+//
+// Weight layout (block_q1_0x4, 8-byte interleave): qs[4*b + j] is byte b of
+// column j, i.e. sign bits of weights 8b..8b+7 of that column (bit set = +1).
+//
+// Instead of expanding sign bits into byte masks (4 ops per 32 weights on
+// AVX2, which has no mask registers), each bit is kept in place as the factor
+// 2^q of a byte lane and multiplied directly with vpdpbusd / pmaddubsw. The
+// 32 lanes of a sub-block are arranged as L = 4*q + c (q = bit, c = byte), so
+// the four bytes summed by one dword all carry the same factor 2^q; the dword
+// then holds 2^q * (sum over the positive weights with bit index q). Dividing
+// by 2^q is a single variable shift, done once per 128-weight block instead of
+// once per 32. The activations are permuted once per call to match (lane L of
+// sub-block k holds y[32k + 8c + q]).
+//
+// With P = sum of y over positive weights and S = sum of all y:
+//     dot(w, y) = P - (S - P) = 2P - S
+//
+// The activations for this path are quantized by ggml_quantize_row_q8_0_g128 /
+// ggml_quantize_mat_q8_0_4x8_g128: one scale per 128 values, so a whole Q1_0
+// block is accumulated in int32 and converted to float exactly once.
+// ---------------------------------------------------------------------------
+
+// lane L -> byte (L & 3) of column j (bytes of column j sit at 4*c + j)
+#define GGML_Q1_SHUF_COL(j) _mm256_setr_epi8( \
+        4*0+(j), 4*1+(j), 4*2+(j), 4*3+(j), 4*0+(j), 4*1+(j), 4*2+(j), 4*3+(j), \
+        4*0+(j), 4*1+(j), 4*2+(j), 4*3+(j), 4*0+(j), 4*1+(j), 4*2+(j), 4*3+(j), \
+        4*0+(j), 4*1+(j), 4*2+(j), 4*3+(j), 4*0+(j), 4*1+(j), 4*2+(j), 4*3+(j), \
+        4*0+(j), 4*1+(j), 4*2+(j), 4*3+(j), 4*0+(j), 4*1+(j), 4*2+(j), 4*3+(j))
+
+// lane L -> 1 << (L >> 2)
+#define GGML_Q1_BITM() _mm256_setr_epi8( \
+        1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 8, 8, 8, 8, 16, 16, 16, 16, 32, 32, 32, 32, \
+        64, 64, 64, 64, (char) 128, (char) 128, (char) 128, (char) 128)
+
+// Permute 32 int8 activations of one sub-block: lane 4*q + c <- y[8*c + q].
+static inline __m256i __q1_0_permute_y_avx2(__m256i y) {
+    const __m256i idx  = _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7);
+    const __m256i shuf = _mm256_setr_epi8(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
+                                          0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+    return _mm256_shuffle_epi8(_mm256_permutevar8x32_epi32(y, idx), shuf);
+}
+
+static inline int32_t __q1_0_hsum_i8_avx2(__m256i y) {
+    const __m256i s16 = _mm256_maddubs_epi16(_mm256_set1_epi8(1), y);       // u8(1) * s8(y), pairs
+    const __m256i s32 = _mm256_madd_epi16(s16, _mm256_set1_epi16(1));
+    const __m128i s   = _mm_add_epi32(_mm256_castsi256_si128(s32), _mm256_extracti128_si256(s32, 1));
+    const __m128i t   = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4E));
+    const __m128i u   = _mm_add_epi32(t, _mm_shuffle_epi32(t, 0xB1));
+    return _mm_cvtsi128_si32(u);
+}
+
+static inline float __q1_0_hsum_ps_avx2(__m256 a) {
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(a), _mm256_extractf128_ps(a, 1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_movehdup_ps(s));
+    return _mm_cvtss_f32(s);
+}
+
+// Convert the 4 fp16 column scales of a block_q1_0x4 to fp32.
+static inline __m128 __q1_0_load_d4(const ggml_half * d) {
+#if defined(__F16C__)
+    return _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *) d));
+#else
+    return _mm_setr_ps(GGML_CPU_FP16_TO_FP32(d[0]), GGML_CPU_FP16_TO_FP32(d[1]),
+                       GGML_CPU_FP16_TO_FP32(d[2]), GGML_CPU_FP16_TO_FP32(d[3]));
+#endif
+}
+
+// acc += (d0 * d1) * (2 * (P_lanes >> q) - S / 8)   [lanes sum to d0*d1*(2P - S)]
+static inline __m256 __q1_0_fold_block_avx2(__m256 acc, __m256i iacc, __m256 scale, __m256 neg_s_over_8) {
+    const __m256i shifts = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    const __m256  p      = _mm256_cvtepi32_ps(_mm256_srav_epi32(iacc, shifts));
+    const __m256  v      = _mm256_fmadd_ps(p, _mm256_set1_ps(2.0f), neg_s_over_8);
+    return _mm256_fmadd_ps(v, scale, acc);
+}
+#endif // __AVX2__
+
 void ggml_gemv_q1_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VNNI__)
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VNNI__) && !defined(GGML_Q1_0_DISABLE_AVX512)
     {
         const int qk = QK1_0;
         const int nb = n / qk;
@@ -6504,13 +6585,103 @@ void ggml_gemv_q1_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
         }
         return;
     }
+#elif defined(__AVX2__)
+    {
+        const int qk = QK1_0;
+        const int nb = n / qk;
+
+        assert(nr == 1);
+        assert(n % qk == 0);
+        assert(nc % 4 == 0);
+        UNUSED(bs);
+        UNUSED(nr);
+
+        const block_q8_0 * GGML_RESTRICT a_ptr = (const block_q8_0 *) vy;
+
+        // scratch: permuted activations (n bytes) + per-block d1 and -S/8 (2*nb floats)
+        alignas(32) uint8_t stack_buf[16384 + 2 * 128 * sizeof(float)];
+        const size_t need = (size_t) n + 2 * (size_t) nb * sizeof(float);
+        uint8_t * scratch = need <= sizeof(stack_buf) ? stack_buf : (uint8_t *) malloc(need);
+        uint8_t * yperm = scratch;
+        float   * d1v   = (float *) (scratch + n);
+        float   * nsv   = d1v + nb;
+
+        for (int l = 0; l < nb; ++l) {
+            int32_t sum = 0;
+            for (int k = 0; k < 4; ++k) {
+                const __m256i y = _mm256_loadu_si256((const __m256i *) a_ptr[4 * l + k].qs);
+                sum += __q1_0_hsum_i8_avx2(y);
+                _mm256_storeu_si256((__m256i *) (yperm + (4 * l + k) * 32), __q1_0_permute_y_avx2(y));
+            }
+            d1v[l] = GGML_CPU_FP16_TO_FP32(a_ptr[4 * l].d); // shared by the 4 blocks (g128 quantizer)
+            nsv[l] = -(float) sum * 0.125f;
+        }
+
+        const __m256i shuf0 = GGML_Q1_SHUF_COL(0);
+        const __m256i shuf1 = GGML_Q1_SHUF_COL(1);
+        const __m256i shuf2 = GGML_Q1_SHUF_COL(2);
+        const __m256i shuf3 = GGML_Q1_SHUF_COL(3);
+        const __m256i bitm  = GGML_Q1_BITM();
+
+        for (int x = 0; x < nc / 4; x++) {
+            const block_q1_0x4 * GGML_RESTRICT b_ptr = (const block_q1_0x4 *) vx + (x * nb);
+
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps();
+            __m256 acc3 = _mm256_setzero_ps();
+
+            for (int l = 0; l < nb; l++) {
+                __m256i i0 = _mm256_setzero_si256();
+                __m256i i1 = _mm256_setzero_si256();
+                __m256i i2 = _mm256_setzero_si256();
+                __m256i i3 = _mm256_setzero_si256();
+
+                const uint8_t * GGML_RESTRICT yp = yperm + l * 128;
+
+                for (int k = 0; k < 4; ++k) {
+                    const __m256i wb = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) (b_ptr[l].qs + 16 * k)));
+                    const __m256i y  = _mm256_loadu_si256((const __m256i *) (yp + 32 * k));
+
+                    const __m256i t0 = _mm256_and_si256(_mm256_shuffle_epi8(wb, shuf0), bitm);
+                    const __m256i t1 = _mm256_and_si256(_mm256_shuffle_epi8(wb, shuf1), bitm);
+                    const __m256i t2 = _mm256_and_si256(_mm256_shuffle_epi8(wb, shuf2), bitm);
+                    const __m256i t3 = _mm256_and_si256(_mm256_shuffle_epi8(wb, shuf3), bitm);
+
+                    i0 = mul_sum_us8_pairs_acc_int32x8(i0, t0, y);
+                    i1 = mul_sum_us8_pairs_acc_int32x8(i1, t1, y);
+                    i2 = mul_sum_us8_pairs_acc_int32x8(i2, t2, y);
+                    i3 = mul_sum_us8_pairs_acc_int32x8(i3, t3, y);
+                }
+
+                const __m256 ns   = _mm256_set1_ps(nsv[l]);
+                const __m128 d01  = _mm_mul_ps(__q1_0_load_d4(b_ptr[l].d), _mm_set1_ps(d1v[l]));
+                const __m256 d01v = _mm256_castps128_ps256(d01);
+
+                acc0 = __q1_0_fold_block_avx2(acc0, i0, _mm256_permutevar8x32_ps(d01v, _mm256_setzero_si256()), ns);
+                acc1 = __q1_0_fold_block_avx2(acc1, i1, _mm256_permutevar8x32_ps(d01v, _mm256_set1_epi32(1)), ns);
+                acc2 = __q1_0_fold_block_avx2(acc2, i2, _mm256_permutevar8x32_ps(d01v, _mm256_set1_epi32(2)), ns);
+                acc3 = __q1_0_fold_block_avx2(acc3, i3, _mm256_permutevar8x32_ps(d01v, _mm256_set1_epi32(3)), ns);
+            }
+
+            s[x * 4 + 0] = __q1_0_hsum_ps_avx2(acc0);
+            s[x * 4 + 1] = __q1_0_hsum_ps_avx2(acc1);
+            s[x * 4 + 2] = __q1_0_hsum_ps_avx2(acc2);
+            s[x * 4 + 3] = __q1_0_hsum_ps_avx2(acc3);
+        }
+
+        if (scratch != stack_buf) {
+            free(scratch);
+        }
+        return;
+    }
 #endif // AVX512 VNNI
 
     ggml_gemv_q1_0_4x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
 void ggml_gemm_q1_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VNNI__)
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VNNI__) && !defined(GGML_Q1_0_DISABLE_AVX512)
     {
         const int qk = QK1_0;
         const int nb = n / qk;
@@ -6576,6 +6747,100 @@ void ggml_gemm_q1_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                 }
             }
         }
+        return;
+    }
+#elif defined(__AVX2__)
+    {
+        const int qk = QK1_0;
+        const int nb = n / qk;
+
+        assert(n % qk == 0);
+        assert(nr % 4 == 0);
+        assert(nc % 4 == 0);
+
+        // scratch for one group of 4 rows: permuted activations (4*n bytes) + d1[4][nb] + (-S/8)[4][nb]
+        const size_t need = 4 * (size_t) n + 8 * (size_t) nb * sizeof(float);
+        uint8_t * scratch = (uint8_t *) malloc(need);
+        uint8_t * yperm = scratch;                       // row m at yperm + m*n
+        float   * d1v   = (float *) (scratch + 4 * (size_t) n); // d1v[m*nb + l]
+        float   * nsv   = d1v + 4 * nb;                  // nsv[m*nb + l]
+
+        const __m256i shuf[4] = { GGML_Q1_SHUF_COL(0), GGML_Q1_SHUF_COL(1), GGML_Q1_SHUF_COL(2), GGML_Q1_SHUF_COL(3) };
+        const __m256i bitm    = GGML_Q1_BITM();
+
+        for (int y = 0; y < nr / 4; y++) {
+            const block_q8_0x4 * GGML_RESTRICT a_ptr = (const block_q8_0x4 *) vy + (4 * y * nb);
+
+            // prologue: de-interleave + permute the 4 activation rows, block sums, scales
+            for (int l = 0; l < nb; ++l) {
+                int32_t sum[4] = { 0, 0, 0, 0 };
+                for (int k = 0; k < 4; ++k) {
+                    const block_q8_0x4 * GGML_RESTRICT a_blk = a_ptr + 4 * l + k;
+                    for (int m = 0; m < 4; ++m) {
+                        // row m, 32 values = 4 chunks of 8 bytes at qs[c*32 + m*8]
+                        const __m128i c0 = _mm_loadl_epi64((const __m128i *) (a_blk->qs + 0 * 32 + m * 8));
+                        const __m128i c1 = _mm_loadl_epi64((const __m128i *) (a_blk->qs + 1 * 32 + m * 8));
+                        const __m128i c2 = _mm_loadl_epi64((const __m128i *) (a_blk->qs + 2 * 32 + m * 8));
+                        const __m128i c3 = _mm_loadl_epi64((const __m128i *) (a_blk->qs + 3 * 32 + m * 8));
+                        const __m256i ym = _mm256_set_m128i(_mm_unpacklo_epi64(c2, c3), _mm_unpacklo_epi64(c0, c1));
+                        sum[m] += __q1_0_hsum_i8_avx2(ym);
+                        _mm256_storeu_si256((__m256i *) (yperm + (size_t) m * n + (4 * l + k) * 32), __q1_0_permute_y_avx2(ym));
+                    }
+                }
+                for (int m = 0; m < 4; ++m) {
+                    d1v[m * nb + l] = GGML_CPU_FP16_TO_FP32(a_ptr[4 * l].d[m]); // shared by the 4 blocks (g128 quantizer)
+                    nsv[m * nb + l] = -(float) sum[m] * 0.125f;
+                }
+            }
+
+            for (int x = 0; x < nc / 4; x++) {
+                const block_q1_0x4 * GGML_RESTRICT b_ptr = (const block_q1_0x4 *) vx + (x * nb);
+
+                for (int j = 0; j < 4; ++j) {
+                    const __m256i shufj = shuf[j];
+                    const uint8_t * GGML_RESTRICT yp0 = yperm + 0 * (size_t) n;
+                    const uint8_t * GGML_RESTRICT yp1 = yperm + 1 * (size_t) n;
+                    const uint8_t * GGML_RESTRICT yp2 = yperm + 2 * (size_t) n;
+                    const uint8_t * GGML_RESTRICT yp3 = yperm + 3 * (size_t) n;
+
+                    __m256 acc0 = _mm256_setzero_ps();
+                    __m256 acc1 = _mm256_setzero_ps();
+                    __m256 acc2 = _mm256_setzero_ps();
+                    __m256 acc3 = _mm256_setzero_ps();
+
+                    for (int l = 0; l < nb; l++) {
+                        __m256i i0 = _mm256_setzero_si256();
+                        __m256i i1 = _mm256_setzero_si256();
+                        __m256i i2 = _mm256_setzero_si256();
+                        __m256i i3 = _mm256_setzero_si256();
+
+                        for (int k = 0; k < 4; ++k) {
+                            const __m256i wb = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) (b_ptr[l].qs + 16 * k)));
+                            const __m256i t  = _mm256_and_si256(_mm256_shuffle_epi8(wb, shufj), bitm);
+                            const size_t  o  = (size_t) (4 * l + k) * 32;
+
+                            i0 = mul_sum_us8_pairs_acc_int32x8(i0, t, _mm256_loadu_si256((const __m256i *) (yp0 + o)));
+                            i1 = mul_sum_us8_pairs_acc_int32x8(i1, t, _mm256_loadu_si256((const __m256i *) (yp1 + o)));
+                            i2 = mul_sum_us8_pairs_acc_int32x8(i2, t, _mm256_loadu_si256((const __m256i *) (yp2 + o)));
+                            i3 = mul_sum_us8_pairs_acc_int32x8(i3, t, _mm256_loadu_si256((const __m256i *) (yp3 + o)));
+                        }
+
+                        const float d0 = GGML_CPU_FP16_TO_FP32(b_ptr[l].d[j]);
+                        acc0 = __q1_0_fold_block_avx2(acc0, i0, _mm256_set1_ps(d0 * d1v[0 * nb + l]), _mm256_set1_ps(nsv[0 * nb + l]));
+                        acc1 = __q1_0_fold_block_avx2(acc1, i1, _mm256_set1_ps(d0 * d1v[1 * nb + l]), _mm256_set1_ps(nsv[1 * nb + l]));
+                        acc2 = __q1_0_fold_block_avx2(acc2, i2, _mm256_set1_ps(d0 * d1v[2 * nb + l]), _mm256_set1_ps(nsv[2 * nb + l]));
+                        acc3 = __q1_0_fold_block_avx2(acc3, i3, _mm256_set1_ps(d0 * d1v[3 * nb + l]), _mm256_set1_ps(nsv[3 * nb + l]));
+                    }
+
+                    s[(y * 4 + 0) * bs + x * 4 + j] = __q1_0_hsum_ps_avx2(acc0);
+                    s[(y * 4 + 1) * bs + x * 4 + j] = __q1_0_hsum_ps_avx2(acc1);
+                    s[(y * 4 + 2) * bs + x * 4 + j] = __q1_0_hsum_ps_avx2(acc2);
+                    s[(y * 4 + 3) * bs + x * 4 + j] = __q1_0_hsum_ps_avx2(acc3);
+                }
+            }
+        }
+
+        free(scratch);
         return;
     }
 #endif // AVX512 VNNI
