@@ -2222,7 +2222,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         auto * ctx_dft = this->params.ctx_dft;
         if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq && deferred[seq_id].pending) {
-            flush_deferred(seq_id);
+            // rows left over from the previous task on this slot. They are only worth decoding when they
+            // are the tail of a prefix the new prompt reuses: the same tokens at the same positions, and
+            // positions that directly continue what ctx_dft holds. Otherwise (client cancelled a task,
+            // a different conversation landed on the slot) the server has already trimmed ctx_dft past
+            // them, and decoding them would put stale positions into the recurrent draft state.
+            auto & d = deferred[seq_id];
+            const llama_pos pos_max_dft = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+            bool reuse = d.n_valid > 0 && d.pos[0] == pos_max_dft + 1;
+            for (int32_t k = 0; reuse && k < d.n_valid; ++k) {
+                reuse = d.pos[k] < N && prompt[d.pos[k]] == d.tokens[k];
+            }
+            if (reuse) {
+                flush_deferred(seq_id);
+            } else {
+                d.pending = false;
+                d.n_valid = 0;
+            }
         }
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
 
