@@ -749,6 +749,20 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 #endif // defined(GGML_USE_HIP)
 }
 
+// c += dot(a as 4 unsigned bytes, b as 4 signed bytes). Used by the ternary paths that keep the raw
+// digits {0,1,2} and subtract the exact integer activation sum once per block instead of biasing
+// every word (two SIMD ops per 4 weights). PTX dp4a takes mixed .u32.s32 operand types directly.
+static __device__ __forceinline__ int ggml_cuda_dp4a_us(const unsigned int a, const int b, int c) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A
+    asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(c) : "r"(a), "r"(b), "r"(c));
+    return c;
+#else
+    const uint8_t * a8 = (const uint8_t *) &a;
+    const int8_t  * b8 = (const int8_t *)  &b;
+    return c + (int) a8[0]*b8[0] + (int) a8[1]*b8[1] + (int) a8[2]*b8[2] + (int) a8[3]*b8[3];
+#endif
+}
+
 static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const float v, const float u) {
     acc += v*u;
 }

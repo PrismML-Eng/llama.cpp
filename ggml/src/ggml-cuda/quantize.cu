@@ -59,7 +59,8 @@ static __device__ __forceinline__ float nvfp4_native_scale_error(
 //            {0,1,2} -> {-1,0,+1} into one subtraction per 32-block instead of a SIMD byte
 //            subtract per 4 weights (bit-identical to the biased path)
 //   PT       planar-transposed layout consumed by the 2-8 column PTQ1_0 mat-vec path
-//            (see mmvq-ptq1_0.cuh); same quantization, same bytes per row as block_q8_1
+//            (see mmvq-ptq1_0.cuh); same quantization, same bytes per row as block_q8_1, and the
+//            same exact integer sum in ds.y as SOA_ISUM so that kernel can also use unbiased trits
 template <ggml_cuda_q8_1_layout layout>
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
@@ -110,12 +111,16 @@ static __global__ void quantize_q8_1(
         const int     e    = i0 % QK_PTQ1_0;
         ycol[((e / 16)*nblk + kb) * 16 + (e % 16)] = q;
 
+        int isum = q;
+        isum = warp_reduce_sum<QK8_1>(isum);
+
         if (iqs > 0) {
             return;
         }
 
+        // |isum| <= 32*127 fits int16; keep the raw bits in the half slot (read back with __half_as_short).
         half2 * ds = (half2 *) (ycol + 8*nblk*16) + kb*4 + e / QK8_1;
-        *ds = make_half2(d, sum);
+        *ds = make_half2(__float2half(d), __short_as_half((short) isum));
         return;
     }
     if constexpr (layout == GGML_CUDA_Q8_1_SOA_ISUM) {
