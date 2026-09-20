@@ -1,0 +1,115 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+#include "mul_mat_vec_base.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+
+// PTQ1_0 dedicated matvec with a shared-memory LUT decoder.
+// One 1280-float LUT in shared memory maps (multiplier-index m in 0..4, byte b)
+// straight to the decoded weight, built once per workgroup (5 rows x 256 bytes).
+// Every decode then costs one shared load + one subtract instead of
+// mul+and+mul+shift+sub. Thread assignment replaces the region branch:
+//   itid  0.. 9 : region 1, elements e0 = itid*8 (qs[e0&15 .. +7])
+//   itid 10..14 : region 2, elements 80 + (itid-10)*8 (qs[16..23])
+//   itid 15     : region 3, elements 120..127 (qh byte pairs)
+void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
+    uint e0;
+    uint mi;
+    if (itid < 10u) {
+        e0 = itid * 8u;
+        mi = e0 >> 4u;                     // exponent 0..4
+    } else if (itid < 15u) {
+        e0 = 80u + (itid - 10u) * 8u;
+        mi = itid - 10u;                   // exponent 0..4
+    } else {
+        e0 = 120u;
+        mi = 0u;                           // region 3 uses its own inline decode
+    }
+
+    const uint y_idx = i * QUANT_K + e0;
+
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint ib0 = a_offset + (first_row+n)*num_blocks_per_row;
+        if (i >= num_blocks_per_row) {
+            continue;
+        }
+
+        const FLOAT_TYPE d = FLOAT_TYPE(data_a[ib0 + i].d);
+
+        if (itid < 15u) {
+            // regions 1+2: base byte index inside qs
+            const uint qbase = (itid < 10u) ? (e0 & 15u) : (16u + ((e0 - 80u) & 7u));
+            const uint mm = (mi == 0u) ? 1u : (mi == 1u) ? 3u : (mi == 2u) ? 9u : (mi == 3u) ? 27u : 81u;
+            const uvec4 w0 = ((uvec4(uint(data_a[ib0 + i].qs[qbase    ]),
+                                     uint(data_a[ib0 + i].qs[qbase + 1u]),
+                                     uint(data_a[ib0 + i].qs[qbase + 2u]),
+                                     uint(data_a[ib0 + i].qs[qbase + 3u])) * mm) & 0xFFu) * 3u >> 8u;
+            const uvec4 w1 = ((uvec4(uint(data_a[ib0 + i].qs[qbase + 4u]),
+                                     uint(data_a[ib0 + i].qs[qbase + 5u]),
+                                     uint(data_a[ib0 + i].qs[qbase + 6u]),
+                                     uint(data_a[ib0 + i].qs[qbase + 7u])) * mm) & 0xFFu) * 3u >> 8u;
+            const vec4 wf0 = vec4(w0) - 1.0f;
+            const vec4 wf1 = vec4(w1) - 1.0f;
+
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                const vec4 b0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4]);
+                const vec4 b1 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 1]);
+                temp[j][n] += (dot(wf0, b0) + dot(wf1, b1)) * d;
+            }
+        } else {
+            // region 3: elements 120..127 alternate qh[0],qh[1] with SHARED exponent
+            // pairs: t=0..7 -> (qh[t&1], n=t>>1) => n = 0,0,1,1,2,2,3,3
+            const uint b0 = uint(data_a[ib0 + i].qh[0]);
+            const uint b1 = uint(data_a[ib0 + i].qh[1]);
+            const uvec4 e_r3_0 = ((uvec4(b0,      b1,      b0*3u,   b1*3u  )) & 0xFFu) * 3u >> 8u;
+            const uvec4 e_r3_1 = ((uvec4(b0*9u,   b1*9u,   b0*27u,  b1*27u )) & 0xFFu) * 3u >> 8u;
+            const vec4 wf0 = vec4(e_r3_0) - 1.0f;
+            const vec4 wf1 = vec4(e_r3_1) - 1.0f;
+
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                const vec4 b0v = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4]);
+                const vec4 b1v = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 1]);
+                temp[j][n] += (dot(wf0, b0v) + dot(wf1, b1v)) * d;
+            }
+        }
+    }
+}
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    uint a_offset, b_offset, d_offset;
+    get_offsets(a_offset, b_offset, d_offset);
+
+    const uint num_blocks_per_row = p.ncols / QUANT_K;
+
+    const uint it_size = gl_WorkGroupSize.x/16;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint itid = tid%16;  // 0...15
+    const uint ix = tid/16;
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
+            temp[j][i] = FLOAT_TYPE(0);
+        }
+    }
+
+    for (uint i0 = 0; i0 < num_blocks_per_row; i0 += it_size)
+        calc_superblock(a_offset, b_offset, itid, i0 + ix, num_blocks_per_row, first_row, num_rows);
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}

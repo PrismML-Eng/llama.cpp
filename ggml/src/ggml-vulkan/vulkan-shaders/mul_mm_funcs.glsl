@@ -161,11 +161,52 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const float d = float(data_a[ib].d);
 
+            // FADI-OPT: an 8-element group shares one exponent n and reads
+            // consecutive bytes, so one multiplier + vector decode replaces
+            // 16 ptq1_0_trit() calls. NOTE: convert to float BEFORE the -1
+            // (uint 0-1 wraps to 4.29e9, not -1).
+            uint base;
+            uint n;
+            if (grp < 10u) {
+                base = e0 & 15u;
+                n    = e0 >> 4u;
+            } else if (grp < 15u) {
+                base = 16u + ((e0 - 80u) & 7u);
+                n    = (e0 - 80u) >> 3u;
+            } else {
+                base = 0u;
+                n    = 0u;
+            }
+            const uint m = (n == 0u) ? 1u : (n == 1u) ? 3u : (n == 2u) ? 9u : (n == 3u) ? 27u : 81u;
+
             const uint k_pair = row * LOAD_VEC_A / 2;
-            [[unroll]] for (uint l = 0; l < 4; ++l) {
-                store_a(col, k_pair + l, FLOAT_TYPEV2(
-                    ptq1_0_trit(ib, 0u, e0 + 2u*l)      * d,
-                    ptq1_0_trit(ib, 0u, e0 + 2u*l + 1u) * d));
+            if (grp < 15u) {
+                const uvec4 i0 = (((uvec4(uint(data_a[ib].qs[base    ]),
+                                           uint(data_a[ib].qs[base + 1u]),
+                                           uint(data_a[ib].qs[base + 2u]),
+                                           uint(data_a[ib].qs[base + 3u])) * m) & 0xFFu) * 3u) >> 8u;
+                const uvec4 i1 = (((uvec4(uint(data_a[ib].qs[base + 4u]),
+                                           uint(data_a[ib].qs[base + 5u]),
+                                           uint(data_a[ib].qs[base + 6u]),
+                                           uint(data_a[ib].qs[base + 7u])) * m) & 0xFFu) * 3u) >> 8u;
+                const vec4 f0 = (vec4(i0) - 1.0f) * d;
+                const vec4 f1 = (vec4(i1) - 1.0f) * d;
+                store_a(col, k_pair,     FLOAT_TYPEV2(f0.x, f0.y));
+                store_a(col, k_pair + 1, FLOAT_TYPEV2(f0.z, f0.w));
+                store_a(col, k_pair + 2, FLOAT_TYPEV2(f1.x, f1.y));
+                store_a(col, k_pair + 3, FLOAT_TYPEV2(f1.z, f1.w));
+            } else {
+                // region 3: elements 120..127 alternate qh[0],qh[1] with paired exponents
+                const uint b0 = uint(data_a[ib].qh[0]);
+                const uint b1 = uint(data_a[ib].qh[1]);
+                const uvec4 j0 = (((uvec4(b0,     b1,     b0 * 3u, b1 * 3u )) & 0xFFu) * 3u) >> 8u;
+                const uvec4 j1 = (((uvec4(b0 * 9u, b1 * 9u, b0 * 27u, b1 * 27u)) & 0xFFu) * 3u) >> 8u;
+                const vec4 r0 = (vec4(j0) - 1.0f) * d;
+                const vec4 r1 = (vec4(j1) - 1.0f) * d;
+                store_a(col, k_pair,     FLOAT_TYPEV2(r0.x, r0.y));
+                store_a(col, k_pair + 1, FLOAT_TYPEV2(r0.z, r0.w));
+                store_a(col, k_pair + 2, FLOAT_TYPEV2(r1.x, r1.y));
+                store_a(col, k_pair + 3, FLOAT_TYPEV2(r1.z, r1.w));
             }
 #elif defined(DATA_A_Q1_0)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
