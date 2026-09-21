@@ -1053,6 +1053,8 @@ static int64_t get_row_rounding(ggml_type type, const std::array<float, GGML_SYC
 
     switch(type) {
         case GGML_TYPE_Q1_0:
+        case GGML_TYPE_PTQ1_0:
+        case GGML_TYPE_PQ2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
             return max_compute_capability >= VER_GEN9 ? 128 : 64;
@@ -4485,7 +4487,9 @@ static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_
 }
 
 static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    return ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+    return ggml_is_quantized(src0->type) &&
+           src0->type != GGML_TYPE_PQ2_0 &&
+           src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
            src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 }
 
@@ -6034,6 +6038,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_F32:
                     case GGML_TYPE_Q1_0:
+                    case GGML_TYPE_PTQ1_0:
+                    case GGML_TYPE_PQ2_0:
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_NVFP4:
                     case GGML_TYPE_IQ2_XXS:
@@ -6159,6 +6165,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
 
                 if (src1_type == GGML_TYPE_F32) {
                     if (src0_type == GGML_TYPE_Q1_0 ||
+                        src0_type == GGML_TYPE_PTQ1_0 ||
+                        src0_type == GGML_TYPE_PQ2_0 ||
                         src0_type == GGML_TYPE_NVFP4 ||
                         src0_type == GGML_TYPE_Q2_K ||
                         src0_type == GGML_TYPE_Q3_K ||

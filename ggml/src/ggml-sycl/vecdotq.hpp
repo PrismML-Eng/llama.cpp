@@ -344,6 +344,62 @@ vec_dot_q1_0_q8_1(const void *__restrict__ vbq,
     return d1 * bq8_1_chunk->ds[0] * sumi;
 }
 
+#define VDR_PTQ1_0_Q8_1_MMVQ 4
+
+static __dpct_inline__ float
+vec_dot_ptq1_0_q8_1(const void *__restrict__ vbq,
+                    const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+    GGML_UNUSED(iqs);
+    const block_ptq1_0 * bq      = (const block_ptq1_0 *) vbq;
+    int                  sumi[4] = { 0, 0, 0, 0 };
+
+#pragma unroll
+    for (int m = 0; m < 16; ++m) {
+        uint32_t v = bq->qs[m];
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w = v * 3;
+            const int      q = (int) (w >> 8) - 1;
+            v                = w & 0xFF;
+            const int e      = t * 16 + m;
+            sumi[e >> 5] += q * (int) bq8_1[e >> 5].qs[e & 31];
+        }
+    }
+
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        uint32_t v = bq->qs[16 + m];
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w = v * 3;
+            const int      q = (int) (w >> 8) - 1;
+            v                = w & 0xFF;
+            const int e      = 80 + t * 8 + m;
+            sumi[e >> 5] += q * (int) bq8_1[e >> 5].qs[e & 31];
+        }
+    }
+
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        uint32_t v = bq->qh[h];
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const uint32_t w = v * 3;
+            const int      q = (int) (w >> 8) - 1;
+            v                = w & 0xFF;
+            const int e      = 120 + t * 2 + h;
+            sumi[e >> 5] += q * (int) bq8_1[e >> 5].qs[e & 31];
+        }
+    }
+
+    float acc = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        acc += ((const float) bq8_1[k].ds[0]) * (float) sumi[k];
+    }
+    return (float) bq->d * acc;
+}
+
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
 // MMVQ = mul_mat_vec_q, MMQ = mul_mat_q
 
