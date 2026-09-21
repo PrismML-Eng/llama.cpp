@@ -2747,15 +2747,7 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
     return true;
 }
 
-// GET_ROWS(cache[D, n_rs], ids[n_seqs]) -> [RESHAPE] -> GATED_DELTA_NET src[5].
-// build_rs gathers each layer's live recurrent state into a temp (3 MB for the 27B) that only the
-// GDN kernel reads. In-graph the gather kernel is ~8 us/layer and its dirty output sits in L2 until
-// the FFN weight stream evicts it, which made the gate/up GEMVs in GDN layers ~15% slower than the
-// identical GEMVs in attention layers. When the gathered temp has no other consumer, skip the
-// GET_ROWS and let the kernel index the cache row directly. Single-sequence only: with several
-// sequences a gathered row may alias a row another sequence writes in the same op.
-// GGML_CUDA_GDN_GATHER_FUSION=0 disables it. The registration lives in the evaluating context
-// (ctx.gdn_gathers()), so concurrent contexts or threads never see each other's skips.
+// GET_ROWS -> [RESHAPE] -> GATED_DELTA_NET src[5]. Skip the GET_ROWS launch when that temp has one consumer and let the kernel index the cache row. The allocator still reserved the unused temp. Single-sequence only. GGML_CUDA_GDN_GATHER_FUSION=0 disables. Registry is per evaluating context.
 static bool ggml_cuda_try_gdn_gather_skip(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
     static const bool disabled = getenv("GGML_CUDA_GDN_GATHER_FUSION") != nullptr &&
                                  atoi(getenv("GGML_CUDA_GDN_GATHER_FUSION")) == 0;
@@ -4388,7 +4380,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                // recurrent-state gather folded into the GDN kernel (no temp, no kernel)
+                // skip GET_ROWS launch; GDN indexes the cache. The gather temp stays allocated.
                 if (node->op == GGML_OP_GET_ROWS && !is_concurrent_event_active &&
                         ggml_cuda_try_gdn_gather_skip(*cuda_ctx, cgraph, i)) {
                     continue;
