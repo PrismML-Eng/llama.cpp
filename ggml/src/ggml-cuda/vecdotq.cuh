@@ -984,8 +984,59 @@ static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(const void * __restr
         acc += __low2float(bq8_1[iqs + k].ds) * (float) (sumi[k] - sumu[k]);
     }
     return (float) bq->d * acc;
+#elif defined(GGML_USE_MUSA)
+    // MUSA cannot compile the HIP amdgcn path. Scalar decode, same as the pre-#211 generic entry.
+    const block_ptq1_0 * bq      = (const block_ptq1_0 *) vbq + kbx;
+    int                  sumi[4] = { 0, 0, 0, 0 };
+
+#    pragma unroll
+    for (int m = 0; m < 16; ++m) {
+        uint32_t v = bq->qs[m];
+#    pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w = v * 3;
+            const int      q = (int) (w >> 8) - 1;
+            v                = w & 0xFF;
+            const int e      = t * 16 + m;
+            sumi[e >> 5] += q * (int) bq8_1[iqs + (e >> 5)].qs[e & 31];
+        }
+    }
+
+#    pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        uint32_t v = bq->qs[16 + m];
+#    pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w = v * 3;
+            const int      q = (int) (w >> 8) - 1;
+            v                = w & 0xFF;
+            const int e      = 80 + t * 8 + m;
+            sumi[e >> 5] += q * (int) bq8_1[iqs + (e >> 5)].qs[e & 31];
+        }
+    }
+
+#    pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        uint32_t v = bq->qh[h];
+#    pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const uint32_t w = v * 3;
+            const int      q = (int) (w >> 8) - 1;
+            v                = w & 0xFF;
+            const int e      = 120 + t * 2 + h;
+            sumi[e >> 5] += q * (int) bq8_1[iqs + (e >> 5)].qs[e & 31];
+        }
+    }
+
+    float acc = 0.0f;
+#    pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        acc += __low2float(bq8_1[iqs + k].ds) * (float) sumi[k];
+    }
+    return (float) bq->d * acc;
 #else
-    // HIP/MUSA stub: NVIDIA PTQ1_0 uses vec_dot_ptq1_0_q8_1_multi.
+    // NVIDIA PTQ1_0 goes through vec_dot_ptq1_0_q8_1_multi; this generic entry is unused there.
+    // The SoA _multi signature does not match a plain AoS call, so do not forward.
     GGML_UNUSED(vbq);
     GGML_UNUSED(bq8_1);
     GGML_UNUSED(kbx);
