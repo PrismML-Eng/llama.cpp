@@ -2459,6 +2459,38 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // Catch-up that leads into this draft rides in the same decode as the anchors. The stash
+        // can already be llama_n_batch(ctx_dft) rows (n_tokens == n_max+1 == n_batch); the extra
+        // anchor then overflows both the host batch and llama_decode. Flush first when the
+        // combined count would not fit; llama_decode enforces the same limit, so growing the
+        // host allocation alone is not enough.
+        {
+            const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
+            int32_t catchup_rows = 0;
+            int32_t n_anchors = 0;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                auto & dp = dparams[seq_id];
+                auto & d = deferred[seq_id];
+                if (d.catchup_failed || !dp.drafting) {
+                    continue;
+                }
+                if (d.pending) {
+                    catchup_rows += d.n_valid;
+                }
+                n_anchors++;
+            }
+            if (!common_speculative_mtp_first_decode_fits(n_b, catchup_rows, n_anchors)) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (!dparams[seq_id].drafting || !deferred[seq_id].pending) {
+                        continue;
+                    }
+                    if (!flush_deferred(seq_id)) {
+                        dparams[seq_id].drafting = false;
+                    }
+                }
+            }
+        }
+
         common_batch_clear(batch);
 
         // keep track of which sequences are still drafting
@@ -3389,6 +3421,13 @@ llama_context * common_speculative_init_result::context() {
 
 common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt) {
     return std::make_unique<common_speculative_init_result>(params, model_tgt, ctx_tgt);
+}
+
+bool common_speculative_mtp_first_decode_fits(int32_t n_batch, int32_t catchup_rows, int32_t n_anchors) {
+    if (n_batch <= 0 || catchup_rows < 0 || n_anchors < 0) {
+        return false;
+    }
+    return (int64_t) catchup_rows + (int64_t) n_anchors <= (int64_t) n_batch;
 }
 
 common_speculative_output_limits common_speculative_get_output_limits(
