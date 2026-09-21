@@ -281,10 +281,16 @@ static __host__ int ptq1_0_pt_rows_per_cta(const int blocks_per_row, const int n
 template <int ncols, int ROWS, bool has_fusion, bool has_gate>
 __launch_bounds__(PTQ1_0_PT_THREADS, (ncols <= 2 ? 4 : (ncols <= 4 ? PTQ1_0_PT_MINB_34 : 2)))
 static __global__ void mul_mat_vec_ptq1_0_pt(
-        const void * GGML_CUDA_RESTRICT vx, const void * GGML_CUDA_RESTRICT vy, const ggml_cuda_mm_fusion_args_device fusion,
-        float * GGML_CUDA_RESTRICT dst,
+        const void * vx_, const void * vy_, const ggml_cuda_mm_fusion_args_device fusion,
+        float * dst_,
         const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
         const int rows_per_cta, const uint3 bpr_fd, const uint3 rpc_fd) {
+    // GGML_CUDA_RESTRICT stays off the formal parameters: cudafe's host stub drops __restrict
+    // from the explicit specialization and MSVC/GCC then reject it (C2912 / "does not match
+    // any template declaration") when compiling sm_90/sm_120. Same pattern as mul_mat_vec_q.
+    const void * GGML_CUDA_RESTRICT vx = vx_;
+    const void * GGML_CUDA_RESTRICT vy = vy_;
+    float      * GGML_CUDA_RESTRICT dst = dst_;
     extern __shared__ float partials[];        // [ncols][rows_per_cta][bprp], then partials_gate
     const int bpr  = ncols_x / QK_PTQ1_0;      // K blocks per row
     const int bprp = bpr + 1;                  // partials row stride: odd, so the per-pair epilogue reads are bank-conflict-free

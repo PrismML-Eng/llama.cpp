@@ -1057,11 +1057,10 @@ enum ggml_cuda_q8_1_layout : int {
     GGML_CUDA_Q8_1_PT       = 2, // PTQ1_0, 2-8 columns or MoE ids: planar-transposed (mmvq-ptq1_0.cuh)
 };
 
-// The single decision both sides (quantizer, kernel) must agree on. The one-column plain mat-vec is
-// the decode hot path: SOA_ISUM's exact int16 sums remove a SIMD byte subtract per 4 weights and its
-// 32-block grouping makes the small-K warp-per-row geometry read activations in 1 L1 wavefront.
-// With 2-8 columns the shared weight decode dominates and the PT layout's dedicated kernel wins;
-// MoE (ids) also takes PT so mul_mat_vec_q_moe has one layout to read.
+// The single decision both sides (quantizer, kernel) must agree on. Column count is the first
+// cut: 2-8 columns and MoE (ids) always take the planar-transposed kernel. One-column decode
+// is architecture-specific and is resolved on the host (ggml_cuda_q8_1_layout_host): this
+// constexpr helper only knows column count, so it reports the Ada default (SOA_ISUM at 1-col).
 static constexpr __host__ __device__ ggml_cuda_q8_1_layout ggml_cuda_q8_1_layout_for(ggml_type type_src0, int ncols_dst, bool has_ids) {
 #if defined(GGML_USE_HIP)
     GGML_UNUSED(type_src0); GGML_UNUSED(ncols_dst); GGML_UNUSED(has_ids);
@@ -1074,13 +1073,21 @@ static constexpr __host__ __device__ ggml_cuda_q8_1_layout ggml_cuda_q8_1_layout
 #endif
 }
 
-// Host-side wrapper used by both the quantizer call and the kernel switch. Under
-// GGML_CUDA_BATCH_INVARIANT the one-column case must run the same arithmetic as 2-8 columns, so it
-// takes the planar layout too (the SoA vec-dot sums in a different order).
+// Host-side wrapper used by both the quantizer call and the kernel switch.
+// Under GGML_CUDA_BATCH_INVARIANT the one-column case must run the same arithmetic as 2-8
+// columns, so it takes the planar layout (the SoA vec-dot sums in a different order).
+// Ampere (sm_80/86, including the 3060/3090/170HX): the #218 PT kernel wins at one column
+// too (+5.9% tg128 vs SoA on a 3060). Ada and newer keep SOA_ISUM at one column (4070 win).
 static inline ggml_cuda_q8_1_layout ggml_cuda_q8_1_layout_host(ggml_type type_src0, int ncols_dst, bool has_ids) {
     const ggml_cuda_q8_1_layout l = ggml_cuda_q8_1_layout_for(type_src0, ncols_dst, has_ids);
     if (l == GGML_CUDA_Q8_1_SOA_ISUM && ggml_cuda_batch_invariant()) {
         return GGML_CUDA_Q8_1_PT;
+    }
+    if (l == GGML_CUDA_Q8_1_SOA_ISUM) {
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_ADA_LOVELACE) {
+            return GGML_CUDA_Q8_1_PT;
+        }
     }
     return l;
 }

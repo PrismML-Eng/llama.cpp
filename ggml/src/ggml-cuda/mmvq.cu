@@ -836,8 +836,9 @@ static __global__ void mul_mat_vec_q(
         if constexpr (type == GGML_TYPE_PTQ1_0) {
             GGML_UNUSED(kqs);
             GGML_UNUSED(kby);
-            // Two activation layouts, one decision (ggml_cuda_q8_1_layout_for): a one-column plain
-            // mat-vec reads the warp-transposed exact-isum layout through vec_dot_ptq1_0_q8_1_multi,
+            // Two activation layouts, one decision (ggml_cuda_q8_1_layout_host): Ada one-column
+            // reads the warp-transposed exact-isum layout through vec_dot_ptq1_0_q8_1_multi;
+            // Ampere one-column and every 2-8 column / MoE path take the planar kernel.
             // everything else (2-8 columns, MoE ids) reads the planar layout of mmvq-ptq1_0.cuh.
             // y_soa is the host's copy of that decision, baked in as a template parameter.
             if constexpr (ncols_dst == 1 && y_soa) {
