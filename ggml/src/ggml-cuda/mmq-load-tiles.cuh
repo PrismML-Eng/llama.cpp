@@ -300,12 +300,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const cha
         int * row = x_qs + i * (2 * MMQ_TILE_NE_K + 1) + kbx * (QK_PTQ1_0 / 4);
 #    endif
 
-        // Branch-free unpack. All 8 lanes of a block run the same 5-iteration trit-extraction loop
-        // on their own 32-bit word: lanes 0-5 take qs words 0-5, lane 6 takes word 6
-        // (qh[0] | qh[1] << 8 | d << 16) with both 16-bit halves walking the two qh bytes, lane 7
-        // computes and discards. Only the shared-memory store offsets differ per lane, so the warp
-        // never diverges. The previous lane<4 / lane<6 / lane==6 branch chain serialized 5+5+2
-        // iterations per warp and made this loader ~2.7x slower than the PQ2_0 one for the same tile.
+        // Branch-free unpack: all 8 lanes run the same 5-iteration trit loop on their own 32-bit word. Only smem store offsets differ, so the warp does not diverge.
         const uint32_t packed = get_int_b4(bxi->qs, lane < 7 ? lane : 6);
         uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);   // bytes 0,1 as 16-bit lanes
         uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342);   // bytes 2,3
