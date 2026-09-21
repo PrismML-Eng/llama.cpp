@@ -1242,9 +1242,23 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
 
         // Tool call parser
         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
-            auto arg_close  = p.tool_arg_close(p.literal("\n</parameter>\n"));
+            // The newlines framing </parameter> are what the template asks for, but the
+            // model drops one often enough to matter: a value written as `Note</parameter>`
+            // never matches the fully-framed literal, so the scan runs on to the NEXT
+            // closing tag and swallows the intervening `<parameter=...>` blocks into the
+            // first argument, leaving the rest null. Accept the looser spellings too,
+            // longest first so the framed form still wins where it is present.
+            const std::vector<std::string> arg_close_delims = {
+                "\n</parameter>\n", "\n</parameter>", "</parameter>\n", "</parameter>",
+            };
+            auto arg_close  = p.tool_arg_close(p.choice({
+                p.literal("\n</parameter>\n"),
+                p.literal("\n</parameter>"),
+                p.literal("</parameter>\n"),
+                p.literal("</parameter>"),
+            }));
             auto arg_string = p.rule("xml-arg-string",
-                p.ac(p.tool_arg_string_value(p.until("\n</parameter>\n")) + arg_close, "\n</parameter>\n"));
+                p.ac(p.tool_arg_string_value(p.until_one_of(arg_close_delims)) + arg_close, arg_close_delims));
 
             auto tool_choice = p.choice();
             foreach_function(inputs.tools, [&](const json & tool) {
