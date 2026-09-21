@@ -3397,8 +3397,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * weight = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
             if (weight && weight->type == GGML_TYPE_F32 && ggml_is_contiguous(weight) &&
                     weight->ne[0] == node->ne[0] && ggml_nrows(weight) == 1 &&
-                    // the norm weight is broadcast over rows, so it must not be written to
-                    weight->data != node->data && weight->data != mul->data) {
+                    weight->data != node->data && weight->data != rms_norm->data &&
+                    weight->data != mul->data) {
                 ggml_cuda_op_add_rms_norm_fused(*cuda_ctx, node, rms_norm, mul);
                 return 2;
             }
