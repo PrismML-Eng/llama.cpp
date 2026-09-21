@@ -1068,7 +1068,12 @@ public:
             out << ")";
             return _add_rule(rule_name, out.str());
         }
-        if (schema.empty() || schema_type == "object") {
+        // An empty schema is NOT "an object": it constrains nothing, so it falls through to
+        // the any-value case below, which already documents exactly this reading. Catching it
+        // here forced `{"items": {}}` to accept only objects, so a model asked for a tuple
+        // like ["field", "op", value] could not emit the strings at all — the grammar left it
+        // `[{...}]` or `[]` as the only reachable shapes.
+        if (schema_type == "object") {
             return _add_rule(rule_name, _add_primitive("object", PRIMITIVE_RULES.at("object")));
         }
         if (schema_type.is_null() && schema.is_object()) {
