@@ -353,43 +353,70 @@ vec_dot_ptq1_0_q8_1(const void *__restrict__ vbq,
     const block_ptq1_0 * bq      = (const block_ptq1_0 *) vbq;
     int                  sumi[4] = { 0, 0, 0, 0 };
 
+    // Widen four bytes to 16-bit lanes so multiply-by-three cannot carry between bytes
 #pragma unroll
-    for (int m = 0; m < 16; ++m) {
-        uint32_t v = bq->qs[m];
+    for (int g = 0; g < 4; ++g) {
+        const uint32_t packed = get_int_from_uint8_aligned(bq->qs, g);
+        uint32_t v_lo = (packed & 0x000000FF) | ((packed & 0x0000FF00) << 8);
+        uint32_t v_hi = ((packed >> 16) & 0x000000FF) | ((packed & 0xFF000000) >> 8);
+
 #pragma unroll
         for (int t = 0; t < 5; ++t) {
-            const uint32_t w = v * 3;
-            const int      q = (int) (w >> 8) - 1;
-            v                = w & 0xFF;
-            const int e      = t * 16 + m;
-            sumi[e >> 5] += q * (int) bq8_1[e >> 5].qs[e & 31];
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo = w_lo & 0x00FF00FF;
+            v_hi = w_hi & 0x00FF00FF;
+
+            const uint32_t perm = ((w_lo >> 8) & 0x000000FF) |
+                                  ((w_lo >> 16) & 0x0000FF00) |
+                                  ((w_hi << 8)  & 0x00FF0000) |
+                                  (w_hi         & 0xFF000000);
+            const int q = byte_sub_4(perm, 0x01010101);
+            const int e = t * 16 + 4 * g;
+            const int u = get_int_from_int8_aligned(bq8_1[e >> 5].qs, (e & 31) >> 2);
+            sumi[e >> 5] = dpct::dp4a(q, u, sumi[e >> 5]);
         }
     }
 
 #pragma unroll
-    for (int m = 0; m < 8; ++m) {
-        uint32_t v = bq->qs[16 + m];
+    for (int g = 0; g < 2; ++g) {
+        const uint32_t packed = get_int_from_uint8_aligned(bq->qs + 16, g);
+        uint32_t v_lo = (packed & 0x000000FF) | ((packed & 0x0000FF00) << 8);
+        uint32_t v_hi = ((packed >> 16) & 0x000000FF) | ((packed & 0xFF000000) >> 8);
+
 #pragma unroll
         for (int t = 0; t < 5; ++t) {
-            const uint32_t w = v * 3;
-            const int      q = (int) (w >> 8) - 1;
-            v                = w & 0xFF;
-            const int e      = 80 + t * 8 + m;
-            sumi[e >> 5] += q * (int) bq8_1[e >> 5].qs[e & 31];
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo = w_lo & 0x00FF00FF;
+            v_hi = w_hi & 0x00FF00FF;
+
+            const uint32_t perm = ((w_lo >> 8) & 0x000000FF) |
+                                  ((w_lo >> 16) & 0x0000FF00) |
+                                  ((w_hi << 8)  & 0x00FF0000) |
+                                  (w_hi         & 0xFF000000);
+            const int q = byte_sub_4(perm, 0x01010101);
+            const int e = 80 + t * 8 + 4 * g;
+            const int u = get_int_from_int8_aligned(bq8_1[e >> 5].qs, (e & 31) >> 2);
+            sumi[e >> 5] = dpct::dp4a(q, u, sumi[e >> 5]);
         }
     }
 
+    uint32_t v = (uint32_t) bq->qh[0] | ((uint32_t) bq->qh[1] << 16);
 #pragma unroll
-    for (int h = 0; h < 2; ++h) {
-        uint32_t v = bq->qh[h];
-#pragma unroll
-        for (int t = 0; t < 4; ++t) {
-            const uint32_t w = v * 3;
-            const int      q = (int) (w >> 8) - 1;
-            v                = w & 0xFF;
-            const int e      = 120 + t * 2 + h;
-            sumi[e >> 5] += q * (int) bq8_1[e >> 5].qs[e & 31];
-        }
+    for (int t = 0; t < 4; t += 2) {
+        const uint32_t w0 = v * 3;
+        v = w0 & 0x00FF00FF;
+        const uint32_t w1 = v * 3;
+        v = w1 & 0x00FF00FF;
+
+        const uint32_t perm = ((w0 >> 8) & 0x000000FF) |
+                              ((w0 >> 16) & 0x0000FF00) |
+                              ((w1 << 8)  & 0x00FF0000) |
+                              (w1         & 0xFF000000);
+        const int q = byte_sub_4(perm, 0x01010101);
+        const int u = get_int_from_int8_aligned(bq8_1[3].qs, 6 + t / 2);
+        sumi[3] = dpct::dp4a(q, u, sumi[3]);
     }
 
     float acc = 0.0f;
