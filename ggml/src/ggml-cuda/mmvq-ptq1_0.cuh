@@ -1,4 +1,4 @@
-﻿// PTQ1_0 mat-vec inner loop on a planar-transposed Q8_1 activation layout.
+// PTQ1_0 mat-vec inner loop on a planar-transposed Q8_1 activation layout.
 //
 // Why: the stock mmvq path hands each thread one 128-weight PTQ1_0 block and
 // walks the activations as 32 scattered 4-byte loads per column out of

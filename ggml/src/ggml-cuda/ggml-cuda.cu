@@ -1,4 +1,4 @@
-﻿#include "ggml-cuda.h"
+#include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
@@ -2750,11 +2750,6 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
     return true;
 }
 
-// GET_ROWS(cache[D, n_rs], ids[n_seqs]) -> [RESHAPE] -> GATED_DELTA_NET src[5].
-// build_rs gathers each layer's live recurrent state into a temp (3 MB for the 27B) that only the
-// GDN kernel reads. In-graph the gather kernel is ~8 us/layer and its dirty output sits in L2 until
-// the FFN weight stream evicts it, which made the gate/up GEMVs in GDN layers ~15% slower than the
-// identical GEMVs in attention layers. When the gathered temp has no other consumer, skip the
 // A Hadamard rotation of an activation ([MUL signs, RESHAPE,] MUL_MAT with GGML_HINT_SRC0_IS_HADAMARD)
 // whose every use is a PTQ1_0 mat-vec on the mmvq path does not need to exist in F32: each of those
 // mat-vecs quantizes it to q8_1 straight away, so the transform kernel quantizes as it goes and writes

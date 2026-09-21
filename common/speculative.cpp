@@ -2081,6 +2081,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         std::vector<float>       h;          // n_rows * n_embd, shifted target rows as process() builds them
         int32_t n_valid = 0;
         bool    pending = false;
+        bool    catchup_failed = false;      // flush_deferred decode failed; do not draft this seq
     };
     std::vector<deferred_rows> deferred;
 
@@ -2108,6 +2109,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t rc = llama_decode(params.ctx_dft, batch);
         if (rc != 0) {
             SPC_ERR("llama_decode(ctx_dft) deferred catch-up failed rc=%d (pos=%d)\n", (int) rc, (int) d.pos[0]);
+            d.catchup_failed = true;
             return false;
         }
         return true;
@@ -2234,7 +2236,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 reuse = d.pos[k] < N && prompt[d.pos[k]] == d.tokens[k];
             }
             if (reuse) {
-                flush_deferred(seq_id);
+                if (!flush_deferred(seq_id)) {
+                    // ctx_dft is not caught up; begin() cannot draft this prompt
+                    return;
+                }
             } else {
                 d.pending = false;
                 d.n_valid = 0;
@@ -2438,13 +2443,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // on their own first (uses `batch`, so before it is built)
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & d = deferred[seq_id];
+            auto & dp = dparams[seq_id];
+            if (d.catchup_failed) {
+                dp.drafting = false;
+                continue;
+            }
             if (!d.pending) {
                 continue;
             }
-            const auto & dp = dparams[seq_id];
             const bool leads_in = dp.drafting && d.n_valid > 0 && d.pos[d.n_valid - 1] + 1 == dp.n_past;
             if (!leads_in) {
-                flush_deferred(seq_id);
+                if (!flush_deferred(seq_id)) {
+                    dp.drafting = false;
+                }
             }
         }
 

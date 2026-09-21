@@ -2131,6 +2131,14 @@ DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(256, 256, 64, GGML_TYPE_Q8_0)
 
 // Head sizes with in-place quantized K/V kernels (matches the instantiations above).
 static inline bool ggml_cuda_fattn_mma_kv_native_supported(const ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(dst);
+    return false;
+#else
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc)) {
+        return false;
+    }
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -2140,13 +2148,8 @@ static inline bool ggml_cuda_fattn_mma_kv_native_supported(const ggml_tensor * d
     if (!(Q->ne[0] == 128 || Q->ne[0] == 256) || V->ne[0] != Q->ne[0]) {
         return false;
     }
-    // Rows must be 32-bit addressable for the block-pair loads.
-    for (const ggml_tensor * t : {K, V}) {
-        if (t->nb[1] % 4 != 0 || t->nb[2] % 4 != 0 || t->nb[3] % 4 != 0) {
-            return false;
-        }
-    }
-    return true;
+    return ggml_cuda_is_aligned(K, 4) && ggml_cuda_is_aligned(V, 4);
+#endif
 }
 
 #define DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(DKQ, DV, ncols)   \
