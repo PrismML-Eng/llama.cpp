@@ -1,12 +1,7 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 
-// Columns per warp for the S_v == 128, non-KDA kernel. The host launch geometry and the compiled
-// kernel must agree, so both derive it from this one predicate: the kernel passes __CUDA_ARCH__,
-// the host passes the highest compiled arch the device will actually run
-// (ggml_cuda_highest_compiled_arch(cc)), not the raw runtime capability. NVIDIA Ampere and newer
-// take 4 columns (tuned on GB10, a straight win on consumer Ampere/Ada too); HIP and MUSA keep 1,
-// whatever their capability values (which carry vendor offsets above GGML_CUDA_CC_AMPERE) say.
+// Host and device must agree on columns/warp. Kernel uses __CUDA_ARCH__; host uses ggml_cuda_highest_compiled_arch(cc). NVIDIA Ampere+ and S_v==128 and !KDA -> 4; HIP/MUSA stay 1.
 static constexpr __host__ __device__ int gdn_cols_per_warp(int arch, int S_v, bool KDA) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     (void) arch; (void) S_v; (void) KDA;
@@ -232,9 +227,7 @@ static void launch_gated_delta_net(
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int num_warps = 4;
-    // The recurrence is serial over tokens, so prefill lives or dies on this kernel's per-step
-    // efficiency (RTX 4070, Bonsai 2 27B: pp2048 1220 -> 1297 t/s, decode unchanged). Must match
-    // the kernel's compile-time choice: same predicate, fed the arch that was compiled for this cc.
+    // Same predicate as the kernel, fed the arch compiled for this cc.
     const int cols_per_warp = GGML_CUDA_CC_IS_NVIDIA(cc) ? gdn_cols_per_warp(ggml_cuda_highest_compiled_arch(cc), S_v, KDA) : 1;
     dim3      grid_dims(H, n_seqs, (S_v + num_warps * cols_per_warp - 1) / (num_warps * cols_per_warp));
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
