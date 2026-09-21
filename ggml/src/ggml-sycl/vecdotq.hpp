@@ -427,6 +427,32 @@ vec_dot_ptq1_0_q8_1(const void *__restrict__ vbq,
     return (float) bq->d * acc;
 }
 
+#define VDR_PQ2_0_Q8_1_MMVQ 1
+
+static __dpct_inline__ float
+vec_dot_pq2_0_q8_1(const void *__restrict__ vbq,
+                   const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+    const block_pq2_0 * bq2_0       = (const block_pq2_0 *) vbq;
+    const block_q8_1  * bq8_1_chunk = bq8_1 + iqs;
+    const float         d2          = bq2_0->d;
+    const uint8_t     * qs_chunk    = bq2_0->qs + iqs * 8;
+
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const uint8_t  q  = qs_chunk[j];
+        const uint32_t vi = ((q >> 0) & 0x3) |
+                            (((q >> 2) & 0x3) << 8) |
+                            (((q >> 4) & 0x3) << 16) |
+                            (((q >> 6) & 0x3) << 24);
+        const int w = byte_sub_4(vi, 0x01010101);
+        const int u = get_int_from_int8_aligned(bq8_1_chunk->qs, j);
+        sumi = dpct::dp4a(w, u, sumi);
+    }
+
+    return d2 * ((const float) bq8_1_chunk->ds[0]) * (float) sumi;
+}
+
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
 // MMVQ = mul_mat_vec_q, MMQ = mul_mat_q
 

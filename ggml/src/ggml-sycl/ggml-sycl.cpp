@@ -4488,7 +4488,6 @@ static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_
 
 static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     return ggml_is_quantized(src0->type) &&
-           src0->type != GGML_TYPE_PQ2_0 &&
            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
            src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 }
