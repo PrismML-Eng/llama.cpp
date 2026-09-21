@@ -804,7 +804,7 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     return d2 * d8 * sumi;
 }
 
-#if !defined(GGML_USE_HIP)
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // y_col0: activation column 0 base (warp-transposed layout, see ggml_cuda_ptq1_q8_word);
 // kbx_x: absolute PTQ1 block index into vbq; kb: K-block index within the row;
 // stride_col_y: column stride in block_q8_1 units.
@@ -818,8 +818,7 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __
     const block_ptq1_0 * bq                 = (const block_ptq1_0 *) vbq + kbx_x;
     int                  sumi[ncols_dst][4] = {};
 
-    // Lane-coalesced activation words: word ww of this K-block is at yw[ww*32]; 32 lanes of a
-    // warp own 32 consecutive K-blocks, so every load below is 32 consecutive words.
+    // SoA q8: word ww of this K-block is at yw[ww*32], so a warp load is 32 consecutive words.
     const int * __restrict__ yw = (const int *) y_col0 + (kb >> 5) * GGML_CUDA_PTQ1_Q8_GROUP_WORDS + (kb & 31);
     const uint32_t           sy = stride_col_y * (sizeof(block_q8_1) / 4);
 #    define PTQ1_U(j, sub, m) yw[(j) * sy + ((sub) * 8 + (m)) * GGML_CUDA_PTQ1_Q8_GROUP_KB]
@@ -986,8 +985,7 @@ static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(const void * __restr
     }
     return (float) bq->d * acc;
 #else
-    // Unreachable on CUDA: mul_mat_vec_q routes every PTQ1_0 ncols_dst through
-    // vec_dot_ptq1_0_q8_1_multi, which needs the column base for the warp-transposed q8 layout.
+    // HIP/MUSA stub: NVIDIA PTQ1_0 uses vec_dot_ptq1_0_q8_1_multi.
     GGML_UNUSED(vbq);
     GGML_UNUSED(bq8_1);
     GGML_UNUSED(kbx);

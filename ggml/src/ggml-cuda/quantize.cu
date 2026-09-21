@@ -51,10 +51,7 @@ static __device__ __forceinline__ float nvfp4_native_scale_error(
 #endif // CUDART_VERSION >= 12080
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
-// exact_isum: store the integer sum of the quantized values (bit-cast into the ds.y half slot)
-// instead of the float sum of the inputs. Ternary vec-dots (PTQ1_0) use it to fold the
-// digit bias {0,1,2} -> {-1,0,+1} into one subtraction per 32-block instead of a SIMD byte
-// subtract per 4 weights, with results bit-identical to the biased path.
+// exact_isum: store the integer q8 sum in ds.y so PTQ1_0 can fold digit bias once per 32-block. Bit-identical to the per-nibble subtract.
 template <bool exact_isum>
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(

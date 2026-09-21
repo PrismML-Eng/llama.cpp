@@ -669,15 +669,7 @@ static __global__ void mul_mat_vec_q(
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if constexpr (small_k && type == GGML_TYPE_PTQ1_0 && nwarps > 1 && rows_per_cuda_block == nwarps) {
-        // Warp-per-row geometry for small K.
-        // The generic small_k loop strides K-blocks across the whole block (kbx = tid; kbx += 128), so
-        // for K=5120 (40 blocks) only threads 0..39 ever load anything: warp 0 is full, warp 1 has
-        // 8 lanes, warps 2..3 only wait at __syncthreads while holding SM warp slots. Measured
-        // in-graph with CUPTI on an RTX 4070: 350-390 GB/s for every K=5120 GEMV vs 460 GB/s for the
-        // K=17408 geometry where all four warps stream. Here warp w owns row row0+w and its 32 lanes
-        // stride that row's K-blocks: every warp issues loads, the reduction is a shuffle, and
-        // there is no shared memory or block barrier. Activations are re-read per warp but they
-        // are 20 KB and L1/L2 resident.
+        // Warp-per-row small-K: warp w owns row row0+w and its lanes stride that row's K-blocks. No smem, no block barrier.
         const int  warp   = threadIdx.y;
         const int  lane   = threadIdx.x;
         const bool row_ok = uint32_t(row0 + warp) < stride_col_dst;
@@ -812,9 +804,8 @@ static __global__ void mul_mat_vec_q(
             }
 #endif
 
-#if !defined(GGML_USE_HIP)
-        // PTQ1_0 activations use the warp-transposed q8 layout (ggml_cuda_ptq1_q8_word), so the
-        // vec-dot is handed the column base and the K-block index instead of &y[kby].
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        // PTQ1_0 NVIDIA SoA q8 layout: pass the column base and K-block index, not &y[kby].
         if constexpr (type == GGML_TYPE_PTQ1_0) {
             GGML_UNUSED(kby);
             GGML_UNUSED(kqs);
@@ -998,9 +989,9 @@ static __global__ void mul_mat_vec_q_moe(
         const int kby = kbx * (qk/QK8_1);
         const int kqs = vdr * (threadIdx.x % (qi/vdr));
 
-#if !defined(GGML_USE_HIP)
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         if constexpr (type == GGML_TYPE_PTQ1_0) {
-            // Warp-transposed q8 layout: hand the vec-dot the column base and K-block index.
+            // NVIDIA SoA q8: hand the vec-dot the column base and K-block index.
             GGML_UNUSED(kby);
             GGML_UNUSED(kqs);
 #pragma unroll
