@@ -33,7 +33,7 @@
 #define PTQ1_0_PT_THREADS      128
 #define PTQ1_0_PT_MAX_ROWS     16
 #define PTQ1_0_PT_MAX_COLS     8    // equals MMVQ_MAX_BATCH_SIZE, checked in mmvq.cu
-#define PTQ1_0_PT_SMEM_FLOATS  4096 // 16 KiB of partial sums per weight matrix, dynamic
+#define PTQ1_0_PT_SMEM_FLOATS  4096 // 16 KiB of partial sums per weight matrix: the target when choosing rows per CTA
 
 // the PT path is CUDA only; HIP keeps the block_q8_1 layout and the old vec_dot
 static constexpr __host__ __device__ bool ptq1_0_pt_enabled() {
@@ -270,6 +270,20 @@ static __host__ int ptq1_0_pt_rows_per_cta(const int blocks_per_row, const int n
     return best;
 }
 
+// rows per work item: 4 up to 4 columns (independent blocks per thread, activation reuse across rows), 2 beyond
+static constexpr __host__ __device__ int ptq1_0_pt_rows_per_item(const int ncols_dst) {
+    return ncols_dst <= 4 ? 4 : 2;
+}
+
+// dynamic shared memory the launch requests for a shape: one fp32 partial per (column, row, K block) for the
+// rows of one CTA, twice that with gate fusion. The entry guard and the launcher both call this, so the guard
+// budgets exactly what the launch asks for; rows_per_cta is never below rows_per_item, which is what lets a
+// long enough K exceed the PTQ1_0_PT_SMEM_FLOATS target.
+static __host__ size_t ptq1_0_pt_smem_bytes(const int blocks_per_row, const int ncols_dst, const int nrows_x, const bool has_gate) {
+    const int rows_per_cta = ptq1_0_pt_rows_per_cta(blocks_per_row, ncols_dst, nrows_x, ptq1_0_pt_rows_per_item(ncols_dst));
+    return (size_t) ncols_dst * rows_per_cta * blocks_per_row * sizeof(float) * (has_gate ? 2 : 1);
+}
+
 template <int ncols, int ROWS, bool has_fusion, bool has_gate>
 __launch_bounds__(PTQ1_0_PT_THREADS, (ncols <= 2 ? 4 : (ncols <= 4 ? 3 : 2)))
 static __global__ void mul_mat_vec_ptq1_0_pt(
@@ -398,7 +412,7 @@ static void mul_mat_vec_ptq1_0_pt_launch(
         const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
         const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
         cudaStream_t stream) {
-    constexpr int ROWS = ncols <= 4 ? 4 : 2; // rows per work item: independent blocks per thread for latency hiding, activation reuse across rows; 8 spills
+    constexpr int ROWS = ptq1_0_pt_rows_per_item(ncols); // independent blocks per thread for latency hiding, activation reuse across rows; 8 spills
     const int bpr = ncols_x / QK_PTQ1_0;
     const int rows_per_cta = ptq1_0_pt_rows_per_cta(bpr, ncols, nrows_x, ROWS);
     const uint3 bpr_fd = init_fastdiv_values((uint32_t) bpr);
@@ -406,7 +420,7 @@ static void mul_mat_vec_ptq1_0_pt_launch(
     const dim3 block_dims(PTQ1_0_PT_THREADS, 1, 1);
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
-    const size_t smem = (size_t) ncols * rows_per_cta * bpr * sizeof(float) * (fusion.gate != nullptr ? 2 : 1);
+    const size_t smem = ptq1_0_pt_smem_bytes(bpr, ncols, nrows_x, fusion.gate != nullptr);
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, smem, stream);
     if (has_fusion) {
         GGML_ASSERT(ncols == 1 && "fusion only supported for ncols_dst=1");
@@ -430,7 +444,13 @@ static bool mul_mat_vec_ptq1_0_pt_switch(
         const int stride_row_x, const int stride_col_y, const int stride_col_dst,
         const int nchannels_dst, const int nsamples_dst, cudaStream_t stream) {
     if (!ptq1_0_pt_enabled() || nchannels_dst != 1 || nsamples_dst != 1 || ncols_x % QK_PTQ1_0 != 0 ||
-        ncols_dst < 1 || ncols_dst > PTQ1_0_PT_MAX_COLS || 2 * (ncols_x / QK_PTQ1_0) * ncols_dst > PTQ1_0_PT_SMEM_FLOATS) {
+        ncols_dst < 1 || ncols_dst > PTQ1_0_PT_MAX_COLS) {
+        return false;
+    }
+    // the kernel never opts in to more than the default dynamic shared memory per block (48 KiB on the
+    // supported cards), so a shape whose launch would request more goes to the generic kernel
+    const size_t smem = ptq1_0_pt_smem_bytes(ncols_x / QK_PTQ1_0, ncols_dst, nrows_x, fusion.gate != nullptr);
+    if (smem > ggml_cuda_info().devices[ggml_cuda_get_device()].smpb) {
         return false;
     }
     switch (ncols_dst) {

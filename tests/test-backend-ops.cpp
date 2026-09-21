@@ -10174,6 +10174,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // PTQ1_0 mat-vec kernel, shared-memory boundary: the launch asks for ncols * rows_per_cta * (K / 128) * 4 bytes,
+    // twice that with gate fusion, against the 48 KiB default. With one column and 4 rows per CTA the last K that
+    // fits is 393216 without a gate and 196608 with one; the next K block over each must take the generic kernel.
+    for (int64_t k : {393216, 393344}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 64, 1, k, {1, 1}, {1, 1}));
+    }
+    for (int64_t k : {196608, 196736}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, 1, 64, k,
+            false, 1, 1, false, false, true, false, {1, 1}));
+    }
+
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
             for (bool bias_probs : {false, true}) {
