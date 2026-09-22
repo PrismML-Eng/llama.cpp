@@ -1351,7 +1351,7 @@ static void mul_mat_vec_pq2_0_q8_1_sycl(const void * vx, const void * vy,
         cgh.parallel_for(
             sycl::nd_range<3>(block_nums * block_dims, block_dims),
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q<QK_PQ2_0, QI_PQ2_0, block_pq2_0,
+                mul_mat_vec_q<QK_PQ2_0, MMVQ_PQ2_0_QI, block_pq2_0,
                               VDR_PQ2_0_Q8_1_MMVQ, vec_dot_pq2_0_q8_1>(
                     vx, vy, dst, ncols, nrows, item_ct1);
             });
@@ -1373,7 +1373,7 @@ static void mul_mat_vec_pq2_0_q8_1_sycl_ncols(
         cgh.parallel_for(
             sycl::nd_range<3>(block_nums * block_dims, block_dims),
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_ncols<QK_PQ2_0, QI_PQ2_0, block_pq2_0,
+                mul_mat_vec_q_ncols<QK_PQ2_0, MMVQ_PQ2_0_QI, block_pq2_0,
                                     VDR_PQ2_0_Q8_1_MMVQ, vec_dot_pq2_0_q8_1, ncols_dst>(
                     vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, item_ct1);
             });

@@ -427,30 +427,46 @@ vec_dot_ptq1_0_q8_1(const void *__restrict__ vbq,
     return (float) bq->d * acc;
 }
 
+static __dpct_inline__ uint32_t unpack_2bit_to_byte_lanes(const uint32_t b) {
+    const uint32_t bits = (b | (b << 12)) & 0x000F000Fu;
+    return (bits | (bits << 6)) & 0x03030303u;
+}
+
+// PQ2_0 packs 128 elements into 32 bytes. The kernel derives its lane split from qi/vdr, and
+// QI_PQ2_0 (= 4) would put only 4 lanes on a block, leaving each one an 8-deep serial dp4a chain.
+// MMVQ_PQ2_0_QI spreads a block over 16 lanes instead (2 bytes / 8 elements, 2 dp4a each), which
+// measures ~2x faster on Arc iGPUs; 8 and 32 lanes were both slower, the latter because the
+// per-call scale setup then dominates a single dp4a.
 #define VDR_PQ2_0_Q8_1_MMVQ 1
+#define MMVQ_PQ2_0_QI       16
 
 static __dpct_inline__ float
 vec_dot_pq2_0_q8_1(const void *__restrict__ vbq,
                    const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
-    const block_pq2_0 * bq2_0       = (const block_pq2_0 *) vbq;
-    const block_q8_1  * bq8_1_chunk = bq8_1 + iqs;
-    const float         d2          = bq2_0->d;
-    const uint8_t     * qs_chunk    = bq2_0->qs + iqs * 8;
+    const block_pq2_0 * bq2_0 = (const block_pq2_0 *) vbq;
+    const float         d2    = bq2_0->d;
+
+    // iqs indexes 2-byte groups of qs, i.e. 8 elements. Four groups share one 32-element q8_1
+    // sub-block.
+    const block_q8_1 * bq8_1_chunk = bq8_1 + (iqs >> 2);
+    const int          u_base      = 2 * (iqs & 3);
+
+    uint32_t val = (uint32_t) *(const uint16_t *) (bq2_0->qs + 2 * iqs);
 
     int sumi = 0;
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const uint8_t  q  = qs_chunk[j];
-        const uint32_t vi = ((q >> 0) & 0x3) |
-                            (((q >> 2) & 0x3) << 8) |
-                            (((q >> 4) & 0x3) << 16) |
-                            (((q >> 6) & 0x3) << 24);
-        const int w = byte_sub_4(vi, 0x01010101);
-        const int u = get_int_from_int8_aligned(bq8_1_chunk->qs, j);
-        sumi = dpct::dp4a(w, u, sumi);
+    for (int l = 0; l < 2; ++l) {
+        const uint32_t vi = unpack_2bit_to_byte_lanes(val & 0xFFu);
+        val >>= 8;
+        const int u = get_int_from_int8_aligned(bq8_1_chunk->qs, u_base + l);
+        sumi = dpct::dp4a(vi, u, sumi);
     }
 
-    return d2 * ((const float) bq8_1_chunk->ds[0]) * (float) sumi;
+    const sycl::float2 ds8f = bq8_1_chunk->ds.convert<float, sycl::rounding_mode::automatic>();
+
+    // The unpack leaves quants as 0..2; the second term subtracts the zero point of 1 from each,
+    // scaled by the fraction of the q8_1 sub-block this call covers (8 of 32 elements).
+    return d2 * (sumi * ds8f.x() - 0.25f * ds8f.y());
 }
 
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
@@ -814,15 +830,8 @@ static __dpct_inline__ float vec_dot_q2_0_q8_1_impl(
     for (int i = 0; i < vdr; ++i) {
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            const uint8_t q = (uint8_t) ((uint32_t) v[i] >> (8 * j));
-
-            // unpack 2-bit values to byte lanes (0..3), then apply zero-point
-            // correction with ds8f.y() below, mirroring the q4_0 style.
-            int vi = 0;
-            vi |= (((q >> 0) & 0x3) & 0xFF) << 0;
-            vi |= (((q >> 2) & 0x3) & 0xFF) << 8;
-            vi |= (((q >> 4) & 0x3) & 0xFF) << 16;
-            vi |= (((q >> 6) & 0x3) & 0xFF) << 24;
+            const uint8_t  q  = (uint8_t) ((uint32_t) v[i] >> (8 * j));
+            const uint32_t vi = unpack_2bit_to_byte_lanes(q);
 
             sumi = dpct::dp4a(vi, u[4 * i + j], sumi);
         }
