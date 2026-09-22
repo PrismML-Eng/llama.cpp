@@ -69,6 +69,43 @@ utf8_parse_result common_parse_utf8_codepoint(std::string_view input, size_t off
     return utf8_parse_result(utf8_parse_result::INVALID);
 }
 
+bool common_utf8_sanitize(const std::string & input, std::string & output) {
+    output.clear();
+
+    size_t pos  = 0;
+    size_t last = 0;  // start of the pending run of valid input
+    while (pos < input.size()) {
+        auto result = common_parse_utf8_codepoint(input, pos);
+        if (result.status == utf8_parse_result::SUCCESS) {
+            pos += result.bytes_consumed;
+            continue;
+        }
+        if (result.status == utf8_parse_result::INCOMPLETE) {
+            // Only possible at the tail of input; keep it so that a partial
+            // input can still complete when more data arrives.
+            break;
+        }
+        // INVALID: replace the maximal invalid subpart (lead byte plus any
+        // valid continuation bytes it carries) with a single U+FFFD.
+        output.append(input, last, pos - last);
+        output.append("\xef\xbf\xbd");
+
+        size_t advance = 1;
+        size_t expect  = common_utf8_sequence_length(static_cast<unsigned char>(input[pos]));
+        while (advance < expect && pos + advance < input.size() &&
+               (static_cast<unsigned char>(input[pos + advance]) & 0xc0) == 0x80) {
+            ++advance;
+        }
+        pos  += advance;
+        last  = pos;
+    }
+    if (last == 0) {
+        return false;
+    }
+    output.append(input, last, std::string::npos);
+    return true;
+}
+
 bool common_utf8_is_complete(const std::string & s) {
     if (s.empty()) {
         return true;
