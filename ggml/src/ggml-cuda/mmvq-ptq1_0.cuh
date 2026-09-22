@@ -32,7 +32,7 @@
 // dedicated 2D kernel geometry, see mul_mat_vec_ptq1_0_pt below
 #define PTQ1_0_PT_THREADS      128
 #define PTQ1_0_PT_MAX_ROWS     16
-#define PTQ1_0_PT_MAX_COLS     8    // equals MMVQ_MAX_BATCH_SIZE, checked in mmvq.cu
+#define PTQ1_0_PT_MAX_COLS     4    // 1 to 4 columns here; 5 and above take the MMQ tile path (ggml_cuda_should_use_mmvq)
 #define PTQ1_0_PT_SMEM_FLOATS  4096 // 16 KiB of partial sums per weight matrix: the target when choosing rows per CTA
 
 // the PT path is CUDA only; HIP keeps the block_q8_1 layout and the old vec_dot
@@ -270,7 +270,8 @@ static __host__ int ptq1_0_pt_rows_per_cta(const int blocks_per_row, const int n
     return best;
 }
 
-// rows per work item: 4 up to 4 columns (independent blocks per thread, activation reuse across rows), 2 beyond
+// rows per work item: 4 (independent blocks per thread, activation reuse across rows); the 2-row branch served
+// 5 to 8 columns before the column limit dropped to 4 and is kept only so the arithmetic stays in one place
 static constexpr __host__ __device__ int ptq1_0_pt_rows_per_item(const int ncols_dst) {
     return ncols_dst <= 4 ? 4 : 2;
 }
@@ -437,7 +438,7 @@ static void mul_mat_vec_ptq1_0_pt_launch(
         vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, rows_per_cta, bpr_fd);
 }
 
-// true when the dedicated kernel handles this call (plain 2D, K a multiple of 128, up to 8 columns)
+// true when the dedicated kernel handles this call (plain 2D, K a multiple of 128, 1 to 4 columns)
 static bool mul_mat_vec_ptq1_0_pt_switch(
         const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
         const int ncols_x, const int nrows_x, const int ncols_dst,
@@ -458,10 +459,6 @@ static bool mul_mat_vec_ptq1_0_pt_switch(
         case 2: mul_mat_vec_ptq1_0_pt_launch<2>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
         case 3: mul_mat_vec_ptq1_0_pt_launch<3>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
         case 4: mul_mat_vec_ptq1_0_pt_launch<4>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
-        case 5: mul_mat_vec_ptq1_0_pt_launch<5>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
-        case 6: mul_mat_vec_ptq1_0_pt_launch<6>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
-        case 7: mul_mat_vec_ptq1_0_pt_launch<7>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
-        case 8: mul_mat_vec_ptq1_0_pt_launch<8>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
         default: return false;
     }
     return true;

@@ -297,9 +297,11 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     }
 #if !defined(GGML_USE_HIP)
     if (type == GGML_TYPE_PTQ1_0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) {
-        // the PT mat-vec path shares the weight decode across columns and stays
-        // ahead of the MMQ tile path up to the full mmvq batch
-        return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        // the PT mat-vec path shares the weight decode across columns and stays ahead of the
+        // MMQ tile path up to 4 columns; from 5 on the branch-free MMQ tile loader is faster
+        // (RTX 3060, K = 5120 shapes: a batch of 8 in 64.4 ms through MMQ against 112.7 ms
+        // through the 8-column mat-vec, llama-bench pp8), so 5 and above take that path
+        return ne11 <= PTQ1_0_PT_MAX_COLS;
     }
 #endif
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
