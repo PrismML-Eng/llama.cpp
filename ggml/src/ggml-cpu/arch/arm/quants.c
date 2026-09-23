@@ -219,6 +219,63 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+void ggml_vec_dot_pq1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK_PQ1_0;  // 64: one PQ1_0 block spans two Q8_0 blocks
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_pq1_0 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+#if defined(__ARM_NEON)
+    float32x4_t sumv = vdupq_n_f32(0.0f);
+    const int8x8_t one = vdup_n_s8(1);
+
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+
+        for (int k = 0; k < 2; k++) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[i * 2 + k];
+            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+            const uint8_t * bits = &x[i].qs[k * 4];
+
+            const int8x16_t y0 = vld1q_s8(yb->qs);
+            const int8x16_t y1 = vld1q_s8(yb->qs + 16);
+
+            // table_b2b_0 spreads each bit of a byte into bit 4 of a byte lane: 0x10 or 0x00
+            int8x8_t s0 = vreinterpret_s8_u8(vshr_n_u8(vcreate_u8(table_b2b_0[bits[0]]), 4));
+            int8x8_t s1 = vreinterpret_s8_u8(vshr_n_u8(vcreate_u8(table_b2b_0[bits[1]]), 4));
+            int8x8_t s2 = vreinterpret_s8_u8(vshr_n_u8(vcreate_u8(table_b2b_0[bits[2]]), 4));
+            int8x8_t s3 = vreinterpret_s8_u8(vshr_n_u8(vcreate_u8(table_b2b_0[bits[3]]), 4));
+
+            // 0/1 -> -1/+1
+            s0 = vsub_s8(vadd_s8(s0, s0), one);
+            s1 = vsub_s8(vadd_s8(s1, s1), one);
+            s2 = vsub_s8(vadd_s8(s2, s2), one);
+            s3 = vsub_s8(vadd_s8(s3, s3), one);
+
+            const int32x4_t p0 = ggml_vdotq_s32(vdupq_n_s32(0), vcombine_s8(s0, s1), y0);
+            const int32x4_t p1 = ggml_vdotq_s32(p0,             vcombine_s8(s2, s3), y1);
+
+            sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p1), d0 * d1);
+        }
+    }
+
+    *s = vaddvq_f32(sumv);
+#else
+    UNUSED(nb);
+    UNUSED(x);
+    UNUSED(y);
+    ggml_vec_dot_pq1_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK2_0;
     const int nb = n / qk;
