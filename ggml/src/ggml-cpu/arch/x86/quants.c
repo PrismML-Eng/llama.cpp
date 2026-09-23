@@ -4398,6 +4398,38 @@ void ggml_vec_dot_pq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
         acc = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[i].d) * yb->d), _mm256_cvtepi32_ps(s32), acc);
     }
     sumf = hsum_float_8(acc);
+#elif defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+    // Same structure as the AVX2 path at half the width: the four sub-block dots of a
+    // 128-weight block accumulate in int32 and the block scale is applied once. The unpack
+    // puts byte b's bit-pair j at element 4b+j, which is the order q8 is already in.
+    const __m128i mask = _mm_set1_epi8(3);
+    for (int i = 0; i < nb; i++) {
+        const block_q8_K * GGML_RESTRICT yb = &y[i >> 1];
+        const int8_t * GGML_RESTRICT q8 = yb->qs + 128 * (i & 1);
+        __m128i acc32 = _mm_setzero_si128();
+        for (int k = 0; k < 4; k++) {
+            const __m128i qs  = _mm_loadl_epi64((const __m128i *) &x[i].qs[8 * k]);
+            const __m128i q0  = _mm_and_si128(qs, mask);
+            const __m128i q1  = _mm_and_si128(_mm_srli_epi16(qs, 2), mask);
+            const __m128i q2  = _mm_and_si128(_mm_srli_epi16(qs, 4), mask);
+            const __m128i q3  = _mm_and_si128(_mm_srli_epi16(qs, 6), mask);
+            const __m128i q01 = _mm_unpacklo_epi8(q0, q1);
+            const __m128i q23 = _mm_unpacklo_epi8(q2, q3);
+            const __m128i lo  = _mm_unpacklo_epi16(q01, q23);
+            const __m128i hi  = _mm_unpackhi_epi16(q01, q23);
+            const __m128i y0  = _mm_loadu_si128((const __m128i *) (q8 + 32 * k));
+            const __m128i y1  = _mm_loadu_si128((const __m128i *) (q8 + 32 * k + 16));
+#if defined(__SSSE3__)
+            acc32 = _mm_add_epi32(acc32, mul_sum_ternary_pairs_ssse3(lo, y0));
+            acc32 = _mm_add_epi32(acc32, mul_sum_ternary_pairs_ssse3(hi, y1));
+#else
+            const __m128i ones = _mm_set1_epi8(1);
+            acc32 = _mm_add_epi32(acc32, mul_sum_i8_pairs_sse2(_mm_sub_epi8(lo, ones), y0));
+            acc32 = _mm_add_epi32(acc32, mul_sum_i8_pairs_sse2(_mm_sub_epi8(hi, ones), y1));
+#endif
+        }
+        sumf += (GGML_CPU_FP16_TO_FP32(x[i].d) * yb->d) * (float) hsum_i32_4_sse2(acc32);
+    }
 #else
     ggml_vec_dot_pq2_0_q8_K_generic(n, &sumf, bs, vx, bx, vy, by, nrc);
 #endif

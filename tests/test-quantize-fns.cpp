@@ -208,11 +208,17 @@ static int test_vec_dot_ternary(bool verbose) {
     for (ggml_type type : {GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0}) {
         const auto * traits = ggml_get_type_traits(type);
         const auto * cpu = ggml_get_type_traits_cpu(type);
-        for (int nb : {1, 3}) {
+        // PQ2_0 dots against Q8_K (one float scale per 256), PTQ1_0 against Q8_0 (one fp16
+        // scale per 32), so the activation side is built per format. PQ2_0 needs whole Q8_K
+        // blocks, i.e. an even number of 128-weight blocks.
+        const bool  q8k      = type == GGML_TYPE_PQ2_0;
+        const ggml_type ytype = q8k ? GGML_TYPE_Q8_K : GGML_TYPE_Q8_0;
+        for (int nb : q8k ? std::vector<int>{2, 4} : std::vector<int>{1, 3}) {
             const int n = nb * 128;
             std::vector<block_pq2_0> pq(nb);
             std::vector<block_ptq1_0> ptq(nb);
             std::vector<block_q8_0> q8(nb * 4);
+            std::vector<block_q8_K> q8k_blocks(nb / 2 + 1);
             std::vector<float> x(n), y(n);
             const void * weights = type == GGML_TYPE_PQ2_0 ? (const void *) pq.data() : (const void *) ptq.data();
             for (int pattern = 0; pattern < 256; ++pattern) {
@@ -234,11 +240,32 @@ static int test_vec_dot_ternary(bool verbose) {
                         q8[i].qs[j] = (int8_t) ((pattern + 13*j + i) % 256 - 128);
                     }
                 }
+                for (size_t i = 0; i < q8k_blocks.size(); ++i) {
+                    q8k_blocks[i].d = 0.125f * (i % 4 + 1);
+                    for (int j = 0; j < QK_K; ++j) {
+                        q8k_blocks[i].qs[j] = (int8_t) ((pattern + 13*j + i) % 256 - 128);
+                    }
+                    // bsums is unused by the PQ2_0 dot but keep it consistent.
+                    for (int j = 0; j < QK_K/16; ++j) {
+                        int16_t s = 0;
+                        for (int t = 0; t < 16; ++t) s += q8k_blocks[i].qs[j*16 + t];
+                        q8k_blocks[i].bsums[j] = s;
+                    }
+                }
+                const void * acts = q8k ? (const void *) q8k_blocks.data() : (const void *) q8.data();
                 traits->to_float(weights, x.data(), n);
-                ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(q8.data(), y.data(), n);
+                if (q8k) {
+                    // Q8_K is an activation-only type and has no to_float, so expand it here.
+                    for (int j = 0; j < n; ++j) {
+                        const block_q8_K & b = q8k_blocks[j / QK_K];
+                        y[j] = b.d * (float) b.qs[j % QK_K];
+                    }
+                } else {
+                    ggml_get_type_traits(ytype)->to_float(acts, y.data(), n);
+                }
                 const float ref = dot_product(x.data(), y.data(), n);
                 float result = INFINITY;
-                cpu->vec_dot(n, &result, 0, weights, 0, q8.data(), 0, 1);
+                cpu->vec_dot(n, &result, 0, weights, 0, acts, 0, 1);
                 // Power-of-two scales keep this comparison exact.
                 const bool failed = result != ref;
                 num_failed += failed;
