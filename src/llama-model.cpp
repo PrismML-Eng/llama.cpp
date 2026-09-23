@@ -492,32 +492,27 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
         }
 
+        // Bonsai FFN mirror: PQ2_0-family FFN projections run replicated (their Hadamard
+        // input prep [1024,34] cannot shard under even ratios; replication is exact math).
+        // Q4 and other types untouched -> no regression for standard models.
+        {
+            static const std::regex pattern_ffn_mir("blk\\.\\d*\\.ffn_(up|gate|down)\\.weight");
+            if (std::regex_match(tensor_name, pattern_ffn_mir) &&
+                    (tensor->type == GGML_TYPE_PQ2_0 || tensor->type == GGML_TYPE_PTQ1_0)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+        }
         // Hadamard sign vectors: match their consumers (per width).
         // 17408-wide signs serve split FFN activations -> split; 6144-wide serve
         // mirrored SSM activations -> mirrored.
         {
             static const std::regex pattern_signs("^prism\\.hadamard\\.signs\\.[0-9]+$");
             if (std::regex_match(tensor_name, pattern_signs)) {
-                if (tensor->ne[0] == 17408) {
+                // signs follow their (split) activation shards elementwise;
+                // 6144-wide signs serve axis-0-split SSM activations under even ratios
+                if (tensor->ne[0] == 6144) {
                     return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
                 }
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-            }
-        }
-        // QWEN35 linear-attention block: run fully mirrored (replicated) on each device.
-        // The Hadamard rep=3 tiling cannot shard across 2 devices, so replicate instead.
-        if (ud->model->arch == LLM_ARCH_QWEN35) {
-            if (std::regex_match(tensor_name, pattern_attn_gate_weight) ||
-                    std::regex_match(tensor_name, pattern_ssm_out_weight) ||
-                    std::regex_match(tensor_name, pattern_qkv_weight) ||
-                    std::regex_match(tensor_name, pattern_ssm_conv1d) ||
-                    std::regex_match(tensor_name, pattern_ssm_dt) ||
-                    std::regex_match(tensor_name, pattern_ssm_a) ||
-                    std::regex_match(tensor_name, pattern_ssm_alpha) ||
-                    std::regex_match(tensor_name, pattern_ssm_beta) ||
-                    std::regex_match(tensor_name, pattern_ssm_beta_alpha) ||
-                    std::regex_match(tensor_name, pattern_r_cache) ||
-                    std::regex_match(tensor_name, pattern_s_cache)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
         }
@@ -635,16 +630,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                     return {{key_dim, 2 + head_ratio}};
                 }
                 if (std::regex_match(tensor_name, pattern_attn_gate_weight) || std::regex_match(tensor_name, pattern_ssm_out_weight)) {
-                    // whole 6144-dim as ONE segment so uneven ratios (1:2) map whole rep-groups
-                    // to devices instead of cutting every group (needed for Hadamard rep=3 views)
-                    GGML_ASSERT(tensor->ne[axis] == key_dim * head_ratio);
-                    return {{key_dim * head_ratio, 1}};
+                    return {{key_dim, head_ratio}};
                 }
                 if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a) ||
                         std::regex_match(tensor_name, pattern_ssm_alpha) || std::regex_match(tensor_name, pattern_ssm_beta)) {
-                    // whole dim as ONE segment so uneven ratios stay exact (match gate path 1:2)
-                    GGML_ASSERT(tensor->ne[axis] == n_k_heads * head_ratio);
-                    return {{n_k_heads * head_ratio, 1}};
+                    return {{n_k_heads, head_ratio}};
                 }
                 if (std::regex_match(tensor_name, pattern_r_cache)) {
                     return {{key_dim * (hparams.ssm_d_conv - 1), 2 + head_ratio}};

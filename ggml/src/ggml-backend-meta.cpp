@@ -621,6 +621,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_BACKEND_SPLIT_AXIS_1:
             case GGML_BACKEND_SPLIT_AXIS_2:
             case GGML_BACKEND_SPLIT_AXIS_3: {
+                // Explicit Hadamard-permute mapping (qwen35 hybrid): a [128,16,3,...] view of an
+                // axis-0-split 6144-dim splits on nk (axis 1, 8+8). The generic cumulative rule
+                // would pick the rep dim (size 3, unshardable). FWHT keeps full 128, reps stay whole.
+                if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 &&
+                        tensor->src[0] && tensor->src[0]->ne[0] == 6144 &&
+                        tensor->ne[0] == 128 && tensor->ne[1] == 16 && tensor->ne[2] == 3) {
+                    return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+                }
                 int64_t base_ne_in = 1;
                 for (int dim = 0; dim <= src_ss[0].axis; dim++) {
                     base_ne_in *= tensor->src[0]->ne[dim];
