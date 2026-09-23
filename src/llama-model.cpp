@@ -492,6 +492,35 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
         }
 
+        // Hadamard sign vectors: match their consumers (per width).
+        // 17408-wide signs serve split FFN activations -> split; 6144-wide serve
+        // mirrored SSM activations -> mirrored.
+        {
+            static const std::regex pattern_signs("^prism\\.hadamard\\.signs\\.[0-9]+$");
+            if (std::regex_match(tensor_name, pattern_signs)) {
+                if (tensor->ne[0] == 17408) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+                }
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+        }
+        // QWEN35 linear-attention block: run fully mirrored (replicated) on each device.
+        // The Hadamard rep=3 tiling cannot shard across 2 devices, so replicate instead.
+        if (ud->model->arch == LLM_ARCH_QWEN35) {
+            if (std::regex_match(tensor_name, pattern_attn_gate_weight) ||
+                    std::regex_match(tensor_name, pattern_ssm_out_weight) ||
+                    std::regex_match(tensor_name, pattern_qkv_weight) ||
+                    std::regex_match(tensor_name, pattern_ssm_conv1d) ||
+                    std::regex_match(tensor_name, pattern_ssm_dt) ||
+                    std::regex_match(tensor_name, pattern_ssm_a) ||
+                    std::regex_match(tensor_name, pattern_ssm_alpha) ||
+                    std::regex_match(tensor_name, pattern_ssm_beta) ||
+                    std::regex_match(tensor_name, pattern_ssm_beta_alpha) ||
+                    std::regex_match(tensor_name, pattern_r_cache) ||
+                    std::regex_match(tensor_name, pattern_s_cache)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+        }
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
@@ -606,11 +635,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                     return {{key_dim, 2 + head_ratio}};
                 }
                 if (std::regex_match(tensor_name, pattern_attn_gate_weight) || std::regex_match(tensor_name, pattern_ssm_out_weight)) {
-                    return {{key_dim, head_ratio}};
+                    // whole 6144-dim as ONE segment so uneven ratios (1:2) map whole rep-groups
+                    // to devices instead of cutting every group (needed for Hadamard rep=3 views)
+                    GGML_ASSERT(tensor->ne[axis] == key_dim * head_ratio);
+                    return {{key_dim * head_ratio, 1}};
                 }
                 if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a) ||
                         std::regex_match(tensor_name, pattern_ssm_alpha) || std::regex_match(tensor_name, pattern_ssm_beta)) {
-                    return {{n_k_heads, head_ratio}};
+                    // whole dim as ONE segment so uneven ratios stay exact (match gate path 1:2)
+                    GGML_ASSERT(tensor->ne[axis] == n_k_heads * head_ratio);
+                    return {{n_k_heads * head_ratio, 1}};
                 }
                 if (std::regex_match(tensor_name, pattern_r_cache)) {
                     return {{key_dim * (hparams.ssm_d_conv - 1), 2 + head_ratio}};
@@ -800,6 +834,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = ne_s - low;
             split_state.nr[is] = nr_s;
+            fprintf(stderr, "SEG %s ax=%d ne=[%lld,%lld]\n", tensor_name.c_str(),
+                (int)split_state.axis,
+                (long long)split_state.ne[is*ud->n_devices+0], (long long)split_state.ne[is*ud->n_devices+1]);
+            if (tensor_name.find("ssm_out") != std::string::npos || tensor_name.find("attn_gate") != std::string::npos) {
+                fprintf(stderr, "DBG_SEG tensor=%s axis=%d ne_s=%lld nr_s=%u g=%lld ne=[%lld,%lld] rot=%d split=[%g,%g]\n",
+                    tensor_name.c_str(), (int)split_state.axis, (long long)ne_s, nr_s, (long long)g_s,
+                    (long long)split_state.ne[is*ud->n_devices+0], (long long)split_state.ne[is*ud->n_devices+1],
+                    tc.rotation, tensor_split ? tensor_split[0] : -1.0f, tensor_split && ud->n_devices > 1 ? tensor_split[1] : -1.0f);
+            }
         }
         split_state.n_segments = segments.size();
     } else {

@@ -534,6 +534,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
+        if (ret.axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+            fprintf(stderr, "DBG_GENERIC tensor='%s' op=%d", tensor->name, (int)tensor->op);
+            for (size_t k = 0; k < GGML_MAX_SRC; k++) {
+                if (tensor->src[k]) fprintf(stderr, " src%zu='%s'[ax=%d ne=%lld,%lld]", k, tensor->src[k]->name,
+                    (int)src_ss[k].axis, (long long)src_ss[k].ne[0], (long long)src_ss[k].ne[1]);
+            }
+            fprintf(stderr, "\n");
+        }
         GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         return ret;
     };
@@ -636,15 +644,28 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                     }
                 }
                 // Reshape outputs use one segment; split-state propagation merges source segments.
+                // Prefer a dim that actually divides across devices (e.g. skip rep=3 tilings);
+                // first cumulative match kept as fallback = legacy behavior for all working models.
                 int64_t base_ne_out = 1;
+                int fallback_dim = -1;
+                uint32_t fallback_nr = 1;
                 for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
                     base_ne_out *= tensor->ne[dim];
                     if (base_ne_out % base_ne_in == 0) {
-                        return {ggml_backend_meta_split_axis(dim), {0}, {uint32_t(base_ne_out/base_ne_in)}, 1};
+                        if (fallback_dim < 0) {
+                            fallback_dim = dim;
+                            fallback_nr = uint32_t(base_ne_out/base_ne_in);
+                        }
+                        if (n_bufs > 0 && tensor->ne[dim] % (int64_t) n_bufs == 0) {
+                            return {ggml_backend_meta_split_axis(dim), {0}, {uint32_t(base_ne_out/base_ne_in)}, 1};
+                        }
                     }
                     if (base_ne_out > base_ne_in) {
                         GGML_ASSERT(src_ss[0].n_segments == 1);
                         GGML_ASSERT(src_ss[0].nr[0]      == 1);
+                        if (fallback_dim >= 0) {
+                            return {ggml_backend_meta_split_axis(fallback_dim), {0}, {fallback_nr}, 1};
+                        }
                         return {ggml_backend_meta_split_axis(dim), {0}, {1}, 1};
                     }
                 }
@@ -1083,7 +1104,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         split_state.ne[j] *= tensor->ne[split_state.axis];
                         if (split_state.ne[j] != 0 || tensor->src[i]->ne[src_ss[i].axis] != 0) {
                             const int64_t div = tensor->src[i]->ne[src_ss[i].axis] * split_state.nr[0];
-                            GGML_ASSERT(split_state.ne[j] % div == 0);
+                            if (div != 0 && split_state.ne[j] % div != 0) {
+                                fprintf(stderr, "DBG_CHAIN:");
+                                { const ggml_tensor * c = tensor; for (int d = 0; d < 7 && c; d++) {
+                                    fprintf(stderr, " [%s op=%d]", c->name, (int)c->op);
+                                    c = c->src[0];
+                                } fprintf(stderr, "\n"); }
+                                fprintf(stderr, "DBG_SPLIT_FAIL tensor='%s' op=%d axis=%d ne=[%lld,%lld,%lld,%lld] src='%s' src_axis=%d src_ne=%lld ne_j=%lld div=%lld nr0=%lld nbufs=%zu j=%zu srcop=%d srcsrc0op=%d srcseg=%zu srcne0=%lld srcne1=%lld srcnr0=%u srcnr1=%u\n",
+                                    tensor->name, (int)tensor->op, (int)split_state.axis,
+                                    (long long)tensor->ne[0], (long long)tensor->ne[1], (long long)tensor->ne[2], (long long)tensor->ne[3],
+                                    tensor->src[i]->name, (int)src_ss[i].axis, (long long)tensor->src[i]->ne[src_ss[i].axis],
+                                    (long long)split_state.ne[j], (long long)div, (long long)split_state.nr[0], n_bufs, j, (int)tensor->src[i]->op, tensor->src[i]->src[0] ? (int)tensor->src[i]->src[0]->op : -1, src_ss[i].n_segments, (long long)src_ss[i].ne[0], (long long)src_ss[i].ne[1], src_ss[i].nr[0], src_ss[i].nr[1]);
+                            }
+                            GGML_ASSERT(div == 0 || split_state.ne[j] % div == 0);
                             split_state.ne[j] /= div;
                         }
                     }
@@ -1094,6 +1127,20 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         int64_t sum = 0;
                         for (size_t s = 0; s < src_ss[i].n_segments; s++) {
                             sum += src_ss[i].ne[s*n_bufs + j] * src_ss[i].nr[s];
+                        }
+                        if (!(split_state.ne[j]*split_state.nr[0] * tensor->src[i]->ne[src_ss[i].axis]
+                                                                 == sum * tensor->ne[split_state.axis])) {
+                            fprintf(stderr, "DBG_CONS tensor='%s' op=%d ax=%d ne=[%lld,%lld] srci=%d src='%s' sax=%d sne=[%lld,%lld]\n",
+                                tensor->name, (int)tensor->op, (int)split_state.axis,
+                                (long long)split_state.ne[0], (long long)split_state.ne[1], (int)i,
+                                tensor->src[i]->name, (int)src_ss[i].axis,
+                                (long long)src_ss[i].ne[0], (long long)src_ss[i].ne[1]);
+                            for (size_t k = 0; k < GGML_MAX_SRC; k++) {
+                                if (tensor->src[k]) fprintf(stderr, "  src%zu='%s' ax=%d ne=[%lld,%lld] nr0=%u nseg=%zu\n",
+                                    k, tensor->src[k]->name, (int)src_ss[k].axis,
+                                    (long long)src_ss[k].ne[0], (long long)src_ss[k].ne[1],
+                                    src_ss[k].nr[0], src_ss[k].n_segments);
+                            }
                         }
                         GGML_ASSERT(split_state.ne[j]*split_state.nr[0] * tensor->src[i]->ne[src_ss[i].axis]
                                                                  == sum * tensor->ne[split_state.axis]);
