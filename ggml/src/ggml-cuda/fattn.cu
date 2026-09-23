@@ -533,7 +533,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
-// forward declaration, defined below
 static bool ggml_cuda_flash_attn_ext_mma_q8_0_eligible(int device, const ggml_tensor * dst);
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
@@ -595,7 +594,7 @@ static int ggml_cuda_fattn_q8_0_mma_ncols1_min() {
 }
 
 // eligibility for the fused q8_0 path, shared by the dispatcher and get_alloc_size
-// (it must skip the f16 reservation exactly when this returns true)
+// so the f16 K/V reservation is skipped exactly when the fused kernel runs
 static bool ggml_cuda_flash_attn_ext_mma_q8_0_eligible(int device, const ggml_tensor * dst) {
     const ggml_tensor * KQV  = dst;
     const ggml_tensor * Q    = dst->src[0];
@@ -629,11 +628,6 @@ static bool ggml_cuda_flash_attn_ext_mma_q8_0_eligible(int device, const ggml_te
         if (t->nb[1] % 16 != 0 || t->nb[2] % 16 != 0 || t->nb[3] % 16 != 0 || ((uintptr_t) t->data) % 16 != 0) {
             return false;
         }
-    }
-
-    // mirror the dispatcher's ncols1 gate exactly
-    if (Q->ne[1] == 1 && ggml_cuda_fattn_q8_0_mma_ncols1_min() != 1) {
-        return false;
     }
 
     return true;
