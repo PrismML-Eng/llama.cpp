@@ -68,6 +68,10 @@ static void llama_verify_hadamard_graph(
 
         const auto it = rotations.find(node->src[0]);
         if (it == rotations.end()) {
+            if (inverses.count(node->src[0])) {
+                throw std::runtime_error(format(
+                    "Hadamard-latent table '%s' is used as a head without a forward transform", node->src[0]->name));
+            }
             continue;
         }
         const ggml_tensor * src = unwrap(node->src[1]);
