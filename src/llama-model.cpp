@@ -492,6 +492,32 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
         }
 
+        // QWEN35 linear block: mirror SSM weights (replicated compute needs no sharding;
+        // residual stream is mirrored, verified by working Q4 tensor-split).
+        if (ud->model->arch == LLM_ARCH_QWEN35) {
+            if (std::regex_match(tensor_name, pattern_attn_gate_weight) ||
+                    std::regex_match(tensor_name, pattern_ssm_out_weight) ||
+                    std::regex_match(tensor_name, pattern_qkv_weight) ||
+                    std::regex_match(tensor_name, pattern_ssm_conv1d) ||
+                    std::regex_match(tensor_name, pattern_ssm_dt) ||
+                    std::regex_match(tensor_name, pattern_ssm_a) ||
+                    std::regex_match(tensor_name, pattern_ssm_alpha) ||
+                    std::regex_match(tensor_name, pattern_ssm_beta) ||
+                    std::regex_match(tensor_name, pattern_ssm_beta_alpha) ||
+                    std::regex_match(tensor_name, pattern_r_cache) ||
+                    std::regex_match(tensor_name, pattern_s_cache)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+        }
+        // Bonsai output head mirror: replicated output projection (logits identical on
+        // both devices, no gather order issues). PQ2_0-gated so Q4 models are untouched.
+        {
+            static const std::regex pattern_out_mir("^output\\.weight$");
+            if (std::regex_match(tensor_name, pattern_out_mir) &&
+                    (tensor->type == GGML_TYPE_PQ2_0 || tensor->type == GGML_TYPE_PTQ1_0)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+        }
         // Bonsai FFN mirror: PQ2_0-family FFN projections run replicated (their Hadamard
         // input prep [1024,34] cannot shard under even ratios; replication is exact math).
         // Q4 and other types untouched -> no regression for standard models.
@@ -508,11 +534,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         {
             static const std::regex pattern_signs("^prism\\.hadamard\\.signs\\.[0-9]+$");
             if (std::regex_match(tensor_name, pattern_signs)) {
-                // signs follow their (split) activation shards elementwise;
-                // 6144-wide signs serve axis-0-split SSM activations under even ratios
-                if (tensor->ne[0] == 6144) {
-                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
-                }
+                // sign vectors replicate; elementwise consumers broadcast them
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
         }

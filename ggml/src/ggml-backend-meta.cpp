@@ -563,6 +563,25 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             return src_ss[0]; // GGML_OP_ADD_ID
         }
         GGML_ASSERT(tensor->src[2] == nullptr || src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        // Broadcast: one side mirrored (full copy on each device), other side split,
+        // same shape -> result follows the split side (each device combines local shards).
+        // Covers Hadamard signs/scales against split activations. Only fires where the
+        // old code asserted, so no behavior change for loading models.
+        for (int ab = 0; ab < 2; ab++) {
+            const int ia = ab, ib = 1 - ab;
+            if (src_ss[ia].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                    src_ss[ib].axis >= 0 && src_ss[ib].axis < GGML_MAX_DIMS) {
+                bool same_shape = true;
+                for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+                    const int64_t nd = tensor->src[ib]->ne[dim];
+                    const int64_t nm = tensor->src[ia]->ne[dim];
+                    if (nd != nm && nm != 1) { same_shape = false; break; }
+                }
+                if (same_shape) {
+                    return src_ss[ib];
+                }
+            }
+        }
         return handle_generic(src_ss, /*scalar_only =*/ false);
     };
 
