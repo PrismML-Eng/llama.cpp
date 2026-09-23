@@ -1627,7 +1627,7 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc)) {
         compute_type = GGML_TYPE_F32;
     }
-    if (dst->op_params[0] == GGML_PREC_F32) {
+    if (dst->op_params[0] == GGML_PREC_F32 || src0->type == GGML_TYPE_PQ1_0) {
         compute_type = GGML_TYPE_F32;
     }
 
@@ -5237,6 +5237,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
                     case GGML_TYPE_Q1_0:
+                    case GGML_TYPE_PQ1_0:
                     case GGML_TYPE_Q2_0:
                     case GGML_TYPE_PQ2_0:
                     case GGML_TYPE_PTQ1_0:
@@ -5278,6 +5279,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_I32:
                     case GGML_TYPE_Q1_0:
+                    case GGML_TYPE_PQ1_0:
                     case GGML_TYPE_Q2_0:
                     case GGML_TYPE_PQ2_0:
                     case GGML_TYPE_PTQ1_0:

@@ -21,6 +21,7 @@
 // PQ2_0 x Q8_K has only the generic vec_dot outside x86; alias it until a SIMD version lands
 #define ggml_vec_dot_pq2_0_q8_K_generic ggml_vec_dot_pq2_0_q8_K
 #define ggml_vec_dot_ptq1_0_q8_0_generic ggml_vec_dot_ptq1_0_q8_0
+#define ggml_vec_dot_pq1_0_q8_0_generic ggml_vec_dot_pq1_0_q8_0
 #define ggml_vec_dot_q2_0_q8_0_generic ggml_vec_dot_q2_0_q8_0
 #define ggml_vec_dot_tq1_0_q8_K_generic ggml_vec_dot_tq1_0_q8_K
 #define ggml_vec_dot_tq2_0_q8_K_generic ggml_vec_dot_tq2_0_q8_K
@@ -84,6 +85,7 @@
 #elif defined(__aarch64__) || defined(__arm__) || defined(_M_ARM) || defined(_M_ARM64)
 // PTQ1_0 currently has only the generic vec_dot; alias it here until a SIMD version lands
 #define ggml_vec_dot_ptq1_0_q8_0_generic ggml_vec_dot_ptq1_0_q8_0
+#define ggml_vec_dot_pq1_0_q8_0_generic ggml_vec_dot_pq1_0_q8_0
 // PQ2_0 x Q8_K has only the generic vec_dot outside x86; alias it until a SIMD version lands
 #define ggml_vec_dot_pq2_0_q8_K_generic ggml_vec_dot_pq2_0_q8_K
 // repack.cpp
@@ -100,6 +102,7 @@
 #elif defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
 // PTQ1_0 currently has only the generic vec_dot; alias it here until a SIMD version lands
 #define ggml_vec_dot_ptq1_0_q8_0_generic ggml_vec_dot_ptq1_0_q8_0
+#define ggml_vec_dot_pq1_0_q8_0_generic ggml_vec_dot_pq1_0_q8_0
 // quants.c
 #define ggml_vec_dot_q2_0_q8_0_generic ggml_vec_dot_q2_0_q8_0
 // repack.cpp
@@ -132,6 +135,7 @@
 #elif defined(__POWERPC__) || defined(__powerpc__)
 // PTQ1_0 currently has only the generic vec_dot; alias it here until a SIMD version lands
 #define ggml_vec_dot_ptq1_0_q8_0_generic ggml_vec_dot_ptq1_0_q8_0
+#define ggml_vec_dot_pq1_0_q8_0_generic ggml_vec_dot_pq1_0_q8_0
 // ref: https://github.com/ggml-org/llama.cpp/pull/14146#issuecomment-2972561679
 // quants.c
 #define quantize_row_q8_K_generic quantize_row_q8_K
@@ -190,6 +194,7 @@
 #elif defined(__loongarch64)
 // PTQ1_0 currently has only the generic vec_dot; alias it here until a SIMD version lands
 #define ggml_vec_dot_ptq1_0_q8_0_generic ggml_vec_dot_ptq1_0_q8_0
+#define ggml_vec_dot_pq1_0_q8_0_generic ggml_vec_dot_pq1_0_q8_0
 // quants.c
 #define quantize_row_q8_K_generic quantize_row_q8_K
 #define ggml_vec_dot_tq1_0_q8_K_generic ggml_vec_dot_tq1_0_q8_K
@@ -248,6 +253,7 @@
 #elif defined(__riscv)
 // PTQ1_0 currently has only the generic vec_dot; alias it here until a SIMD version lands
 #define ggml_vec_dot_ptq1_0_q8_0_generic ggml_vec_dot_ptq1_0_q8_0
+#define ggml_vec_dot_pq1_0_q8_0_generic ggml_vec_dot_pq1_0_q8_0
 // quants.c
 #define ggml_vec_dot_nvfp4_q8_0_generic ggml_vec_dot_nvfp4_q8_0
 #define ggml_vec_dot_q2_0_q8_0_generic ggml_vec_dot_q2_0_q8_0
@@ -299,6 +305,7 @@
 #elif defined(__s390x__)
 // PTQ1_0 currently has only the generic vec_dot; alias it here until a SIMD version lands
 #define ggml_vec_dot_ptq1_0_q8_0_generic ggml_vec_dot_ptq1_0_q8_0
+#define ggml_vec_dot_pq1_0_q8_0_generic ggml_vec_dot_pq1_0_q8_0
 // quants.c
 #define quantize_row_q8_K_generic quantize_row_q8_K
 #define ggml_vec_dot_nvfp4_q8_0_generic ggml_vec_dot_nvfp4_q8_0
@@ -363,6 +370,7 @@
 #elif defined(__wasm__)
 // PTQ1_0 currently has only the generic vec_dot; alias it here until a SIMD version lands
 #define ggml_vec_dot_ptq1_0_q8_0_generic ggml_vec_dot_ptq1_0_q8_0
+#define ggml_vec_dot_pq1_0_q8_0_generic ggml_vec_dot_pq1_0_q8_0
 // quants.c
 #define ggml_vec_dot_tq1_0_q8_K_generic ggml_vec_dot_tq1_0_q8_K
 #define ggml_vec_dot_tq2_0_q8_K_generic ggml_vec_dot_tq2_0_q8_K

@@ -78,6 +78,39 @@ void dequantize_q1_0(device const block_q1_0 * xb, short il, thread type4x4 & re
     reg = (type4x4) reg_f;
 }
 
+template <typename type4x4>
+void dequantize_pq1_0(device const block_pq1_0 * xb, short il, thread type4x4 & reg) {
+    device const uint8_t * qs = xb->qs;
+    const float d = xb->d;
+    const float neg_d = -d;
+
+    const int byte_offset = il * 2;  // il*16 bits = il*2 bytes
+    const uint8_t b0 = qs[byte_offset];
+    const uint8_t b1 = qs[byte_offset + 1];
+
+    float4x4 reg_f;
+
+    reg_f[0][0] = select(neg_d, d, bool(b0 & 0x01));
+    reg_f[0][1] = select(neg_d, d, bool(b0 & 0x02));
+    reg_f[0][2] = select(neg_d, d, bool(b0 & 0x04));
+    reg_f[0][3] = select(neg_d, d, bool(b0 & 0x08));
+    reg_f[1][0] = select(neg_d, d, bool(b0 & 0x10));
+    reg_f[1][1] = select(neg_d, d, bool(b0 & 0x20));
+    reg_f[1][2] = select(neg_d, d, bool(b0 & 0x40));
+    reg_f[1][3] = select(neg_d, d, bool(b0 & 0x80));
+
+    reg_f[2][0] = select(neg_d, d, bool(b1 & 0x01));
+    reg_f[2][1] = select(neg_d, d, bool(b1 & 0x02));
+    reg_f[2][2] = select(neg_d, d, bool(b1 & 0x04));
+    reg_f[2][3] = select(neg_d, d, bool(b1 & 0x08));
+    reg_f[3][0] = select(neg_d, d, bool(b1 & 0x10));
+    reg_f[3][1] = select(neg_d, d, bool(b1 & 0x20));
+    reg_f[3][2] = select(neg_d, d, bool(b1 & 0x40));
+    reg_f[3][3] = select(neg_d, d, bool(b1 & 0x80));
+
+    reg = (type4x4) reg_f;
+}
+
 template <typename type4>
 void dequantize_q1_0_t4(device const block_q1_0 * xb, short il, thread type4 & reg) {
     const float d = xb->d;

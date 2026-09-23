@@ -36,6 +36,7 @@ SOURCE_FATTN_MMA_CASE = "DECL_FATTN_MMA_F16_CASE({head_size_kq}, {head_size_v}, 
 
 TYPES_MMQ = [
     "GGML_TYPE_Q1_0",
+    "GGML_TYPE_PQ1_0",
     "GGML_TYPE_Q2_0",
     "GGML_TYPE_PQ2_0",
     "GGML_TYPE_PTQ1_0",
