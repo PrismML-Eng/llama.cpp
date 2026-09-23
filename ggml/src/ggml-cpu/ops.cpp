@@ -9084,6 +9084,173 @@ static void ggml_flash_attn_ext_reduce_partials(
     }
 }
 
+#if defined(__AVX512F__) && defined(__AVX512DQ__) && defined(__F16C__)
+#define GGML_FA_DEC_TILE   16  // KV rows per tile
+#define GGML_FA_DEC_MAX_G  16  // q heads per KV head
+#define GGML_FA_DEC_MAX_D  512
+
+static bool ggml_flash_attn_ext_decode_avx512_supported(const ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || q->type != GGML_TYPE_F32 || logit_softcap != 0.0f) {
+        return false;
+    }
+    if (k->ne[0] % 16 != 0 || v->ne[0] % 16 != 0 || k->ne[0] > GGML_FA_DEC_MAX_D || v->ne[0] > GGML_FA_DEC_MAX_D) {
+        return false;
+    }
+    if (q->ne[2] % k->ne[2] != 0 || k->ne[2] != v->ne[2] || q->ne[2]/k->ne[2] > GGML_FA_DEC_MAX_G) {
+        return false;
+    }
+    return q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1;
+}
+
+// [M, S, VKQ] partials of every q head for the KV rows [ic_start, ic_end)
+static void ggml_compute_forward_flash_attn_ext_f16_decode_avx512(
+        const ggml_tensor * dst,
+        int64_t ic_start, int64_t ic_end,
+        float * partials, int64_t partial_stride) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    const int64_t DK   = k->ne[0];
+    const int64_t DV   = v->ne[0];
+    const int64_t nek2 = k->ne[2];
+    const int64_t G    = q->ne[2]/nek2;
+    const int     T    = GGML_FA_DEC_TILE;
+
+    float scale    = 1.0f;
+    float max_bias = 0.0f;
+    memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+
+    const uint32_t n_head      = q->ne[2];
+    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2(n_head));
+    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    alignas(64) static thread_local float Qs [GGML_FA_DEC_MAX_G*GGML_FA_DEC_MAX_D]; // q * scale, per head
+    alignas(64) static thread_local float acc[GGML_FA_DEC_MAX_G*GGML_FA_DEC_MAX_D]; // VKQ, per head
+    alignas(64) static thread_local float Kt [GGML_FA_DEC_TILE*GGML_FA_DEC_MAX_D];  // K tile, f32 rows
+    alignas(64) static thread_local float Vt [GGML_FA_DEC_TILE*GGML_FA_DEC_MAX_D];  // V tile, f32 rows
+    float M[GGML_FA_DEC_MAX_G];
+    float S[GGML_FA_DEC_MAX_G];
+    float slope[GGML_FA_DEC_MAX_G];
+    const ggml_fp16_t * mp[GGML_FA_DEC_MAX_G];
+
+    for (int64_t ik2 = 0; ik2 < nek2; ++ik2) {
+        for (int64_t j = 0; j < G; ++j) {
+            const int64_t h = ik2*G + j;
+            const float * pq = (const float *) ((const char *) q->data + h*q->nb[2]);
+            for (int64_t d = 0; d < DK; ++d) {
+                Qs[j*DK + d] = pq[d]*scale;
+            }
+            memset(acc + j*DV, 0, DV*sizeof(float));
+            M[j] = -INFINITY;
+            S[j] = 0.0f;
+            slope[j] = (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
+            mp[j] = mask ? (const ggml_fp16_t *) ((const char *) mask->data + (h % mask->ne[2])*mask->nb[2]) : NULL;
+        }
+
+        for (int64_t ic = ic_start; ic < ic_end; ic += T) {
+            const int nt = (int) MIN((int64_t) T, ic_end - ic);
+
+            // convert the K and V rows of the tile once
+            for (int t = 0; t < nt; ++t) {
+                const ggml_fp16_t * kr = (const ggml_fp16_t *) ((const char *) k->data + (ic + t)*k->nb[1] + ik2*k->nb[2]);
+                const ggml_fp16_t * vr = (const ggml_fp16_t *) ((const char *) v->data + (ic + t)*v->nb[1] + ik2*v->nb[2]);
+                for (int64_t d = 0; d < DK; d += 16) {
+                    _mm512_store_ps(Kt + t*DK + d, _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (kr + d))));
+                }
+                for (int64_t d = 0; d < DV; d += 16) {
+                    _mm512_store_ps(Vt + t*DV + d, _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (vr + d))));
+                }
+            }
+
+            for (int64_t j = 0; j < G; ++j) {
+                // scores of this head for the tile (lanes >= nt stay -inf)
+                alignas(64) float sc[16];
+                const float * qj = Qs + j*DK;
+                for (int t = 0; t < 16; ++t) {
+                    sc[t] = -INFINITY;
+                }
+                for (int t = 0; t < nt; ++t) {
+                    const float mv = mp[j] ? slope[j]*GGML_CPU_FP16_TO_FP32(mp[j][ic + t]) : 0.0f;
+                    if (mv == -INFINITY) {
+                        continue;
+                    }
+                    __m512 a0 = _mm512_setzero_ps();
+                    __m512 a1 = _mm512_setzero_ps();
+                    const float * kt = Kt + t*DK;
+                    int64_t d = 0;
+                    for (; d + 32 <= DK; d += 32) {
+                        a0 = _mm512_fmadd_ps(_mm512_load_ps(qj + d),      _mm512_load_ps(kt + d),      a0);
+                        a1 = _mm512_fmadd_ps(_mm512_load_ps(qj + d + 16), _mm512_load_ps(kt + d + 16), a1);
+                    }
+                    for (; d < DK; d += 16) {
+                        a0 = _mm512_fmadd_ps(_mm512_load_ps(qj + d), _mm512_load_ps(kt + d), a0);
+                    }
+                    sc[t] = _mm512_reduce_add_ps(_mm512_add_ps(a0, a1)) + mv;
+                }
+
+                __m512 s = _mm512_load_ps(sc);
+                const float tile_max = _mm512_reduce_max_ps(s);
+                if (tile_max == -INFINITY) {
+                    continue;
+                }
+                const float Mnew = fmaxf(M[j], tile_max);
+                const float ms   = expf(M[j] - Mnew); // 0 when M[j] is -inf
+                const __m512 pv  = ggml_v_expf(_mm512_sub_ps(s, _mm512_set1_ps(Mnew)));
+                _mm512_store_ps(sc, pv);
+                S[j] = S[j]*ms + _mm512_reduce_add_ps(pv);
+                M[j] = Mnew;
+
+                // acc = acc*ms + sum_t p[t]*V[t], 16 floats of acc at a time kept in a register
+                float * aj = acc + j*DV;
+                const __m512 msv = _mm512_set1_ps(ms);
+                for (int64_t d = 0; d < DV; d += 16) {
+                    __m512 a = _mm512_mul_ps(_mm512_load_ps(aj + d), msv);
+                    for (int t = 0; t < nt; ++t) {
+                        a = _mm512_fmadd_ps(_mm512_set1_ps(sc[t]), _mm512_load_ps(Vt + t*DV + d), a);
+                    }
+                    _mm512_store_ps(aj + d, a);
+                }
+            }
+        }
+
+        for (int64_t j = 0; j < G; ++j) {
+            const int64_t h = ik2*G + j;
+            float * aj = acc + j*DV;
+
+            // sinks - apply only on the first kv-chunk
+            if (sinks && ic_start == 0) {
+                const float sv = ((const float *) sinks->data)[h];
+                float ms = 1.0f;
+                float vs = 1.0f;
+                if (sv > M[j]) {
+                    ms = expf(M[j] - sv);
+                    M[j] = sv;
+                    ggml_vec_scale_f32(DV, aj, ms);
+                } else {
+                    vs = expf(sv - M[j]);
+                }
+                S[j] = S[j]*ms + vs;
+            }
+
+            float * partial = partials + h*partial_stride;
+            partial[0] = M[j];
+            partial[1] = S[j];
+            memcpy(partial + 2, aj, DV*sizeof(float));
+        }
+    }
+}
+#endif
+
 static void ggml_compute_forward_flash_attn_ext_f16(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -9148,7 +9315,16 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t partial_stride = nth * partial_size;
         float *       chunk_partials = partials_base + ith * partial_size;
 
-        if (ic_start < nek1) {
+#if defined(__AVX512F__) && defined(__AVX512DQ__) && defined(__F16C__)
+        const bool use_decode_avx512 = ggml_flash_attn_ext_decode_avx512_supported(dst);
+#else
+        const bool use_decode_avx512 = false;
+#endif
+        if (ic_start < nek1 && use_decode_avx512) {
+#if defined(__AVX512F__) && defined(__AVX512DQ__) && defined(__F16C__)
+            ggml_compute_forward_flash_attn_ext_f16_decode_avx512(dst, ic_start, ic_end, chunk_partials, partial_stride);
+#endif
+        } else if (ic_start < nek1) {
             for (int64_t q_head = 0; q_head < neq2; q_head++) {
                 ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                     params, dst, q_head, q_head + 1, ic_start, ic_end,
