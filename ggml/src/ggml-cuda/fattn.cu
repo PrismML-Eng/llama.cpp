@@ -533,6 +533,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
+// forward declaration, defined below
+static bool ggml_cuda_flash_attn_ext_mma_q8_0_eligible(int device, const ggml_tensor * dst);
+
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -561,6 +564,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             break;
     }
 
+    // the fused q8_0 path reads the quantized cache directly, so skip the f16 K/V reservation
+    if (ggml_cuda_flash_attn_ext_mma_q8_0_eligible(device, dst)) {
+        need_f16_K = false;
+        need_f16_V = false;
+    }
+
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
 
@@ -585,16 +594,16 @@ static int ggml_cuda_fattn_q8_0_mma_ncols1_min() {
     return value;
 }
 
-// Decode with q8_0 K and V: the kernel reads the quantized cache and packs the GQA heads (ncols2 = 8),
-// the generic path would first convert the whole cache to f16.
-static bool ggml_cuda_flash_attn_ext_mma_q8_0(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+// eligibility for the fused q8_0 path, shared by the dispatcher and get_alloc_size
+// (it must skip the f16 reservation exactly when this returns true)
+static bool ggml_cuda_flash_attn_ext_mma_q8_0_eligible(int device, const ggml_tensor * dst) {
     const ggml_tensor * KQV  = dst;
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
 
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int cc = ggml_cuda_info().devices[device].cc;
     // only tuned and tested on Ampere
     const bool is_ampere = GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_ADA_LOVELACE;
     if (!ggml_cuda_fattn_q8_0_mma_enabled() || !turing_mma_available(cc) || !is_ampere) {
@@ -621,6 +630,23 @@ static bool ggml_cuda_flash_attn_ext_mma_q8_0(ggml_backend_cuda_context & ctx, g
             return false;
         }
     }
+
+    // mirror the dispatcher's ncols1 gate exactly
+    if (Q->ne[1] == 1 && ggml_cuda_fattn_q8_0_mma_ncols1_min() != 1) {
+        return false;
+    }
+
+    return true;
+}
+
+// Decode with q8_0 K and V: the kernel reads the quantized cache and packs the GQA heads (ncols2 = 8),
+// the generic path would first convert the whole cache to f16.
+static bool ggml_cuda_flash_attn_ext_mma_q8_0(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (!ggml_cuda_flash_attn_ext_mma_q8_0_eligible(ggml_cuda_get_device(), dst)) {
+        return false;
+    }
+
+    const ggml_tensor * Q = dst->src[0];
 
     if (Q->ne[1] == 1 && ggml_cuda_fattn_q8_0_mma_ncols1_min() == 1) {
         ggml_cuda_flash_attn_ext_mma_q8_0_case<256, 256, 1, 8>(ctx, dst);
