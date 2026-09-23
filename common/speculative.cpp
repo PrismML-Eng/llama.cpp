@@ -2096,8 +2096,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (!d.pending) {
             return true;
         }
-        d.pending = false;
         if (d.n_valid <= 0) {
+            d.pending = false;
             return true;
         }
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
@@ -2112,6 +2112,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             d.catchup_failed = true;
             return false;
         }
+        d.pending = false;
         return true;
     }
 
@@ -2223,6 +2224,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         auto * ctx_dft = this->params.ctx_dft;
+        if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            // A failed catch-up used to stick for the life of the slot. This task is a new prompt.
+            deferred[seq_id].catchup_failed = false;
+        }
         if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq && deferred[seq_id].pending) {
             // rows left over from the previous task on this slot. They are only worth decoding when they
             // are the tail of a prefix the new prompt reuses: the same tokens at the same positions, and
@@ -2459,11 +2464,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        // Catch-up that leads into this draft rides in the same decode as the anchors. The stash
-        // can already be llama_n_batch(ctx_dft) rows (n_tokens == n_max+1 == n_batch); the extra
-        // anchor then overflows both the host batch and llama_decode. Flush first when the
-        // combined count would not fit; llama_decode enforces the same limit, so growing the
-        // host allocation alone is not enough.
+        // Catch-up that leads into this draft rides in the same decode as the anchors. batch is
+        // allocated at exactly llama_n_batch(ctx_dft); a full stash (n_tokens == n_max+1 == n_batch)
+        // plus the anchor is a one-row heap overflow, and llama_decode enforces the same limit.
+        // Flush first when the combined count would not fit. Growing only the host allocation
+        // would still abort in decode.
         {
             const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
             int32_t catchup_rows = 0;
@@ -2496,6 +2501,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // keep track of which sequences are still drafting
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
+        std::vector<char> catchup_in_batch(n_seq, 0);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
@@ -2515,7 +2521,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     common_batch_add(batch, d.tokens[k], d.pos[k], { seq_id }, false);
                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, d.h.data() + (size_t) k * n_embd, row_bytes);
                 }
-                d.pending = false;
+                // Leave pending set until this decode succeeds. Clearing it here dropped the
+                // rows on a failed llama_decode: they were in neither the stash nor ctx_dft.
+                catchup_in_batch[seq_id] = 1;
             }
 
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
@@ -2550,7 +2558,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             int ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
+                if (i == 0) {
+                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                        if (catchup_in_batch[seq_id]) {
+                            deferred[seq_id].catchup_failed = true;
+                        }
+                    }
+                }
                 break;
+            }
+            if (i == 0) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (catchup_in_batch[seq_id]) {
+                        deferred[seq_id].pending = false;
+                    }
+                }
             }
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the

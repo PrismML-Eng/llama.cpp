@@ -1057,10 +1057,10 @@ enum ggml_cuda_q8_1_layout : int {
     GGML_CUDA_Q8_1_PT       = 2, // PTQ1_0, 2-8 columns or MoE ids: planar-transposed (mmvq-ptq1_0.cuh)
 };
 
-// The single decision both sides (quantizer, kernel) must agree on. Column count is the first
-// cut: 2-8 columns and MoE (ids) always take the planar-transposed kernel. One-column decode
-// is architecture-specific and is resolved on the host (ggml_cuda_q8_1_layout_host): this
-// constexpr helper only knows column count, so it reports the Ada default (SOA_ISUM at 1-col).
+// Column-count helper, not the layout decision. 2-8 columns and MoE (ids) take the planar
+// kernel. One column returns the Ada default (SOA_ISUM). Ampere and GGML_CUDA_BATCH_INVARIANT
+// override that to PT in ggml_cuda_q8_1_layout_host, which is what the quantizer and the kernel
+// switch both call. This helper does not consult the compute capability.
 static constexpr __host__ __device__ ggml_cuda_q8_1_layout ggml_cuda_q8_1_layout_for(ggml_type type_src0, int ncols_dst, bool has_ids) {
 #if defined(GGML_USE_HIP)
     GGML_UNUSED(type_src0); GGML_UNUSED(ncols_dst); GGML_UNUSED(has_ids);
