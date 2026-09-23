@@ -6146,6 +6146,16 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 ggml_type src0_type = op->src[0]->type;
                 ggml_type src1_type = op->src[1]->type;
 
+                // Quantizing a float row into PTQ1_0 or PQ2_0 has no kernel: both are
+                // produced offline by the converter, which also applies the Hadamard
+                // rotation the packing assumes. ggml_sycl_cpy() would take the
+                // float -> quantized branch and assert, so decline the pair here and let
+                // the scheduler fall back. The quant -> same-quant copies are handled.
+                if ((src1_type == GGML_TYPE_PTQ1_0 || src1_type == GGML_TYPE_PQ2_0) &&
+                    src0_type != src1_type) {
+                    return false;
+                }
+
                 if (src0_type == GGML_TYPE_F16) {
                     if (src1_type == GGML_TYPE_Q2_K ||
                         src1_type == GGML_TYPE_Q3_K ||
