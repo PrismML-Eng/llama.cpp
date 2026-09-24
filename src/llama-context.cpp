@@ -2524,6 +2524,7 @@ ggml_cgraph * llama_context::graph_reserve(
     auto * gf = model.build_graph(gparams);
 
     this->n_input_tensors = llama_graph_n_input_tensors(gf);
+
     this->n_outputs = save_n_outputs;
 
     // initialize scheduler with the specified graph
@@ -2559,6 +2560,8 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.hadamard_rotations =*/ &model.hadamard_rotations,
+        /*.hadamard_inverses  =*/ &model.hadamard_inverses,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
