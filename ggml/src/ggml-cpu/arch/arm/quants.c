@@ -336,12 +336,12 @@ void ggml_vec_dot_pq2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
             const uint8x8_t raw = vld1_u8(&x[i].qs[k * 8]);
             const uint8x16_t raw16 = vcombine_u8(raw, raw);
 
-            uint8x16_t bytes0 = vqtbl1q_u8(raw16, idx_lo);
+            uint8x16_t bytes0 = ggml_vqtbl1q_u8(raw16, idx_lo);
             int8x16_t qv0 = vsubq_s8(
                 vreinterpretq_s8_u8(vandq_u8(vshlq_u8(bytes0, shifts), mask2)),
                 one);
 
-            uint8x16_t bytes1 = vqtbl1q_u8(raw16, idx_hi);
+            uint8x16_t bytes1 = ggml_vqtbl1q_u8(raw16, idx_hi);
             int8x16_t qv1 = vsubq_s8(
                 vreinterpretq_s8_u8(vandq_u8(vshlq_u8(bytes1, shifts), mask2)),
                 one);
@@ -406,9 +406,9 @@ void ggml_vec_dot_pq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
             const uint8x16_t raw16 = vcombine_u8(raw, raw);
 
             const int8x16_t qv0 = vsubq_s8(
-                vreinterpretq_s8_u8(vandq_u8(vshlq_u8(vqtbl1q_u8(raw16, idx_lo), shifts), mask2)), one);
+                vreinterpretq_s8_u8(vandq_u8(vshlq_u8(ggml_vqtbl1q_u8(raw16, idx_lo), shifts), mask2)), one);
             const int8x16_t qv1 = vsubq_s8(
-                vreinterpretq_s8_u8(vandq_u8(vshlq_u8(vqtbl1q_u8(raw16, idx_hi), shifts), mask2)), one);
+                vreinterpretq_s8_u8(vandq_u8(vshlq_u8(ggml_vqtbl1q_u8(raw16, idx_hi), shifts), mask2)), one);
 
             const int8x16_t y0 = vld1q_s8(q8 + 32 * k);
             const int8x16_t y1 = vld1q_s8(q8 + 32 * k + 16);
