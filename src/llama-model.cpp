@@ -526,15 +526,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                  std::regex_match(tensor_name, pattern_kv_cache))) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
-        // Bonsai output head mirror: replicated output projection (logits identical on
-        // both devices, no gather order issues). PQ2_0-gated so Q4 models are untouched.
-        {
-            static const std::regex pattern_out_mir("^output\\.weight$");
-            if (std::regex_match(tensor_name, pattern_out_mir) &&
-                    (tensor->type == GGML_TYPE_PQ2_0 || tensor->type == GGML_TYPE_PTQ1_0)) {
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-            }
-        }
         // FFN is split (hadamard input is 1024-block aligned; signs.17408 splits with it).
         // Hadamard sign vectors: a 1-D signs vector must carry the SAME split state
         // as the activation it multiplies (the elementwise mul indexes from the
