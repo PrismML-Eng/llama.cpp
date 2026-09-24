@@ -6,6 +6,8 @@
 extern "C" {
 #endif
 
+bool ggml_metal_ptq1_multicol_enabled(const struct ggml_tensor * op);
+
 struct ggml_metal_buffer_id {
     void * metal; // id<MTLBuffer>
     size_t offs;

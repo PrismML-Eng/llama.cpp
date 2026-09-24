@@ -2800,7 +2800,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            (op->src[0]->type == GGML_TYPE_Q1_0 && q1_0_ext_enable) ||
            op->src[0]->type == GGML_TYPE_Q2_0 ||
            op->src[0]->type == GGML_TYPE_PQ2_0 ||
-           op->src[0]->type == GGML_TYPE_PTQ1_0 ||
+           (op->src[0]->type == GGML_TYPE_PTQ1_0 && !ggml_metal_ptq1_multicol_enabled(op)) ||
            op->src[0]->type == GGML_TYPE_Q4_0 ||
            op->src[0]->type == GGML_TYPE_Q4_1 ||
            op->src[0]->type == GGML_TYPE_Q5_0 ||
