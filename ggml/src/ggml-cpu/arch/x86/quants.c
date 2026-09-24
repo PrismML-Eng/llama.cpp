@@ -4206,6 +4206,7 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 // 128 weights, against 4x(2 dpbusd + sub + cvt + fmadd) on the Q8_0 path). The sum(y) correction for the
 // unsigned codes is kept per lane (dpbusd(ones, y)) so the per-lane partials stay exact; the tiled GEMM in
 // llamafile/sgemm.cpp uses the same per-block float op and the same reduction, so both paths agree bit-for-bit.
+#if defined(__AVX2__)
 static inline __m256i pq2k_dpbusd_acc(__m256i acc, __m256i u, __m256i s) {
 #if defined(GGML_DPBUSD_256)
     return GGML_DPBUSD_256(acc, u, s);
@@ -4213,6 +4214,7 @@ static inline __m256i pq2k_dpbusd_acc(__m256i acc, __m256i u, __m256i s) {
     return _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(u, s), _mm256_set1_epi16(1)));
 #endif
 }
+#endif
 void ggml_vec_dot_pq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK_K == 0);
     assert(nrc == 1);
@@ -4252,6 +4254,9 @@ void ggml_vec_dot_pq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
     }
     sumf = hsum_float_8(acc);
 #else
+    UNUSED(x);
+    UNUSED(y);
+    UNUSED(nb);
     ggml_vec_dot_pq2_0_q8_K_generic(n, &sumf, bs, vx, bx, vy, by, nrc);
 #endif
     *s = sumf;
