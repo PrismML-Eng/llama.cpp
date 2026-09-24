@@ -877,15 +877,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = ne_s - low;
             split_state.nr[is] = nr_s;
-            fprintf(stderr, "SEG %s ax=%d ne=[%lld,%lld]\n", tensor_name.c_str(),
-                (int)split_state.axis,
-                (long long)split_state.ne[is*ud->n_devices+0], (long long)split_state.ne[is*ud->n_devices+1]);
-            if (tensor_name.find("ssm_out") != std::string::npos || tensor_name.find("attn_gate") != std::string::npos) {
-                fprintf(stderr, "DBG_SEG tensor=%s axis=%d ne_s=%lld nr_s=%u g=%lld ne=[%lld,%lld] rot=%d split=[%g,%g]\n",
-                    tensor_name.c_str(), (int)split_state.axis, (long long)ne_s, nr_s, (long long)g_s,
-                    (long long)split_state.ne[is*ud->n_devices+0], (long long)split_state.ne[is*ud->n_devices+1],
-                    tc.rotation, tensor_split ? tensor_split[0] : -1.0f, tensor_split && ud->n_devices > 1 ? tensor_split[1] : -1.0f);
-            }
         }
         split_state.n_segments = segments.size();
     } else {
