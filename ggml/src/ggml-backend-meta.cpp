@@ -608,8 +608,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             ggml_backend_meta_split_state ret = src_ss[0];
             ret.axis = GGML_BACKEND_SPLIT_AXIS_0;
-            ret.nr[0] = 1;
-            ret.n_segments = 1;
             return ret;
         }
         if (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
@@ -849,10 +847,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     auto handle_ssm_conv = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis == src_ss[1].axis) {
             if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
-                return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+                ggml_backend_meta_split_state ret = src_ss[0];
+                ret.axis = GGML_BACKEND_SPLIT_AXIS_1;
+                return ret;
             }
             if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1) {
-                return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+                ggml_backend_meta_split_state ret = src_ss[0];
+                ret.axis = GGML_BACKEND_SPLIT_AXIS_0;
+                return ret;
             }
         }
         return handle_generic(src_ss, /*scalar_only =*/ false);
@@ -872,7 +874,25 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         // state shape is [S_v, S_v, H_v, n_seqs] (s0 only); the heads dim is its own axis 2,
         // so a head-aligned split on the input cache lands on axis 2 here.
         GGML_ASSERT(src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_2 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_1 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_0);
-        return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+        // qwen35 grouped-V: the GDN output is laid out as head_ratio blocks of n_k heads
+        // (device-local V groups). Preserve that grouping so the downstream ssm_out
+        // (segmented {key_dim, head_ratio}) matches its activation layout.
+        {
+            const int64_t gdn_head_dim  = tensor->src[0]->ne[0];
+            const int64_t gdn_n_k_heads = tensor->src[0]->ne[1];
+            const size_t  gdn_n_bufs    = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+            ggml_backend_meta_split_state gdn_ret = {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+            if (gdn_head_dim > 0 && gdn_n_k_heads > 0 && tensor->ne[0] % (gdn_head_dim * gdn_n_k_heads) == 0) {
+                const int64_t gdn_ratio = tensor->ne[0] / (gdn_head_dim * gdn_n_k_heads);
+                if (gdn_ratio > 1 && tensor->ne[0] % (int64_t)(gdn_n_bufs * gdn_ratio) == 0) {
+                    gdn_ret.nr[0] = (uint32_t) gdn_ratio;
+                    for (size_t j = 0; j < gdn_n_bufs; j++) {
+                        gdn_ret.ne[j] = tensor->ne[0] / (int64_t)(gdn_n_bufs * gdn_ratio);
+                    }
+                }
+            }
+            return gdn_ret;
+        }
     };
 
     auto calculate_split_state = [&]() -> ggml_backend_meta_split_state {
@@ -1111,7 +1131,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
             } break;
         }
-        if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
+        const bool split_ne_precomputed = split_state.nr[0] > 1 && split_state.ne[0] > 0;
+        if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS && !split_ne_precomputed) {
             bool first_src_split_by_axis = true;
             const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
 
@@ -1120,7 +1141,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                     continue;
                 }
                 if (first_src_split_by_axis) {
+                    const bool seg_copy = src_ss[i].n_segments > 1 &&
+                        tensor->ne[split_state.axis] == tensor->src[i]->ne[src_ss[i].axis];
+                    if (seg_copy) {
+                        split_state.n_segments = src_ss[i].n_segments;
+                        for (size_t s = 0; s < src_ss[i].n_segments; s++) {
+                            split_state.nr[s] = src_ss[i].nr[s];
+                            for (size_t j = 0; j < n_bufs; j++) {
+                                split_state.ne[s*n_bufs + j] = src_ss[i].ne[s*n_bufs + j];
+                            }
+                        }
+                    }
                     for (size_t j = 0; j < n_bufs; j++) {
+                        if (seg_copy) break;
                         // Take over ratio from src:
                         for (size_t s = 0; s < src_ss[i].n_segments; s++) {
                             split_state.ne[s*n_bufs + j] = 0;

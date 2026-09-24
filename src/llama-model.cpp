@@ -494,7 +494,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         // QWEN35 linear block: mirror SSM weights (replicated compute needs no sharding;
         // residual stream is mirrored, verified by working Q4 tensor-split).
-        if (ud->model->arch == LLM_ARCH_QWEN35) {
+        if (false && ud->model->arch == LLM_ARCH_QWEN35) {
             if (std::regex_match(tensor_name, pattern_attn_gate_weight) ||
                     std::regex_match(tensor_name, pattern_ssm_out_weight) ||
                     std::regex_match(tensor_name, pattern_qkv_weight) ||
@@ -515,7 +515,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // and the (mirrored) SSM output; one vector cannot serve a split and a
         // mirrored consumer at once. Keep the small attention block mirrored and
         // split the large FFN instead.
-        if (!ud->model->hadamard_sign_data.empty() &&
+        if (false && !ud->model->hadamard_sign_data.empty() &&
                 (std::regex_match(tensor_name, pattern_q_weight) ||
                  std::regex_match(tensor_name, pattern_kv_weight) ||
                  std::regex_match(tensor_name, pattern_q_bias) ||
@@ -545,7 +545,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             static const std::string signs_prefix = "prism.hadamard.signs.";
             if (tensor_name.compare(0, signs_prefix.size(), signs_prefix) == 0) {
                 const long sign_width = std::stol(tensor_name.substr(signs_prefix.size()));
-                if (sign_width == 17408) {
+                if (sign_width == 17408 || sign_width == 6144) {
                     return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
                 }
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
@@ -664,8 +664,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                     GGML_ASSERT(tensor->ne[axis] == 2*key_dim + value_dim);
                     return {{key_dim, 2 + head_ratio}};
                 }
-                if (std::regex_match(tensor_name, pattern_attn_gate_weight) || std::regex_match(tensor_name, pattern_ssm_out_weight)) {
+                if (std::regex_match(tensor_name, pattern_attn_gate_weight)) {
                     return {{key_dim, head_ratio}};
+                }
+                if (std::regex_match(tensor_name, pattern_ssm_out_weight)) {
+                    // ssm_out consumes the hadamard-regrouped (perm_rep) activation, whose
+                    // device-local layout is a contiguous axis-0 half; keep it contiguous
+                    // so the weight rows match the activation elements per device.
+                    return {{tensor->ne[axis], 1}};
                 }
                 if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a) ||
                         std::regex_match(tensor_name, pattern_ssm_alpha) || std::regex_match(tensor_name, pattern_ssm_beta)) {
