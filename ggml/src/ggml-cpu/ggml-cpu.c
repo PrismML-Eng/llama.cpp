@@ -1214,6 +1214,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
+    GGML_UNUSED(type);
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const bool src1_cont = ggml_is_contiguous(src1);
@@ -1525,8 +1527,6 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const void * wdata) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
-
-    const enum ggml_type type = src0->type;
 
     ggml_vec_dot_t    const vec_dot      = ggml_cpu_vec_dot(src0);
     enum ggml_type    const vec_dot_type = ggml_cpu_vec_dot_type(src0);
