@@ -304,6 +304,9 @@ static __global__ void mul_mat_vec_ptq1_0_pt(
     const void * GGML_CUDA_RESTRICT vx = vx_;
     const void * GGML_CUDA_RESTRICT vy = vy_;
     float      * GGML_CUDA_RESTRICT dst = dst_;
+    // launched through ggml_cuda_kernel_launch, which opts into PDL on Hopper and newer: wait for the kernel
+    // that wrote vy (the q8_1 activation quantization) before reading it
+    ggml_cuda_pdl_sync();
     extern __shared__ float partials[];        // [ncols][rows_per_cta][bprp], then partials_gate
     const int bpr  = ncols_x / QK_PTQ1_0;      // K blocks per row
     const int bprp = bpr + 1;                  // partials row stride: odd, so the per-pair epilogue reads are bank-conflict-free
