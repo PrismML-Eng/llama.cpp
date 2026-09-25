@@ -4838,6 +4838,71 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// GGML_OP_MUL (router weights) + n_exp x GGML_OP_VIEW + (n_exp - 1) x GGML_OP_ADD
+// the weighted-expert reduce that build_moe_ffn emits after the down projection; the CUDA
+// backend folds this subgraph into one kernel (ggml_cuda_op_moe_weighted_reduce)
+struct test_moe_weighted_reduce : public test_case {
+    const int64_t n_embd;
+    const int64_t n_exp;
+    const int64_t n_tok;
+    // compute the weights in-graph so they are a dying intermediate rather than a graph input:
+    // the allocator may then place the reduce output over them, which is the case the fused
+    // kernel has to detect and stage the weights for. A scale by 1.0 is used rather than a
+    // softmax because it is exact on every backend, so the 0.0 error bound below still holds.
+    const bool weights_intermediate;
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, n_exp, n_tok, weights_intermediate);
+    }
+
+    // the fused kernel is specified to be bit-identical to the unfused MUL + ADD chain
+    double max_nmse_err() override {
+        return 0.0;
+    }
+
+    test_moe_weighted_reduce(int64_t n_embd = 64, int64_t n_exp = 4, int64_t n_tok = 7, bool weights_intermediate = false)
+        : n_embd(n_embd), n_exp(n_exp), n_tok(n_tok), weights_intermediate(weights_intermediate) {
+        GGML_ASSERT(n_exp >= 2);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_exp, n_tok);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_exp, n_tok);
+        ggml_set_name(w, "w");
+        if (weights_intermediate) {
+            w = ggml_scale(ctx, w, 1.0f);
+        }
+
+        ggml_tensor * experts = ggml_mul(ctx, x, w);
+        ggml_set_name(experts, "experts");
+
+        // build_moe_ffn expands every view before the first add, and the CUDA matcher expects
+        // that node order: MUL, then the n_exp views, then the add chain
+        std::vector<ggml_tensor *> cur_experts(n_exp);
+        for (int64_t e = 0; e < n_exp; ++e) {
+            cur_experts[e] = ggml_view_2d(ctx, experts, n_embd, n_tok, experts->nb[2], e*experts->nb[1]);
+            ggml_build_forward_expand(gf, cur_experts[e]);
+        }
+
+        ggml_tensor * out = cur_experts[0];
+        for (int64_t e = 1; e < n_exp; ++e) {
+            out = ggml_add(ctx, out, cur_experts[e]);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_WEIGHTED_REDUCE";
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -9523,6 +9588,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
+
+    // MoE weighted-expert reduce (CUDA fuses MUL + views + add chain into one kernel).
+    // n_embd 64 takes the float4 path, 66 the scalar one; 15 is the fusion's expert cap and 16 must
+    // fall through to the unfused ops; the intermediate variants make the weights a dying tensor.
+    for (bool intermediate : { false, true }) {
+        for (int64_t n_exp : { 2, 3, 4, 8, 15, 16 }) {
+            test_cases.emplace_back(new test_moe_weighted_reduce(64, n_exp,  7, intermediate));
+        }
+        test_cases.emplace_back(new test_moe_weighted_reduce(66,  4,  7, intermediate));
+        test_cases.emplace_back(new test_moe_weighted_reduce(64,  8,  1, intermediate));
+        test_cases.emplace_back(new test_moe_weighted_reduce(64,  8, 32, intermediate));
+    }
 
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
