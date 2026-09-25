@@ -8,8 +8,11 @@
 #include "ggml-metal-ops.h"
 #include "ggml-metal-tuning.h"
 
+#include <cstdlib>
 #include <mutex>
 #include <string>
+
+#include <TargetConditionals.h>
 
 #define GGML_METAL_NAME "MTL"
 #define GGML_METAL_MAX_DEVICES 16
@@ -571,6 +574,32 @@ static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
     ggml_metal_set_n_cb(ctx, n_cb);
 }
 
+// The number of command buffers a graph is split into, besides the main thread's.
+//
+// On iPhone-class devices (iOS, iPadOS, visionOS, tvOS; not Mac Catalyst) it is 4. iOS discards a command buffer
+// that has run for about 5 s of GPU time when another GPU client (such as the display compositor) is waiting,
+// failing the graph with "Discarded (victim of GPU error/recovery)" (kIOGPUCommandBufferCallbackErrorInnocentVictim).
+// With 1, the command buffer holding ~90% of a 512-token prefill graph of a 27B model runs 5-7 s on an iPhone 17 Pro
+// Max and failed in 10 of 50 runs; with 4 (1.6-2.3 s each) none failed and prefill speed was unchanged.
+//
+// GGML_METAL_N_CB=1..8 overrides the default.
+static int ggml_backend_metal_default_n_cb(void) {
+#if TARGET_OS_IPHONE && !TARGET_OS_MACCATALYST
+    int n_cb = 4;
+#else
+    int n_cb = 1;
+#endif
+    if (const char * env = getenv("GGML_METAL_N_CB")) {
+        const int v = atoi(env);
+        if (v >= 1 && v <= 8) {
+            n_cb = v;
+        } else {
+            GGML_LOG_WARN("%s: ignoring GGML_METAL_N_CB=%s (expected 1..8)\n", __func__, env);
+        }
+    }
+    return n_cb;
+}
+
 static ggml_backend_i ggml_backend_metal_i = {
     /* .get_name                = */ ggml_backend_metal_name,
     /* .free                    = */ ggml_backend_metal_free,
@@ -614,7 +643,7 @@ ggml_backend_t ggml_backend_metal_init(void) {
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, ggml_backend_metal_default_n_cb());
 
     return backend;
 }
@@ -709,7 +738,7 @@ static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t 
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, ggml_backend_metal_default_n_cb());
 
     return backend;
 
