@@ -1242,9 +1242,31 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
 
         // Tool call parser
         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
-            auto arg_close  = p.tool_arg_close(p.literal("\n</parameter>\n"));
+            // A value ran to the next fully-framed "\n</parameter>\n" and swallowed whatever
+            // lay between, so one bad close tag cost every argument after it. Two spellings
+            // caused that in practice: a dropped newline (`Note</parameter>`) and a tag named
+            // after the value instead of the parameter (`Project</Project>`).
+            //
+            // So the value now ends at the first of: any spelling of the close tag, which is
+            // consumed; or the start of the next argument / the end of the call, which is not
+            // — those two can never appear inside a value, so meeting one means the value
+            // ended, however the model chose to close it. The close tag is optional for the
+            // same reason: by then the argument is already delimited.
+            const std::vector<std::string> arg_close_delims = {
+                "\n</parameter>\n", "\n</parameter>", "</parameter>\n", "</parameter>",
+            };
+            std::vector<std::string> arg_stop_delims = arg_close_delims;
+            arg_stop_delims.push_back("<parameter=");
+            arg_stop_delims.push_back("</function>");
+
+            auto arg_close  = p.tool_arg_close(p.optional(p.choice({
+                p.literal("\n</parameter>\n"),
+                p.literal("\n</parameter>"),
+                p.literal("</parameter>\n"),
+                p.literal("</parameter>"),
+            })));
             auto arg_string = p.rule("xml-arg-string",
-                p.ac(p.tool_arg_string_value(p.until("\n</parameter>\n")) + arg_close, "\n</parameter>\n"));
+                p.ac(p.tool_arg_string_value(p.until_one_of(arg_stop_delims)) + arg_close, arg_stop_delims));
 
             auto tool_choice = p.choice();
             foreach_function(inputs.tools, [&](const json & tool) {
