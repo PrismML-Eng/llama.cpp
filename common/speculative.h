@@ -89,6 +89,9 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 
+// types of the implementations that were actually initialized, in priority order
+std::vector<enum common_speculative_type> common_speculative_get_types(const common_speculative * spec);
+
 // TEST/DEBUG ONLY: directly stage target-tap context rows for the dspark
 // implementation (if registered), bypassing the normal process()-driven
 // capture path, which requires a real target context with

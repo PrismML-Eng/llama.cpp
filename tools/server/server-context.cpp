@@ -1202,8 +1202,20 @@ private:
                 [](common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
 
         if (spec) {
+            const auto spec_types_active = common_speculative_get_types(spec.get());
             SRV_INF("speculative decoding enabled: %s\n",
-                    common_speculative_type_name_str(spec_types_requested).c_str());
+                    common_speculative_type_name_str(spec_types_active).c_str());
+
+            std::vector<common_speculative_type> spec_types_skipped;
+            for (const auto t : spec_types_requested) {
+                if (std::find(spec_types_active.begin(), spec_types_active.end(), t) == spec_types_active.end()) {
+                    spec_types_skipped.push_back(t);
+                }
+            }
+            if (!spec_types_skipped.empty()) {
+                SRV_WRN("speculative types requested but not initialized (e.g. no draft model): %s\n",
+                        common_speculative_type_name_str(spec_types_skipped).c_str());
+            }
         } else {
             if (!spec_types_requested.empty()) {
                 SRV_WRN("speculative decoding (%s) was requested but is disabled: %s\n",

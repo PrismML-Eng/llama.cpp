@@ -3545,6 +3545,16 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
     }
 }
 
+std::vector<enum common_speculative_type> common_speculative_get_types(const common_speculative * spec) {
+    std::vector<enum common_speculative_type> types;
+    if (spec != nullptr) {
+        for (const auto & impl : spec->impls) {
+            types.push_back(impl->type);
+        }
+    }
+    return types;
+}
+
 void common_speculative_print_stats(const common_speculative * spec) {
     if (spec == nullptr) {
         return;
