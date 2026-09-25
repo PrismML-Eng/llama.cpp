@@ -173,6 +173,19 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 
 // ---------------------------------------------------------------------------------------------------------
 
+// GGML_CUDA_BATCH_INVARIANT=1: for batches of 1 to 4 columns, pick kernels whose per-column
+// arithmetic does not depend on the column count on the paths this flag covers: the F16 and BF16
+// mat-vec paths it selects, the PTQ1_0 mat-vec (1 to 4 columns; 5 and above take the MMQ tile
+// path, which this flag does not touch), and flash attention up to 8 queries. On those paths a
+// token decoded alone and a token verified inside a speculative batch see the same logits bit
+// for bit. Other weight types and attention shapes outside those kernels can still pick
+// batch-dependent kernels, so this is not a whole-model guarantee. Costs some throughput at
+// 2 to 4 columns.
+static inline bool ggml_cuda_batch_invariant() {
+    static const bool enabled = getenv("GGML_CUDA_BATCH_INVARIANT") != nullptr;
+    return enabled;
+}
+
 #define MATRIX_ROW_PADDING 512 // last row of quant. matrices is a multiple of this to avoid out-of-bounds memory accesses
 
 #define GGML_CUDA_MAX_STREAMS 8
