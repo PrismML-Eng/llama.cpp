@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cinttypes>
 #include <climits>
 #include <cmath>
 #include <cstring>
@@ -614,6 +615,21 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         if (id != LLAMA_TOKEN_NULL) {
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
+            {
+                const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+                if (id < 0 || id >= n_vocab) {
+                    // diagnostic: a backend-sampled id outside the vocab would otherwise surface much later as a
+                    // std::vector::at() throw in the tokenizer ("invalid vector subscript"). log the origin and
+                    // fall back to the CPU chain on the (already fetched) logits/candidates.
+                    LOG_ERR("%s: backend sampler returned out-of-vocab token id %d (idx=%d, n_vocab=%d, cur_p.size=%zu, cur_p[0].id=%d) - falling back to CPU sampling\n",
+                            __func__, id, idx, n_vocab, cur_p.size, cur_p.size > 0 ? cur_p.data[0].id : -1);
+                    id = LLAMA_TOKEN_NULL;
+                }
+            }
+        }
+
+        if (id != LLAMA_TOKEN_NULL) {
+
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
 
@@ -638,6 +654,14 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     llama_sampler_apply(chain, &cur_p);
 
     id = cur_p.data[cur_p.selected].id;
+
+    {
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        if (id < 0 || id >= n_vocab) {
+            LOG_ERR("%s: CPU chain selected out-of-vocab token id %d (idx=%d, n_vocab=%d, selected=%" PRId64 ", cur_p.size=%zu) - candidate ids from the backend are corrupt\n",
+                    __func__, id, idx, n_vocab, cur_p.selected, cur_p.size);
+        }
+    }
 
     if (grammar_first || !grammar_should_apply(gsmpl)) {
         return id;

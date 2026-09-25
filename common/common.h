@@ -329,6 +329,12 @@ struct common_params_speculative_draft {
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
+    // stop drafting once the sequence is this long (0 = never). Deep in the context a step is bound
+    // by reading the KV cache, and the draft passes plus the multi-column verify add to that read
+    // without shortening it: on a 4070 with Bonsai 2 27B the draft is +85% at zero depth, breaks
+    // even near 24k tokens and costs 30% at 64k. Past the cutoff the slot decodes one token per step.
+    int32_t n_depth_max = 0;
+
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     common_params_model mparams;
