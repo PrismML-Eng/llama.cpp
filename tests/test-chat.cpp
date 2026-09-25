@@ -2092,6 +2092,204 @@ static void test_lfm2_parser(const std::string & template_path, bool detailed_de
 
 }
 
+
+// Regression for production HTTP 500 on malformed model output: the logged
+// "unparsed peg-native output" text is effective_input.substr(result.end), i.e.
+// the suffix starting at the failed region, not the full model output. The
+// fixture below reconstructs a plausible output around that real suffix: a
+// reasoning block closed with </think>, then a content region that carries two
+// malformed sequences (EB 82 followed by '.', a truncated 3-byte character).
+static const std::string malformed_utf8_suffix =
+"바다 위를 나는 갈매기는 아침 햇살을 받아 하얗게 빛났다. 날개가 바람에 실려 천천히, 그러나 단호하게 펴지며 파도 위를 스쳤다. 그 아래로 끝없이 펼쳐진 바다는 아직 어둡고, 그러나 햇살이 닿는 곳마다 은빛 물결이 살아 움직이는 듯했다.\n"
+"\n"
+"갈매기는 한 번 더 날개를 접었다. 그 순간, 바람이 날개 아래로 밀어 올려주고, 다시 한 번 힘차게 펴졌다. 그 반복 속에서, 마치 바다가 그에게 날아갈 힘을 빌려주는 것 같았다.\n"
+"\n"
+"연안에 서 있는 낯선한 낯선한 "
+"\xeb\x82"
+"... 아니, 연안에서 낯선 "
+"\xeb\x82"
+"...\n"
+"\n"
+"---\n"
+"\n"
+"죄송합니다. 반복된 문장 때문에 자연스럽게 이어쓰기 어렵습니다. 원하시는 방향을 알려주시면 다시 작성드리겠습니다. 예를 들어:\n"
+"\n"
+"- **시적·수상적**으로 이어쓰기 (분위기, 감각 중심)\n"
+"- **사건·이야기**로 이어쓰기 (갈매기를 따라가는 인물, 사건 발생)\n"
+"- **단순히 한 문장만** 자연스럽게 확장하기\n"
+"\n"
+"어떤 방향이 좋으신가요?";
+
+static const std::string malformed_utf8_suffix_sanitized =
+"바다 위를 나는 갈매기는 아침 햇살을 받아 하얗게 빛났다. 날개가 바람에 실려 천천히, 그러나 단호하게 펴지며 파도 위를 스쳤다. 그 아래로 끝없이 펼쳐진 바다는 아직 어둡고, 그러나 햇살이 닿는 곳마다 은빛 물결이 살아 움직이는 듯했다.\n"
+"\n"
+"갈매기는 한 번 더 날개를 접었다. 그 순간, 바람이 날개 아래로 밀어 올려주고, 다시 한 번 힘차게 펴졌다. 그 반복 속에서, 마치 바다가 그에게 날아갈 힘을 빌려주는 것 같았다.\n"
+"\n"
+"연안에 서 있는 낯선한 낯선한 �... 아니, 연안에서 낯선 �...\n"
+"\n"
+"---\n"
+"\n"
+"죄송합니다. 반복된 문장 때문에 자연스럽게 이어쓰기 어렵습니다. 원하시는 방향을 알려주시면 다시 작성드리겠습니다. 예를 들어:\n"
+"\n"
+"- **시적·수상적**으로 이어쓰기 (분위기, 감각 중심)\n"
+"- **사건·이야기**로 이어쓰기 (갈매기를 따라가는 인물, 사건 발생)\n"
+"- **단순히 한 문장만** 자연스럽게 확장하기\n"
+"\n"
+"어떤 방향이 좋으신가요?";
+
+static void test_chat_malformed_utf8(bool detailed_debug) {
+    LOG_DBG("%s\n", __func__);
+
+    auto tst = peg_tester("models/templates/Qwen3.5-4B.jinja", detailed_debug);
+
+    // malformed UTF-8 inside the reasoning region is recovered as U+FFFD
+    tst.test("reasoning with bad \xeb\x82 bytes.</think>\n\nDone.")
+        .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+        .enable_thinking(true)
+        .expect_reasoning("reasoning with bad \xef\xbf\xbd bytes.")
+        .expect_content("Done.")
+        .run();
+
+    // reconstructed real failure: reasoning closed, malformed bytes in content
+    tst.test("short reasoning.\n</think>\n\n" + malformed_utf8_suffix)
+        .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+        .enable_thinking(true)
+        .expect_reasoning("short reasoning.")
+        .expect_content(malformed_utf8_suffix_sanitized)
+        .run();
+
+    // reasoning region itself never terminates (no </think>): the malformed
+    // bytes must still not abort the parse
+    tst.test(malformed_utf8_suffix)
+        .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+        .enable_thinking(true)
+        .expect_reasoning(malformed_utf8_suffix_sanitized)
+        .run();
+
+    // content-only path (thinking disabled / no reasoning extraction): the
+    // empty <think> prefill from the generation prompt stays in content
+    tst.test("plain \xeb\x82 text")
+        .reasoning_format(COMMON_REASONING_FORMAT_NONE)
+        .enable_thinking(false)
+        .expect_content("<think>\n\n</think>\n\nplain \xef\xbf\xbd text")
+        .run();
+
+    auto tmpls = read_templates("models/templates/Qwen3.5-4B.jinja");
+
+    common_chat_templates_inputs tool_inputs;
+    tool_inputs.messages               = { message_user };
+    tool_inputs.add_generation_prompt  = true;
+    tool_inputs.enable_thinking        = true;
+    tool_inputs.reasoning_format       = COMMON_REASONING_FORMAT_AUTO;
+    tool_inputs.tools                  = { run_in_terminal_tool };
+    // REQUIRED so a corrupted tool call cannot be silently dropped by the
+    // optional tool-call rule
+    tool_inputs.tool_choice            = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+
+    auto tool_parser = make_peg_parser(tmpls.get(), tool_inputs, detailed_debug);
+
+    // negative: malformed UTF-8 inside a tool call argument must not be
+    // repaired into an executable call - the parse must still fail
+    {
+        bool threw = false;
+        try {
+            tool_parser.parse("<tool_call>\n<function=run_in_terminal>\n<parameter=command>\npw\xeb\x82" "d\n</parameter>\n</function>\n</tool_call>", false);
+        } catch (const std::exception &) {
+            threw = true;
+        }
+        if (!threw) {
+            throw std::runtime_error("expected failure for corrupted tool call argument");
+        }
+    }
+
+    // negative: malformed UTF-8 breaking a structural literal must still fail
+    {
+        bool threw = false;
+        try {
+            tool_parser.parse("<tool_call>\n<function=run_in_ter\xeb\x82minal>\n<parameter=command>\npwd\n</parameter>\n</function>\n</tool_call>", false);
+        } catch (const std::exception &) {
+            threw = true;
+        }
+        if (!threw) {
+            throw std::runtime_error("expected failure for corrupted tool call structure");
+        }
+    }
+
+    // negative: malformed UTF-8 inside a non-string (JSON) argument
+    {
+        common_chat_templates_inputs int_tool_inputs;
+        int_tool_inputs.messages              = { message_user };
+        int_tool_inputs.add_generation_prompt = true;
+        int_tool_inputs.enable_thinking       = false;
+        int_tool_inputs.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
+        int_tool_inputs.tools                 = { special_function_tool };
+        int_tool_inputs.tool_choice           = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+        auto int_tool_parser = make_peg_parser(tmpls.get(), int_tool_inputs, detailed_debug);
+        bool threw = false;
+        try {
+            int_tool_parser.parse("<tool_call>\n<function=special_function>\n<parameter=arg1>\n1\xeb\x82\n</parameter>\n</function>\n</tool_call>", false);
+        } catch (const std::exception &) {
+            threw = true;
+        }
+        if (!threw) {
+            throw std::runtime_error("expected failure for corrupted JSON tool argument");
+        }
+    }
+
+    // a trailing truncated sequence is preserved, not committed to U+FFFD:
+    // in partial input more bytes can still complete it, and on a final
+    // parse it keeps the same NEED_MORE semantics as before (content up to
+    // the tail is emitted, the incomplete bytes are withheld, no failure)
+    {
+        common_chat_templates_inputs partial_inputs;
+        partial_inputs.messages              = { message_user };
+        partial_inputs.add_generation_prompt = true;
+        partial_inputs.enable_thinking       = false;
+        partial_inputs.reasoning_format      = COMMON_REASONING_FORMAT_NONE;
+        auto partial_parser = make_peg_parser(tmpls.get(), partial_inputs, detailed_debug);
+        auto msg = partial_parser.parse(std::string("plain text \xeb\x82"), /* is_partial = */ true);
+        assert_not_contains(msg.content, "\xef\xbf\xbd");
+        assert_not_contains(msg.content, "\xeb");
+
+        auto msg_final = partial_parser.parse(std::string("plain text \xeb\x82"), /* is_partial = */ false);
+        if (msg_final.content.find("plain text") == std::string::npos) {
+            throw std::runtime_error("final parse dropped content before incomplete tail");
+        }
+        assert_not_contains(msg_final.content, "\xef\xbf\xbd");
+    }
+
+    // generic content parser (empty arena -> content(rest) + end): malformed
+    // bytes in plain input are recovered the same way
+    {
+        common_chat_parser_params generic_params;
+        auto msg = common_chat_parse("plain \xeb\x82 text", false, generic_params);
+        if (msg.content != "plain \xef\xbf\xbd text") {
+            throw std::runtime_error("unexpected generic parse content: " + msg.content);
+        }
+    }
+
+    // structural mismatch without malformed UTF-8 still fails as before
+    {
+        common_chat_templates_inputs plain_inputs;
+        plain_inputs.messages              = { message_user };
+        plain_inputs.add_generation_prompt = true;
+        plain_inputs.enable_thinking       = false;
+        plain_inputs.reasoning_format      = COMMON_REASONING_FORMAT_NONE;
+        plain_inputs.tools                 = { run_in_terminal_tool };
+        plain_inputs.tool_choice           = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+        auto strict_parser = make_peg_parser(tmpls.get(), plain_inputs, detailed_debug);
+        bool threw = false;
+        try {
+            strict_parser.parse("<tool_call>\n<function=nonexistent_tool>\n</function>\n</tool_call>", false);
+        } catch (const std::exception &) {
+            threw = true;
+        }
+        if (!threw) {
+            throw std::runtime_error("expected failure for structural mismatch");
+        }
+    }
+}
+
 static void test_template_output_peg_parsers(bool detailed_debug) {
     LOG_DBG("%s\n", __func__);
 
@@ -7239,6 +7437,7 @@ int main(int argc, char ** argv) {
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
         test_template_output_peg_parsers(detailed_debug);
+        test_chat_malformed_utf8(detailed_debug);
         std::cout << "\n[chat] All tests passed!" << '\n';
     }
     return 0;
