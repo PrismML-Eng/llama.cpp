@@ -213,6 +213,11 @@ struct server_slot {
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
 
+    // per-request drafting policy, set in launch_slot_with_task from "speculative.n_max"
+    // (LLAMA_SERVER_SPEC_MULTISLOT=0 restores the server-wide policy: every slot drafts, no cap)
+    bool spec_enabled = false; // false: the slot never drafts -> one token per step, single state plane
+    int  spec_n_max   = -1;    // per-request draft cap; < 0: no per-request limit
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -443,6 +448,11 @@ struct server_slot {
             return 0;
         }
 
+        // the request opted out of drafting ("speculative.n_max": 0)
+        if (!spec_enabled) {
+            return 0;
+        }
+
         // determine the max draft that fits the current slot state
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
@@ -450,6 +460,12 @@ struct server_slot {
 
         if (n_remaining() > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
+        }
+
+        // per-request cap; a request without the field carries the server-wide n_max, at which the
+        // draft implementation stops anyway, so the clamp is a no-op for it
+        if (spec_n_max > 0) {
+            n_draft_max = std::min(n_draft_max, spec_n_max);
         }
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
@@ -863,6 +879,11 @@ private:
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
+
+    // env: LLAMA_SERVER_SPEC_MULTISLOT (default 1). 0 restores the server-wide speculative policy:
+    // every slot drafts with the global n_max, the per-request "speculative.n_max" is ignored and
+    // every sequence keeps the full rollback snapshot budget
+    bool spec_multislot = true;
 
     int n_empty_consecutive = 0;
 
@@ -1285,6 +1306,15 @@ private:
 
             if (slots_n_diff) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_N_DIFF = %d\n", slots_n_diff);
+            }
+        }
+
+        {
+            const char * LLAMA_SERVER_SPEC_MULTISLOT = getenv("LLAMA_SERVER_SPEC_MULTISLOT");
+            spec_multislot = LLAMA_SERVER_SPEC_MULTISLOT ? atoi(LLAMA_SERVER_SPEC_MULTISLOT) != 0 : true;
+
+            if (!spec_multislot) {
+                SRV_WRN("%s\n", "LLAMA_SERVER_SPEC_MULTISLOT = 0: per-request \"speculative.n_max\" is ignored, every slot drafts");
             }
         }
 
@@ -1748,6 +1778,24 @@ private:
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+
+        // per-request drafting policy: "speculative.n_max": 0 opts the request out of speculative
+        // decoding, so the slot adds exactly one token per step and N such slots decode as one
+        // N x 1 ubatch (the shape the no-spec server decodes). A request without the field keeps the
+        // server-wide n_max -> the unchanged drafting path. The schema rejects negative values.
+        {
+            const int n_max_req = slot.task->params.speculative.draft.n_max;
+
+            slot.spec_enabled = slot.can_speculate() && (!spec_multislot || n_max_req != 0);
+            slot.spec_n_max   = spec_multislot ? n_max_req : -1;
+
+            // rollback snapshot budget of the slot's sequence (recurrent memories; a no-op for the
+            // others): every plane for a drafting slot (K = n_rs_seq + 1, the unchanged graph), none
+            // for an opted-out slot (K = 1: plane 0 only, the graph the no-spec server builds). Set
+            // before the slot's first ubatch. The MTP draft context holds a plain KV cache, so the
+            // call goes to ctx_tgt only.
+            llama_memory_seq_rs_snapshots(llama_get_memory(ctx_tgt), slot.id, slot.spec_enabled ? llama_n_rs_seq(ctx_tgt) : 0);
+        }
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt

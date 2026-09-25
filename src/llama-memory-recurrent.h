@@ -26,7 +26,7 @@ public:
                      uint32_t   n_rs_seq,
         const layer_filter_cb & filter);
 
-    ~llama_memory_recurrent() = default;
+    ~llama_memory_recurrent();
 
     //
     // llama_memory_i
@@ -44,6 +44,7 @@ public:
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+    bool seq_rs_snapshots(llama_seq_id seq_id, uint32_t n_snap) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
@@ -77,6 +78,21 @@ public:
     std::vector<uint32_t> rs_idx;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+
+    // per-seq rollback snapshot budget in [0, n_rs_seq] (llama_memory_seq_rs_snapshots): the number
+    // of snapshot planes a ubatch may write for the seq -- the graph writes K = 1 + the max over the
+    // ubatch's seqs (llama_memory_recurrent_context::get_n_snap) -- and the largest partial rollback
+    // seq_rm accepts for it. Defaults to n_rs_seq; only the API changes it (not seq_rm/clear/state_read)
+    std::vector<uint32_t> rs_n_snap;
+
+    // per-seq count of snapshot planes actually written by the seq's last ubatch: planes
+    // 1..rs_n_valid hold the states 1..rs_n_valid tokens back from cell.pos, an older ubatch
+    // left whatever lies beyond. The largest partial rollback seq_rm can honour without reading
+    // a stale plane. Recorded when a ubatch is applied (min(T, K) - 1), copied by seq_cp,
+    // 0 after rm_all / clear / state_read
+    std::vector<uint32_t> rs_n_valid;
+
+    void set_rs_n_valid(llama_seq_id seq_id, uint32_t n); // seq_id < 0: every seq
 
     // computed before each graph build
     uint32_t n = 0;
@@ -120,6 +136,18 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    // host RS buffers backed by an anonymous private mmap (kernel zero pages,
+    // resident only where written) and wrapped with
+    // ggml_backend_cpu_buffer_from_ptr, which does not own the memory: unmapped
+    // in the destructor after the buffers are freed. Empty when
+    // LLAMA_RS_EAGER_ZERO=1 or on non-Linux hosts (eager alloc + memset).
+    struct rs_mmap_region {
+        ggml_backend_buffer_t buf;
+        void *                ptr;
+        size_t                size;
+    };
+    std::vector<rs_mmap_region> mmaps;
 
     size_t total_size() const;
 
@@ -172,6 +200,21 @@ public:
     ggml_tensor * get_s_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // true when the GDN op may update this ubatch's cache rows in place: not the
+    // full (reserve) context, the cell range is exactly the ubatch (n == n_seqs)
+    // and every cell reads its own state (src0 == own index; a pending rollback
+    // still reads a plane of the same cell). Side-effect free on purpose: unlike
+    // s_copy() it never consumes the per-seq rollback index, so it can be
+    // evaluated at graph build and again in can_reuse.
+    bool rs_inplace_ok(uint32_t n_seqs) const;
+
+    // rollback snapshot planes of the current ubatch: the GDN paths write K = 1 + get_n_snap()
+    // state planes per seq. It is the max of the per-seq budgets (mem->rs_n_snap) over the
+    // ubatch's seqs, n_rs_seq for the full (reserve) context so the compute buffers fit the
+    // largest graph, and 0 when the memory keeps no snapshots. Side-effect free (same rule as
+    // rs_inplace_ok): evaluated at graph build and again in can_reuse (part of the reuse key).
+    uint32_t get_n_snap() const;
 
 private:
     const llama_memory_status status;

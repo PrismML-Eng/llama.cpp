@@ -6,11 +6,20 @@
 // that class of bug at all.
 //
 //   pass A (reference): run S sequences concurrently, no rollback.
-//   pass B (rollback):  identical, but sequence 0 periodically over-generates R
-//                       tokens which are then seq_rm()'d away and re-generated.
+//   pass B (rollback):  identical, but sequence 0 periodically decodes its next
+//                       token together with R draft tokens as ONE ubatch (the
+//                       server's verify shape) and then seq_rm()s the R draft
+//                       positions away.
 //
 // PASS requires every sequence -- including the untouched ones -- to emit
 // exactly the reference token stream.
+//
+// The rollback stays inside the verify ubatch on purpose: a ubatch snapshots the
+// state after each of its last min(T, K) - 1 tokens and never the state it
+// started from, so a rollback across single-token steps is refused. At a
+// rollback step sequence 0's logits come from an (R + 1)-token ubatch and the
+// other sequences decode without it, so a mismatch exactly there can in rare
+// near-tie cases be matmul rounding rather than a snapshot bug.
 #include "llama.h"
 
 #include <cstdio>
@@ -153,8 +162,62 @@ int main(int argc, char ** argv) {
             out[s].push_back(greedy_ith(ctx, vocab, batch.n_tokens - 1));
         }
 
+        const int n_vocab_run = llama_vocab_n_tokens(vocab);
+
+        // invariant at the top of every iteration: out[s].back() is sampled-but-not-yet-decoded
         int since = 0;
         while ((int) out[0].size() < n_predict) {
+            if (with_rollback && since >= stride && (int) out[0].size() + rewind + 2 < n_predict) {
+                n_rollbacks++;
+                // seq 0 alone takes a verify-style step: its pending token plus `rewind`
+                // draft tokens as ONE ubatch (logits for the pending token's row only),
+                // then the drafts are dropped. A ubatch snapshots the state after each
+                // of its last min(T, K) - 1 tokens and never the state it started from,
+                // so with T = rewind + 1 the rollback of `rewind` positions is the
+                // largest this ubatch supports and lands on the state after the pending
+                // token -- needs n_rs_seq >= rewind. The drafts' content is irrelevant.
+                const int npos0 = npos[0];
+                batch.n_tokens  = 0;
+                for (int r = 0; r <= rewind; r++) {
+                    const llama_token t = r == 0 ? out[0].back() : (llama_token) ((out[0].back() + 7*r + 1) % n_vocab_run);
+                    batch.token[r]     = t;
+                    batch.pos[r]       = npos0 + r;
+                    batch.n_seq_id[r]  = 1;
+                    batch.seq_id[r][0] = 0;
+                    batch.logits[r]    = r == 0;
+                    batch.n_tokens++;
+                }
+                if (llama_decode(ctx, batch)) {
+                    fprintf(stderr, "decode(verify) failed\n");
+                    return false;
+                }
+
+                const llama_pos keep = npos0 + 1;
+                if (!llama_memory_seq_rm(mem, 0, keep, -1)) {
+                    fprintf(stderr, "ROLLBACK REFUSED: keep=%d npos0=%d rewind=%d\n", keep, npos0 + rewind + 1, rewind);
+                    return false;
+                }
+                npos[0] = keep;
+                out[0].push_back(greedy_ith(ctx, vocab, 0));
+
+                // the other sequences take their ordinary single-token step
+                std::vector<std::pair<int, llama_token>> others;
+                for (int s = 1; s < n_seqs; s++) {
+                    others.push_back({ s, out[s].back() });
+                }
+                if (!others.empty()) {
+                    if (!submit(others)) {
+                        fprintf(stderr, "decode(step) failed\n");
+                        return false;
+                    }
+                    for (int s = 1; s < n_seqs; s++) {
+                        out[s].push_back(greedy_ith(ctx, vocab, s - 1));
+                    }
+                }
+                since = 0;
+                continue;
+            }
+
             // one token per sequence, all in one batch
             std::vector<std::pair<int, llama_token>> items;
             for (int s = 0; s < n_seqs; s++) {
@@ -168,36 +231,6 @@ int main(int argc, char ** argv) {
                 out[s].push_back(greedy_ith(ctx, vocab, s));
             }
             since++;
-
-            if (with_rollback && since >= stride && (int) out[0].size() + rewind + 2 < n_predict) {
-                n_rollbacks++;
-                // seq 0 alone over-generates, then discards
-                for (int r = 0; r < rewind; r++) {
-                    std::vector<std::pair<int, llama_token>> one = {
-                        { 0, out[0].back() }
-                    };
-                    if (!submit(one)) {
-                        fprintf(stderr, "decode(draft) failed\n");
-                        return false;
-                    }
-                    out[0].push_back(greedy_ith(ctx, vocab, 0));
-                }
-                for (int r = 0; r < rewind; r++) {
-                    out[0].pop_back();
-                }
-
-                // invariant: out[s].back() is sampled-but-not-yet-decoded. The
-                // drafts occupied positions [npos0 - rewind, npos0), and that
-                // range also covers the decode of the still-pending token, so
-                // discarding it restores the exact pre-draft state -- no replay.
-                const llama_pos keep = npos[0] - rewind;
-                if (!llama_memory_seq_rm(mem, 0, keep, -1)) {
-                    fprintf(stderr, "ROLLBACK REFUSED: keep=%d npos0=%d rewind=%d\n", keep, npos[0], rewind);
-                    return false;
-                }
-                npos[0] = keep;
-                since   = 0;
-            }
         }
 
         llama_batch_free(batch);
