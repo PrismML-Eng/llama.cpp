@@ -349,6 +349,7 @@ struct server_slot_stats {
 
     // speculative decoding stats
     // note: the per-position breakdown lives in server_slot, it is not needed in a task result
+    bool     speculative         = false; // speculation is enabled for this slot: report draft_n even if 0
     uint64_t n_draft_tokens      = 0;
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;

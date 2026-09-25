@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
+#include <iterator>
 #include <memory>
 #include <filesystem>
 #include <utility>
@@ -347,6 +348,7 @@ struct server_slot {
 
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
+        stats.speculative = can_speculate();
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
@@ -1194,9 +1196,23 @@ private:
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
         }
 
+        std::vector<common_speculative_type> spec_types_requested;
+        std::copy_if(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                std::back_inserter(spec_types_requested),
+                [](common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
+
         if (spec) {
-            SRV_TRC("%s", "speculative decoding context initialized\n");
+            SRV_INF("speculative decoding enabled: %s\n",
+                    common_speculative_type_name_str(spec_types_requested).c_str());
         } else {
+            if (!spec_types_requested.empty()) {
+                SRV_WRN("speculative decoding (%s) was requested but is disabled: %s\n",
+                        common_speculative_type_name_str(spec_types_requested).c_str(),
+                        ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO
+                            ? "the target context cannot remove tokens from a sequence"
+                            : "no speculative implementation could be initialized");
+            }
+
             spec_init.reset();
             ctx_dft   = nullptr;
             model_dft = nullptr;
@@ -1211,6 +1227,8 @@ private:
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
+
+            slot.stats.speculative = slot.can_speculate();
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;

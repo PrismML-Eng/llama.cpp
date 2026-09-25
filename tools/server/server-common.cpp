@@ -79,7 +79,9 @@ json server_slot_stats::to_json() const {
         {"predicted_per_second",   n_gen_tps()},
     };
 
-    if (n_draft_tokens > 0) {
+    // report the draft counters whenever speculation is enabled, so "enabled, nothing drafted"
+    // (e.g. an n-gram speculator that found no match) is distinguishable from "speculation off"
+    if (speculative || n_draft_tokens > 0) {
         base["draft_n"]          = n_draft_tokens;
         base["draft_n_accepted"] = n_draft_accepted;
     }
