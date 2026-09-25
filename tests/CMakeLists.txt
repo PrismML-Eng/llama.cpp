@@ -147,7 +147,11 @@ endif()
 # dspark Phase 1 forward-graph gate (Tier 1: synthetic tap features / Tier 2:
 # diff vs the DeepSpec python reference). Not wired into `ctest` since both
 # tiers need a real dspark GGUF passed on the command line; run manually.
-llama_build(test-dspark-forward.cpp)
+# Uses internal functions not exported with LLAMA_API, so like the tests below it
+# is skipped on Windows when building with shared libraries.
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    llama_build(test-dspark-forward.cpp)
+endif()
 
 # dspark loader gate for the GIDD log-SNR metadata contract: conditioning=true
 # requires finite, ordered min/max_log_snr (src/models/dspark.cpp
