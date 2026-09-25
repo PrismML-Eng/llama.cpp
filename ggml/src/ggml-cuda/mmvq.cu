@@ -667,6 +667,81 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (small_k && type == GGML_TYPE_PTQ1_0 && nwarps > 1 && rows_per_cuda_block == nwarps) {
+        // Warp-per-row small-K: warp w owns row row0+w and its lanes stride that row's K-blocks. No smem, no block barrier.
+        const int  warp   = threadIdx.y;
+        const int  lane   = threadIdx.x;
+        const bool row_ok = uint32_t(row0 + warp) < stride_col_dst;
+
+        float acc[ncols_dst]      = { 0.0f };
+        float acc_gate[ncols_dst] = { 0.0f };
+        if (row_ok) {
+            const int kbx_row = kbx_offset + warp * stride_row_x;
+            for (int kbx = lane; kbx < blocks_per_row_x; kbx += warp_size) {
+                float dots[ncols_dst];
+                vec_dot_ptq1_0_q8_1_multi<ncols_dst>(vx, y, kbx_row + kbx, kbx, stride_col_y, dots);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    acc[j] += dots[j];
+                }
+                if constexpr (has_fusion && has_gate) {
+                    vec_dot_ptq1_0_q8_1_multi<ncols_dst>(vgate, y, kbx_row + kbx, kbx, stride_col_y, dots);
+#pragma unroll
+                    for (int j = 0; j < ncols_dst; ++j) {
+                        acc_gate[j] += dots[j];
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            acc[j] = warp_reduce_sum<warp_size>(acc[j]);
+            if constexpr (has_fusion && has_gate) {
+                acc_gate[j] = warp_reduce_sum<warp_size>(acc_gate[j]);
+            }
+        }
+        if (lane == 0 && row_ok) {
+            float * dst_row = dst + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0 + warp;
+            [[maybe_unused]] const uint32_t channel_bias = ids ? channel_x : channel_dst;
+            [[maybe_unused]] const int64_t  bias_off     = sample_dst*stride_sample_dst + channel_bias*stride_channel_dst + row0 + warp;
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                float result = acc[j];
+                if constexpr (has_fusion) {
+                    if (use_bias) {
+                        result += ((const float *) fusion.x_bias)[bias_off + j*stride_col_dst];
+                    }
+                    if constexpr (has_gate) {
+                        float gate_value = acc_gate[j];
+                        if (use_gate_bias) {
+                            gate_value += ((const float *) fusion.gate_bias)[bias_off + j*stride_col_dst];
+                        }
+                        switch (active_glu) {
+                            case GGML_GLU_OP_SWIGLU:
+                                result *= ggml_cuda_op_silu_single(gate_value);
+                                break;
+                            case GGML_GLU_OP_GEGLU:
+                                result *= ggml_cuda_op_gelu_single(gate_value);
+                                break;
+                            case GGML_GLU_OP_SWIGLU_OAI:
+                                result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                                break;
+                            default:
+                                result = result * gate_value;
+                                break;
+                        }
+                    }
+                }
+                dst_row[j*stride_col_dst] = result;
+            }
+        }
+        GGML_UNUSED_VARS(use_gate, use_scale, use_gate_scale, gate_bias, x_bias, x_scale, gate_scale, x_scales,
+                         gate_scales, x_biases, gate_biases, tmp, tmp_gate, vec_dot_q_cuda, blocks_per_iter);
+        return;
+    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
     if constexpr ((type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_PQ2_0) &&
                   table_id == MMVQ_PARAMETERS_GB10) {
         using block_t = std::conditional_t<type == GGML_TYPE_Q1_0, block_q1_0,
@@ -715,12 +790,29 @@ static __global__ void mul_mat_vec_q(
             // x block quant index when casting the quants to int
             const int kqs = vdr * (tid % (qi/vdr));
 
-#if !defined(GGML_USE_HIP)
-        if constexpr (type == GGML_TYPE_PTQ1_0 && ncols_dst > 1 && ncols_dst <= 3) {
+#if defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            if constexpr (type == GGML_TYPE_PTQ1_0) {
+                const int kbx_prefetch = kbx + blocks_per_iter;
+                if (kbx_prefetch < blocks_per_row_x && tid % (qi / vdr) == 0) {
+#    pragma unroll
+                    for (int i = 0; i < rows_per_cuda_block; ++i) {
+                        const block_ptq1_0 * prefetch_ptr =
+                            (const block_ptq1_0 *) vx + kbx_offset + i * stride_row_x + kbx_prefetch;
+                        asm volatile("prefetch.global.L2 [%0];" ::"l"(__cvta_generic_to_global(prefetch_ptr)));
+                    }
+                }
+            }
+#endif
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        // PTQ1_0 NVIDIA SoA q8 layout: pass the column base and K-block index, not &y[kby].
+        if constexpr (type == GGML_TYPE_PTQ1_0) {
+            GGML_UNUSED(kby);
+            GGML_UNUSED(kqs);
 #    pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 float dots[ncols_dst];
-                vec_dot_ptq1_0_q8_1_multi<ncols_dst>(vx, &y[kby], kbx_offset + i * stride_row_x + kbx, kqs,
+                vec_dot_ptq1_0_q8_1_multi<ncols_dst>(vx, y, kbx_offset + i * stride_row_x + kbx, kbx,
                                                      stride_col_y, dots);
 #    pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
@@ -729,7 +821,7 @@ static __global__ void mul_mat_vec_q(
 
                 if constexpr (has_fusion) {
                     if constexpr (has_gate) {
-                        vec_dot_ptq1_0_q8_1_multi<ncols_dst>(vgate, &y[kby], kbx_offset + i * stride_row_x + kbx, kqs,
+                        vec_dot_ptq1_0_q8_1_multi<ncols_dst>(vgate, y, kbx_offset + i * stride_row_x + kbx, kbx,
                                                              stride_col_y, dots);
 #    pragma unroll
                         for (int j = 0; j < ncols_dst; ++j) {
@@ -897,9 +989,24 @@ static __global__ void mul_mat_vec_q_moe(
         const int kby = kbx * (qk/QK8_1);
         const int kqs = vdr * (threadIdx.x % (qi/vdr));
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        if constexpr (type == GGML_TYPE_PTQ1_0) {
+            // NVIDIA SoA q8: hand the vec-dot the column base and K-block index.
+            GGML_UNUSED(kby);
+            GGML_UNUSED(kqs);
 #pragma unroll
-        for (int i = 0; i < c_rows_per_block; ++i) {
-            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            for (int i = 0; i < c_rows_per_block; ++i) {
+                float dot;
+                vec_dot_ptq1_0_q8_1_multi<1>(vx, y, kbx_offset + i*stride_row_x + kbx, kbx, 0, &dot);
+                tmp[i] += dot;
+            }
+        } else
+#endif
+        {
+#pragma unroll
+            for (int i = 0; i < c_rows_per_block; ++i) {
+                tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            }
         }
     }
 
@@ -1433,7 +1540,11 @@ void ggml_cuda_mul_mat_vec_q(
         }
     }
 
-    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    if (ggml_cuda_q8_1_exact_isum(src0->type)) {
+        // Warp-transposed q8 layout needs whole 32-K-block groups per column.
+        ne10_padded = GGML_PAD(ne10_padded, GGML_CUDA_PTQ1_K_PAD);
+    }
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
     {
         const int64_t s11 = src1->nb[1] / ts_src1;

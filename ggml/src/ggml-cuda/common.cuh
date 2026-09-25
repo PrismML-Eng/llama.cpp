@@ -1026,6 +1026,32 @@ struct ggml_cuda_type_traits<GGML_TYPE_PTQ1_0> {
     static constexpr int qi = QI_PTQ1_0;
 };
 
+// PTQ1_0 NVIDIA path: row-quantizer stores the exact integer q8 sum in ds.y and the warp-transposed q8 layout. HIP and MUSA keep the old quantizer and vec-dot.
+static constexpr __host__ __device__ bool ggml_cuda_q8_1_exact_isum(ggml_type type_src0) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(type_src0);
+    return false;
+#else
+    return type_src0 == GGML_TYPE_PTQ1_0;
+#endif
+}
+
+// Warp-transposed (SoA) q8_1 layout for NVIDIA PTQ1_0 MMVQ: word w of each 32-block group is contiguous so a warp load is one L1 wavefront. K padded to a multiple of 4096.
+#define GGML_CUDA_PTQ1_Q8_GROUP_KB     32
+#define GGML_CUDA_PTQ1_Q8_WORDS_PER_KB 36
+#define GGML_CUDA_PTQ1_Q8_GROUP_WORDS  (GGML_CUDA_PTQ1_Q8_GROUP_KB * GGML_CUDA_PTQ1_Q8_WORDS_PER_KB)
+#define GGML_CUDA_PTQ1_K_PAD           (GGML_CUDA_PTQ1_Q8_GROUP_KB * QK_PTQ1_0)
+
+// Word offset (within one activation column) of word w (0..7 = qs words, 8 = ds) of block_q8_1 ib.
+static constexpr __host__ __device__ int ggml_cuda_ptq1_q8_word(int ib, int w) {
+    const int kb   = ib >> 2;
+    const int sub  = ib & 3;
+    const int g    = kb >> 5;
+    const int lane = kb & 31;
+    const int ww   = w < 8 ? sub * 8 + w : 32 + sub;
+    return g * GGML_CUDA_PTQ1_Q8_GROUP_WORDS + ww * GGML_CUDA_PTQ1_Q8_GROUP_KB + lane;
+}
+
 template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q4_0> {
     static constexpr int qk = QK4_0;

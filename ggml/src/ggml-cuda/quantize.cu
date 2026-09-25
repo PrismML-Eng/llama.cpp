@@ -51,6 +51,8 @@ static __device__ __forceinline__ float nvfp4_native_scale_error(
 #endif // CUDART_VERSION >= 12080
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
+// exact_isum: store the integer q8 sum in ds.y so PTQ1_0 can fold digit bias once per 32-block. Bit-identical to the per-nibble subtract.
+template <bool exact_isum>
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
         const float * x_ptr, void * vy_ptr,
@@ -84,13 +86,32 @@ static __global__ void quantize_q8_1(
     ggml_cuda_pdl_sync();
     const float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
     float amax = fabsf(xi);
-    float sum = xi;
 
     amax = warp_reduce_max<QK8_1>(amax);
-    sum  = warp_reduce_sum<QK8_1>(sum);
 
     const float  d = amax / 127.0f;
     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    if constexpr (exact_isum) {
+        // Warp-transposed layout (see ggml_cuda_ptq1_q8_word); ne0 is padded to GGML_CUDA_PTQ1_K_PAD.
+        int isum = q;
+        isum = warp_reduce_sum<QK8_1>(isum);
+        int32_t *     yw       = (int32_t *) vy;
+        const int64_t col      = i_cont / ne0;
+        const int64_t col_base = col * (ne0 / QK8_1) * (int64_t) (sizeof(block_q8_1) / 4);
+        const int     ib_col   = (int) (i0 / QK8_1);
+        ((int8_t *) (yw + col_base + ggml_cuda_ptq1_q8_word(ib_col, iqs / 4)))[iqs % 4] = q;
+        if (iqs > 0) {
+            return;
+        }
+        // |isum| <= 32*127 fits int16; keep the raw bits in the half slot.
+        const half2 ds = make_half2(__float2half(d), __short_as_half((short) isum));
+        yw[col_base + ggml_cuda_ptq1_q8_word(ib_col, 8)] = *reinterpret_cast<const int32_t *>(&ds);
+        return;
+    }
+
+    float sum = xi;
+    sum = warp_reduce_sum<QK8_1>(sum);
 
     y[ib].qs[iqs] = q;
 
@@ -648,8 +669,11 @@ void quantize_row_q8_1_cuda(
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
-    ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
-    GGML_UNUSED(type_src0);
+    if (ggml_cuda_q8_1_exact_isum(type_src0)) {
+        ggml_cuda_kernel_launch(quantize_q8_1<true>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    } else {
+        ggml_cuda_kernel_launch(quantize_q8_1<false>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    }
 }
 
 void quantize_mmq_q8_1_cuda(
