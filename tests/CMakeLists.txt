@@ -169,6 +169,11 @@ endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
 
+# byte-for-byte check of the cache-writing GDN op (ggml_gated_delta_net_cache)
+# against the legacy gathered and rows+set_rows paths; CPU only, tiny synthetic
+# shapes, no model needed
+llama_build_and_test(test-gdn-inplace.cpp)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp)
