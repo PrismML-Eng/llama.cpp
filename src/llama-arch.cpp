@@ -419,6 +419,17 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ADAPTER_LORA_PROMPT_PREFIX,      "adapter.lora.prompt_prefix" },
     { LLM_KV_ADAPTER_ALORA_INVOCATION_TOKENS, "adapter.alora.invocation_tokens" },
 
+    { LLM_KV_HADAMARD_VERSION,              "prism.hadamard.version"              },
+    { LLM_KV_HADAMARD_BLOCK_SIZE,           "prism.hadamard.block_size"           },
+    { LLM_KV_HADAMARD_TRANSFORM,            "prism.hadamard.transform"            },
+    { LLM_KV_HADAMARD_AXIS,                 "prism.hadamard.axis"                 },
+    { LLM_KV_HADAMARD_SIGN_MODE,            "prism.hadamard.sign_mode"            },
+    { LLM_KV_HADAMARD_SIGN_WIDTHS,          "prism.hadamard.sign_widths"          },
+    { LLM_KV_HADAMARD_SIGN_VALUES,          "prism.hadamard.sign_values"          },
+    { LLM_KV_HADAMARD_WEIGHT_NAMES,         "prism.hadamard.weight_names"         },
+    { LLM_KV_HADAMARD_INVERSE_WEIGHT_NAMES, "prism.hadamard.inverse_weight_names" },
+    { LLM_KV_HADAMARD_GDN_V_GROUPED,        "prism.hadamard.gdn_v_grouped"        },
+
     { LLM_KV_XIELU_ALPHA_N,         "xielu.alpha_n"         },
     { LLM_KV_XIELU_ALPHA_P,         "xielu.alpha_p"         },
     { LLM_KV_XIELU_BETA,            "xielu.beta"            },

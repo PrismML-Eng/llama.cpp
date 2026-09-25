@@ -1245,7 +1245,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     }
 
     uint32_t hadamard_version = 0;
-    if (ml.get_key("prism.hadamard.version", hadamard_version, false)) {
+    if (ml.get_key(LLM_KV_HADAMARD_VERSION, hadamard_version, false)) {
         if (hadamard_version != 1) {
             throw std::runtime_error(format("unsupported prism.hadamard.version: %u", hadamard_version));
         }
@@ -1256,11 +1256,11 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         std::string sign_mode;
         std::vector<std::string> weight_names;
 
-        ml.get_key("prism.hadamard.block_size", block_size);
-        ml.get_key("prism.hadamard.transform", transform);
-        ml.get_key("prism.hadamard.axis", axis);
-        ml.get_key("prism.hadamard.sign_mode", sign_mode);
-        ml.get_arr("prism.hadamard.weight_names", weight_names);
+        ml.get_key(LLM_KV_HADAMARD_BLOCK_SIZE, block_size);
+        ml.get_key(LLM_KV_HADAMARD_TRANSFORM, transform);
+        ml.get_key(LLM_KV_HADAMARD_AXIS, axis);
+        ml.get_key(LLM_KV_HADAMARD_SIGN_MODE, sign_mode);
+        ml.get_arr(LLM_KV_HADAMARD_WEIGHT_NAMES, weight_names);
 
         if (block_size == 0 || (block_size & (block_size - 1)) != 0) {
             throw std::runtime_error(format("invalid prism.hadamard.block_size: %u", block_size));
@@ -1281,8 +1281,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         if (sign_mode == "explicit") {
             std::vector<int32_t> sign_widths;
             std::vector<int32_t> sign_values;
-            ml.get_arr("prism.hadamard.sign_widths", sign_widths);
-            ml.get_arr("prism.hadamard.sign_values", sign_values);
+            ml.get_arr(LLM_KV_HADAMARD_SIGN_WIDTHS, sign_widths);
+            ml.get_arr(LLM_KV_HADAMARD_SIGN_VALUES, sign_values);
             // an empty sign table would silently read as identity
             if (sign_widths.empty()) {
                 throw std::runtime_error("prism.hadamard.sign_mode is explicit but sign_widths is empty");
@@ -1306,7 +1306,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             }
         }
 
-        ml.get_key("prism.hadamard.gdn_v_grouped", hadamard_gdn_v_grouped, false);
+        ml.get_key(LLM_KV_HADAMARD_GDN_V_GROUPED, hadamard_gdn_v_grouped, false);
 
         // the transform is applied only in build_lora_mm/build_lora_mm_id, so refuse
         // archs and tensor kinds not verified to route every matmul through them
@@ -1367,7 +1367,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 
         // row-lookup tables store rotated rows and get the inverse after the lookup
         std::vector<std::string> inverse_names;
-        ml.get_arr("prism.hadamard.inverse_weight_names", inverse_names, false);
+        ml.get_arr(LLM_KV_HADAMARD_INVERSE_WEIGHT_NAMES, inverse_names, false);
         for (const auto & name : inverse_names) {
             // only the token-embedding lookup applies the inverse
             if (name != "token_embd.weight") {
