@@ -18,6 +18,35 @@
 
 #include "repack.h"
 
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <unordered_set>
+
+// move the pages of [start, end) to the NUMA node of the calling thread (best effort)
+static void ggml_repack_move_pages_to_local_node(const void * start, const void * end) {
+    unsigned cpu = 0;
+    unsigned node = 0;
+    if (syscall(SYS_getcpu, &cpu, &node, NULL) != 0) {
+        return;
+    }
+    const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
+    uintptr_t addr = (uintptr_t) start & ~(page - 1);
+    const uintptr_t stop = (uintptr_t) end;
+    void * pages[256];
+    int nodes[256];
+    int status[256];
+    while (addr < stop) {
+        int n = 0;
+        for (; n < 256 && addr < stop; n++, addr += page) {
+            pages[n] = (void *) addr;
+            nodes[n] = (int) node;
+        }
+        syscall(SYS_move_pages, 0, (unsigned long) n, pages, nodes, status, 2 /* MPOL_MF_MOVE */);
+    }
+}
+#endif
+
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Woverlength-strings"
 #endif
@@ -5053,6 +5082,24 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         // The first chunk comes from our thread_id, the rest will get auto-assigned.
         int current_chunk = ith;
+
+#if defined(__linux__)
+        // with NUMA the split is static and threads are bound to nodes: keep each thread's rows of this
+        // weight on its node (done once per weight and thread count, the repack itself ran on one thread)
+        if (disable_chunking && nchunk1 == 1 && ith < nchunk0) {
+            static thread_local std::unordered_set<uintptr_t> placed;
+            if (placed.insert((uintptr_t) src0->data ^ ((uintptr_t) nth << 48)).second) {
+                int64_t r0 = dr0 * ith;
+                int64_t r1 = MIN(r0 + dr0, nr0);
+                r0 = (r0 % NB_COLS) ? r0 + NB_COLS - (r0 % NB_COLS) : r0;
+                r1 = (r1 % NB_COLS) ? r1 + NB_COLS - (r1 % NB_COLS) : r1;
+                r1 = MIN(r1, ne01);
+                if (r0 < r1) {
+                    ggml_repack_move_pages_to_local_node((const char *) src0->data + r0 * nb01, (const char *) src0->data + r1 * nb01);
+                }
+            }
+        }
+#endif
 
         while (current_chunk < nchunk0 * nchunk1) {
             const int64_t ith0 = current_chunk % nchunk0;
