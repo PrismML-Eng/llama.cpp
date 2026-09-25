@@ -298,6 +298,10 @@ static __global__ void mul_mat_vec_ptq1_0_pt(
     const void * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void * GGML_CUDA_RESTRICT vy  = vy_ptr;
     float      * GGML_CUDA_RESTRICT dst = dst_ptr;
+    // launched through ggml_cuda_kernel_launch, which opts into PDL on Hopper and newer: wait for the kernel
+    // that wrote vy (the q8_1 activation quantization) before reading it
+    ggml_cuda_pdl_sync();
+
     extern __shared__ float partials_dyn[];
     float * partials = partials_dyn;                                       // [ncols][rows_per_cta][bpr]
     [[maybe_unused]] float * partials_gate = partials_dyn + ncols*rows_per_cta*(ncols_x / QK_PTQ1_0);
