@@ -555,6 +555,25 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             return src_ss[0]; // GGML_OP_ADD_ID
         }
         GGML_ASSERT(tensor->src[2] == nullptr || src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        // Broadcast: one side mirrored (full copy on each device), other side split,
+        // same shape -> result follows the split side (each device combines local shards).
+        // Covers Hadamard signs/scales against split activations. Only fires where the
+        // old code asserted, so no behavior change for loading models.
+        for (int ab = 0; ab < 2; ab++) {
+            const int ia = ab, ib = 1 - ab;
+            if (src_ss[ia].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                    src_ss[ib].axis >= 0 && src_ss[ib].axis < GGML_MAX_DIMS) {
+                bool same_shape = true;
+                for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+                    const int64_t nd = tensor->src[ib]->ne[dim];
+                    const int64_t nm = tensor->src[ia]->ne[dim];
+                    if (nd != nm && nm != 1) { same_shape = false; break; }
+                }
+                if (same_shape) {
+                    return src_ss[ib];
+                }
+            }
+        }
         return handle_generic(src_ss, /*scalar_only =*/ false);
     };
 
@@ -581,8 +600,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             ggml_backend_meta_split_state ret = src_ss[0];
             ret.axis = GGML_BACKEND_SPLIT_AXIS_0;
-            ret.nr[0] = 1;
-            ret.n_segments = 1;
             return ret;
         }
         if (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
@@ -613,6 +630,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_BACKEND_SPLIT_AXIS_1:
             case GGML_BACKEND_SPLIT_AXIS_2:
             case GGML_BACKEND_SPLIT_AXIS_3: {
+                // Explicit Hadamard-permute mapping (qwen35 hybrid): a [128,16,3,...] view of an
+                // axis-0-split 6144-dim splits on nk (axis 1, 8+8). The generic cumulative rule
+                // would pick the rep dim (size 3, unshardable). FWHT keeps full 128, reps stay whole.
+                if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 &&
+                        tensor->src[0] && tensor->src[0]->ne[0] == 6144 &&
+                        tensor->ne[0] == 128 && tensor->ne[1] == 16 && tensor->ne[2] == 3) {
+                    return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+                }
                 int64_t base_ne_in = 1;
                 for (int dim = 0; dim <= src_ss[0].axis; dim++) {
                     base_ne_in *= tensor->src[0]->ne[dim];
@@ -636,15 +661,28 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                     }
                 }
                 // Reshape outputs use one segment; split-state propagation merges source segments.
+                // Prefer a dim that actually divides across devices (e.g. skip rep=3 tilings);
+                // first cumulative match kept as fallback = legacy behavior for all working models.
                 int64_t base_ne_out = 1;
+                int fallback_dim = -1;
+                uint32_t fallback_nr = 1;
                 for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
                     base_ne_out *= tensor->ne[dim];
                     if (base_ne_out % base_ne_in == 0) {
-                        return {ggml_backend_meta_split_axis(dim), {0}, {uint32_t(base_ne_out/base_ne_in)}, 1};
+                        if (fallback_dim < 0) {
+                            fallback_dim = dim;
+                            fallback_nr = uint32_t(base_ne_out/base_ne_in);
+                        }
+                        if (n_bufs > 0 && tensor->ne[dim] % (int64_t) n_bufs == 0) {
+                            return {ggml_backend_meta_split_axis(dim), {0}, {uint32_t(base_ne_out/base_ne_in)}, 1};
+                        }
                     }
                     if (base_ne_out > base_ne_in) {
                         GGML_ASSERT(src_ss[0].n_segments == 1);
                         GGML_ASSERT(src_ss[0].nr[0]      == 1);
+                        if (fallback_dim >= 0) {
+                            return {ggml_backend_meta_split_axis(fallback_dim), {0}, {fallback_nr}, 1};
+                        }
                         return {ggml_backend_meta_split_axis(dim), {0}, {1}, 1};
                     }
                 }
@@ -801,10 +839,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     auto handle_ssm_conv = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis == src_ss[1].axis) {
             if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
-                return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+                ggml_backend_meta_split_state ret = src_ss[0];
+                ret.axis = GGML_BACKEND_SPLIT_AXIS_1;
+                return ret;
             }
             if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1) {
-                return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+                ggml_backend_meta_split_state ret = src_ss[0];
+                ret.axis = GGML_BACKEND_SPLIT_AXIS_0;
+                return ret;
             }
         }
         return handle_generic(src_ss, /*scalar_only =*/ false);
@@ -824,7 +866,25 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         // state shape is [S_v, S_v, H_v, n_seqs] (s0 only); the heads dim is its own axis 2,
         // so a head-aligned split on the input cache lands on axis 2 here.
         GGML_ASSERT(src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_2 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_1 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_0);
-        return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+        // qwen35 grouped-V: the GDN output is laid out as head_ratio blocks of n_k heads
+        // (device-local V groups). Preserve that grouping so the downstream ssm_out
+        // (segmented {key_dim, head_ratio}) matches its activation layout.
+        {
+            const int64_t gdn_head_dim  = tensor->src[0]->ne[0];
+            const int64_t gdn_n_k_heads = tensor->src[0]->ne[1];
+            const size_t  gdn_n_bufs    = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+            ggml_backend_meta_split_state gdn_ret = {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+            if (gdn_head_dim > 0 && gdn_n_k_heads > 0 && tensor->ne[0] % (gdn_head_dim * gdn_n_k_heads) == 0) {
+                const int64_t gdn_ratio = tensor->ne[0] / (gdn_head_dim * gdn_n_k_heads);
+                if (gdn_ratio > 1 && tensor->ne[0] % (int64_t)(gdn_n_bufs * gdn_ratio) == 0) {
+                    gdn_ret.nr[0] = (uint32_t) gdn_ratio;
+                    for (size_t j = 0; j < gdn_n_bufs; j++) {
+                        gdn_ret.ne[j] = tensor->ne[0] / (int64_t)(gdn_n_bufs * gdn_ratio);
+                    }
+                }
+            }
+            return gdn_ret;
+        }
     };
 
     auto calculate_split_state = [&]() -> ggml_backend_meta_split_state {
@@ -1063,7 +1123,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
             } break;
         }
-        if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
+        const bool split_ne_precomputed = split_state.nr[0] > 1 && split_state.ne[0] > 0;
+        if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS && !split_ne_precomputed) {
             bool first_src_split_by_axis = true;
             const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
 
@@ -1072,7 +1133,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                     continue;
                 }
                 if (first_src_split_by_axis) {
+                    const bool seg_copy = src_ss[i].n_segments > 1 &&
+                        tensor->ne[split_state.axis] == tensor->src[i]->ne[src_ss[i].axis];
+                    if (seg_copy) {
+                        split_state.n_segments = src_ss[i].n_segments;
+                        for (size_t s = 0; s < src_ss[i].n_segments; s++) {
+                            split_state.nr[s] = src_ss[i].nr[s];
+                            for (size_t j = 0; j < n_bufs; j++) {
+                                split_state.ne[s*n_bufs + j] = src_ss[i].ne[s*n_bufs + j];
+                            }
+                        }
+                    }
                     for (size_t j = 0; j < n_bufs; j++) {
+                        if (seg_copy) break;
                         // Take over ratio from src:
                         for (size_t s = 0; s < src_ss[i].n_segments; s++) {
                             split_state.ne[s*n_bufs + j] = 0;
@@ -1083,7 +1156,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         split_state.ne[j] *= tensor->ne[split_state.axis];
                         if (split_state.ne[j] != 0 || tensor->src[i]->ne[src_ss[i].axis] != 0) {
                             const int64_t div = tensor->src[i]->ne[src_ss[i].axis] * split_state.nr[0];
-                            GGML_ASSERT(split_state.ne[j] % div == 0);
+                            GGML_ASSERT(div == 0 || split_state.ne[j] % div == 0);
                             split_state.ne[j] /= div;
                         }
                     }

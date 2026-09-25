@@ -492,6 +492,56 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
         }
 
+        // QWEN35 linear block: mirror SSM weights (replicated compute needs no sharding;
+        // residual stream is mirrored, verified by working Q4 tensor-split).
+        if (false && ud->model->arch == LLM_ARCH_QWEN35) {
+            if (std::regex_match(tensor_name, pattern_attn_gate_weight) ||
+                    std::regex_match(tensor_name, pattern_ssm_out_weight) ||
+                    std::regex_match(tensor_name, pattern_qkv_weight) ||
+                    std::regex_match(tensor_name, pattern_ssm_conv1d) ||
+                    std::regex_match(tensor_name, pattern_ssm_dt) ||
+                    std::regex_match(tensor_name, pattern_ssm_a) ||
+                    std::regex_match(tensor_name, pattern_ssm_alpha) ||
+                    std::regex_match(tensor_name, pattern_ssm_beta) ||
+                    std::regex_match(tensor_name, pattern_ssm_beta_alpha) ||
+                    std::regex_match(tensor_name, pattern_r_cache) ||
+                    std::regex_match(tensor_name, pattern_s_cache)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+        }
+        // Bonsai (hadamard-folded PQ2_0): 1-D sign vectors feed the hadamard input
+        // transform and must carry the SAME split state as the activation they
+        // multiply. signs.6144 is consumed by BOTH the attention-output activation
+        // and the (mirrored) SSM output; one vector cannot serve a split and a
+        // mirrored consumer at once. Keep the small attention block mirrored and
+        // split the large FFN instead.
+        if (false && !ud->model->hadamard_sign_data.empty() &&
+                (std::regex_match(tensor_name, pattern_q_weight) ||
+                 std::regex_match(tensor_name, pattern_kv_weight) ||
+                 std::regex_match(tensor_name, pattern_q_bias) ||
+                 std::regex_match(tensor_name, pattern_kv_bias) ||
+                 std::regex_match(tensor_name, pattern_qk_norm) ||
+                 std::regex_match(tensor_name, pattern_attn_out_weight) ||
+                 std::regex_match(tensor_name, pattern_attn_out_bias) ||
+                 std::regex_match(tensor_name, pattern_kv_cache))) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+        // FFN is split (hadamard input is 1024-block aligned; signs.17408 splits with it).
+        // Hadamard sign vectors: a 1-D signs vector must carry the SAME split state
+        // as the activation it multiplies (the elementwise mul indexes from the
+        // device-local offset). The FFN input activation (ffn_swiglu, width 17408)
+        // is split axis-0, so its signs split too; every other width is consumed by
+        // mirrored activations and stays mirrored.
+        {
+            static const std::string signs_prefix = "prism.hadamard.signs.";
+            if (tensor_name.compare(0, signs_prefix.size(), signs_prefix) == 0) {
+                const long sign_width = std::stol(tensor_name.substr(signs_prefix.size()));
+                if (sign_width == 17408 || sign_width == 6144) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+                }
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+        }
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
@@ -605,8 +655,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                     GGML_ASSERT(tensor->ne[axis] == 2*key_dim + value_dim);
                     return {{key_dim, 2 + head_ratio}};
                 }
-                if (std::regex_match(tensor_name, pattern_attn_gate_weight) || std::regex_match(tensor_name, pattern_ssm_out_weight)) {
+                if (std::regex_match(tensor_name, pattern_attn_gate_weight)) {
                     return {{key_dim, head_ratio}};
+                }
+                if (std::regex_match(tensor_name, pattern_ssm_out_weight)) {
+                    // ssm_out consumes the hadamard-regrouped (perm_rep) activation, whose
+                    // device-local layout is a contiguous axis-0 half; keep it contiguous
+                    // so the weight rows match the activation elements per device.
+                    return {{tensor->ne[axis], 1}};
                 }
                 if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a) ||
                         std::regex_match(tensor_name, pattern_ssm_alpha) || std::regex_match(tensor_name, pattern_ssm_beta)) {
@@ -749,6 +805,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // FFN
+        // Hadamard sign vectors: use the same 1024-block granularity as the FFN
+        // hadamard input so the elementwise-mul split state equals ffn_swiglu's.
+        {
+            static const std::string signs_pfx = "prism.hadamard.signs.";
+            if (tensor_name.compare(0, signs_pfx.size(), signs_pfx) == 0) {
+                return {std::lcm(blck_size, 1024)};
+            }
+        }
         if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_up_bias) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_weight) || std::regex_match(tensor_name, pattern_ffn_gate_bias) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
@@ -756,7 +820,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
-            const int64_t blck_size_perf = std::lcm(blck_size, 128);
+            const int64_t blck_size_perf = (tensor->type == GGML_TYPE_PQ2_0 || tensor->type == GGML_TYPE_PTQ1_0)
+                ? std::lcm(blck_size, 1024) : std::lcm(blck_size, 128);
             GGML_ASSERT(segments.size() == 1);
             return {blck_size_perf};
         }
@@ -769,6 +834,18 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     ggml_backend_meta_split_state split_state;
     memset(&split_state, 0, sizeof(split_state));
     tensor_config tc = get_tensor_config();
+    // Hadamard FFN: force rotation 0 so every layer's ffn_swiglu split and the
+    // shared 1-D signs vector receive identical device boundaries (rotation would
+    // make odd/even layers disagree, which a single shared vector cannot satisfy).
+    if (!ud->model->hadamard_sign_data.empty()) {
+        static const std::string signs_pfx_rot = "prism.hadamard.signs.";
+        if (std::regex_match(tensor_name, pattern_ffn_up_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_gate_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_down_weight) ||
+                tensor_name.compare(0, signs_pfx_rot.size(), signs_pfx_rot) == 0) {
+            tc.rotation = 0;
+        }
+    }
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
