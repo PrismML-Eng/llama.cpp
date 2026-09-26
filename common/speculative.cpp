@@ -3490,6 +3490,15 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
 
+    // ARC-LAB: the draft context inherits the target's physical batch (2048 on the Arc server = a 784 MiB compute
+    // buffer for an MTP layer that drafts 1-3 tokens); its prompt catch-up already runs in n_ubatch chunks.
+    if (const char * ub = getenv("LLAMA_ARG_SPEC_DRAFT_UBATCH")) {
+        const int32_t n = atoi(ub);
+        if (n > 0 && n < result.n_ubatch) {
+            result.n_ubatch = n;
+        }
+    }
+
     // the K-cache mean-center bias is calibrated for the target model
     // (per-head/channel K layout); the draft model has a different K
     // geometry, so it must not inherit the bias

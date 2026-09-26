@@ -58,6 +58,45 @@ template <> struct block_q_t<GGML_TYPE_Q4_0> {
     static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
 };
 
+template <> struct block_q_t<GGML_TYPE_PQ2_0> {
+    struct traits {
+        static constexpr uint32_t qk       = QK_PQ2_0;
+        static constexpr uint32_t qi       = QK_PQ2_0 / 16;  // 16 two-bit quants per int
+        static constexpr uint32_t qr       = 4;
+        static constexpr uint32_t vdr_mmvq = 4;
+    };
+
+    static constexpr std::pair<int, int> get_block_offset(const int block_index, const int /* nblocks */) {
+        return { block_index * (QK_PQ2_0 / 4), 0 };
+    }
+
+    static constexpr std::pair<int, int> get_d_offset(int nrows, int ncols, const int block_index) {
+        return { (ncols / 4 * nrows) + block_index * sizeof(ggml_half), 0 };
+    }
+
+    static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
+};
+
+template <> struct block_q_t<GGML_TYPE_PTQ1_0> {
+    struct traits {
+        static constexpr uint32_t qk       = QK_PTQ1_0;
+        static constexpr uint32_t qi       = 4;
+        static constexpr uint32_t qr       = 1;
+        static constexpr uint32_t vdr_mmvq = 4;  // one lane takes a whole block
+    };
+
+    // first: qs offset, second: qh offset
+    static constexpr std::pair<int, int> get_block_offset(const int block_index, const int nblocks) {
+        return { block_index * 24, nblocks * 24 + block_index * 2 };
+    }
+
+    static constexpr std::pair<int, int> get_d_offset(int nrows, int ncols, const int block_index) {
+        return { (ncols / QK_PTQ1_0 * nrows) * 26 + block_index * sizeof(ggml_half), 0 };
+    }
+
+    static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
+};
+
 template <> struct block_q_t<GGML_TYPE_Q2_K> {
     struct traits {
         static constexpr uint32_t qk       = QK_K;

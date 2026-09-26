@@ -91,6 +91,41 @@ template <int ElementsPerWI> struct quantize_and_reorder_q8_1_soa {
     }
 };
 
+// ARC-LAB: q8_1 activations for the PTQ1_0 decode-once mat-vec (one lane per 128-weight block). Same values as
+// quantize_and_reorder_q8_1_soa, but within a row the 16-byte chunk c of block b sits at (c * nb128 + b) * 16 and the
+// half2 (d, sum) of sub-block k at kx + (k * nb128 + b) * 4, so the 16 lanes' loads of one chunk are one contiguous
+// 256-byte read (the SoA layout made every such load touch 16 cache lines). Needs kx % 128 == 0.
+template <int ElementsPerWI> struct quantize_and_reorder_q8_1_ptq1_il {
+    __dpct_inline__ void operator()(const float * __restrict__ x, void * reordered_q8_tensor, const int kx,
+                                    const int kx_padded, const sycl::nd_item<1> & it) const {
+        auto subgroup_id = it.get_group(0);
+        auto wi_id       = it.get_local_id(0);
+
+        sycl::vec<int8_t, ElementsPerWI> quantized_values;
+        float                            d   = 0.0f;
+        float                            sum = 0.0f;
+        quantize_q8_1_impl<ElementsPerWI>(x, quantized_values, d, sum, it);
+
+        const int num_blocks_per_row = kx / QK8_1;
+        const int nb128              = kx / 128;
+        const int row                = subgroup_id / num_blocks_per_row;
+        const int col                = subgroup_id % num_blocks_per_row;  // q8_1 block within the row
+        const auto row_offset        = (size_t) row * (kx_padded / QK8_1) * sizeof(block_q8_1);
+        const int b                  = col / 4;                           // 128-block
+        const int w                  = 32 * (col % 4) + wi_id * ElementsPerWI;
+        const int c                  = w / 16;
+        const int byte               = w % 16;
+
+        auto quant_ptr = (int8_t *) ((char *) reordered_q8_tensor + row_offset + (size_t) (c * nb128 + b) * 16 + byte);
+        *reinterpret_cast<sycl::vec<int8_t, ElementsPerWI> *>(quant_ptr) = quantized_values;
+
+        auto ds_ptr = (sycl::half2 *) ((char *) reordered_q8_tensor + row_offset + kx) + ((col % 4) * nb128 + b);
+        if (wi_id == 0) {
+            *ds_ptr = sycl::half2(sycl::half(d), sycl::half(sum));
+        }
+    }
+};
+
 template <int ElementsPerWI> struct quantize_q8_1 {
     __dpct_inline__ void operator()(const float * __restrict__ x, void * q8_tensor, const int kx, const int kx_padded,
                                     const sycl::nd_item<1> & it) const {

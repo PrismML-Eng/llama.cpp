@@ -737,6 +737,752 @@ static void reorder_mul_mat_vec_q4_0_q8_1_sycl_switch_ncols(
     }
 }
 
+static void reorder_mul_mat_vec_pq2_0_q8_1_sycl(const void * vx, const void * vy, float * dst, const int ncols,
+                                                const int nrows, dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_PQ2_0 == 0);
+    constexpr size_t num_subgroups = WARP_SIZE;
+    const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_PQ2_0>>(vx, vy, dst, ncols, nrows,
+                                                                                            nd_item);
+                         });
+    });
+}
+
+template <int ncols_dst>
+static void reorder_mul_mat_vec_pq2_0_q8_1_sycl_ncols(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows,
+        const int stride_col_y_bytes, const int stride_col_dst,
+        dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_PQ2_0 == 0);
+    constexpr size_t num_subgroups = WARP_SIZE;
+    const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_q_reorder_ncols<reorder_vec_dot_q_sycl<GGML_TYPE_PQ2_0>, ncols_dst>(
+                                 vx, /*vgate=*/ nullptr, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst,
+                                 /*glu_op=*/ GGML_GLU_OP_SWIGLU, nd_item);
+                         });
+    });
+}
+
+static void reorder_mul_mat_vec_pq2_0_q8_1_sycl_switch_ncols(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows, const int ncols_dst,
+        const int stride_col_y_bytes, const int stride_col_dst,
+        dpct::queue_ptr stream) {
+    switch (ncols_dst) {
+        case 1: reorder_mul_mat_vec_pq2_0_q8_1_sycl(vx, vy, dst, ncols, nrows, stream); break;
+        case 2: reorder_mul_mat_vec_pq2_0_q8_1_sycl_ncols<2>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 3: reorder_mul_mat_vec_pq2_0_q8_1_sycl_ncols<3>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 4: reorder_mul_mat_vec_pq2_0_q8_1_sycl_ncols<4>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 5: reorder_mul_mat_vec_pq2_0_q8_1_sycl_ncols<5>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 6: reorder_mul_mat_vec_pq2_0_q8_1_sycl_ncols<6>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 7: reorder_mul_mat_vec_pq2_0_q8_1_sycl_ncols<7>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 8: reorder_mul_mat_vec_pq2_0_q8_1_sycl_ncols<8>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        default: GGML_ABORT("unsupported ncols_dst=%d for PQ2_0 reorder multi-col MMVQ", ncols_dst);
+    }
+}
+
+// PTQ1_0 single-column: one lane takes a whole block, so a sub-group takes R rows and spreads all
+// R * blocks_per_row blocks over its lanes. Rows of 40 blocks leave no idle lane at R = 2.
+template <int R>
+static void mul_mat_vec_ptq1_0_reorder_rows(const void * __restrict__ vx, const void * __restrict__ vy,
+                                            float * __restrict__ dst, const int ncols, const int nrows,
+                                            const sycl::nd_item<3> & nd_item) {
+    using block_type = ggml_sycl_reordered::block_q_t<GGML_TYPE_PTQ1_0>;
+
+    const auto sg   = nd_item.get_sub_group();
+    const int  row0 = (nd_item.get_group_linear_id() * sg.get_group_linear_range() + sg.get_group_linear_id()) * R;
+    if (row0 >= nrows) {
+        return;
+    }
+
+    const int blocks_per_row = ncols / QK_PTQ1_0;
+    const int nblocks        = nrows * blocks_per_row;
+    const int lane           = sg.get_local_linear_id();
+
+    float acc[R] = {};
+    for (int i = lane; i < R * blocks_per_row; i += WARP_SIZE) {
+        const int r = i / blocks_per_row;
+        const int b = i - r * blocks_per_row;
+        if (row0 + r >= nrows) {
+            continue;
+        }
+        const int           ibx = (row0 + r) * blocks_per_row + b;
+        const int8_t *      q8  = (const int8_t *) vy + b * QK_PTQ1_0;
+        const sycl::half2 * ds  = (const sycl::half2 *) ((const char *) vy + ncols + b * block_type::block_to_q8_1_ratio() * sizeof(sycl::half2));
+        const float         v   = reorder_vec_dot_q_sycl<GGML_TYPE_PTQ1_0>()(
+            vx, block_type::get_block_offset(ibx, nblocks), block_type::get_d_offset(nrows, ncols, ibx), q8, ds, 0);
+#pragma unroll
+        for (int k = 0; k < R; ++k) {
+            acc[k] += r == k ? v : 0.0f;
+        }
+    }
+
+#pragma unroll
+    for (int k = 0; k < R; ++k) {
+        const float sum = sycl::reduce_over_group(sg, acc[k], std::plus<>());
+        if (lane == k && row0 + k < nrows) {
+            dst[row0 + k] = sum;
+        }
+    }
+}
+
+template <int R>
+static void launch_mul_mat_vec_ptq1_0_reorder_rows(const void * vx, const void * vy, float * dst, const int ncols,
+                                                   const int nrows, dpct::queue_ptr stream) {
+    constexpr size_t num_subgroups = WARP_SIZE;
+    const int block_num_y = ceil_div(nrows, R * GGML_SYCL_MMV_Y * (int) num_subgroups);
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_ptq1_0_reorder_rows<R>(vx, vy, dst, ncols, nrows, nd_item);
+                         });
+    });
+}
+
+// ARC-LAB: single-column PTQ1_0 mat-vec in the layout of the Vulkan shader (mul_mat_vecq_ptq1_0.comp, 47 us vs 60 on the
+// 17408x5120 FFN matrix): two lanes per 128-weight block (lane 0: qs dwords 0..2, lane 1: dwords 3..5 + qh); a block's
+// activations are loaded ONCE and reused for the NR rows of the subgroup (the per-lane-block kernel reloads 128 B of
+// activations per row, over 4x the weight bytes); trits decoded per level on two bytes at a time in 16-bit lanes and fed
+// straight to dp4a against pre-masked activation words, so the residue byte multiplies a zero (no repacking).
+// Core: rows row0 .. row0 + NR - 1 of NM same-shape matrices (NM = 2: gate and up) against one activation column;
+// temp[m][n] holds this lane's partial sums (not yet reduced over the subgroup).
+template <int NR, int NM>
+static inline void ptq1_0_pairs_core(const uint8_t * const (&bases)[NM], const void * __restrict__ vy, const int ncols,
+                                     const int nrows, const int row0, const int lane, float (&temp)[NM][NR]) {
+    const int bpr     = ncols / QK_PTQ1_0;
+    const int nblocks = nrows * bpr;
+    const int sub     = lane & 1;
+
+    const uint32_t *    y32  = static_cast<const uint32_t *>(vy);
+    const sycl::half2 * yds  = (const sycl::half2 *) ((const char *) vy + ncols);
+
+#pragma unroll
+    for (int m = 0; m < NM; ++m) {
+#pragma unroll
+        for (int n = 0; n < NR; ++n) {
+            temp[m][n] = 0.0f;
+        }
+    }
+
+    for (int b = lane >> 1; b < bpr; b += WARP_SIZE / 2) {
+        const uint32_t *   yb  = y32 + b * (QK_PTQ1_0 / 4);
+        const sycl::float2 ds0 = yds[b * 4 + 0].convert<float, sycl::rounding_mode::automatic>();
+        const sycl::float2 ds1 = yds[b * 4 + 1].convert<float, sycl::rounding_mode::automatic>();
+        const sycl::float2 ds2 = yds[b * 4 + 2].convert<float, sycl::rounding_mode::automatic>();
+        const sycl::float2 ds3 = yds[b * 4 + 3].convert<float, sycl::rounding_mode::automatic>();
+        // accA: this lane's first qs dword (sub-block t/2); accB: the other two (lane 0: t/2, lane 1: 2,2,3,3,3)
+        const float sA0 = ds0.x(), sA1 = ds1.x(), sA2 = ds2.x();
+        const float sB0 = sub ? ds2.x() : ds0.x();
+        const float sB1 = sub ? ds3.x() : ds1.x();
+        const float sB2 = sub ? ds3.x() : ds2.x();
+        const float bias = sub ? (ds2.y() + ds3.y()) : (ds0.y() + ds1.y());
+
+        // activation words per trit level, pre-masked: yh = bytes 1,3; yl = bytes 0,2 moved to 1,3
+        int yl0[5], yh0[5], yl1[5], yh1[5], yl2[5], yh2[5];
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t a0 = sub ? yb[4 * t + 3] : yb[4 * t];
+            const uint32_t a1 = sub ? yb[20 + 2 * t] : yb[4 * t + 1];
+            const uint32_t a2 = sub ? yb[21 + 2 * t] : yb[4 * t + 2];
+            yh0[t] = (int) (a0 & 0xFF00FF00u);
+            yh1[t] = (int) (a1 & 0xFF00FF00u);
+            yh2[t] = (int) (a2 & 0xFF00FF00u);
+            yl0[t] = (int) ((a0 << 8) & 0xFF00FF00u);
+            yl1[t] = (int) ((a1 << 8) & 0xFF00FF00u);
+            yl2[t] = (int) ((a2 << 8) & 0xFF00FF00u);
+        }
+        const int yq0 = (int) yb[30];
+        const int yq1 = (int) yb[31];
+
+#pragma unroll
+        for (int m = 0; m < NM; ++m) {
+        const uint8_t * base = bases[m];
+#pragma unroll
+        for (int n = 0; n < NR; ++n) {
+            const int row = row0 + n;
+            if (row >= nrows) {
+                break;
+            }
+            const int        ibx = row * bpr + b;
+            const uint32_t * q32 = (const uint32_t *) (base + ibx * 24) + 3 * sub;
+            const uint32_t   w0 = q32[0], w1 = q32[1], w2 = q32[2];
+            const uint8_t *  qh = base + nblocks * 24 + ibx * 2;
+            const float      da = (float) *(reinterpret_cast<const ggml_half *>(base + nblocks * 26 + ibx * 2));
+
+            uint32_t v0l = w0 & 0x00FF00FFu, v0h = (w0 >> 8) & 0x00FF00FFu;
+            uint32_t v1l = w1 & 0x00FF00FFu, v1h = (w1 >> 8) & 0x00FF00FFu;
+            uint32_t v2l = w2 & 0x00FF00FFu, v2h = (w2 >> 8) & 0x00FF00FFu;
+            int accA0 = 0, accA1 = 0, accA2 = 0, accB0 = 0, accB1 = 0, accB2 = 0;
+            auto level = [](uint32_t & vl, uint32_t & vh, int yl, int yh, int & acc) {
+                const uint32_t wl = vl * 3u, wh = vh * 3u;
+                vl = wl & 0x00FF00FFu;
+                vh = wh & 0x00FF00FFu;
+                acc = dpct::dp4a((int) wl, yl, acc);
+                acc = dpct::dp4a((int) wh, yh, acc);
+            };
+            level(v0l, v0h, yl0[0], yh0[0], accA0); level(v1l, v1h, yl1[0], yh1[0], accB0); level(v2l, v2h, yl2[0], yh2[0], accB0);
+            level(v0l, v0h, yl0[1], yh0[1], accA0); level(v1l, v1h, yl1[1], yh1[1], accB0); level(v2l, v2h, yl2[1], yh2[1], accB0);
+            level(v0l, v0h, yl0[2], yh0[2], accA1); level(v1l, v1h, yl1[2], yh1[2], accB1); level(v2l, v2h, yl2[2], yh2[2], accB1);
+            level(v0l, v0h, yl0[3], yh0[3], accA1); level(v1l, v1h, yl1[3], yh1[3], accB1); level(v2l, v2h, yl2[3], yh2[3], accB1);
+            level(v0l, v0h, yl0[4], yh0[4], accA2); level(v1l, v1h, yl1[4], yh1[4], accB2); level(v2l, v2h, yl2[4], yh2[4], accB2);
+            {
+                // qh trits -> elements 120 + 2m + h, sub-block 3 (lane 1 only; lane 0 decodes zeros)
+                uint32_t vq = sub ? ((uint32_t) qh[0] | ((uint32_t) qh[1] << 16)) : 0u;
+                uint32_t wq = vq * 3u;
+                vq = wq & 0x00FF00FFu;
+                int q01 = (int) (((wq >> 8) & 0x3u) | ((wq >> 16) & 0x300u));
+                wq = vq * 3u;
+                vq = wq & 0x00FF00FFu;
+                q01 |= (int) (((wq << 8) & 0x30000u) | (wq & 0x03000000u));
+                wq = vq * 3u;
+                vq = wq & 0x00FF00FFu;
+                int q23 = (int) (((wq >> 8) & 0x3u) | ((wq >> 16) & 0x300u));
+                wq = vq * 3u;
+                q23 |= (int) (((wq << 8) & 0x30000u) | (wq & 0x03000000u));
+                accB2 = dpct::dp4a(q01, yq0, accB2);
+                accB2 = dpct::dp4a(q23, yq1, accB2);
+            }
+            const float sum = sA0 * accA0 + sA1 * accA1 + sA2 * accA2 + sB0 * accB0 + sB1 * accB1 + sB2 * accB2 - bias;
+            temp[m][n] += da * sum;
+        }
+        }
+    }
+}
+
+template <int NR>
+static void mul_mat_vec_ptq1_0_pairs(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+                                     const int ncols, const int nrows, const sycl::nd_item<3> & nd_item) {
+    const auto sg   = nd_item.get_sub_group();
+    const int  lane = sg.get_local_linear_id();
+    const int  row0 = (nd_item.get_group_linear_id() * sg.get_group_linear_range() + sg.get_group_linear_id()) * NR;
+    if (row0 >= nrows) {
+        return;
+    }
+    const uint8_t * const bases[1] = { static_cast<const uint8_t *>(vx) };
+    float temp[1][NR];
+    ptq1_0_pairs_core<NR, 1>(bases, vy, ncols, nrows, row0, lane, temp);
+#pragma unroll
+    for (int n = 0; n < NR; ++n) {
+        const float s = sycl::reduce_over_group(sg, temp[0][n], std::plus<>());
+        if (lane == 0 && row0 + n < nrows) {
+            dst[row0 + n] = s;
+        }
+    }
+}
+
+// ARC-LAB: up to 3 matrices that share one activation (GDN qkv + z, attention q + k + v) in ONE launch: the row-group
+// index space is the matrices stacked, each subgroup serves NR rows of one of them. A launch costs ~10 us beyond its
+// weight bytes on the B580 (in-model trace: 1 MB attn_k 12 us), so merging saves the tail of every extra launch and
+// one activation quantization. Row counts must be multiples of NR.
+struct ptq1_0_multi_args {
+    const void * vx[3];
+    float *      dst[3];
+    int          nrows[3];
+};
+
+template <int NR>
+static void mul_mat_vec_ptq1_0_pairs_multi(const ptq1_0_multi_args a, const void * __restrict__ vy, const int ncols,
+                                           const int nrows_total, const sycl::nd_item<3> & nd_item) {
+    const auto sg   = nd_item.get_sub_group();
+    const int  lane = sg.get_local_linear_id();
+    int        row0 = (nd_item.get_group_linear_id() * sg.get_group_linear_range() + sg.get_group_linear_id()) * NR;
+    if (row0 >= nrows_total) {
+        return;
+    }
+    int m = 0;
+    if (row0 >= a.nrows[0]) {
+        row0 -= a.nrows[0];
+        m = 1;
+        if (row0 >= a.nrows[1]) {
+            row0 -= a.nrows[1];
+            m = 2;
+        }
+    }
+    const int             nrows    = a.nrows[m];
+    const uint8_t * const bases[1] = { static_cast<const uint8_t *>(a.vx[m]) };
+    float * const         dst      = a.dst[m];
+    float temp[1][NR];
+    ptq1_0_pairs_core<NR, 1>(bases, vy, ncols, nrows, row0, lane, temp);
+#pragma unroll
+    for (int n = 0; n < NR; ++n) {
+        const float s = sycl::reduce_over_group(sg, temp[0][n], std::plus<>());
+        if (lane == 0 && row0 + n < nrows) {
+            dst[row0 + n] = s;
+        }
+    }
+}
+
+// ARC-LAB: single-column gate/up + GLU with the pairs core: each subgroup dots NR rows of BOTH matrices against one load
+// of the activations and writes act(gate) * up.
+template <int NR>
+static void mul_mat_vec_ptq1_0_pairs_glu(const void * __restrict__ vup, const void * __restrict__ vgate,
+                                         const void * __restrict__ vy, float * __restrict__ dst, const int ncols,
+                                         const int nrows, const ggml_glu_op glu_op, const sycl::nd_item<3> & nd_item) {
+    const auto sg   = nd_item.get_sub_group();
+    const int  lane = sg.get_local_linear_id();
+    const int  row0 = (nd_item.get_group_linear_id() * sg.get_group_linear_range() + sg.get_group_linear_id()) * NR;
+    if (row0 >= nrows) {
+        return;
+    }
+    const uint8_t * const bases[2] = { static_cast<const uint8_t *>(vup), static_cast<const uint8_t *>(vgate) };
+    float temp[2][NR];
+    ptq1_0_pairs_core<NR, 2>(bases, vy, ncols, nrows, row0, lane, temp);
+#pragma unroll
+    for (int n = 0; n < NR; ++n) {
+        const float u = sycl::reduce_over_group(sg, temp[0][n], std::plus<>());
+        const float g = sycl::reduce_over_group(sg, temp[1][n], std::plus<>());
+        if (lane == 0 && row0 + n < nrows) {
+            dst[row0 + n] = u * (glu_op == GGML_GLU_OP_SWIGLU ? op_silu(g) : op_gelu(g));
+        }
+    }
+}
+
+template <int NR>
+static void launch_ptq1_0_pairs(const void * vx, const void * vy, float * dst, const int ncols, const int nrows,
+                                dpct::queue_ptr stream) {
+    constexpr size_t     num_subgroups = WARP_SIZE;
+    const int            block_num_y   = ceil_div(nrows, NR * GGML_SYCL_MMV_Y * (int) num_subgroups);
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_ptq1_0_pairs<NR>(vx, vy, dst, ncols, nrows, nd_item);
+                         });
+    });
+}
+
+template <int NR>
+static void launch_ptq1_0_pairs_multi(const ptq1_0_multi_args & a, const void * vy, const int ncols, const int nrows_total,
+                                      dpct::queue_ptr stream) {
+    constexpr size_t     num_subgroups = WARP_SIZE;
+    const int            block_num_y   = ceil_div(nrows_total, NR * GGML_SYCL_MMV_Y * (int) num_subgroups);
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+    const ptq1_0_multi_args args = a;
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_ptq1_0_pairs_multi<NR>(args, vy, ncols, nrows_total, nd_item);
+                         });
+    });
+}
+
+template <int NR>
+static void launch_ptq1_0_pairs_glu(const void * vup, const void * vgate, const void * vy, float * dst, const int ncols,
+                                    const int nrows, const ggml_glu_op glu_op, dpct::queue_ptr stream) {
+    constexpr size_t     num_subgroups = WARP_SIZE;
+    const int            block_num_y   = ceil_div(nrows, NR * GGML_SYCL_MMV_Y * (int) num_subgroups);
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_ptq1_0_pairs_glu<NR>(vup, vgate, vy, dst, ncols, nrows, glu_op, nd_item);
+                         });
+    });
+}
+
+// ARC-LAB: n matrices (<= 3) sharing one SoA-quantized activation column, one launch. False = caller runs them apart.
+bool ggml_sycl_ptq1_0_mul_mat_vec_multi(const void * const * vx, float * const * dst, const int * nrows, const int nm,
+                                        const void * vy, const int ncols, dpct::queue_ptr stream) {
+    constexpr int NR = 4;
+    if (nm < 2 || nm > 3 || ncols % QK_PTQ1_0 != 0) {
+        return false;
+    }
+    ptq1_0_multi_args a = {};
+    int total = 0;
+    for (int m = 0; m < nm; ++m) {
+        if (nrows[m] % NR != 0) {
+            return false;
+        }
+        a.vx[m]    = vx[m];
+        a.dst[m]   = dst[m];
+        a.nrows[m] = nrows[m];
+        total += nrows[m];
+    }
+    launch_ptq1_0_pairs_multi<NR>(a, vy, ncols, total, stream);
+    return true;
+}
+
+// ARC-LAB: single-column fused gate/up + GLU (pairs core). GGML_SYCL_PTQ1_GLU1=0 declines (unfused path).
+bool ggml_sycl_ptq1_0_glu_n1_enabled() {
+    static const bool on = !getenv("GGML_SYCL_PTQ1_GLU1") || atoi(getenv("GGML_SYCL_PTQ1_GLU1")) != 0;
+    return on;
+}
+
+static void reorder_mul_mat_vec_ptq1_0_q8_1_sycl(const void * vx, const void * vy, float * dst, const int ncols,
+                                                 const int nrows, dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_PTQ1_0 == 0);
+    // ARC-LAB: Vulkan-style kernel (two lanes per block, activations reused over NR rows), 4 rows per subgroup by default.
+    // Whole model (llama-bench tg128, B580): old 36.96, NR 2 36.62, NR 4 37.54, NR 8 34.99 t/s. test-backend-ops favours
+    // NR 8 (10240x5120 36.0 -> 27.0 us) but reruns one matrix that stays in the 18 MB L2; in the model the weights stream
+    // from memory and NR 8 lost 7% of mat-vec time (unitrace). GGML_SYCL_PTQ1_PAIRS=0 restores the per-lane-block kernel.
+    static const int pairs_env = getenv("GGML_SYCL_PTQ1_PAIRS") ? atoi(getenv("GGML_SYCL_PTQ1_PAIRS")) : -1;
+    const int pairs = pairs_env >= 0 ? pairs_env : 4;
+    if (pairs == 2) { launch_ptq1_0_pairs<2>(vx, vy, dst, ncols, nrows, stream); return; }
+    if (pairs == 4) { launch_ptq1_0_pairs<4>(vx, vy, dst, ncols, nrows, stream); return; }
+    if (pairs == 8) { launch_ptq1_0_pairs<8>(vx, vy, dst, ncols, nrows, stream); return; }
+    // two rows per sub-group only when one row leaves lanes idle in the last round
+    if ((ncols / QK_PTQ1_0) % WARP_SIZE == 0) {
+        constexpr size_t     num_subgroups = WARP_SIZE;
+        const int            block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
+        const sycl::range<3> block_nums(1, 1, block_num_y);
+        const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+        stream->submit([&](sycl::handler & cgh) {
+            cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                             [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                 mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_PTQ1_0>>(vx, vy, dst, ncols,
+                                                                                                 nrows, nd_item);
+                             });
+        });
+    } else {
+        launch_mul_mat_vec_ptq1_0_reorder_rows<2>(vx, vy, dst, ncols, nrows, stream);
+    }
+}
+
+bool ggml_sycl_ptq1_0_ncols_dec_enabled() {
+    static const bool off = getenv("GGML_SYCL_PTQ1_NCOLS_DEC_OFF") != nullptr;
+    return !off;
+}
+
+// ARC-LAB: PTQ1_0 multi-column mat-vec (MTP verify, n-gram drafts, fused gate/up) that decodes each block's trits
+// ONCE and reuses them for every column; mul_mat_vec_q_reorder_ncols re-decodes per column (at 4 columns a matrix
+// cost 2.5x the single-column time). R rows per sub-group keeps every lane busy when a row's block count is not a
+// multiple of the sub-group (Bonsai K 5120 = 40 blocks).
+template <int R, int ncols_dst, bool has_fusion, int PROBE = 0>  // PROBE: lab-only compile-time timing variants
+static inline void ptq1_0_ncols_dec_body(const void * __restrict__ vx, const void * __restrict__ vgate,
+                                         const void * __restrict__ vy, float * __restrict__ dst, const int ncols,
+                                         const int nrows, const int stride_col_y_bytes, const int stride_col_dst,
+                                         const ggml_glu_op glu_op, const sycl::sub_group & sg, const int row0) {
+    using block_type = ggml_sycl_reordered::block_q_t<GGML_TYPE_PTQ1_0>;
+
+    const int blocks_per_row = ncols / QK_PTQ1_0;
+    const int nblocks        = nrows * blocks_per_row;
+    const int lane           = sg.get_local_linear_id();
+
+    float acc[R][ncols_dst] = {};
+    [[maybe_unused]] float accg[has_fusion ? R : 1][has_fusion ? ncols_dst : 1] = {};
+
+    auto load_decode = [&](const void * w, const std::pair<int, int> bx, const std::pair<int, int> dof, int * qw) -> float {
+        const uint8_t * base = static_cast<const uint8_t *>(w);
+        uint8_t qs[24];
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            *(sycl::uint2 *) (qs + 8 * k) = ((const sycl::uint2 *) (base + bx.first))[k];
+        }
+        const uint8_t * qh = base + bx.second;
+        if constexpr (PROBE == 1) {  // no trit decode
+#pragma unroll
+            for (int k = 0; k < 32; ++k) {
+                qw[k] = (int) qs[k % 24] | ((int) qh[k & 1] << 8);
+            }
+        } else {
+            ptq1_0_decode_block(qs, (uint32_t) qh[0] | ((uint32_t) qh[1] << 16), qw);
+        }
+        return (float) *(reinterpret_cast<const ggml_half *>(base + dof.first));
+    };
+
+    for (int i = lane; i < R * blocks_per_row; i += WARP_SIZE) {
+        const int r = i / blocks_per_row;
+        const int b = i - r * blocks_per_row;
+        if (row0 + r >= nrows) {
+            continue;
+        }
+        const int  ibx = (row0 + r) * blocks_per_row + b;
+        const auto bx  = block_type::get_block_offset(ibx, nblocks);
+        const auto dof = block_type::get_d_offset(nrows, ncols, ibx);
+
+        int         qw[32];
+        const float d = load_decode(vx, bx, dof, qw);
+        [[maybe_unused]] int   qg[has_fusion ? 32 : 1];
+        [[maybe_unused]] float dg = 0.0f;
+        if constexpr (has_fusion) {
+            dg = load_decode(vgate, bx, dof, qg);
+        }
+
+        // activations in the quantize_and_reorder_q8_1_ptq1_il layout: chunk c of block b at [c * blocks_per_row + b]
+        auto dot_col = [&](const int * q, const sycl::int4 * xb, const sycl::half2 * dsb, const float dd) -> float {
+            int si[4] = { 0, 0, 0, 0 };
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                const sycl::int4 xv = xb[c * blocks_per_row];
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    si[c >> 1] = dpct::dp4a(q[4 * c + u], xv[u], si[c >> 1]);
+                }
+            }
+            float a = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const sycl::float2 dsf = dsb[k * blocks_per_row].convert<float, sycl::rounding_mode::automatic>();
+                a += si[k] * dsf.x() - dsf.y();
+            }
+            return dd * a;
+        };
+
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const char *        vy_j = (const char *) vy + j * stride_col_y_bytes;
+            const sycl::int4 *  xb   = (const sycl::int4 *) vy_j + (PROBE == 2 ? 0 : b);  // PROBE 2: hot activations
+            const sycl::half2 * dsb  = (const sycl::half2 *) (vy_j + ncols) + b;
+            float v;
+            if constexpr (PROBE == 3) {  // dot only for column 0; later columns still load their activations
+                if (j == 0) {
+                    v = dot_col(qw, xb, dsb, d);
+                } else {
+                    int sink = 0;
+#pragma unroll
+                    for (int c = 0; c < 8; ++c) {
+                        const sycl::int4 xv = xb[c * blocks_per_row];
+                        sink ^= xv[0] ^ xv[1] ^ xv[2] ^ xv[3];
+                    }
+                    v = (float) sink * 1e-30f + (float) dsb[0].x() * 1e-30f;
+                }
+            } else {
+                v = dot_col(qw, xb, dsb, d);
+            }
+#pragma unroll
+            for (int k = 0; k < R; ++k) {
+                acc[k][j] += r == k ? v : 0.0f;
+            }
+            if constexpr (has_fusion) {
+                const float vg = dot_col(qg, xb, dsb, dg);
+#pragma unroll
+                for (int k = 0; k < R; ++k) {
+                    accg[k][j] += r == k ? vg : 0.0f;
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int k = 0; k < R; ++k) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            float sum = sycl::reduce_over_group(sg, acc[k][j], std::plus<>());
+            if constexpr (has_fusion) {
+                const float gate = sycl::reduce_over_group(sg, accg[k][j], std::plus<>());
+                sum *= glu_op == GGML_GLU_OP_SWIGLU ? op_silu(gate) : op_gelu(gate);
+            }
+            if (lane == 0 && row0 + k < nrows) {
+                dst[j * stride_col_dst + row0 + k] = sum;
+            }
+        }
+    }
+}
+
+template <int R, int ncols_dst, bool has_fusion, int PROBE = 0>
+static void mul_mat_vec_ptq1_0_ncols_dec(const void * __restrict__ vx, const void * __restrict__ vgate,
+                                         const void * __restrict__ vy, float * __restrict__ dst, const int ncols,
+                                         const int nrows, const int stride_col_y_bytes, const int stride_col_dst,
+                                         const ggml_glu_op glu_op, const sycl::nd_item<3> & nd_item) {
+    const auto sg   = nd_item.get_sub_group();
+    const int  row0 = (nd_item.get_group_linear_id() * sg.get_group_linear_range() + sg.get_group_linear_id()) * R;
+    if (row0 >= nrows) {
+        return;
+    }
+    ptq1_0_ncols_dec_body<R, ncols_dst, has_fusion, PROBE>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes,
+                                                           stride_col_dst, glu_op, sg, row0);
+}
+
+static bool ptq1_0_ncols_dec_enabled() {
+    return ggml_sycl_ptq1_0_ncols_dec_enabled();
+}
+
+template <int ncols_dst, bool has_fusion>
+static void launch_ptq1_0_ncols_dec(const void * vx, const void * vgate, const void * vy, float * dst, const int ncols,
+                                    const int nrows, const int stride_col_y_bytes, const int stride_col_dst,
+                                    const ggml_glu_op glu_op, dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_PTQ1_0 == 0);
+    constexpr size_t num_subgroups = WARP_SIZE;
+    auto go = [&](auto rc) {
+        constexpr int        R           = decltype(rc)::value;
+        const int            block_num_y = ceil_div(nrows, R * GGML_SYCL_MMV_Y * (int) num_subgroups);
+        const sycl::range<3> block_nums(1, 1, block_num_y);
+        const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+        stream->submit([&](sycl::handler & cgh) {
+            cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                             [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                 mul_mat_vec_ptq1_0_ncols_dec<R, ncols_dst, has_fusion>(
+                                     vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, nd_item);
+                             });
+        });
+    };
+    static const int probe = getenv("GGML_SYCL_PTQ1_PROBE") ? atoi(getenv("GGML_SYCL_PTQ1_PROBE")) : 0;  // lab timing only
+    if (!has_fusion && probe >= 1 && probe <= 3 && (ncols / QK_PTQ1_0) % WARP_SIZE != 0) {
+        auto launch_probe = [&](auto pc) {
+            using PC = decltype(pc);
+            const int block_num_y = ceil_div(nrows, 2 * GGML_SYCL_MMV_Y * (int) num_subgroups);
+            const sycl::range<3> block_nums(1, 1, block_num_y);
+            const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+            stream->submit([&](sycl::handler & cgh) {
+                cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                                 [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                     mul_mat_vec_ptq1_0_ncols_dec<2, ncols_dst, false, PC::value>(vx, vgate, vy, dst, ncols, nrows,
+                                         stride_col_y_bytes, stride_col_dst, glu_op, nd_item);
+                                 });
+            });
+        };
+        if (probe == 1) {
+            launch_probe(std::integral_constant<int, 1>{});
+        } else if (probe == 2) {
+            launch_probe(std::integral_constant<int, 2>{});
+        } else {
+            launch_probe(std::integral_constant<int, 3>{});
+        }
+        return;
+    }
+    static const bool fused_r1 = getenv("GGML_SYCL_PTQ1_FUSED_R1") != nullptr;  // ARC-LAB lab knob
+    if ((ncols / QK_PTQ1_0) % WARP_SIZE == 0 || (has_fusion && fused_r1)) {
+        go(std::integral_constant<int, 1>{});
+    } else {
+        go(std::integral_constant<int, 2>{});
+    }
+}
+
+// ARC-LAB: the same-input merge (ggml_sycl_ptq1_0_mul_mat_vec_multi) for 2..8 columns (MTP verify / n-gram drafts):
+// subgroups over the stacked rows of up to 3 matrices, each served by the decode-once body; activations in the ptq1_il
+// layout, every dst contiguous (column stride = its row count). Row counts must be multiples of R.
+template <int R, int ncols_dst>
+static void mul_mat_vec_ptq1_0_ncols_dec_multi(const ptq1_0_multi_args a, const void * __restrict__ vy, const int ncols,
+                                               const int nrows_total, const int stride_col_y_bytes,
+                                               const sycl::nd_item<3> & nd_item) {
+    const auto sg  = nd_item.get_sub_group();
+    int        row0 = (nd_item.get_group_linear_id() * sg.get_group_linear_range() + sg.get_group_linear_id()) * R;
+    if (row0 >= nrows_total) {
+        return;
+    }
+    int m = 0;
+    if (row0 >= a.nrows[0]) {
+        row0 -= a.nrows[0];
+        m = 1;
+        if (row0 >= a.nrows[1]) {
+            row0 -= a.nrows[1];
+            m = 2;
+        }
+    }
+    ptq1_0_ncols_dec_body<R, ncols_dst, false>(a.vx[m], nullptr, vy, a.dst[m], ncols, a.nrows[m], stride_col_y_bytes,
+                                               a.nrows[m], GGML_GLU_OP_SWIGLU, sg, row0);
+}
+
+template <int ncols_dst>
+static void launch_ptq1_0_ncols_dec_multi(const ptq1_0_multi_args & a, const void * vy, const int ncols, const int total,
+                                          const int stride_col_y_bytes, const bool r1, dpct::queue_ptr stream) {
+    constexpr size_t num_subgroups = WARP_SIZE;
+    const ptq1_0_multi_args args   = a;
+    auto go = [&](auto rc) {
+        constexpr int        R           = decltype(rc)::value;
+        const int            block_num_y = ceil_div(total, R * GGML_SYCL_MMV_Y * (int) num_subgroups);
+        const sycl::range<3> block_nums(1, 1, block_num_y);
+        const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+        stream->submit([&](sycl::handler & cgh) {
+            cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                             [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                 mul_mat_vec_ptq1_0_ncols_dec_multi<R, ncols_dst>(args, vy, ncols, total,
+                                                                                  stride_col_y_bytes, nd_item);
+                             });
+        });
+    };
+    if (r1) {
+        go(std::integral_constant<int, 1>{});
+    } else {
+        go(std::integral_constant<int, 2>{});
+    }
+}
+
+bool ggml_sycl_ptq1_0_mul_mat_vec_multi_ncols(const void * const * vx, float * const * dst, const int * nrows,
+                                              const int nm, const void * vy, const int ncols, const int ncols_dst,
+                                              const int stride_col_y_bytes, dpct::queue_ptr stream) {
+    if (nm < 2 || nm > 3 || ncols % QK_PTQ1_0 != 0 || ncols_dst < 2 || ncols_dst > 8 || !ptq1_0_ncols_dec_enabled()) {
+        return false;
+    }
+    const bool r1 = (ncols / QK_PTQ1_0) % WARP_SIZE == 0;  // as launch_ptq1_0_ncols_dec: 2 rows when lanes would idle
+    const int  R  = r1 ? 1 : 2;
+    ptq1_0_multi_args a = {};
+    int total = 0;
+    for (int m = 0; m < nm; ++m) {
+        if (nrows[m] % R != 0) {
+            return false;
+        }
+        a.vx[m]    = vx[m];
+        a.dst[m]   = dst[m];
+        a.nrows[m] = nrows[m];
+        total += nrows[m];
+    }
+    switch (ncols_dst) {
+        case 2: launch_ptq1_0_ncols_dec_multi<2>(a, vy, ncols, total, stride_col_y_bytes, r1, stream); break;
+        case 3: launch_ptq1_0_ncols_dec_multi<3>(a, vy, ncols, total, stride_col_y_bytes, r1, stream); break;
+        case 4: launch_ptq1_0_ncols_dec_multi<4>(a, vy, ncols, total, stride_col_y_bytes, r1, stream); break;
+        case 5: launch_ptq1_0_ncols_dec_multi<5>(a, vy, ncols, total, stride_col_y_bytes, r1, stream); break;
+        case 6: launch_ptq1_0_ncols_dec_multi<6>(a, vy, ncols, total, stride_col_y_bytes, r1, stream); break;
+        case 7: launch_ptq1_0_ncols_dec_multi<7>(a, vy, ncols, total, stride_col_y_bytes, r1, stream); break;
+        case 8: launch_ptq1_0_ncols_dec_multi<8>(a, vy, ncols, total, stride_col_y_bytes, r1, stream); break;
+    }
+    return true;
+}
+
+template <int ncols_dst>
+static void reorder_mul_mat_vec_ptq1_0_q8_1_sycl_ncols(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows,
+        const int stride_col_y_bytes, const int stride_col_dst,
+        dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_PTQ1_0 == 0);
+    if (ptq1_0_ncols_dec_enabled()) {
+        launch_ptq1_0_ncols_dec<ncols_dst, false>(vx, nullptr, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst,
+                                                  GGML_GLU_OP_SWIGLU, stream);
+        return;
+    }
+    constexpr size_t num_subgroups = WARP_SIZE;
+    const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_q_reorder_ncols<reorder_vec_dot_q_sycl<GGML_TYPE_PTQ1_0>, ncols_dst>(
+                                 vx, /*vgate=*/ nullptr, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst,
+                                 /*glu_op=*/ GGML_GLU_OP_SWIGLU, nd_item);
+                         });
+    });
+}
+
+static void reorder_mul_mat_vec_ptq1_0_q8_1_sycl_switch_ncols(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows, const int ncols_dst,
+        const int stride_col_y_bytes, const int stride_col_dst,
+        dpct::queue_ptr stream) {
+    switch (ncols_dst) {
+        case 1: reorder_mul_mat_vec_ptq1_0_q8_1_sycl(vx, vy, dst, ncols, nrows, stream); break;
+        case 2: reorder_mul_mat_vec_ptq1_0_q8_1_sycl_ncols<2>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 3: reorder_mul_mat_vec_ptq1_0_q8_1_sycl_ncols<3>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 4: reorder_mul_mat_vec_ptq1_0_q8_1_sycl_ncols<4>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 5: reorder_mul_mat_vec_ptq1_0_q8_1_sycl_ncols<5>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 6: reorder_mul_mat_vec_ptq1_0_q8_1_sycl_ncols<6>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 7: reorder_mul_mat_vec_ptq1_0_q8_1_sycl_ncols<7>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 8: reorder_mul_mat_vec_ptq1_0_q8_1_sycl_ncols<8>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        default: GGML_ABORT("unsupported ncols_dst=%d for PTQ1_0 reorder multi-col MMVQ", ncols_dst);
+    }
+}
+
 static void mul_mat_vec_q4_0_q8_1_sycl(const void * vx, const void * vy, float * dst, const int ncols, const int nrows,
                                        dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK4_0 == 0);
@@ -1455,6 +2201,126 @@ static void mul_mat_vec_q2_0_q8_1_sycl_switch_ncols(
         case 7: mul_mat_vec_q2_0_q8_1_sycl_ncols<7>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
         case 8: mul_mat_vec_q2_0_q8_1_sycl_ncols<8>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
         default: GGML_ABORT("unsupported ncols_dst=%d for Q2_0 multi-col MMVQ", ncols_dst);
+    }
+}
+
+static void mul_mat_vec_pq2_0_q8_1_sycl(const void * vx, const void * vy,
+                                        float * dst, const int ncols,
+                                        const int nrows,
+                                        dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_PQ2_0 == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                mul_mat_vec_q<QK_PQ2_0, QI_PQ2_0, block_pq2_0,
+                              VDR_PQ2_0_Q8_1_MMVQ, vec_dot_pq2_0_q8_1>(
+                    vx, vy, dst, ncols, nrows, item_ct1);
+            });
+    });
+}
+
+template <int ncols_dst>
+static void mul_mat_vec_pq2_0_q8_1_sycl_ncols(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows,
+        const int stride_col_y, const int stride_col_dst,
+        dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_PQ2_0 == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                mul_mat_vec_q_ncols<QK_PQ2_0, QI_PQ2_0, block_pq2_0,
+                                    VDR_PQ2_0_Q8_1_MMVQ, vec_dot_pq2_0_q8_1, ncols_dst>(
+                    vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, item_ct1);
+            });
+    });
+}
+
+static void mul_mat_vec_pq2_0_q8_1_sycl_switch_ncols(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows, const int ncols_dst,
+        const int stride_col_y, const int stride_col_dst,
+        dpct::queue_ptr stream) {
+    switch (ncols_dst) {
+        case 1: mul_mat_vec_pq2_0_q8_1_sycl(vx, vy, dst, ncols, nrows, stream); break;
+        case 2: mul_mat_vec_pq2_0_q8_1_sycl_ncols<2>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 3: mul_mat_vec_pq2_0_q8_1_sycl_ncols<3>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 4: mul_mat_vec_pq2_0_q8_1_sycl_ncols<4>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 5: mul_mat_vec_pq2_0_q8_1_sycl_ncols<5>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 6: mul_mat_vec_pq2_0_q8_1_sycl_ncols<6>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 7: mul_mat_vec_pq2_0_q8_1_sycl_ncols<7>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 8: mul_mat_vec_pq2_0_q8_1_sycl_ncols<8>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        default: GGML_ABORT("unsupported ncols_dst=%d for PQ2_0 multi-col MMVQ", ncols_dst);
+    }
+}
+
+static void mul_mat_vec_ptq1_0_q8_1_sycl(const void * vx, const void * vy,
+                                        float * dst, const int ncols,
+                                        const int nrows,
+                                        dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_PTQ1_0 == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                mul_mat_vec_q<QK_PTQ1_0, QI_PTQ1_0, block_ptq1_0,
+                              VDR_PTQ1_0_Q8_1_MMVQ, vec_dot_ptq1_0_q8_1>(
+                    vx, vy, dst, ncols, nrows, item_ct1);
+            });
+    });
+}
+
+template <int ncols_dst>
+static void mul_mat_vec_ptq1_0_q8_1_sycl_ncols(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows,
+        const int stride_col_y, const int stride_col_dst,
+        dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_PTQ1_0 == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                mul_mat_vec_q_ncols<QK_PTQ1_0, QI_PTQ1_0, block_ptq1_0,
+                                    VDR_PTQ1_0_Q8_1_MMVQ, vec_dot_ptq1_0_q8_1, ncols_dst>(
+                    vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, item_ct1);
+            });
+    });
+}
+
+static void mul_mat_vec_ptq1_0_q8_1_sycl_switch_ncols(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows, const int ncols_dst,
+        const int stride_col_y, const int stride_col_dst,
+        dpct::queue_ptr stream) {
+    switch (ncols_dst) {
+        case 1: mul_mat_vec_ptq1_0_q8_1_sycl(vx, vy, dst, ncols, nrows, stream); break;
+        case 2: mul_mat_vec_ptq1_0_q8_1_sycl_ncols<2>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 3: mul_mat_vec_ptq1_0_q8_1_sycl_ncols<3>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 4: mul_mat_vec_ptq1_0_q8_1_sycl_ncols<4>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 5: mul_mat_vec_ptq1_0_q8_1_sycl_ncols<5>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 6: mul_mat_vec_ptq1_0_q8_1_sycl_ncols<6>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 7: mul_mat_vec_ptq1_0_q8_1_sycl_ncols<7>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        case 8: mul_mat_vec_ptq1_0_q8_1_sycl_ncols<8>(vx, vy, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); break;
+        default: GGML_ABORT("unsupported ncols_dst=%d for PTQ1_0 multi-col MMVQ", ncols_dst);
     }
 }
 
@@ -2503,6 +3369,62 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                     mul_mat_vec_q2_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
                 }
                 break;
+            case GGML_TYPE_PQ2_0:
+                if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
+                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                    if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
+                        const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
+                        const int stride_col_dst     = dst->ne[0];
+                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_pq2_0_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
+                        reorder_mul_mat_vec_pq2_0_q8_1_sycl_switch_ncols(
+                            src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
+                            src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
+                        return;
+                    } else {
+                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_pq2_0_q8_1_sycl\n");
+                        reorder_mul_mat_vec_pq2_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                    }
+                } else if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
+                    const int stride_col_y   = src1_padded_col_size / QK8_1;
+                    const int stride_col_dst = dst->ne[0];
+                    GGML_SYCL_DEBUG("Calling mul_mat_vec_pq2_0_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
+                    mul_mat_vec_pq2_0_q8_1_sycl_switch_ncols(
+                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
+                        src1_ncols, stride_col_y, stride_col_dst, stream);
+                    return;
+                } else if (i == 0 || src1_ncols == 1) {
+                    GGML_SYCL_DEBUG("Calling mul_mat_vec_pq2_0_q8_1_sycl\n");
+                    mul_mat_vec_pq2_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                }
+                break;
+            case GGML_TYPE_PTQ1_0:
+                if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
+                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                    if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
+                        const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
+                        const int stride_col_dst     = dst->ne[0];
+                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_ptq1_0_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
+                        reorder_mul_mat_vec_ptq1_0_q8_1_sycl_switch_ncols(
+                            src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
+                            src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
+                        return;
+                    } else {
+                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_ptq1_0_q8_1_sycl\n");
+                        reorder_mul_mat_vec_ptq1_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                    }
+                } else if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
+                    const int stride_col_y   = src1_padded_col_size / QK8_1;
+                    const int stride_col_dst = dst->ne[0];
+                    GGML_SYCL_DEBUG("Calling mul_mat_vec_ptq1_0_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
+                    mul_mat_vec_ptq1_0_q8_1_sycl_switch_ncols(
+                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
+                        src1_ncols, stride_col_y, stride_col_dst, stream);
+                    return;
+                } else if (i == 0 || src1_ncols == 1) {
+                    GGML_SYCL_DEBUG("Calling mul_mat_vec_ptq1_0_q8_1_sycl\n");
+                    mul_mat_vec_ptq1_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                }
+                break;
             case GGML_TYPE_Q2_K:
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                     ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
@@ -2992,7 +3914,7 @@ static void launch_mul_mat_vec_q_reorder_glu(const void * vx, const void * vgate
                                              const int ncols, const int nrows, const int stride_col_y_bytes,
                                              const int stride_col_dst, const ggml_glu_op glu_op,
                                              dpct::queue_ptr stream) {
-    GGML_ASSERT(ncols % QK_K == 0);
+    GGML_ASSERT(ncols % ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>::traits::qk == 0);
 
     constexpr size_t num_subgroups = WARP_SIZE;
 
@@ -3010,18 +3932,11 @@ static void launch_mul_mat_vec_q_reorder_glu(const void * vx, const void * vgate
     });
 }
 
-bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu_op glu_op, const void * vx,
-                                         const void * vgate, const void * vy, float * dst, int ncols, int nrows,
-                                         int ncols_dst, int stride_col_y_bytes, int stride_col_dst,
-                                         dpct::queue_ptr stream) {
-    if (src0_type != GGML_TYPE_Q4_K) {
-        return false;
-    }
-    if (glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_GEGLU) {
-        return false;
-    }
-
-    using vec_dot = reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>;
+template <ggml_type type>
+static bool mul_mat_vec_q_glu_reorder_type(enum ggml_glu_op glu_op, const void * vx, const void * vgate, const void * vy,
+                                           float * dst, int ncols, int nrows, int ncols_dst, int stride_col_y_bytes,
+                                           int stride_col_dst, dpct::queue_ptr stream) {
+    using vec_dot = reorder_vec_dot_q_sycl<type>;
 
     switch (ncols_dst) {
         case 1:
@@ -3056,6 +3971,47 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu
             launch_mul_mat_vec_q_reorder_glu<vec_dot, 8>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes,
                                                          stride_col_dst, glu_op, stream);
             return true;
+        default:
+            return false;
+    }
+    return false;
+}
+
+bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu_op glu_op, const void * vx,
+                                         const void * vgate, const void * vy, float * dst, int ncols, int nrows,
+                                         int ncols_dst, int stride_col_y_bytes, int stride_col_dst,
+                                         dpct::queue_ptr stream) {
+    if (glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_GEGLU) {
+        return false;
+    }
+    switch (src0_type) {
+        case GGML_TYPE_Q4_K:
+            return mul_mat_vec_q_glu_reorder_type<GGML_TYPE_Q4_K>(glu_op, vx, vgate, vy, dst, ncols, nrows, ncols_dst,
+                                                                  stride_col_y_bytes, stride_col_dst, stream);
+        case GGML_TYPE_PQ2_0:
+            return mul_mat_vec_q_glu_reorder_type<GGML_TYPE_PQ2_0>(glu_op, vx, vgate, vy, dst, ncols, nrows, ncols_dst,
+                                                                   stride_col_y_bytes, stride_col_dst, stream);
+        case GGML_TYPE_PTQ1_0:
+            if (ncols_dst == 1 && ggml_sycl_ptq1_0_glu_n1_enabled()) {
+                static const int glu_nr = getenv("GGML_SYCL_PTQ1_GLU1_NR") ? atoi(getenv("GGML_SYCL_PTQ1_GLU1_NR")) : 2;
+                if (glu_nr == 4) {
+                    launch_ptq1_0_pairs_glu<4>(vx, vgate, vy, dst, ncols, nrows, glu_op, stream);
+                } else {
+                    launch_ptq1_0_pairs_glu<2>(vx, vgate, vy, dst, ncols, nrows, glu_op, stream);
+                }
+                return true;
+            }
+            if (ptq1_0_ncols_dec_enabled() && ncols_dst >= 1 && ncols_dst <= 8) {
+#define PTQ1_DEC_GLU(N) case N: launch_ptq1_0_ncols_dec<N, true>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, \
+                                                                  stride_col_dst, glu_op, stream); return true;
+                switch (ncols_dst) {
+                    PTQ1_DEC_GLU(1) PTQ1_DEC_GLU(2) PTQ1_DEC_GLU(3) PTQ1_DEC_GLU(4)
+                    PTQ1_DEC_GLU(5) PTQ1_DEC_GLU(6) PTQ1_DEC_GLU(7) PTQ1_DEC_GLU(8)
+                }
+#undef PTQ1_DEC_GLU
+            }
+            return mul_mat_vec_q_glu_reorder_type<GGML_TYPE_PTQ1_0>(glu_op, vx, vgate, vy, dst, ncols, nrows, ncols_dst,
+                                                                    stride_col_y_bytes, stride_col_dst, stream);
         default:
             return false;
     }

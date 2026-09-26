@@ -47,6 +47,58 @@ static __dpct_inline__ void dequantize_q2_0(const void *vx, const int64_t ib,
 #endif // GGML_SYCL_F16
 }
 
+static __dpct_inline__ void dequantize_pq2_0(const void *vx, const int64_t ib,
+                                             const int iqs, dfloat2 &v) {
+    const block_pq2_0 * x = (const block_pq2_0 *) vx;
+
+    const dfloat d = x[ib].d;
+
+    const int byte_idx = iqs / 4;
+    const int shift = (iqs % 4) * 2;
+    const uint8_t vui = x[ib].qs[byte_idx];
+
+    v.x() = (vui >> shift) & 3;
+    v.y() = (vui >> (shift + 2)) & 3;
+
+#ifdef GGML_SYCL_F16
+    v.s0() = ((dfloat)v.s0() - 1.0f) * d;
+    v.s1() = ((dfloat)v.s1() - 1.0f) * d;
+#else
+    v.x() = ((dfloat)v.x() - 1.0f) * d;
+    v.y() = ((dfloat)v.y() - 1.0f) * d;
+#endif // GGML_SYCL_F16
+}
+
+// Trit of element e (0..127) in a PTQ1_0 block: 16 bytes x 5, 8 bytes x 5, then 2 qh bytes x 4.
+static __dpct_inline__ int ptq1_0_trit(const uint8_t * qs, const uint8_t * qh, const int e) {
+    uint32_t v;
+    int      t;
+    if (e < 80) {
+        v = qs[e % 16];
+        t = e / 16;
+    } else if (e < 120) {
+        v = qs[16 + (e - 80) % 8];
+        t = (e - 80) / 8;
+    } else {
+        v = qh[(e - 120) % 2];
+        t = (e - 120) / 2;
+    }
+    for (int i = 0; i < t; ++i) {
+        v = (v * 3) & 0xFF;
+    }
+    return (int) ((v * 3) >> 8);
+}
+
+static __dpct_inline__ void dequantize_ptq1_0(const void *vx, const int64_t ib,
+                                              const int iqs, dfloat2 &v) {
+    const block_ptq1_0 * x = (const block_ptq1_0 *) vx;
+
+    const dfloat d = x[ib].d;
+
+    v.x() = (dfloat) (ptq1_0_trit(x[ib].qs, x[ib].qh, iqs + 0) - 1) * d;
+    v.y() = (dfloat) (ptq1_0_trit(x[ib].qs, x[ib].qh, iqs + 1) - 1) * d;
+}
+
 static __dpct_inline__ void dequantize_q4_0(const void *vx, const int64_t ib,
                                             const int iqs, dfloat2 &v) {
     const block_q4_0 * x = (const block_q4_0 *) vx;

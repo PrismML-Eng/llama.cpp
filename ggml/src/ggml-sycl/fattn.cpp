@@ -19,6 +19,7 @@
 #include "fattn-vec.hpp"
 #include "fattn.hpp"
 #include "fattn-onednn.hpp"
+#include "fattn-dec.hpp"
 
 
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
@@ -98,6 +99,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
     BEST_FATTN_KERNEL_VEC      = 100,
     BEST_FATTN_KERNEL_ONEDNN   = 150, // oneDNN SDPA: native F16 (PR #25222)
+    BEST_FATTN_KERNEL_DEC      = 160, // ARC-LAB: q4_0 KV decode, 1-4 query tokens (fattn-dec.cpp)
     BEST_FATTN_KERNEL_TILE     = 200,
     BEST_FATTN_KERNEL_MKL      = 300,
 };
@@ -111,6 +113,11 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 #endif// SYCL_FLASH_ATTN
 
     if(!g_ggml_sycl_enable_flash_attention) return BEST_FATTN_KERNEL_NONE;
+
+    // ARC-LAB: generation / MTP-verify batches on a q4_0 cache read it directly (TILE dequantizes the whole cache per call)
+    if (ggml_sycl_flash_attn_ext_dec_supported(dst)) {
+        return BEST_FATTN_KERNEL_DEC;
+    }
 
     const ggml_tensor * KQV   = dst;
     const ggml_tensor * Q     = dst->src[0];
@@ -262,7 +269,10 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
                 }
             }
         } else {
-            if (Q->ne[1] <= 2) {
+            // like the CUDA backend: with GQA packing available, the tile kernel reads each quantized K/V head once
+            // for all its query heads; the vec kernel re-reads it per query head (gqa_ratio x the KV traffic)
+            static const bool gqa_tile = ggml_sycl_get_env("GGML_SYCL_FA_QUANT_GQA_TILE", 1) != 0;
+            if (Q->ne[1] <= 2 && !(gqa_tile && gqa_opt_applies)) {
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
@@ -323,6 +333,9 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MKL:
             ggml_sycl_flash_attn_ext_mkl(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_DEC:
+            ggml_sycl_flash_attn_ext_dec(ctx, dst);
             break;
     }
 

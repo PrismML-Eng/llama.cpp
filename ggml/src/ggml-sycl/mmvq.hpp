@@ -73,4 +73,15 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(
     int                stride_col_dst,       // floats between output columns in dst
     dpct::queue_ptr    stream);
 
+// ARC-LAB: PTQ1_0 decode-once multi-column mat-vec on (GGML_SYCL_PTQ1_NCOLS_DEC_OFF unset); its activations must be
+// quantized with quantize_and_reorder_q8_1_ptq1_il (plain path: 2..8 columns; fused gate/up path: 1..8 columns)
+bool ggml_sycl_ptq1_0_ncols_dec_enabled();
+// ARC-LAB: single-column PTQ1_0 helpers (pairs kernel)
+bool ggml_sycl_ptq1_0_glu_n1_enabled();
+bool ggml_sycl_ptq1_0_mul_mat_vec_multi(const void * const * vx, float * const * dst, const int * nrows, const int nm,
+                                        const void * vy, const int ncols, dpct::queue_ptr stream);
+bool ggml_sycl_ptq1_0_mul_mat_vec_multi_ncols(const void * const * vx, float * const * dst, const int * nrows,
+                                              const int nm, const void * vy, const int ncols, const int ncols_dst,
+                                              const int stride_col_y_bytes, dpct::queue_ptr stream);
+
 #endif // GGML_SYCL_MMVQ_HPP

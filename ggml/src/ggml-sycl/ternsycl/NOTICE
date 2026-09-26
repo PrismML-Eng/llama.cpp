@@ -1,0 +1,8 @@
+TernSYCL
+Copyright (c) 2026, Intel Corporation. BSD 3-Clause License, see LICENSE.md.
+
+The SYCL kernels are ports of the TernOCL OpenCL kernels
+(https://github.com/libxsmm/TernOCL), which port Intel XeTLA kernels
+(int2_fp16_upcvt_xmx_xe.hpp, int2_fp16_dpas_xmx_xe.hpp,
+int2_bf16_dpas_xmx_xe.hpp) and follow their data layouts, dequantization and
+quantization schemes.

@@ -238,6 +238,34 @@ static void convert_mul_mat_vec_f16_sycl(const void *vx, const dfloat *y,
 }
 
 #ifdef GGML_SYCL_DMMV_HAS_BF16
+// ARC-LAB: small-output bf16 mat-vec (Bonsai's delta-net gate projections: 48 x 5120, 96 calls per token).
+// The generic dequantize_mul_mat_vec gives each row one sub-group, so 48 rows used 48 sub-groups and reached
+// ~25 GB/s on the B580 (~20 us per call). Here each row gets a 256-wide work-group that splits K, loads 8 bf16
+// at a time and reduces over the group.
+static void bf16_gemv_rowsplit_sycl(const void * vx, const dfloat * y, float * dst, const int ncols,
+                                    const int nrows, dpct::queue_ptr stream) {
+    constexpr int WG = 256;
+    stream->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) nrows * WG), sycl::range<1>(WG)),
+        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            const int row = it.get_group(0);
+            const int tid = it.get_local_id(0);
+            const uint16_t * x = (const uint16_t *) vx + (size_t) row * ncols;
+            float sum = 0.0f;
+            for (int i = tid * 8; i < ncols; i += WG * 8) {
+                const sycl::vec<uint16_t, 8> w = *(const sycl::vec<uint16_t, 8> *) (x + i);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    sum += sycl::bit_cast<float>((uint32_t) w[j] << 16) * (float) y[i + j];
+                }
+            }
+            sum = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
+            if (tid == 0) {
+                dst[row] = sum;
+            }
+        });
+}
+
 static void convert_mul_mat_vec_bf16_sycl(const void *vx, const dfloat *y,
                                           float *dst, const int ncols,
                                           const int nrows,
@@ -2209,9 +2237,15 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
             convert_mul_mat_vec_f16_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
             break;
 #ifdef GGML_SYCL_DMMV_HAS_BF16
-        case GGML_TYPE_BF16:
-            convert_mul_mat_vec_bf16_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
+        case GGML_TYPE_BF16: {
+            static const bool rowsplit = getenv("GGML_SYCL_BF16_ROWSPLIT_OFF") == nullptr;
+            if (rowsplit && row_diff <= 512 && ne00 % 8 == 0 && ((uintptr_t) src0_dd_i % 16) == 0) {
+                bf16_gemv_rowsplit_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
+            } else {
+                convert_mul_mat_vec_bf16_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
+            }
             break;
+        }
 #endif
         default:
             printf("ggml_sycl_op_dequantize_mul_mat_vec unsupported GGML_TYPE %d\n", src0->type);

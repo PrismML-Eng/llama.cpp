@@ -171,6 +171,35 @@ static void dequantize_row_q4_0_sycl_reorder(const void *vx, dst_t *y, const int
 }
 
 template <typename dst_t>
+static void dequantize_row_pq2_0_sycl_reorder(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
+    GGML_ASSERT(k % QK_PQ2_0 == 0);
+    const uint8_t *    qs = (const uint8_t *) vx;
+    const sycl::half * d  = (const sycl::half *) (qs + k / 4);
+    stream->parallel_for(sycl::range<1>(k / 4), [=](sycl::id<1> i) {
+        const float   dv = d[i / (QK_PQ2_0 / 4)];
+        const uint8_t q  = qs[i];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            y[i * 4 + j] = (float) (((q >> (2 * j)) & 3) - 1) * dv;
+        }
+    });
+}
+
+template <typename dst_t>
+static void dequantize_row_ptq1_0_sycl_reorder(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
+    GGML_ASSERT(k % QK_PTQ1_0 == 0);
+    const int64_t      nb = k / QK_PTQ1_0;
+    const uint8_t *    qs = (const uint8_t *) vx;
+    const uint8_t *    qh = qs + nb * 24;
+    const sycl::half * d  = (const sycl::half *) (qs + nb * 26);
+    stream->parallel_for(sycl::range<1>(k), [=](sycl::id<1> id) {
+        const int64_t i  = id[0];
+        const int64_t ib = i / QK_PTQ1_0;
+        y[i] = (float) (ptq1_0_trit(qs + ib * 24, qh + ib * 2, (int) (i % QK_PTQ1_0)) - 1) * (float) d[ib];
+    });
+}
+
+template <typename dst_t>
 static void dequantize_row_q8_0_sycl_reorder(const void *vx, dst_t *y, const int64_t k,
                                      dpct::queue_ptr stream) {
 
@@ -663,6 +692,18 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
             return dequantize_block_sycl<QK_PQ2_0, QR_PQ2_0, dequantize_pq2_0>;
         case GGML_TYPE_Q2_0:
             return dequantize_block_sycl<QK2_0, QR2_0, dequantize_q2_0>;
+        case GGML_TYPE_PTQ1_0:
+            if (dst->src[0]->extra &&
+                ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                return dequantize_row_ptq1_0_sycl_reorder;
+            }
+            return dequantize_block_sycl<QK_PTQ1_0, QR_PTQ1_0, dequantize_ptq1_0>;
+        case GGML_TYPE_PQ2_0:
+            if (dst->src[0]->extra &&
+                ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                return dequantize_row_pq2_0_sycl_reorder;
+            }
+            return dequantize_block_sycl<QK_PQ2_0, QR_PQ2_0, dequantize_pq2_0>;
         case GGML_TYPE_Q4_0:
             if (dst->src[0]->extra &&
                 ((ggml_tensor_extra_gpu*)dst->src[0]->extra)->optimized_feature.reorder) {
@@ -757,6 +798,18 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
             return dequantize_block_sycl<QK_PQ2_0, QR_PQ2_0, dequantize_pq2_0>;
         case GGML_TYPE_Q2_0:
             return dequantize_block_sycl<QK2_0, QR2_0, dequantize_q2_0>;
+        case GGML_TYPE_PTQ1_0:
+            if (dst->src[0]->extra &&
+                ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                return dequantize_row_ptq1_0_sycl_reorder;
+            }
+            return dequantize_block_sycl<QK_PTQ1_0, QR_PTQ1_0, dequantize_ptq1_0>;
+        case GGML_TYPE_PQ2_0:
+            if (dst->src[0]->extra &&
+                ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                return dequantize_row_pq2_0_sycl_reorder;
+            }
+            return dequantize_block_sycl<QK_PQ2_0, QR_PQ2_0, dequantize_pq2_0>;
         case GGML_TYPE_Q4_0:
             if (dst->src[0]->extra &&
                 ((ggml_tensor_extra_gpu*)dst->src[0]->extra)->optimized_feature.reorder) {
@@ -886,4 +939,69 @@ to_fp16_nc_sycl_t ggml_get_to_fp16_nc_sycl(ggml_type type) {
         default:
             return nullptr;
     }
+}
+
+void ggml_sycl_quant_to_s4(ggml_type type, bool reordered, const void * vx, uint8_t * w4, float * scales,
+                           int64_t nrows, int64_t ncols, dpct::queue_ptr stream) {
+    GGML_ASSERT(type == GGML_TYPE_PQ2_0 || type == GGML_TYPE_PTQ1_0);
+    GGML_ASSERT(ncols % 128 == 0);
+    const int64_t   nb   = nrows * ncols / 128;
+    const uint8_t * base = (const uint8_t *) vx;
+    const bool      ptq  = type == GGML_TYPE_PTQ1_0;
+    // one work item = 8 elements = one uint32 of s4
+    stream->parallel_for(sycl::range<1>(nb * 16), [=](sycl::id<1> id) {
+        const int64_t ib = id[0] / 16;
+        const int     c  = (int) (id[0] % 16);
+        int           v[8];
+        sycl::half    d;
+        if (ptq) {
+            const uint8_t * qs;
+            const uint8_t * qh;
+            if (reordered) {
+                qs = base + ib * 24;
+                qh = base + nb * 24 + ib * 2;
+                d  = ((const sycl::half *) (base + nb * 26))[ib];
+            } else {
+                const block_ptq1_0 * x = (const block_ptq1_0 *) vx + ib;
+                qs = x->qs;
+                qh = x->qh;
+                d  = x->d;
+            }
+            // trit t of byte b = ((b * 3^t) mod 256) * 3 >> 8
+            constexpr uint32_t pow3[5] = { 1, 3, 9, 27, 81 };
+            if (c < 10) {         // elements t*16 + m, 8 consecutive m
+                const uint32_t p = pow3[c / 2];
+                const int      m = (c % 2) * 8;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) v[i] = (int) ((((qs[m + i] * p) & 0xFF) * 3) >> 8) - 1;
+            } else if (c < 15) {  // elements 80 + t*8 + m, m = 0..7
+                const uint32_t p = pow3[c - 10];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) v[i] = (int) ((((qs[16 + i] * p) & 0xFF) * 3) >> 8) - 1;
+            } else {              // elements 120 + t*2 + h
+#pragma unroll
+                for (int i = 0; i < 8; ++i) v[i] = (int) ((((qh[i % 2] * pow3[i / 2]) & 0xFF) * 3) >> 8) - 1;
+            }
+        } else {
+            const uint8_t * qs;
+            if (reordered) {
+                qs = base + ib * 32;
+                d  = ((const sycl::half *) (base + nb * 32))[ib];
+            } else {
+                const block_pq2_0 * x = (const block_pq2_0 *) vx + ib;
+                qs = x->qs;
+                d  = x->d;
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) v[i] = ((qs[2 * c + i / 4] >> (2 * (i % 4))) & 3) - 1;
+        }
+        uint32_t out = 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) out |= (uint32_t) (v[i] & 0xF) << (4 * i);
+        ((uint32_t *) w4)[id[0]] = out;
+        if (c == 0) {
+            const int64_t bpr = ncols / 128;
+            scales[(ib % bpr) * nrows + ib / bpr] = d;  // [group][row]
+        }
+    });
 }

@@ -678,6 +678,10 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", func);
         resolve(llm_fused_op_gdn_ar_probe, cparams.fused_gdn_ar);
         resolve(llm_fused_op_gdn_ch_probe, cparams.fused_gdn_ch);
+        if (const char * e = getenv("LLAMA_FUSED_GDN_CH"); e && atoi(e) == 0) {
+            cparams.fused_gdn_ch = false;  // A/B: use the graph-level chunked delta net for prompt batches
+            LLAMA_LOG_INFO("%s: fused GDN (chunked) disabled by LLAMA_FUSED_GDN_CH=0\n", func);
+        }
         cparams.auto_fgdn = false;
     }
 
