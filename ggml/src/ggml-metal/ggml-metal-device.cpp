@@ -844,7 +844,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    // Q1_0 products made only of full tiles can use the static-K32 tensor kernel (GGML_METAL_Q1_MM_K32=1)
+    static const bool q1_k32_env = getenv("GGML_METAL_Q1_MM_K32") && atoi(getenv("GGML_METAL_Q1_MM_K32")) == 1;
+    const bool q1_k32 = q1_k32_env && has_tensor && tsrc0 == GGML_TYPE_Q1_0 && tsrc1 == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                        !bc_inp && !bc_out && op->ne[0] >= NRA && op->ne[1] >= NRB &&
+                        ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op);
+
+    if (q1_k32) {
+        snprintf(base, 256, "kernel_mul_mm_q1_0_f32_k32");
+    } else {
+        snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    }
     snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
              base, bc_inp, bc_out, ne12, ne13, r2, r3);
 
