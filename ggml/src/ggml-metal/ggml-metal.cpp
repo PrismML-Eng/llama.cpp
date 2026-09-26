@@ -574,15 +574,8 @@ static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
     ggml_metal_set_n_cb(ctx, n_cb);
 }
 
-// The number of command buffers a graph is split into, besides the main thread's.
-//
-// On iPhone-class devices (iOS, iPadOS, visionOS, tvOS; not Mac Catalyst) it is 4. iOS discards a command buffer
-// that has run for about 5 s of GPU time when another GPU client (such as the display compositor) is waiting,
-// failing the graph with "Discarded (victim of GPU error/recovery)" (kIOGPUCommandBufferCallbackErrorInnocentVictim).
-// With 1, the command buffer holding ~90% of a 512-token prefill graph of a 27B model runs 5-7 s on an iPhone 17 Pro
-// Max and failed in 10 of 50 runs; with 4 (1.6-2.3 s each) none failed and prefill speed was unchanged.
-//
-// GGML_METAL_N_CB=1..8 overrides the default.
+// iOS discards a command buffer after ~5 s of GPU time when another GPU client waits (InnocentVictim), so split graphs into 4 there
+// GGML_METAL_N_CB=1..8 overrides the default
 static int ggml_backend_metal_default_n_cb(void) {
 #if TARGET_OS_IPHONE && !TARGET_OS_MACCATALYST
     int n_cb = 4;

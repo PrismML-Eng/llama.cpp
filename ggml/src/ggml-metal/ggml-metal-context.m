@@ -662,9 +662,7 @@ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
 }
 
 void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
-    // with an abort callback, the encoders commit only command buffers 0 and 1 (later ones only when capturing);
-    // the main thread's buffer is index n_cb, so with n_cb > 1 it would never run and synchronize would wait
-    // forever
+    // with an abort callback only command buffers 0 and 1 are committed; the main one is index n_cb, so n_cb > 1 hangs
     if (ctx->abort_callback && n_cb > 1) {
         GGML_LOG_WARN("%s: an abort callback allows only 1 extra command buffer; using 1 instead of %d\n", __func__, n_cb);
         n_cb = 1;
