@@ -1282,6 +1282,110 @@ kernel void kernel_mul_mv_pq2_0_f32(
     kernel_mul_mv_pq2_0_f32_impl<N_R0_PQ2_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
+// PQ2_0 mat-vec for two columns: floors once per byte, collapse coefficients once per column (same arithmetic as kernel_mul_mv_pq2_0_f32)
+template<int nr0, int nr1>
+kernel void kernel_mul_mv_pq2_0_multicol(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+
+    const int nb = args.ne00/QK_PQ2_0;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y * nr1;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+
+    device const float * y = (device const float *) (src1 + offset1);
+
+    device const block_pq2_0 * ax[nr0];
+    for (int row = 0; row < nr0; ++row) {
+        const uint64_t offset0 = min(first_row + row, args.ne01 - 1)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+        ax[row] = (device const block_pq2_0 *) ((device char *) src0 + offset0);
+    }
+
+    float yl[nr1][16];
+    float sumy[nr1];
+    float sumf[nr0][nr1] = {};
+
+    const short ix = (tiisg/8);
+    const short il = (tiisg%8)*16;
+
+    device const float * yb = y + ix*QK_PQ2_0 + il;
+
+    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/8) {
+        FOR_UNROLL (short col = 0; col < nr1; ++col) {
+            device const float * yc = (device const float *) ((device const char *) yb + col*args.nb11);
+
+            sumy[col] = 0.f;
+
+            FOR_UNROLL (short j = 0; j < 4; j++) {
+                const float y0 = yc[4*j + 0];
+                const float y1 = yc[4*j + 1];
+                const float y2 = yc[4*j + 2];
+                const float y3 = yc[4*j + 3];
+                sumy[col] += (y0 + y1) + (y2 + y3);
+                yl[col][4*j + 0] = y3 - 4.0f*y2;
+                yl[col][4*j + 1] = y2 - 4.0f*y1;
+                yl[col][4*j + 2] = y1 - 4.0f*y0;
+                yl[col][4*j + 3] = y0;
+            }
+        }
+
+        FOR_UNROLL (short row = 0; row < nr0; row++) {
+            device const block_pq2_0 * qb = ax[row] + ib;
+            device const uint8_t * qs = qb->qs + (il / 4);
+
+            float acc[nr1] = {};
+
+            FOR_UNROLL (short j = 0; j < 4; j++) {
+                const float b  = (float) qs[j];
+                const float u  = b * (1.0f/256.0f);
+                const float g1 = floor( 4.0f*u);
+                const float g2 = floor(16.0f*u);
+                const float g3 = floor(64.0f*u);
+                FOR_UNROLL (short col = 0; col < nr1; ++col) {
+                    acc[col] += g1*yl[col][4*j + 0];
+                    acc[col] += g2*yl[col][4*j + 1];
+                    acc[col] += g3*yl[col][4*j + 2];
+                    acc[col] +=  b*yl[col][4*j + 3];
+                }
+            }
+
+            FOR_UNROLL (short col = 0; col < nr1; ++col) {
+                sumf[row][col] += qb->d * (acc[col] - sumy[col]);
+            }
+        }
+
+        yb += QK_PQ2_0 * (N_SIMDWIDTH/8);
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    for (int row = 0; row < nr0; ++row) {
+        FOR_UNROLL (short col = 0; col < nr1; ++col) {
+            const float tot = simd_sum(sumf[row][col]);
+            if (tiisg == 0 && first_row + row < args.ne01) {
+                dst_f32[(uint64_t) col*args.ne0 + first_row + row] = tot;
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mv_pq2_0_multicol<2, 2>) mul_mv_pq2_multicol_t;
+template [[host_name("kernel_mul_mv_pq2_0_f32_mc_c2")]] kernel mul_mv_pq2_multicol_t kernel_mul_mv_pq2_0_multicol<2, 2>;
+
 kernel void kernel_mul_mv_q4_0_f32(
         constant ggml_metal_kargs_mul_mv & args,
         device const char * src0,
