@@ -479,13 +479,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // GPU device in the model is Metal.
     static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
 
-    // GGML_GDN_ROWS_PLAIN=1 also takes the rows path for plain decode (no snapshots), which removes the per-layer
-    // state gather and copy-back; the result is bitwise identical. Only when no extra cells are relocated
-    // (n_rs == n_seqs): the relocation in build_rs_cache_view runs before the GDN read and, after a cell reorder,
-    // could overwrite a row another sequence reads (the gathered path reads first). Graph reuse compares the
-    // s_copy_extra size, so a batch with extra cells rebuilds and takes the gathered path.
-    // GGML_GDN_ROWS_PLAIN_MAX_TOKENS caps it by tokens per sequence: on an A19 the in-place recurrence is ~18%
-    // slower at 512-token prefill while decode gains. Contexts with n_rs_seq > 0 keep rows mode at every width.
+    // GGML_GDN_ROWS_PLAIN=1: plain decode also updates the state rows in place (bitwise identical), but only when no extra cells are relocated, as that relocation runs before the in-place read
+    // GGML_GDN_ROWS_PLAIN_MAX_TOKENS caps it by tokens per sequence (A19: the in-place recurrence is ~18% slower at 512-token prefill)
     const bool gdn_rows_plain_ok = cparams.gdn_rows_plain && mctx_cur->get_n_rs() == (uint32_t) n_seqs &&
         (cparams.gdn_rows_plain_max_tokens <= 0 || n_seq_tokens <= cparams.gdn_rows_plain_max_tokens);
 
