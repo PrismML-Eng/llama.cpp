@@ -9400,6 +9400,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Q1_0 products made only of full tensor tiles (GGML_METAL_Q1_MM_K32)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q1_0, GGML_TYPE_F32, 128, 256, 512, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q1_0, GGML_TYPE_F32, 64, 128, 256, {2, 3}, {2, 1}));
+
     // PTQ1_0 small batches, row tails and broadcast dimensions.
     for (int n : {1, 2, 3, 4, 8}) {
         for (int k : {128, 384, 5120}) {
