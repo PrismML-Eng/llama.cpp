@@ -9,9 +9,10 @@
 // pieces, one per plane, and the 4 (d, s) scales are one more 16-byte piece.
 // Adjacent threads read adjacent 16-byte pieces of the same plane, so a warp
 // load touches 4 cache lines instead of 32, and a thread reuses each piece
-// for every row it owns. The decode, the dp4a sequence and the fp32 epilogue
-// are the same operations in the same order as the single-column kernel, so
-// every column count produces the same bits for a given column.
+// for every row it owns. GGML_CUDA_BATCH_INVARIANT=1 keeps the older
+// warp-reduce epilogue so a column verified in a 2-4 wide MTP batch matches
+// the same column decoded alone. The faster four-accumulator epilogue is the
+// default; it can flip a late near-tie (5080: "coastal waters" vs "coastal areas").
 //
 // PT layout, per activation column (all sizes for the padded row length):
 //   plane t (t = 0..7):   nblk * 16 bytes, byte b of block kb is the quant of
@@ -297,7 +298,7 @@ static __global__ void mul_mat_vec_ptq1_0_pt(
         const void * vx_, const void * vy_, const ggml_cuda_mm_fusion_args_device fusion,
         float * dst_,
         const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
-        const int rows_per_cta, const uint3 bpr_fd, const uint3 rpc_fd) {
+        const int rows_per_cta, const uint3 bpr_fd, const uint3 rpc_fd, const bool invariant) {
     // GGML_CUDA_RESTRICT stays off the formal parameters: cudafe's host stub drops __restrict
     // from the explicit specialization and MSVC/GCC then reject it (C2912 / "does not match
     // any template declaration") when compiling sm_90/sm_120. Same pattern as mul_mat_vec_q.
@@ -367,12 +368,66 @@ static __global__ void mul_mat_vec_ptq1_0_pt(
 
     __syncthreads();
 
-    // One thread per (row, column): a fixed-order sequential sum over the K blocks with four
-    // interleaved accumulators (k mod 4), then (s0+s1)+(s2+s3). The order depends only on the weight
-    // shape, so a column gives the same bits for every column count. Profiled against the previous
-    // one-warp-per-pair shuffle reduction (RTX 4070, ncu): that epilogue was ~23% of all issued
-    // instructions (a runtime integer division per pair, a strided loop, 5 dependent SHFL+FADD) and
-    // held ~50% of all warp stall samples while the CTA did no memory traffic.
+    if (invariant) {
+        // Warp-per-(row, column) lane-strided sum + butterfly. Same bits at 1 column and at
+        // 2-4 columns, which is what BATCH_INVARIANT needs for MTP-on == MTP-off. The four-
+        // accumulator path below is faster and can diverge (5080 bisect: 5300cd1).
+        const int warp = tid / WARP_SIZE;
+        const int lane = tid % WARP_SIZE;
+        for (int w = warp; w < rows_per_cta*ncols; w += PTQ1_0_PT_THREADS / WARP_SIZE) {
+            const int j   = w / rows_per_cta;
+            const int r   = w - j*rows_per_cta;
+            const int row = row0 + r;
+
+            float sum = 0.0f;
+            [[maybe_unused]] float sum_gate = 0.0f;
+            for (int kbx = lane; kbx < bpr; kbx += WARP_SIZE) {
+                sum += partials[(j*rows_per_cta + r)*bprp + kbx];
+                if constexpr (has_gate) {
+                    sum_gate += partials_gate[(j*rows_per_cta + r)*bprp + kbx];
+                }
+            }
+            sum = warp_reduce_sum<WARP_SIZE>(sum);
+            if constexpr (has_gate) {
+                sum_gate = warp_reduce_sum<WARP_SIZE>(sum_gate);
+            }
+
+            if (lane == 0 && row < nrows_x) {
+                float result = sum;
+                if constexpr (has_fusion) {
+                    if (fusion.x_bias) {
+                        result += ((const float *) fusion.x_bias)[j*stride_col_dst + row];
+                    }
+                    if constexpr (has_gate) {
+                        float gate_value = sum_gate;
+                        if (fusion.gate_bias) {
+                            gate_value += ((const float *) fusion.gate_bias)[j*stride_col_dst + row];
+                        }
+                        switch (fusion.glu_op) {
+                            case GGML_GLU_OP_SWIGLU:
+                                result *= ggml_cuda_op_silu_single(gate_value);
+                                break;
+                            case GGML_GLU_OP_GEGLU:
+                                result *= ggml_cuda_op_gelu_single(gate_value);
+                                break;
+                            case GGML_GLU_OP_SWIGLU_OAI:
+                                result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                                break;
+                            default:
+                                result = result * gate_value;
+                                break;
+                        }
+                    }
+                }
+                dst[j*stride_col_dst + row] = result;
+            }
+        }
+        return;
+    }
+
+    // One thread per (row, column): four interleaved accumulators (k mod 4), then (s0+s1)+(s2+s3).
+    // Faster than the warp path (~3% decode). Association depends on column count enough to break
+    // MTP-on vs MTP-off identity. GGML_CUDA_BATCH_INVARIANT takes the warp path above.
     for (int p = tid; p < rows_per_cta*ncols; p += PTQ1_0_PT_THREADS) {
         const int j   = fastdiv((uint32_t) p, rpc_fd); // column
         const int r   = p - j*rows_per_cta;             // row within the CTA
@@ -451,7 +506,8 @@ static void mul_mat_vec_ptq1_0_pt_launch(
 
 #define PTQ1_0_PT_LAUNCH(FUS, GATE)                                                                                      \
     ggml_cuda_kernel_launch(mul_mat_vec_ptq1_0_pt<ncols, ROWS, FUS, GATE>, lp,                                           \
-        vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, rows_per_cta, bpr_fd, rpc_fd)
+        vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, rows_per_cta, bpr_fd, rpc_fd, \
+        ggml_cuda_batch_invariant())
 
     if (has_fusion) {
         GGML_ASSERT(ncols == 1 && "fusion only supported for ncols_dst=1");

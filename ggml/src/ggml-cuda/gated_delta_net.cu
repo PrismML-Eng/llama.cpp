@@ -68,6 +68,10 @@ gated_delta_net_cuda(const float * q,
 
     float *       attn_data        = dst;
 
+    // Wait before any s_ids / state load. inp_s_copy is a host upload today, so this is a no-op
+    // on that path; ggml_cuda_try_gdn_gather_skip accepts any I32 ids tensor.
+    ggml_cuda_pdl_sync();
+
     // input state holds s0 only: [S_v, S_v, H, n_seqs] — seq stride is D = H * S_v * S_v.
     // output state layout (per-slot D * n_seqs) — same per-(seq,head) offset as before.
     // fused gather: read this sequence's live state straight out of the cache row s_ids[sequence]
@@ -84,7 +88,6 @@ gated_delta_net_cuda(const float * q,
     float         s_shard[cols_per_warp][rows_per_lane];
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
 
-    ggml_cuda_pdl_sync();
 #pragma unroll
     for (int c = 0; c < cols_per_warp; ++c) {
 #pragma unroll
