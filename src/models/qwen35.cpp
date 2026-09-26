@@ -479,7 +479,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // GPU device in the model is Metal.
     static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
 
-    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0;
+    // GGML_GDN_ROWS_PLAIN=1: plain decode also updates the state rows in place (bitwise identical), but only when no extra cells are relocated, as that relocation runs before the in-place read
+    // GGML_GDN_ROWS_PLAIN_MAX_TOKENS caps it by tokens per sequence (A19: the in-place recurrence is ~18% slower at 512-token prefill)
+    const bool gdn_rows_plain_ok = cparams.gdn_rows_plain && mctx_cur->get_n_rs() == (uint32_t) n_seqs &&
+        (cparams.gdn_rows_plain_max_tokens <= 0 || n_seq_tokens <= cparams.gdn_rows_plain_max_tokens);
+
+    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && (cparams.n_rs_seq > 0 || gdn_rows_plain_ok);
 
     ggml_tensor * state;
     if (gdn_state_rows) {
