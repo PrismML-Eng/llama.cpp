@@ -262,6 +262,7 @@ constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];
 constant short FC_mul_mv_ne12  [[function_constant(FC_MUL_MV + 2)]];
 constant short FC_mul_mv_r2    [[function_constant(FC_MUL_MV + 3)]];
 constant short FC_mul_mv_r3    [[function_constant(FC_MUL_MV + 4)]];
+constant bool  FC_mul_mv_ptq1_full_cols [[function_constant(FC_MUL_MV + 5)]];
 
 template<typename block_q_type, short NR0, typename args_t>
 void mul_vec_q_n_f32_impl(
@@ -1061,6 +1062,9 @@ kernel void kernel_mul_mv_ptq1_0_multicol(
     const int r1 = tgpig.y * nr1;
     const int im = tgpig.z;
 
+    // columns of this tile that exist: nr1 except in a partial last tile (5 or 7 columns)
+    const short ncols = FC_mul_mv_ptq1_full_cols ? nr1 : (short) min(nr1, args.ne11 - r1);
+
     const int first_row = (r0 * NSG + sgitg) * nr0;
 
     const uint i12 = im%FC_mul_mv_ne12;
@@ -1097,7 +1101,9 @@ kernel void kernel_mul_mv_ptq1_0_multicol(
         // Reuse collapse coefficients across rows: c[k-1] = y_{k-1} - 3*y_k, c[4] = y_4.
         float sumy[nr1] = {};
         FOR_UNROLL (short col = 0; col < nr1; ++col) {
-            device const float * yc = (device const float *) ((device const char *) yb + col*args.nb11);
+            // a partial last tile re-reads its final valid column; that result is not written
+            const short yc_col = FC_mul_mv_ptq1_full_cols ? col : min(col, (short) (ncols - 1));
+            device const float * yc = (device const float *) ((device const char *) yb + yc_col*args.nb11);
 
             FOR_UNROLL (short k = 0; k < 2; ++k) {
                 const short m = 2*it + k;
@@ -1141,7 +1147,7 @@ kernel void kernel_mul_mv_ptq1_0_multicol(
     for (int row = 0; row < nr0; ++row) {
         FOR_UNROLL (short col = 0; col < nr1; ++col) {
             const float tot = simd_sum(sumf[row][col]);
-            if (tiisg == 0 && first_row + row < args.ne01) {
+            if (tiisg == 0 && first_row + row < args.ne01 && (FC_mul_mv_ptq1_full_cols || col < ncols)) {
                 dst_f32[(uint64_t) col*args.ne0 + first_row + row] = tot;
             }
         }

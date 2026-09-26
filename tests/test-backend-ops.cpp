@@ -9401,10 +9401,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // PTQ1_0 small batches, row tails and broadcast dimensions.
-    for (int n : {1, 2, 3, 4, 8}) {
+    for (int n : {1, 2, 3, 4, 5, 6, 7, 8}) {
         for (int k : {128, 384, 5120}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 7, n, k, {2, 2}, {2, 1}));
         }
+    }
+    // partial column tiles with a strided B
+    for (int n : {5, 7}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 7, n, 384, {2, 3}, {1, 1}, {0, 2, 1, 3}));
     }
 
     // BF16 is absent from base_types: add the 3 standard non-contig permutations explicitly
