@@ -9400,6 +9400,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // PQ2_0 two columns with a row tail and broadcast, and with a strided B
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 7, 2, 384, {2, 2}, {2, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 7, 2, 384, {2, 3}, {1, 1}, {0, 2, 1, 3}));
+
     // PTQ1_0 small batches, row tails and broadcast dimensions.
     for (int n : {1, 2, 3, 4, 8}) {
         for (int k : {128, 384, 5120}) {
