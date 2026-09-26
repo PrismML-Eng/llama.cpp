@@ -189,7 +189,8 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 void ggml_metal_free(ggml_metal_t ctx) {
     GGML_LOG_INFO("%s: deallocating\n", __func__);
 
-    for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
+    // n_cb command buffers + the main thread's, which is index n_cb
+    for (int i = 0; i <= GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         if (ctx->cmd_bufs[i].obj) {
             [ctx->cmd_bufs[i].obj release];
         }
@@ -661,11 +662,18 @@ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
 }
 
 void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+    // with an abort callback only command buffers 0 and 1 are committed; the main one is index n_cb, so n_cb > 1 hangs
+    if (ctx->abort_callback && n_cb > 1) {
+        GGML_LOG_WARN("%s: an abort callback allows only 1 extra command buffer; using 1 instead of %d\n", __func__, n_cb);
+        n_cb = 1;
+    }
+
     if (ctx->n_cb != n_cb) {
         ctx->n_cb = MIN(n_cb, GGML_METAL_MAX_COMMAND_BUFFERS);
 
-        if (ctx->n_cb > 2) {
-            GGML_LOG_WARN("%s: n_cb = %d, using n_cb > 2 is not recommended and can degrade the performance in some cases\n", __func__, n_cb);
+        // 4 is the default on iOS (ggml-metal.cpp)
+        if (ctx->n_cb > 4) {
+            GGML_LOG_WARN("%s: n_cb = %d, using n_cb > 4 is not recommended and can degrade the performance in some cases\n", __func__, n_cb);
         }
     }
 
@@ -724,6 +732,10 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
 void ggml_metal_set_abort_callback(ggml_metal_t ctx, ggml_abort_callback abort_callback, void * user_data) {
     ctx->abort_callback = abort_callback;
     ctx->abort_callback_data = user_data;
+
+    if (abort_callback && ctx->n_cb > 1) {
+        ggml_metal_set_n_cb(ctx, ctx->n_cb); // clamps to 1
+    }
 }
 
 bool ggml_metal_supports_family(ggml_metal_t ctx, int family) {
