@@ -882,11 +882,21 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     return res;
 }
 
+// widest batch the multi-column kernel takes, as column tiles of at most four; wider batches keep the default route.
+// GGML_METAL_PTQ1_MULTICOL_MAX is clamped to 4..8 (default 8); 4 keeps the kernel to 2-4 columns
+static int ggml_metal_ptq1_multicol_max(void) {
+    static const int max_cols = [] {
+        const char * env = getenv("GGML_METAL_PTQ1_MULTICOL_MAX");
+        return env ? std::min(8, std::max(4, atoi(env))) : 8;
+    }();
+    return max_cols;
+}
+
 bool ggml_metal_ptq1_multicol_enabled(const ggml_tensor * op) {
     static const bool enabled = getenv("GGML_METAL_PTQ1_MULTICOL") && atoi(getenv("GGML_METAL_PTQ1_MULTICOL")) == 1;
     return enabled && op->src[0]->type == GGML_TYPE_PTQ1_0 && op->src[1]->type == GGML_TYPE_F32 &&
            op->src[0]->ne[0] % ggml_blck_size(GGML_TYPE_PTQ1_0) == 0 && op->src[1]->nb[0] == sizeof(float) &&
-           op->src[1]->ne[1] >= 2 && op->src[1]->ne[1] <= 4;
+           op->src[1]->ne[1] >= 2 && op->src[1]->ne[1] <= ggml_metal_ptq1_multicol_max();
 }
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
@@ -907,6 +917,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
 
     const char * suffix = "";
     char ptq1_suffix[16];
+    bool ptq1_mc = false;
 
     // use custom matrix x vector kernel
     switch (tsrc0) {
@@ -959,9 +970,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 nsg = N_SG_PTQ1_0;
                 nr0 = N_R0_PTQ1_0;
                 if (ggml_metal_ptq1_multicol_enabled(op)) {
+                    ptq1_mc = true;
                     nr0 = 4;
                     nsg = 1;
-                    nr1 = ne11;
+                    // at most four columns per tile, split evenly: 5 -> 3+2, 6 -> 3+3, 7 -> 4+3, 8 -> 4+4
+                    nr1 = (ne11 + (ne11 + 3)/4 - 1) / ((ne11 + 3)/4);
                     snprintf(ptq1_suffix, sizeof(ptq1_suffix), "_mc_c%d", nr1);
                     suffix = ptq1_suffix;
                 }
@@ -1091,7 +1104,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     const int16_t r3 = (int16_t) (ne13 / ne03);
 
     snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
-    snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d", base, nsg, ne12, r2, r3);
+    // PTQ1_0 multi-column: every column tile complete (2-4, 6, 8 columns) skips the partial-tile checks
+    const bool ptq1_full_cols = ptq1_mc && ne11 % nr1 == 0;
+    if (ptq1_mc) {
+        snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_full=%d", base, nsg, ne12, r2, r3, ptq1_full_cols);
+    } else {
+        snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d", base, nsg, ne12, r2, r3);
+    }
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1101,6 +1120,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         ggml_metal_cv_set_int16(cv, (int16_t) ne12, FC_MUL_MV + 2);
         ggml_metal_cv_set_int16(cv, r2,             FC_MUL_MV + 3);
         ggml_metal_cv_set_int16(cv, r3,             FC_MUL_MV + 4);
+        if (ptq1_mc) {
+            ggml_metal_cv_set_bool(cv, ptq1_full_cols, FC_MUL_MV + 5);
+        }
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
