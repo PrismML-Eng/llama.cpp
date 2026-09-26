@@ -1,0 +1,106 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#include "mul_mat_vec_base.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+
+// PQ2_0 dedicated mat-vec.
+//   block_pq2_0 = { float16 d; uint8 qs[32]; }  // 34 B per 128 weights (QUANT_K=128)
+//   qs byte b packs elements 4*b..4*b+3 at bit levels 0,2,4,6; w = (q - 1) * d.
+// Thread map: 16 lanes per block (tpb=16), lane itid reads u16 qs[itid] covering
+// elements 8*itid..8*itid+7 - always 2-byte aligned despite the 34-byte stride.
+// For workgroups smaller than 16, each thread replays for the extra lanes
+// (lane = itid + w*tpb), so the shader stays correct down to wg=4.
+//
+// Inner loop uses the identity w = (q - 1) * d  =>  d * (sum(q*y) - sum(y)):
+// per (block, row) the 2-bit fields are decoded once (outside the column loop)
+// and per column the B vector is fetched once for all rows.
+
+// Accumulate one 8-element span of one block into temp[*][0..num_rows).
+// lane selects the u16 word (elements 8*lane..8*lane+7).
+void calc_span(const uint a_offset, const uint b_offset, const uint lane,
+               const uint i, const uint num_blocks_per_row,
+               const uint first_row, const uint num_rows) {
+    vec4 q0[NUM_ROWS], q1[NUM_ROWS];
+    FLOAT_TYPE dv[NUM_ROWS];
+
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        if (n >= num_rows) { break; }
+        const uint ib = a_offset + (first_row + n) * num_blocks_per_row + i;
+        const uint q16 = uint(data_a_packed16[ib].qs[lane]);
+        q0[n] = vec4(uvec4(q16, q16 >> 2u, q16 >> 4u, q16 >> 6u) & 3u);
+        q1[n] = vec4(uvec4(q16 >> 8u, q16 >> 10u, q16 >> 12u, q16 >> 14u) & 3u);
+        dv[n] = FLOAT_TYPE(data_a[ib].d);
+    }
+
+    const uint y_idx = i * QUANT_K + lane * 8u;
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        const uint bo = j * p.batch_stride_b + b_offset + y_idx;
+        const vec4 bv0 = vec4(data_b_v4[bo / 4u]);
+        const vec4 bv1 = vec4(data_b_v4[bo / 4u + 1u]);
+        const FLOAT_TYPE sumb = (bv0.x + bv0.y) + (bv0.z + bv0.w) +
+                                (bv1.x + bv1.y) + (bv1.z + bv1.w);
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            if (n >= num_rows) { break; }
+            const FLOAT_TYPE sumq = dot(q0[n], bv0) + dot(q1[n], bv1);
+            temp[j][n] = fma(dv[n], sumq - sumb, temp[j][n]);
+        }
+    }
+}
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    uint a_offset, b_offset, d_offset;
+    get_offsets(a_offset, b_offset, d_offset);
+
+    const uint num_blocks_per_row = p.ncols / QUANT_K;
+
+    // 16 threads cooperate on one block (one u16 word each). it_size = number
+    // of blocks processed per iteration; leftover threads (wg%16) stay idle.
+    const uint tpb = min(gl_WorkGroupSize.x, 16u);
+    const uint it_size = gl_WorkGroupSize.x / tpb;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint itid = tid % tpb;
+    const uint ix = tid / tpb;
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            temp[j][n] = FLOAT_TYPE(0);
+        }
+    }
+
+    for (uint i0 = 0; i0 < num_blocks_per_row; i0 += it_size) {
+        const uint i = i0 + ix;
+        if (ix < it_size && i < num_blocks_per_row) {
+            // replay for lanes >= tpb when the workgroup is narrower than 16
+            [[unroll]] for (uint w = 0; w < 4; ++w) {
+                const uint lane = itid + w * tpb;
+                if (lane >= 16u) { break; }
+                calc_span(a_offset, b_offset, lane, i, num_blocks_per_row,
+                          first_row, num_rows);
+            }
+        }
+    }
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    // do NUM_ROWS at a time, unless there aren't enough remaining rows
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, min(NUM_ROWS, p.stride_d - first_row));
+    }
+}
