@@ -4988,6 +4988,14 @@ static bool ggml_sycl_t2_mul_mat_try(ggml_backend_sycl_context & ctx, const ggml
     return true;
 }
 
+// ARC-LAB: largest batch run as MMVQ column chunks instead of dequantize-all + GEMM (GGML_SYCL_MMVQ_CHUNK_MAX, default 32).
+// A chunk re-reads the quantized weights; the GEMM path writes and reads the whole matrix as f16 per call, so chunks win
+// for speculative-verify sized batches (Gemma 4 12B q4_0: n-gram drafts of 33+ tokens were ~94% dequantization).
+static int64_t mmvq_chunk_max() {
+    static const int64_t v = getenv("GGML_SYCL_MMVQ_CHUNK_MAX") ? atoll(getenv("GGML_SYCL_MMVQ_CHUNK_MAX")) : 4 * MMVQ_MAX_BATCH_SIZE;
+    return v;
+}
+
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
 
@@ -5037,7 +5045,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     if (!split && ggml_is_quantized(src0->type) && ggml_is_contiguous(src0) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
         src1->ne[1] > MMVQ_MAX_BATCH_SIZE && src1->nb[0] == sizeof(float) &&
-        (src1->ne[1] <= 4 * MMVQ_MAX_BATCH_SIZE || (size_t) src0->ne[0] * src0->ne[1] * sizeof(float) > (1ull << 30))) {
+        (src1->ne[1] <= mmvq_chunk_max() || (size_t) src0->ne[0] * src0->ne[1] * sizeof(float) > (1ull << 30))) {
         for (int64_t c0 = 0; c0 < src1->ne[1]; c0 += MMVQ_MAX_BATCH_SIZE) {
             const int64_t nc = std::min<int64_t>(MMVQ_MAX_BATCH_SIZE, src1->ne[1] - c0);
             ggml_tensor src1_c = *src1;
