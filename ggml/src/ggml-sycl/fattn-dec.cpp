@@ -705,7 +705,7 @@ inline dp_int8   intel_sub_group_i8_i4_matrix_mad_k32(dp_short8, dp_int4, dp_int
 inline dp_float8 intel_sub_group_f16_f16_matrix_mad_k16(dp_short8, dp_int8, dp_float8) { __builtin_unreachable(); }
 #endif
 
-template <int G, int NQ, int KG, int TC>
+template <int D, int G, int NQ, int KG, int TC>
 static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, const char * mask, float * dst,
                                 float * parts, sycl::float2 * meta, float scale, int ne01, int ne02, int ne11,
                                 int nkvh, int ne03, int64_t nb01, int64_t nb02, int64_t nb03, int64_t nb11,
@@ -715,14 +715,15 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
     constexpr int RT   = (R + 7) / 8;        // 8-row DPAS tiles
     constexpr int RP   = RT * 8;
     constexpr int TK   = 16 * KG;            // keys per tile (KG groups of 16, one key per lane)
-    constexpr int NB   = DEC_D / QK4_0;      // 8 blocks per row
+    constexpr int NB   = D / QK4_0;          // q4_0 blocks per row (8 at D 256, 16 at D 512)
     constexpr int NSG  = DEC_WG / 16;        // 16 subgroups
     constexpr int NCH  = (RT + TC - 1) / TC; // row-tile chunks per key group in the Q.K phase
-    constexpr int RW   = DEC_D / QK4_0 * (int) sizeof(block_q4_0) / 4;  // 36 dwords per q4_0 row
+    constexpr int DPS  = D / NSG;            // head dims per subgroup in P.V (16 at D 256, 32 at D 512): all in one block
+    constexpr int XT   = DPS / 8;            // 8-dim output tiles per subgroup
     constexpr int R16  = (R + 15) / 16 * 16; // P.V computes O^T = V^T P^T: rows are the 16-wide N side
     constexpr int RT16 = R16 / 16;
     constexpr int PS   = TK + 16;            // f16 row stride of P ([row][key]); 32-byte aligned rows, fewer bank conflicts
-    static_assert(DEC_D / 16 == NSG && RW == 36, "shape");
+    static_assert(D % 256 == 0 && DPS % 16 == 0 && DPS <= QK4_0, "shape");
     const int nqc = (ne01 + NQ - 1) / NQ;    // token chunks
     static const int probe_env = getenv("GGML_SYCL_FA_DEC_DPAS_PROBE") ? atoi(getenv("GGML_SYCL_FA_DEC_DPAS_PROBE")) : 0;
     const int        probe     = probe_env;  // phase probe: bit0 skip Q.K, bit1 skip P.V, bit2 skip softmax
@@ -787,15 +788,17 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
                 const char * Vh = V + seq * nb23 + kvh * nb22;
                 const sycl::half * mrow = mask ? (const sycl::half *) (mask + (seq % ne33) * nb33) : nullptr;
 
-                // O^T accumulators: subgroup w owns head dims 16 w .. +15 (two 8-dim tiles), lane = query row
-                dp_float8 o[RT16][2];
+                // O^T accumulators: subgroup w owns head dims DPS w .. +DPS-1 (XT 8-dim tiles), lane = query row
+                dp_float8 o[RT16][XT];
 #pragma unroll
                 for (int t = 0; t < RT16; ++t) {
-                    o[t][0] = 0.0f;
-                    o[t][1] = 0.0f;
+#pragma unroll
+                    for (int x = 0; x < XT; ++x) {
+                        o[t][x] = 0.0f;
+                    }
                 }
-                // those dims are the (w % 2) nibbles of qs bytes 0..15 of V block w / 2
-                const int vb = w / 2, vsh = (w % 2) * 4;
+                // those dims lie in V block (DPS w) / 32; dim d of the block = nibble (d / 16) of qs byte d % 16
+                const int vb = (DPS * w) / QK4_0, vd0 = (DPS * w) % QK4_0;
 
                 for (int t0 = k_begin; t0 < k_end; t0 += TK) {
                     // ---- S = Q K^T: job = (key group, chunk of TC row tiles)
@@ -803,13 +806,7 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
                         const int  kg = job % KG, ch = job / KG;
                         const int  j  = t0 + kg * 16 + lane;
                         const bool jv = j < k_end;
-                        const dp_uint4 * kr = (const dp_uint4 *) (Kh + (int64_t) (jv ? j : k_begin) * nb11);
-                        uint32_t row[RW];
-#pragma unroll
-                        for (int i = 0; i < RW / 4; ++i) {
-                            const dp_uint4 v4 = kr[i];
-                            row[4 * i] = v4[0]; row[4 * i + 1] = v4[1]; row[4 * i + 2] = v4[2]; row[4 * i + 3] = v4[3];
-                        }
+                        const uint32_t * kr = (const uint32_t *) (Kh + (int64_t) (jv ? j : k_begin) * nb11);
                         dp_float8 s[TC];
 #pragma unroll
                         for (int tt = 0; tt < TC; ++tt) {
@@ -819,18 +816,18 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
                         for (int b = 0; b < NB; ++b) {
                             // block b = bytes 18 b .. 18 b + 17: fp16 scale, then 16 bytes of nibbles
                             const int o0 = 18 * b;  // even b: dword aligned; odd b: 2 bytes in
+                            const int      wd = o0 / 4;  // the block's 18 bytes lie in these 5 dwords
+                            const uint32_t k0 = kr[wd], k1 = kr[wd + 1], k2 = kr[wd + 2], k3 = kr[wd + 3], k4 = kr[wd + 4];
                             uint32_t sc, q0, q1, q2, q3;
                             if ((o0 & 3) == 0) {
-                                const int wd = o0 / 4;
-                                sc = row[wd] & 0xFFFFu;
-                                q0 = (row[wd] >> 16) | (row[wd + 1] << 16);
-                                q1 = (row[wd + 1] >> 16) | (row[wd + 2] << 16);
-                                q2 = (row[wd + 2] >> 16) | (row[wd + 3] << 16);
-                                q3 = (row[wd + 3] >> 16) | (row[wd + 4] << 16);
+                                sc = k0 & 0xFFFFu;
+                                q0 = (k0 >> 16) | (k1 << 16);
+                                q1 = (k1 >> 16) | (k2 << 16);
+                                q2 = (k2 >> 16) | (k3 << 16);
+                                q3 = (k3 >> 16) | (k4 << 16);
                             } else {
-                                const int wd = o0 / 4;  // scale in the high half of row[wd]
-                                sc = row[wd] >> 16;
-                                q0 = row[wd + 1]; q1 = row[wd + 2]; q2 = row[wd + 3]; q3 = row[wd + 4];
+                                sc = k0 >> 16;  // scale in the high half of k0
+                                q0 = k1; q1 = k2; q2 = k3; q3 = k4;
                             }
                             const float   dk = static_cast<float>(sycl::bit_cast<sycl::half>((uint16_t) sc));
                             const dp_int4 bv = { (int) (q0 ^ 0x88888888u), (int) (q1 ^ 0x88888888u),
@@ -896,8 +893,10 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
 #pragma unroll
                     for (int t = 0; t < RT16; ++t) {
                         const float a = sA[t * 16 + lane];
-                        o[t][0] *= a;
-                        o[t][1] *= a;
+#pragma unroll
+                        for (int x = 0; x < XT; ++x) {
+                            o[t][x] *= a;
+                        }
                     }
 #pragma unroll 1
                     for (int kg = 0; kg < ((probe & 2) ? 0 : KG); ++kg) {
@@ -916,21 +915,24 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
                             q[0] = w1; q[1] = w2; q[2] = w3; q[3] = w4;
                         }
                         const float dv = jv ? static_cast<float>(sycl::bit_cast<sycl::half>((uint16_t) sc)) : 0.0f;
-                        dp_short8 va[2];
+                        dp_short8 va[XT];
 #pragma unroll
-                        for (int x = 0; x < 2; ++x) {
+                        for (int x = 0; x < XT; ++x) {
 #pragma unroll
                             for (int m = 0; m < 8; ++m) {
-                                const int byte = x * 8 + m;  // dim 16 w + byte
-                                const int nib  = (q[byte / 4] >> (8 * (byte % 4) + vsh)) & 0xF;
+                                const int d    = vd0 + x * 8 + m;  // dim within block vb
+                                const int byte = d % 16, sh = (d / 16) * 4;
+                                const int nib  = (q[byte / 4] >> (8 * (byte % 4) + sh)) & 0xF;
                                 va[x][m] = (short) sycl::bit_cast<uint16_t>(sycl::half((float) (nib - 8) * dv));
                             }
                         }
 #pragma unroll
                         for (int t = 0; t < RT16; ++t) {
                             const dp_int8 pb = sP[((t * 16 + lane) * PS + kg * 16) / 16];
-                            o[t][0] = intel_sub_group_f16_f16_matrix_mad_k16(va[0], pb, o[t][0]);
-                            o[t][1] = intel_sub_group_f16_f16_matrix_mad_k16(va[1], pb, o[t][1]);
+#pragma unroll
+                            for (int x = 0; x < XT; ++x) {
+                                o[t][x] = intel_sub_group_f16_f16_matrix_mad_k16(va[x], pb, o[t][x]);
+                            }
                         }
                     }
                     it.barrier(sycl::access::fence_space::local_space);
@@ -944,14 +946,14 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
                         const int64_t jdu = ((int64_t) seq * ne01 + c) * ne02 + kvh * G + r % G;
                         const float   l   = sL[r];
 #pragma unroll
-                        for (int x = 0; x < 2; ++x) {
+                        for (int x = 0; x < XT; ++x) {
 #pragma unroll
                             for (int m = 0; m < 8; ++m) {
-                                const int d = w * 16 + x * 8 + m;
+                                const int d = w * DPS + x * 8 + m;
                                 if (nsplit == 1) {
-                                    dst[jdu * DEC_D + d] = l > 0.0f ? o[t][x][m] / l : 0.0f;
+                                    dst[jdu * D + d] = l > 0.0f ? o[t][x][m] / l : 0.0f;
                                 } else {
-                                    parts[(jdu * nsplit + split) * DEC_D + d] = o[t][x][m];
+                                    parts[(jdu * nsplit + split) * D + d] = o[t][x][m];
                                 }
                             }
                         }
@@ -996,8 +998,10 @@ bool ggml_sycl_flash_attn_ext_dec_supported(const ggml_tensor * dst) {
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&softcap,  (const float *) dst->op_params + 2, sizeof(float));
     return K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0 && Q->type == GGML_TYPE_F32 &&
-           K->ne[0] == DEC_D && V->ne[0] == DEC_D && Q->ne[0] == DEC_D &&
-           Q->ne[2] == 6 * K->ne[2] && V->ne[2] == K->ne[2] &&
+           // Bonsai 2 27B (head 256, 6 query heads per KV head); with the DPAS kernel also Gemma 4's global layers (512, 16)
+           ((K->ne[0] == DEC_D && Q->ne[2] == 6 * K->ne[2]) || (maxq && K->ne[0] == 512 && Q->ne[2] == 16 * K->ne[2]) ||
+            (maxq && K->ne[0] == DEC_D && Q->ne[2] == 2 * K->ne[2])) &&  // Gemma 4 sliding layers (256, 2)
+           V->ne[0] == K->ne[0] && Q->ne[0] == K->ne[0] && V->ne[2] == K->ne[2] &&
            Q->ne[1] >= 1 && Q->ne[1] <= (maxq ? maxq : 4) && Q->ne[3] == K->ne[3] && V->ne[3] == K->ne[3] &&  // 5-8: TILE is faster (v3<6,8> 1172-1240 vs 1049 us @16K)
            !sinks && max_bias == 0.0f && softcap == 0.0f &&
            (!mask || (mask->type == GGML_TYPE_F16 && mask->ne[2] == 1)) &&
@@ -1019,13 +1023,17 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
 
     const int ne01 = Q->ne[1];
     const bool dpas = fattn_dec_dpas_maxq() > 0;
-    const int nq   = ne01 <= 1 ? 1 : ne01 <= 2 ? 2 : ne01 <= 4 ? 4 : 8;
+    const bool d512 = K->ne[0] == 512;  // Gemma 4 global layers: DPAS kernel only, token chunks of 2 (16 heads x 2 rows)
+    const bool g2   = !d512 && Q->ne[2] == 2 * K->ne[2];  // Gemma 4 sliding layers: DPAS kernel only, token chunks of 8
+    const int nq   = d512 ? (ne01 <= 1 ? 1 : 2) : g2 ? (ne01 <= 1 ? 1 : 8) : ne01 <= 1 ? 1 : ne01 <= 2 ? 2 : ne01 <= 4 ? 4 : 8;
     // keys per tile (must match the instantiations below); DPAS: 16 x KG
-    const int tk   = dpas ? (nq == 1 ? 256 : nq == 2 ? 128 : nq == 4 ? 256 : 128) : nq == 8 ? 32 : nq == 4 ? 64 : 128;
+    const int tk   = (d512 || g2) ? (nq == 1 ? 256 : 128)
+                   : dpas ? (nq == 1 ? 256 : nq == 2 ? 128 : nq == 4 ? 256 : 128) : nq == 8 ? 32 : nq == 4 ? 64 : 128;
     const int ne11 = K->ne[1];
 
-    // slices: enough work-groups to fill the GPU (~64 slices per KV head), at least one tile each
-    static const int target = getenv("GGML_SYCL_FA_DEC_SPLITS") ? atoi(getenv("GGML_SYCL_FA_DEC_SPLITS")) : 64;
+    // slices: enough work-groups to fill the GPU (~64 slices per KV head, ~256 in all), at least one tile each
+    static const int target_env = getenv("GGML_SYCL_FA_DEC_SPLITS") ? atoi(getenv("GGML_SYCL_FA_DEC_SPLITS")) : 0;
+    const int target = target_env ? target_env : std::max(64, 256 / std::max(1, (int) K->ne[2]));
     const int ntiles = (ne11 + tk - 1) / tk;
     int nsplit       = std::max(1, std::min(target, ntiles));
     const int chunk  = ((ntiles + nsplit - 1) / nsplit) * tk;
@@ -1044,11 +1052,33 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
     const int64_t   nb33   = mask ? mask->nb[3] : 0;
     const int       ne33   = mask ? (int) mask->ne[3] : 1;
 
-#define FATTN_DEC_DPAS(NQ_, KG_, TC_) fattn_dec_q4_0_dpas<6, NQ_, KG_, TC_>((const char *) Q->data, (const char *) K->data, \
+#define FATTN_DEC_DPAS(NQ_, KG_, TC_) fattn_dec_q4_0_dpas<DEC_D, 6, NQ_, KG_, TC_>((const char *) Q->data, (const char *) K->data, \
         (const char *) V->data, mdata, (float *) dst->data, parts.get(), meta.get(), scale, ne01, (int) Q->ne[2], ne11,      \
         (int) K->ne[2], (int) Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2],     \
         V->nb[3], nb31, nb33, ne33, nsplit, chunk, stream)
-    if (dpas) {
+    if (d512) {
+#define FATTN_DEC_DPAS512(NQ_, KG_, TC_) fattn_dec_q4_0_dpas<512, 16, NQ_, KG_, TC_>((const char *) Q->data, (const char *) K->data, \
+        (const char *) V->data, mdata, (float *) dst->data, parts.get(), meta.get(), scale, ne01, (int) Q->ne[2], ne11,             \
+        (int) K->ne[2], (int) Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2],            \
+        V->nb[3], nb31, nb33, ne33, nsplit, chunk, stream)
+        if (nq == 1) {
+            FATTN_DEC_DPAS512(1, 16, 2);   // 16 rows = 2 tiles, one chunk of 2 per key group
+        } else {
+            FATTN_DEC_DPAS512(2, 8, 2);    // 32 rows = 4 tiles, 2 chunks x 8 key groups
+        }
+#undef FATTN_DEC_DPAS512
+    } else if (g2) {
+#define FATTN_DEC_DPASG2(NQ_, KG_, TC_) fattn_dec_q4_0_dpas<DEC_D, 2, NQ_, KG_, TC_>((const char *) Q->data, (const char *) K->data, \
+        (const char *) V->data, mdata, (float *) dst->data, parts.get(), meta.get(), scale, ne01, (int) Q->ne[2], ne11,            \
+        (int) K->ne[2], (int) Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2],           \
+        V->nb[3], nb31, nb33, ne33, nsplit, chunk, stream)
+        if (nq == 1) {
+            FATTN_DEC_DPASG2(1, 16, 1);    // 2 rows (1 tile)
+        } else {
+            FATTN_DEC_DPASG2(8, 8, 1);     // 16 rows = 2 tiles, 8 key groups x 2
+        }
+#undef FATTN_DEC_DPASG2
+    } else if (dpas) {
         switch (nq) {
             case 1: FATTN_DEC_DPAS(1, 16, 1); break;
             case 2: FATTN_DEC_DPAS(2, 8, 1); break;
@@ -1061,7 +1091,7 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
         mdata, (float *) dst->data, parts.get(), meta.get(), scale, ne01, (int) Q->ne[2], ne11, (int) K->ne[2],           \
         (int) Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3], nb31,    \
         nb33, ne33, nsplit, chunk, stream)
-    if (!dpas) switch (nq) {
+    if (!dpas && !d512 && !g2) switch (nq) {
         case 1: FATTN_DEC_CALL(1); break;
         case 2: FATTN_DEC_CALL(2); break;
         case 8:  // 5-8 tokens (MTP depth 4+, short n-gram drafts): v3 kernel, 48 rows, 32-key tiles, ~59 KB SLM
@@ -1093,19 +1123,26 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
 #undef FATTN_DEC_CALL
 
     if (nsplit > 1) {
-        const int D = DEC_D;
-        const sycl::range<3> grid(Q->ne[3], Q->ne[2], (size_t) ne01 * D);
-        const size_t         nbytes_shared = nsplit * sizeof(sycl::float2);
-        float *              parts_p       = parts.get();
-        sycl::float2 *       meta_p        = meta.get();
-        float *              dst_p         = (float *) dst->data;
-        stream->submit([&](sycl::handler & cgh) {
-            sycl::local_accessor<uint8_t, 1> lm(sycl::range<1>(nbytes_shared), cgh);
-            cgh.parallel_for(sycl::nd_range<3>(grid, sycl::range<3>(1, 1, D)),
-                             [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
-                                 flash_attn_combine_results<DEC_D>(parts_p, meta_p, dst_p, nsplit,
-                                     lm.get_multi_ptr<sycl::access::decorated::no>().get());
-                             });
-        });
+        auto combine = [&](auto dk) {
+            constexpr int D = decltype(dk)::value;
+            const sycl::range<3> grid(Q->ne[3], Q->ne[2], (size_t) ne01 * D);
+            const size_t         nbytes_shared = nsplit * sizeof(sycl::float2);
+            float *              parts_p       = parts.get();
+            sycl::float2 *       meta_p        = meta.get();
+            float *              dst_p         = (float *) dst->data;
+            stream->submit([&](sycl::handler & cgh) {
+                sycl::local_accessor<uint8_t, 1> lm(sycl::range<1>(nbytes_shared), cgh);
+                cgh.parallel_for(sycl::nd_range<3>(grid, sycl::range<3>(1, 1, D)),
+                                 [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
+                                     flash_attn_combine_results<D>(parts_p, meta_p, dst_p, nsplit,
+                                         lm.get_multi_ptr<sycl::access::decorated::no>().get());
+                                 });
+            });
+        };
+        if (d512) {
+            combine(std::integral_constant<int, 512>{});
+        } else {
+            combine(std::integral_constant<int, DEC_D>{});
+        }
     }
 }

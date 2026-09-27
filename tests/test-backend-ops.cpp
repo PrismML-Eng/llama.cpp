@@ -10348,6 +10348,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
         }
     }
+    // ARC-LAB: Gemma 4 global layers on the DPAS decode kernel (head 512, 1 KV head x 16 query heads, q4_0 cache)
+    for (int64_t kv : {512, 4096}) {
+        for (int64_t nb : {1, 2, 3, 4, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {16, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {16, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
+        }
+    }
+    // ARC-LAB: Gemma 4 sliding layers on the DPAS decode kernel (head 256, 8 KV heads x 2 query heads, q4_0 cache)
+    for (int64_t kv : {512, 1024}) {
+        for (int64_t nb : {1, 2, 5, 8, 12}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
+        }
+    }
     // ARC-LAB: oneDNN / MKL prompt-FA correctness sweep in the real cache layout (a report showed kv=1025 / 4096 failing)
     for (int64_t kv : {1024, 1025, 2048, 3072, 4095, 4096, 4097, 6144, 8192}) {
         for (int64_t nb : {33, 64, 512}) {
@@ -10926,6 +10939,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t kv : {16384, 49152}) {  // ARC-LAB: Bonsai 27B decode / MTP verify on a q4_0 cache
         for (int64_t nb : {1, 4, 5, 8}) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+        }
+        for (int64_t nb : {1, 4}) {  // ARC-LAB: Gemma 4 global layers, q4_0 vs f16 cache
+            for (ggml_type t : {GGML_TYPE_Q4_0, GGML_TYPE_F16}) {
+                test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {16, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 2, 1, 3}));
+            }
         }
         for (int64_t nb : {1, 4, 16, 32}) {  // real cache layout (DPAS kernel targets)
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
