@@ -595,8 +595,31 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// ggml-cuda.cu: host-tail staging of tiered buffers (ggml_backend_cuda_tier_buffer_type)
+void * ggml_cuda_tier_stage(const void * ptr, size_t nbytes, cudaStream_t stream);
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    // K/V in a tiered buffer whose host tail this op reaches: copy the used host rows into the VRAM staging
+    // buffer with the copy engine and point K/V at the all-VRAM alias of the same range for this op. Prefill
+    // kernels read each K/V row once per query tile, which for host rows would be PCIe traffic every time;
+    // decode reads each row once, but DMA moves it faster than SMs reading host memory from inside the
+    // kernel (RTX 4070, 180k context, 86k cells in host memory: +28% decode). Nothing is copied for ops
+    // that stay below the tier line. The staged bytes are the same bytes, so results are unchanged.
+    ggml_tensor * K = dst->src[1];
+    ggml_tensor * V = dst->src[2];
+    void * K_data = K ? K->data : nullptr;
+    void * V_data = V ? V->data : nullptr;
+    if (K && V && V != K) {
+        if (void * a = ggml_cuda_tier_stage(K->data, ggml_nbytes(K), ctx.stream())) {
+            K->data = a;
+        }
+        if (void * a = ggml_cuda_tier_stage(V->data, ggml_nbytes(V), ctx.stream())) {
+            V->data = a;
+        }
+    }
+
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
@@ -609,6 +632,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
+    }
+
+    if (K) {
+        K->data = K_data;
+    }
+    if (V) {
+        V->data = V_data;
     }
 }
 
