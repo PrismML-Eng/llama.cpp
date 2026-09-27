@@ -951,9 +951,28 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             } break;
         case GGML_TYPE_PQ2_0:
             {
-                nsg = N_SG_PQ2_0;
-                nr0 = N_R0_PQ2_0;
-            } break;
+                nsg                      = N_SG_PQ2_0;
+                nr0                      = N_R0_PQ2_0;
+                // multi-column variants decode each weight byte once per nr1 src1 columns
+                // (spec-decode verify batches). GGML_METAL_PQ2_0_NR1=1 restores mul_mv_ext.
+                static const int nr1_env = getenv("GGML_METAL_PQ2_0_NR1") ? atoi(getenv("GGML_METAL_PQ2_0_NR1")) : 0;
+                if (nr1_env >= 2 && nr1_env <= 4 && ne11 >= 2) {
+                    nr1 = std::min<int>(nr1_env, ne11);
+                } else if (nr1_env != 1 && (ne11 == 2 || ne11 == 3)) {
+                    nr1 = ne11;
+                }
+                if (nr1 > 1) {
+                    static const int nr0_env =
+                        getenv("GGML_METAL_PQ2_0_NC_NR0") ? atoi(getenv("GGML_METAL_PQ2_0_NC_NR0")) : 4;
+                    static const int nsg_env =
+                        getenv("GGML_METAL_PQ2_0_NC_NSG") ? atoi(getenv("GGML_METAL_PQ2_0_NC_NSG")) : N_SG_PQ2_0;
+                    nr0 = (nr0_env == 2 || nr0_env == 8) ? nr0_env : 4;
+                    nsg = nsg_env >= 1 && nsg_env <= 8 ? nsg_env : N_SG_PQ2_0;
+                    snprintf(ptq1_suffix, sizeof(ptq1_suffix), "_nr1_%d_r%d", nr1, nr0);
+                    suffix = ptq1_suffix;
+                }
+            }
+            break;
         case GGML_TYPE_PTQ1_0:
             {
                 nsg = N_SG_PTQ1_0;
@@ -965,7 +984,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                     snprintf(ptq1_suffix, sizeof(ptq1_suffix), "_mc_c%d", nr1);
                     suffix = ptq1_suffix;
                 }
-            } break;
+            }
+            break;
         case GGML_TYPE_Q4_0:
             {
                 nsg = N_SG_Q4_0;
