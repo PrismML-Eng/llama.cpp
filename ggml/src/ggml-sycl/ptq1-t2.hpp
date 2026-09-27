@@ -9,6 +9,8 @@
 
 // GGML_SYCL_PTQ1_T2: "ffn" = ffn_gate/ffn_up/ffn_down weights, "all" = every PTQ1_0 weight (tests), unset = off
 bool   ggml_sycl_t2_wants(const char * name, int64_t K, int64_t N);
+// Xe2 or newer (16-lane DPAS incl. the int8 x int2 / int8 x int4 builtins): Arc B-series, Lunar Lake, Panther Lake
+bool   ggml_sycl_device_is_xe2();
 // device bytes of the repacked weight: 2-bit codes [K/16, N] u32 + fp16 scales [K/128, N]
 size_t ggml_sycl_t2_bytes(int64_t K, int64_t N);
 // in place: data holds N rows of K/128 block_ptq1_0 (pq2 = false) or block_pq2_0 (pq2 = true) as uploaded, and at least

@@ -64,15 +64,20 @@ void * scratch_get(sycl::queue & q, size_t bytes) {
 
 // the kernels use 16-lane DPAS (Xe2 and newer); Xe-LPG(+) / Alchemist XMX is 8 lanes and has no such kernels, so fall back
 // to the regular path with one warning instead of failing at the first launch. GGML_SYCL_PTQ1_T2_ANYGPU=1 skips the check.
+bool ggml_sycl_device_is_xe2() {
+    const auto & hw = ggml_sycl_info().devices[ggml_sycl_get_device()].hw_info;
+    return hw.arch == gpu_arch::intel_gpu_bmg_g21 || hw.arch == gpu_arch::intel_gpu_bmg_g31 ||
+           hw.arch == gpu_arch::intel_gpu_lnl_m || hw.arch == gpu_arch::intel_gpu_ptl_h ||
+           hw.arch == gpu_arch::intel_gpu_ptl_u || hw.arch == gpu_arch::intel_gpu_wcl;
+}
+
 static bool t2_device_ok() {
     static const bool ok = [] {
         if (getenv("GGML_SYCL_PTQ1_T2_ANYGPU")) {
             return true;
         }
         const auto & hw = ggml_sycl_info().devices[ggml_sycl_get_device()].hw_info;
-        const bool xe2 = hw.arch == gpu_arch::intel_gpu_bmg_g21 || hw.arch == gpu_arch::intel_gpu_bmg_g31 ||
-                         hw.arch == gpu_arch::intel_gpu_lnl_m || hw.arch == gpu_arch::intel_gpu_ptl_h ||
-                         hw.arch == gpu_arch::intel_gpu_ptl_u || hw.arch == gpu_arch::intel_gpu_wcl;
+        const bool xe2 = ggml_sycl_device_is_xe2();
         if (!xe2) {
             GGML_LOG_WARN("%s: GGML_SYCL_PTQ1_T2 needs an Xe2 or newer GPU (Arc B-series, Lunar Lake, Panther Lake); "
                           "%s is not one, using the regular path\n", __func__, hw.name.c_str());

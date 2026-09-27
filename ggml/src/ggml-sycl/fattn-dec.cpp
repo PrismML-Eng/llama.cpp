@@ -15,6 +15,7 @@
 #include "common.hpp"
 #include "fattn-common.hpp"
 #include "fattn-dec.hpp"
+#include "ptq1-t2.hpp"
 #include <cfloat>
 
 namespace {
@@ -967,7 +968,15 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
 static int fattn_dec_dpas_maxq() {  // 0 = DPAS kernel off; else it serves 1 .. maxq query tokens
     static const int v = [] {
         const char * e = getenv("GGML_SYCL_FA_DEC_DPAS");
-        return e ? atoi(e) : 0;
+        int          n = e ? atoi(e) : 0;
+        // the kernel needs Xe2's 16-lane int8 x int4 DPAS; elsewhere fall back instead of failing at the first launch
+        if (n && !getenv("GGML_SYCL_FA_DEC_DPAS_ANYGPU") && !ggml_sycl_device_is_xe2()) {
+            GGML_LOG_WARN("%s: GGML_SYCL_FA_DEC_DPAS needs an Xe2 or newer GPU (Arc B-series, Lunar Lake, Panther Lake); "
+                          "%s is not one, using the regular decode attention\n", __func__,
+                          ggml_sycl_info().devices[ggml_sycl_get_device()].hw_info.name.c_str());
+            n = 0;
+        }
+        return n;
     }();
     return v == 1 ? 32 : v;  // =1 -> default cap
 }
