@@ -10348,6 +10348,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
         }
     }
+    // ARC-LAB: oneDNN / MKL prompt-FA correctness sweep in the real cache layout (a report showed kv=1025 / 4096 failing)
+    for (int64_t kv : {1024, 1025, 2048, 3072, 4095, 4096, 4097, 6144, 8192}) {
+        for (int64_t nb : {33, 64, 512}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
+        }
+    }
     // ARC-LAB: Intel prompt FA (Vulkan fa_pf_gqa): prompt batches at the Bonsai shape, f16 and q4_0 (f16 scratch), both layouts
     for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_Q4_0}) {
         for (int64_t nb : {16, 37, 64}) {

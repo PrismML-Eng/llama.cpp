@@ -172,6 +172,11 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         // (nb1 == H * ne0*2). Only pathological test strides like nb1=32 or
         // nb1=75 for ne0=40 fall through to TILE.
         bool kv_strides_ok = true;
+        for (const ggml_tensor * t : {K, V}) {  // ARC-LAB: interleaved heads must be packed (see fattn-onednn.cpp)
+            if (t->nb[2] < t->nb[1] && t->nb[1] != t->nb[2] * t->ne[2]) {
+                kv_strides_ok = false;
+            }
+        }
         for (const ggml_tensor * t : {K, V}) {
             if (t->type == GGML_TYPE_F16 && t->nb[1] % (t->ne[0] * 2) != 0) {
                 kv_strides_ok = false;

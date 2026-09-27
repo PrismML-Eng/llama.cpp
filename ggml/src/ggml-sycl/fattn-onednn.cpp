@@ -27,6 +27,15 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst) {
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
 
+    // ARC-LAB: heads interleaved per token (llama.cpp's KV-cache view, nb[2] < nb[1]) must be packed: the SDPA / dequant
+    // paths derive the token stride from the head count. A gap between tokens (test-backend-ops kv_view + permute) read
+    // the wrong rows (ERR ~1.2); the real cache is always packed. See ggml-org#27769.
+    for (const ggml_tensor * t : {K, V}) {
+        if (t->nb[2] < t->nb[1] && t->nb[1] != t->nb[2] * t->ne[2]) {
+            return false;
+        }
+    }
+
     // F16 KV: native SDPA at any KV length.
     // Non-F16: dequant to F16 then SDPA at prefill lengths. Only the
     // standard quantized KV cache types (Q4_0-Q8_0) and F32 are accepted
