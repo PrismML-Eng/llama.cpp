@@ -2783,7 +2783,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                // the caller's per-draft cap (the server's depth-dependent draft size) as well as the global one
+                if (params.n_max <= (int) result.size() || (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -3535,8 +3536,26 @@ common_speculative_init_result::common_speculative_init_result(
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }
 
-    // the draft context holds as many tokens per sequence as the target context
+    // the draft context holds as many tokens per sequence as the target context, unless the MTP draft only
+    // ever sees a bounded part of the sequence: the last --spec-draft-window rows (the server drops older ones
+    // before each batch), or rows up to --spec-draft-depth-max (never fed past it). Sizing it for that keeps
+    // its cache small; with the window its cells are reused and its attention span stays that short.
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
+    if (spec_mtp) {
+        const int32_t window    = params.speculative.draft.n_window;
+        const int32_t depth_max = params.speculative.draft.n_depth_max;
+        const int32_t span      = window > 0 ? window : depth_max;
+        if (span > 0) {
+            const uint32_t n_seq  = std::max<uint32_t>(1, cparams.n_seq_max);
+            const uint32_t need   = (uint32_t) span + 2*std::max<uint32_t>(cparams.n_batch, cparams.n_ubatch) + 256;
+            const uint32_t capped = GGML_PAD(need, 256) * n_seq;
+            if (capped < cparams.n_ctx) {
+                LOG_INF("%s: draft context sized to %u tokens (%s %d, target %u)\n", __func__, capped,
+                        window > 0 ? "spec-draft-window" : "spec-draft-depth-max", span, cparams.n_ctx);
+                cparams.n_ctx = capped;
+            }
+        }
+    }
 
     // n_rs_seq stays as common_context_params_to_llama set it: the draft context needs the same rollback window as the target, with n_rs_seq == 0 its seq_rm fails silently on partial acceptance and keeps stale positions
     cparams.ctx_other = ctx_tgt;
