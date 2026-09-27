@@ -2971,6 +2971,138 @@ inline void ggml_sycl_op_argsort(ggml_backend_sycl_context & ctx, ggml_tensor * 
                          main_stream, ctx.device, ctx.pool());
 }
 
+// ARC-LAB: two-pass top-k for long rows (the MTP draft picks its tokens from the 248K-entry vocabulary: the one-group
+// kernel above took ~550 us per call on the B580, one work-group on one Xe core plus a serial merge by one thread).
+// Pass 1: up to 256 groups per row, each thread keeps a sorted top-k of a strided slice in registers, then the group
+// merges its 256 lists pairwise in local memory (log2 steps of an O(k) merge). Pass 2: one group per row merges the
+// per-group winners the same way. Ties keep the lower index.
+namespace topk2 {
+constexpr int WG = 256;
+
+template <int K>
+static inline void insert(float (&v)[K], int (&ix)[K], const int k, const float val, const int idx) {
+    if (!(val > v[k - 1] || (val == v[k - 1] && idx < ix[k - 1] && ix[k - 1] >= 0))) {
+        return;
+    }
+    int pos = k - 1;
+    while (pos > 0 && (val > v[pos - 1] || (val == v[pos - 1] && idx < ix[pos - 1]))) {
+        v[pos]  = v[pos - 1];
+        ix[pos] = ix[pos - 1];
+        pos--;
+    }
+    v[pos]  = val;
+    ix[pos] = idx;
+}
+
+// merge the sorted lists of threads [0, WG) in sv/si (stride k) down to thread 0; every thread calls it
+template <int K>
+static inline void tree_merge(const sycl::nd_item<2> & it, float * sv, int * si, const int k, const int tid) {
+    for (int s = WG / 2; s > 0; s >>= 1) {
+        float mv[K];
+        int   mi[K];
+        if (tid < s) {
+            const float * av = sv + tid * k;
+            const int *   ai = si + tid * k;
+            const float * bv = sv + (tid + s) * k;
+            const int *   bi = si + (tid + s) * k;
+            int a = 0, b = 0;
+            for (int o = 0; o < k; ++o) {
+                const bool take_a = av[a] > bv[b] || (av[a] == bv[b] && (bi[b] < 0 || (ai[a] >= 0 && ai[a] < bi[b])));
+                if (take_a) {
+                    mv[o] = av[a];
+                    mi[o] = ai[a];
+                    ++a;
+                } else {
+                    mv[o] = bv[b];
+                    mi[o] = bi[b];
+                    ++b;
+                }
+            }
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+        if (tid < s) {
+            for (int o = 0; o < k; ++o) {
+                sv[tid * k + o] = mv[o];
+                si[tid * k + o] = mi[o];
+            }
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+    }
+}
+
+template <int K>
+static void run(const float * src, int32_t * dst, const int64_t ncols, const int64_t nrows, const int k,
+                ggml_backend_sycl_context & ctx, dpct::queue_ptr q) {
+    const int nblk = (int) std::min<int64_t>(256, (ncols + 2047) / 2048);
+    ggml_sycl_pool_alloc<float> cv(ctx.pool(), (size_t) nrows * nblk * k);
+    ggml_sycl_pool_alloc<int>   ci(ctx.pool(), (size_t) nrows * nblk * k);
+    float * cvp = cv.get();
+    int *   cip = ci.get();
+    q->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> sv(sycl::range<1>(WG * k), cgh);
+        sycl::local_accessor<int, 1>   si(sycl::range<1>(WG * k), cgh);
+        cgh.parallel_for(sycl::nd_range<2>({ (size_t) nrows, (size_t) nblk * WG }, { 1, WG }), [=](sycl::nd_item<2> it) {
+            const int64_t row = it.get_group(0);
+            const int     blk = it.get_group(1);
+            const int     tid = it.get_local_id(1);
+            const float * r   = src + row * ncols;
+            float v[K];
+            int   ix[K];
+            for (int i = 0; i < k; ++i) {
+                v[i]  = -FLT_MAX;
+                ix[i] = -1;
+            }
+            for (int64_t c = (int64_t) blk * WG + tid; c < ncols; c += (int64_t) nblk * WG) {
+                insert<K>(v, ix, k, r[c], (int) c);
+            }
+            float * svp = sv.template get_multi_ptr<sycl::access::decorated::no>().get();
+            int *   sip = si.template get_multi_ptr<sycl::access::decorated::no>().get();
+            for (int i = 0; i < k; ++i) {
+                svp[tid * k + i] = v[i];
+                sip[tid * k + i] = ix[i];
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+            tree_merge<K>(it, svp, sip, k, tid);
+            if (tid < k) {
+                cvp[(row * nblk + blk) * k + tid] = svp[tid];
+                cip[(row * nblk + blk) * k + tid] = sip[tid];
+            }
+        });
+    });
+    q->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> sv(sycl::range<1>(WG * k), cgh);
+        sycl::local_accessor<int, 1>   si(sycl::range<1>(WG * k), cgh);
+        cgh.parallel_for(sycl::nd_range<2>({ (size_t) nrows, (size_t) WG }, { 1, WG }), [=](sycl::nd_item<2> it) {
+            const int64_t row = it.get_group(0);
+            const int     tid = it.get_local_id(1);
+            float v[K];
+            int   ix[K];
+            for (int i = 0; i < k; ++i) {
+                v[i]  = -FLT_MAX;
+                ix[i] = -1;
+            }
+            for (int c = tid; c < nblk * k; c += WG) {
+                const int id = cip[row * nblk * k + c];
+                if (id >= 0) {
+                    insert<K>(v, ix, k, cvp[row * nblk * k + c], id);
+                }
+            }
+            float * svp = sv.template get_multi_ptr<sycl::access::decorated::no>().get();
+            int *   sip = si.template get_multi_ptr<sycl::access::decorated::no>().get();
+            for (int i = 0; i < k; ++i) {
+                svp[tid * k + i] = v[i];
+                sip[tid * k + i] = ix[i];
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+            tree_merge<K>(it, svp, sip, k, tid);
+            if (tid < k) {
+                dst[row * k + tid] = sip[tid];
+            }
+        });
+    });
+}
+}  // namespace topk2
+
 static void ggml_sycl_op_top_k(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
 
@@ -2992,6 +3124,17 @@ static void ggml_sycl_op_top_k(ggml_backend_sycl_context & ctx, ggml_tensor * ds
     GGML_ASSERT(k > 0 && k <= 32);
     GGML_ASSERT(k <= ncols);
 
+    static const bool old_topk = getenv("GGML_SYCL_TOPK_OLD") != nullptr;  // ARC-LAB A/B switch
+    if (!old_topk && ncols >= 8192) {
+        if (k <= 8) {
+            topk2::run<8>(src0_dd, dst_dd, ncols, nrows, k, ctx, main_stream);
+        } else if (k <= 16) {
+            topk2::run<16>(src0_dd, dst_dd, ncols, nrows, k, ctx, main_stream);
+        } else {
+            topk2::run<32>(src0_dd, dst_dd, ncols, nrows, k, ctx, main_stream);
+        }
+        return;
+    }
     top_k_f32_sycl(src0_dd, dst_dd, ncols, nrows, k, main_stream);
 }
 
