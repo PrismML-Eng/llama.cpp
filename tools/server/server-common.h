@@ -310,6 +310,9 @@ struct server_chat_params {
     std::string reasoning_budget_message;
     std::string media_path;
     bool force_pure_content = false;
+    std::vector<std::string> reasoning_effort_allow;    // --reasoning-effort-allow (empty = pass everything)
+    std::string              reasoning_effort_fallback; // --reasoning-effort-fallback
+    int                      reasoning_max_tokens_floor = 0; // --reasoning-max-tokens-floor (0 = off)
 };
 
 // used by /completions endpoint
