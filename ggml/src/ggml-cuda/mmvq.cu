@@ -299,8 +299,15 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (type == GGML_TYPE_PTQ1_0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) {
         // The PT mat-vec path shares the weight decode across columns; with the branch-free PTQ1_0
         // MMQ tile loader the tile path overtakes it at 5+ columns on Ada (RTX 4070, Bonsai 2 27B:
-        // mat-vec 155 t/s vs MMQ 244 t/s at n=8).
-        return ne11 <= 4;
+        // mat-vec 155 t/s vs MMQ 244 t/s at n=8; at n=5 172 vs 162). Under GGML_CUDA_BATCH_INVARIANT every
+        // batch up to MMVQ_MAX_BATCH_SIZE stays on the PT mat-vec, whose per-column arithmetic does not depend
+        // on the column count: a 5-column speculative verify on MMQ would not match the same tokens decoded
+        // alone. GGML_CUDA_PTQ1_MMVQ_MAX overrides the crossover.
+        static const int max_cols = [] {
+            const char * e = getenv("GGML_CUDA_PTQ1_MMVQ_MAX");
+            return e ? atoi(e) : (ggml_cuda_batch_invariant() ? MMVQ_MAX_BATCH_SIZE : 4);
+        }();
+        return ne11 <= max_cols;
     }
 #endif
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
