@@ -69,7 +69,7 @@ XE2_OCL(xe2::ushort8 intel_sub_group_block_read_us8(const XE2_GLOBAL unsigned sh
 // 2D block I/O: (base, width - 1, height - 1, pitch - 1) in bytes, coord (x
 // in elements, y in rows). mRkCvV = R rows x C columns x V blocks.
 #define XE2_2D_RD(ret, sfx) \
-    XE2_IB(ret __builtin_IB_subgroup_block_read_flat_##sfx(long base, int w, int h, int p, xe2::int2 c));
+    XE2_IB(ret __builtin_IB_subgroup_block_read_flat_##sfx(long long base, int w, int h, int p, xe2::int2 c));
 XE2_2D_RD(unsigned, u32_m1k16v1)
 XE2_2D_RD(xe2::uint2, u32_m2k16v1)
 XE2_2D_RD(xe2::uint8, u32_m8k16v1)
@@ -78,12 +78,12 @@ XE2_2D_RD(xe2::ushort2, u16_m1k16v2)
 XE2_2D_RD(xe2::ushort8, u16_m8k16v1)
 XE2_2D_RD(xe2::ushort16, u16_m8k16v2)
 #undef XE2_2D_RD
-XE2_IB(void __builtin_IB_subgroup_block_write_flat_u16_m8k16v1(long base, int w, int h, int p,
+XE2_IB(void __builtin_IB_subgroup_block_write_flat_u16_m8k16v1(long long base, int w, int h, int p,
         xe2::int2 c, xe2::ushort8 v));
-XE2_IB(void __builtin_IB_subgroup_block_write_flat_u32_m8k16v1(long base, int w, int h, int p,
+XE2_IB(void __builtin_IB_subgroup_block_write_flat_u32_m8k16v1(long long base, int w, int h, int p,
         xe2::int2 c, xe2::uint8 v));
 // cache control 0 = default
-XE2_IB(void __builtin_IB_subgroup_block_read_prefetch_u32_m8k16v1(long base, int w, int h, int p,
+XE2_IB(void __builtin_IB_subgroup_block_read_prefetch_u32_m8k16v1(long long base, int w, int h, int p,
         xe2::int2 c, int cc));
 // per-lane LSC load with cache control (IGC LSC_LDCC: 4 = L1 cached, L3 cached)
 XE2_IB(xe2::uint3 __builtin_IB_lsc_load_global_uint3(const XE2_GLOBAL xe2::uint3 *p, int imm_off, int cc));
@@ -92,10 +92,10 @@ namespace xe2 {
 
 // 2D surface: width and pitch in bytes, height in rows
 struct surf {
-    long base;
+    long long base;
     int w, h, p;
     surf(const void *b, int width_bytes, int height, int pitch_bytes)
-        : base((long)b), w(width_bytes - 1), h(height - 1), p(pitch_bytes - 1) {}
+        : base((long long)b), w(width_bytes - 1), h(height - 1), p(pitch_bytes - 1) {}
 };
 
 inline unsigned rd_32b_1r16(const surf &s, int x, int y) {
