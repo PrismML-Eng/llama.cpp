@@ -27,6 +27,10 @@ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
 
+// device buffer whose buffers keep vram_frac of each of n_parts equal parts in VRAM and the remainder in
+// pinned host memory mapped into the same device address range (CUDA VMM). nullptr without VMM.
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_tier_buffer_type(int device, double vram_frac, int n_parts, const char * tag);
+
 // conduct allreduce operation between devices
 GGML_BACKEND_API bool ggml_backend_cuda_allreduce_tensor(ggml_backend_t * backends, struct ggml_tensor ** tensors, size_t n_backends);
 
