@@ -1018,7 +1018,7 @@ static size_t ggml_backend_sycl_buffer_type_get_alloc_size(ggml_backend_buffer_t
         }
     }
     // ARC-LAB: room for the in-place TernSYCL 2-bit repack (GGML_SYCL_PTQ1_T2)
-    if (tensor->type == GGML_TYPE_PTQ1_0 && tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+    if ((tensor->type == GGML_TYPE_PTQ1_0 || tensor->type == GGML_TYPE_PQ2_0) && tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
         ggml_sycl_t2_wants(tensor->name, tensor->ne[0], tensor->ne[1])) {
         size = std::max(size, ggml_sycl_t2_bytes(tensor->ne[0], tensor->ne[1]));
     }
@@ -4812,7 +4812,7 @@ static void ggml_sycl_mul_mat_bf16_small(ggml_backend_sycl_context & ctx, const 
 // ARC-LAB: PTQ1_0 weights chosen by GGML_SYCL_PTQ1_T2 are repacked in place (their buffer was sized for it) on first use
 // and from then on only this path may read them.
 static bool ggml_sycl_t2_tensor(const ggml_tensor * w) {
-    if (w->type != GGML_TYPE_PTQ1_0 || w->ne[2] != 1 || w->ne[3] != 1 || !w->extra) {
+    if ((w->type != GGML_TYPE_PTQ1_0 && w->type != GGML_TYPE_PQ2_0) || w->ne[2] != 1 || w->ne[3] != 1 || !w->extra) {
         return false;
     }
     const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(w->extra);
@@ -4832,7 +4832,10 @@ static bool ggml_sycl_t2_mul_mat_try(ggml_backend_sycl_context & ctx, const ggml
     GGML_ASSERT(src1->ne[3] == 1 && (src1->ne[2] == 1 || src1->nb[2] == src1->ne[1] * src1->nb[1]));
     dpct::queue_ptr stream = ctx.stream();
     if (!extra->optimized_feature.t2) {
-        ggml_sycl_t2_repack(*stream, src0->data, K, N);
+        if (!ggml_sycl_t2_repack(*stream, src0->data, K, N, src0->type == GGML_TYPE_PQ2_0)) {
+            GGML_ABORT("PQ2_0 tensor %s uses code 3 (+2), which the 2-bit XMX layout cannot hold: unset GGML_SYCL_PTQ1_T2",
+                       src0->name);
+        }
         extra->optimized_feature.t2 = true;
     }
     // tokens: ne[1] x ne[2] rows of K floats (row stride nb[1]; planes back to back)

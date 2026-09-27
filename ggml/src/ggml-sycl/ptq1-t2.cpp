@@ -80,54 +80,70 @@ namespace {
 void t2_precompile(sycl::queue & q);
 }
 
-void ggml_sycl_t2_repack(sycl::queue & q, void * data, int64_t K, int64_t N) {
+bool ggml_sycl_t2_repack(sycl::queue & q, void * data, int64_t K, int64_t N, bool pq2) {
     static std::once_flag compiled;
     std::call_once(compiled, [&] { t2_precompile(q); });
     const int64_t nb        = K / QK;
-    const size_t  src_bytes = (size_t) N * nb * BLK_BYTES;
+    const int64_t blk_bytes = pq2 ? 34 : BLK_BYTES;  // block_pq2_0: fp16 d, then 32 bytes of 2-bit codes
+    const size_t  src_bytes = (size_t) N * nb * blk_bytes;
     uint8_t *     tmp       = (uint8_t *) sycl::malloc_device(src_bytes, q);
     if (!tmp) {
         fprintf(stderr, "%s: no device memory for a %zu-byte repack buffer\n", __func__, src_bytes);
         abort();
     }
     q.memcpy(tmp, data, src_bytes).wait();
-    uint32_t * B  = (uint32_t *) data;
-    uint16_t * SB = (uint16_t *) ((char *) data + (size_t) (K / 16) * N * 4);
+    uint32_t * B   = (uint32_t *) data;
+    uint16_t * SB  = (uint16_t *) ((char *) data + (size_t) (K / 16) * N * 4);
+    int *      bad = sycl::malloc_device<int>(1, q);
+    q.memset(bad, 0, sizeof(int)).wait();
     q.parallel_for(sycl::range<2>((size_t) (K / 16), (size_t) N), [=](sycl::item<2> it) {
          const int64_t   kp = it[0], n = it[1];
          const int64_t   g  = kp / 8;
-         const uint8_t * b  = tmp + (n * nb + g) * BLK_BYTES;
+         const uint8_t * b  = tmp + (n * nb + g) * blk_bytes;
          const int       e0 = (int) (kp % 8) * 16;
          uint32_t        w  = 0;
          for (int j = 0; j < 16; ++j) {
              const int e = e0 + j;
-             uint32_t  v;
-             int       lvl;
-             if (e < 80) {
-                 v   = b[e % 16];
-                 lvl = e / 16;
-             } else if (e < 120) {
-                 v   = b[16 + (e - 80) % 8];
-                 lvl = (e - 80) / 8;
+             uint32_t  digit;  // weight = digit - 1
+             if (pq2) {
+                 digit = (b[2 + e / 4] >> (2 * (e % 4))) & 3u;
+                 if (digit == 3u) {
+                     *bad = 1;
+                     digit = 2u;
+                 }
              } else {
-                 v   = b[24 + (e - 120) % 2];
-                 lvl = (e - 120) / 2;
+                 uint32_t v;
+                 int      lvl;
+                 if (e < 80) {
+                     v   = b[e % 16];
+                     lvl = e / 16;
+                 } else if (e < 120) {
+                     v   = b[16 + (e - 80) % 8];
+                     lvl = (e - 80) / 8;
+                 } else {
+                     v   = b[24 + (e - 120) % 2];
+                     lvl = (e - 120) / 2;
+                 }
+                 digit = 0;
+                 for (int t = 0; t <= lvl; ++t) {  // base-3 fixed-point digits, as ptq1_0_decode_block
+                     const uint32_t x = v * 3;
+                     digit            = x >> 8;
+                     v                = x & 0xFF;
+                 }
              }
-             uint32_t digit = 0;
-             for (int t = 0; t <= lvl; ++t) {  // base-3 fixed-point digits, as ptq1_0_decode_block
-                 const uint32_t x = v * 3;
-                 digit            = x >> 8;
-                 v                = x & 0xFF;
-             }
-             const uint32_t code = digit == 2 ? 1u : (digit == 1 ? 0u : 3u);  // weight = digit - 1, 2-bit two's complement
+             const uint32_t code = digit == 2 ? 1u : (digit == 1 ? 0u : 3u);  // 2-bit two's complement of digit - 1
              w |= code << (2 * j);
          }
          B[kp * N + n] = w;
          if (kp % 8 == 0) {
-             SB[g * N + n] = (uint16_t) (b[26] | (b[27] << 8));
+             SB[g * N + n] = pq2 ? (uint16_t) (b[0] | (b[1] << 8)) : (uint16_t) (b[26] | (b[27] << 8));
          }
      }).wait();
+    int bad_h = 0;
+    q.memcpy(&bad_h, bad, sizeof(int)).wait();
+    sycl::free(bad, q);
     sycl::free(tmp, q);
+    return bad_h == 0;
 }
 
 namespace {
