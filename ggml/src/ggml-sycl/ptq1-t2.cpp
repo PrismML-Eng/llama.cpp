@@ -4,6 +4,7 @@
 // feed the s8 x s2 DPAS directly. B580 standalone, 2 GiB rotating weights: 17408x5120 m=1 56 us, m=4 61 us (vs 70 /
 // ~100 in-model for PTQ1_0). The weight grows 31%; activations become int8 with one fp16 scale per 128 (q8_1 is per 32).
 #include "ptq1-t2.hpp"
+#include "common.hpp"
 
 #include "ternsycl/int2_int8_dpas.hpp"
 
@@ -61,9 +62,29 @@ void * scratch_get(sycl::queue & q, size_t bytes) {
 
 }  // namespace
 
+// the kernels use 16-lane DPAS (Xe2 and newer); Xe-LPG(+) / Alchemist XMX is 8 lanes and has no such kernels, so fall back
+// to the regular path with one warning instead of failing at the first launch. GGML_SYCL_PTQ1_T2_ANYGPU=1 skips the check.
+static bool t2_device_ok() {
+    static const bool ok = [] {
+        if (getenv("GGML_SYCL_PTQ1_T2_ANYGPU")) {
+            return true;
+        }
+        const auto & hw = ggml_sycl_info().devices[ggml_sycl_get_device()].hw_info;
+        const bool xe2 = hw.arch == gpu_arch::intel_gpu_bmg_g21 || hw.arch == gpu_arch::intel_gpu_bmg_g31 ||
+                         hw.arch == gpu_arch::intel_gpu_lnl_m || hw.arch == gpu_arch::intel_gpu_ptl_h ||
+                         hw.arch == gpu_arch::intel_gpu_ptl_u || hw.arch == gpu_arch::intel_gpu_wcl;
+        if (!xe2) {
+            GGML_LOG_WARN("%s: GGML_SYCL_PTQ1_T2 needs an Xe2 or newer GPU (Arc B-series, Lunar Lake, Panther Lake); "
+                          "%s is not one, using the regular path\n", __func__, hw.name.c_str());
+        }
+        return xe2;
+    }();
+    return ok;
+}
+
 bool ggml_sycl_t2_wants(const char * name, int64_t K, int64_t N) {
     const int mode = t2_mode();
-    if (mode == 0 || K % QK != 0 || N % 16 != 0) {
+    if (mode == 0 || K % QK != 0 || N % 16 != 0 || !t2_device_ok()) {
         return false;
     }
     if (mode == 2) {
