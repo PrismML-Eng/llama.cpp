@@ -396,6 +396,12 @@ extern "C" {
         // see tools/kv-mean-center to generate this file and docs/kv-mean-center.md for details.
         const char * path_kv_mean_center;
 
+        // tiered KV cache [EXPERIMENTAL]: keep only the first n_kv_vram_cells cells of each K/V tensor in
+        // device memory and the rest in pinned host memory mapped into the same device range (CUDA VMM), so
+        // the context can be larger than what fits in VRAM. Positions past the line are read over PCIe, only
+        // once a sequence is that deep. Output is identical to an all-device cache. 0 = all in device memory.
+        uint32_t n_kv_vram_cells;
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution
