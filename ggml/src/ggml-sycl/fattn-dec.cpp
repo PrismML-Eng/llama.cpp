@@ -681,11 +681,303 @@ static void fattn_dec_q4_0_xmx(const char * Q, const char * K, const char * V, c
     });
 }
 
+
+// ARC-LAB DPAS kernel (GGML_SYCL_FA_DEC_DPAS=1): the q4_0 cache feeds the XMX units without any dequantization pass.
+//   Q.K: s8 x s4 DPAS (intel_sub_group_i8_i4_matrix_mad_k32, not in the public extension spec but provided by IGC on Xe2).
+//        A = Q rows as int8 (one RNE scale per row per 32-dim block, computed once per call), B = the raw 16 bytes of a key's
+//        q4_0 block XOR 0x88888888 (u4 n+8 -> s4 n), one key per lane. q4_0 byte i holds dims i and i+16, so A's k = 2i+h
+//        is dim i + 16h: lane l's A short = (Q[l], Q[l + 16]). S += int result * dq[row] * dk[key].
+//   P.V: f16 DPAS (k16) with P from SLM (A layout) and V dequantized in registers by the subgroup that owns 16 head dims.
+// Query tokens beyond NQ are handled by extra work-groups (grid dim 0 = sequence x token chunk), each reading the KV again.
+namespace {
+typedef short    dp_short8 __attribute__((ext_vector_type(8)));
+typedef int      dp_int4   __attribute__((ext_vector_type(4)));
+typedef int      dp_int8   __attribute__((ext_vector_type(8)));
+typedef float    dp_float8 __attribute__((ext_vector_type(8)));
+typedef unsigned dp_uint4  __attribute__((ext_vector_type(4)));
+}
+#ifdef __SYCL_DEVICE_ONLY__
+SYCL_EXTERNAL dp_int8   intel_sub_group_i8_i4_matrix_mad_k32(dp_short8 a, dp_int4 b, dp_int8 acc);
+SYCL_EXTERNAL dp_float8 intel_sub_group_f16_f16_matrix_mad_k16(dp_short8 a, dp_int8 b, dp_float8 acc);
+#else
+inline dp_int8   intel_sub_group_i8_i4_matrix_mad_k32(dp_short8, dp_int4, dp_int8) { __builtin_unreachable(); }
+inline dp_float8 intel_sub_group_f16_f16_matrix_mad_k16(dp_short8, dp_int8, dp_float8) { __builtin_unreachable(); }
+#endif
+
+template <int G, int NQ, int KG, int TC>
+static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, const char * mask, float * dst,
+                                float * parts, sycl::float2 * meta, float scale, int ne01, int ne02, int ne11,
+                                int nkvh, int ne03, int64_t nb01, int64_t nb02, int64_t nb03, int64_t nb11,
+                                int64_t nb12, int64_t nb13, int64_t nb21, int64_t nb22, int64_t nb23, int64_t nb31,
+                                int64_t nb33, int ne33, int nsplit, int chunk, dpct::queue_ptr stream) {
+    constexpr int R    = G * NQ;             // query rows per KV head and token chunk
+    constexpr int RT   = (R + 7) / 8;        // 8-row DPAS tiles
+    constexpr int RP   = RT * 8;
+    constexpr int TK   = 16 * KG;            // keys per tile (KG groups of 16, one key per lane)
+    constexpr int NB   = DEC_D / QK4_0;      // 8 blocks per row
+    constexpr int NSG  = DEC_WG / 16;        // 16 subgroups
+    constexpr int NCH  = (RT + TC - 1) / TC; // row-tile chunks per key group in the Q.K phase
+    constexpr int RW   = DEC_D / QK4_0 * (int) sizeof(block_q4_0) / 4;  // 36 dwords per q4_0 row
+    constexpr int R16  = (R + 15) / 16 * 16; // P.V computes O^T = V^T P^T: rows are the 16-wide N side
+    constexpr int RT16 = R16 / 16;
+    constexpr int PS   = TK + 16;            // f16 row stride of P ([row][key]); 32-byte aligned rows, fewer bank conflicts
+    static_assert(DEC_D / 16 == NSG && RW == 36, "shape");
+    const int nqc = (ne01 + NQ - 1) / NQ;    // token chunks
+    static const int probe_env = getenv("GGML_SYCL_FA_DEC_DPAS_PROBE") ? atoi(getenv("GGML_SYCL_FA_DEC_DPAS_PROBE")) : 0;
+    const int        probe     = probe_env;  // phase probe: bit0 skip Q.K, bit1 skip P.V, bit2 skip softmax
+
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<dp_short8, 1> sQ8(sycl::range<1>(RT * NB * 16), cgh);   // [tile][block][lane] -> 8 rows
+        sycl::local_accessor<dp_float8, 1> sDQ(sycl::range<1>(RT * NB), cgh);       // [tile][block] -> 8 rows
+        sycl::local_accessor<float, 1>     sS(sycl::range<1>(RP * TK), cgh);        // [row][key]
+        sycl::local_accessor<dp_int8, 1>   sP(sycl::range<1>(R16 * PS / 16), cgh);   // P f16 [row][key], rows of PS halves
+        sycl::local_accessor<float, 1>     sM(sycl::range<1>(R16), cgh);
+        sycl::local_accessor<float, 1>     sL(sycl::range<1>(R16), cgh);
+        sycl::local_accessor<float, 1>     sA(sycl::range<1>(R16), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<3>(sycl::range<3>((size_t) ne03 * nqc, nkvh, (size_t) nsplit * DEC_WG), sycl::range<3>(1, 1, DEC_WG)),
+            [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] {
+                const int tid   = it.get_local_id(2);
+                const int split = it.get_group(2);
+                const int kvh   = it.get_group(1);
+                const int seq   = it.get_group(0) / nqc;
+                const int c0    = (it.get_group(0) % nqc) * NQ;   // first query token of this chunk
+                auto      sg    = it.get_sub_group();
+                const int w     = tid / 16;
+                const int lane  = tid % 16;
+                short *   sQs   = (short *) &sQ8[0];
+                short *   sPs   = (short *) &sP[0];
+
+                // Q -> int8 per (row, block), RNE; padded rows / tokens past ne01 are zero
+                for (int e = tid; e < RP * NB; e += DEC_WG) {
+                    const int r = e / NB, b = e % NB, c = c0 + r / G, g = r % G;
+                    float     x[QK4_0];
+                    float     amax = 0.0f;
+                    const bool real = r < R && c < ne01;
+                    const float * qr = (const float *) (Q + seq * nb03 + (int64_t) c * nb01 + (int64_t) (kvh * G + g) * nb02) + b * QK4_0;
+#pragma unroll
+                    for (int i = 0; i < QK4_0; ++i) {
+                        x[i] = real ? qr[i] * scale : 0.0f;
+                        amax = sycl::fmax(amax, sycl::fabs(x[i]));
+                    }
+                    const float dq = amax / 127.0f;
+                    const float iq = amax > 0.0f ? 127.0f / amax : 0.0f;
+                    const int t = r / 8, m = r % 8;
+                    ((float *) &sDQ[0])[(t * NB + b) * 8 + m] = dq;
+#pragma unroll
+                    for (int l = 0; l < 16; ++l) {
+                        const int lo = (int) sycl::rint(x[l] * iq), hi = (int) sycl::rint(x[l + 16] * iq);
+                        sQs[((t * NB + b) * 16 + l) * 8 + m] = (short) ((lo & 0xFF) | ((hi & 0xFF) << 8));
+                    }
+                }
+                for (int e = tid; e < R16 * PS; e += DEC_WG) {
+                    sPs[e] = 0;  // padded rows keep P = 0
+                }
+                if (tid < R16) {
+                    sM[tid] = DEC_MINF;
+                    sL[tid] = 0.0f;
+                    sA[tid] = 1.0f;
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+
+                const int k_begin = split * chunk;
+                const int k_end   = sycl::min(k_begin + chunk, ne11);
+                const char * Kh = K + seq * nb13 + kvh * nb12;
+                const char * Vh = V + seq * nb23 + kvh * nb22;
+                const sycl::half * mrow = mask ? (const sycl::half *) (mask + (seq % ne33) * nb33) : nullptr;
+
+                // O^T accumulators: subgroup w owns head dims 16 w .. +15 (two 8-dim tiles), lane = query row
+                dp_float8 o[RT16][2];
+#pragma unroll
+                for (int t = 0; t < RT16; ++t) {
+                    o[t][0] = 0.0f;
+                    o[t][1] = 0.0f;
+                }
+                // those dims are the (w % 2) nibbles of qs bytes 0..15 of V block w / 2
+                const int vb = w / 2, vsh = (w % 2) * 4;
+
+                for (int t0 = k_begin; t0 < k_end; t0 += TK) {
+                    // ---- S = Q K^T: job = (key group, chunk of TC row tiles)
+                    for (int job = w; job < ((probe & 1) ? 0 : KG * NCH); job += NSG) {
+                        const int  kg = job % KG, ch = job / KG;
+                        const int  j  = t0 + kg * 16 + lane;
+                        const bool jv = j < k_end;
+                        const dp_uint4 * kr = (const dp_uint4 *) (Kh + (int64_t) (jv ? j : k_begin) * nb11);
+                        uint32_t row[RW];
+#pragma unroll
+                        for (int i = 0; i < RW / 4; ++i) {
+                            const dp_uint4 v4 = kr[i];
+                            row[4 * i] = v4[0]; row[4 * i + 1] = v4[1]; row[4 * i + 2] = v4[2]; row[4 * i + 3] = v4[3];
+                        }
+                        dp_float8 s[TC];
+#pragma unroll
+                        for (int tt = 0; tt < TC; ++tt) {
+                            s[tt] = 0.0f;
+                        }
+#pragma unroll
+                        for (int b = 0; b < NB; ++b) {
+                            // block b = bytes 18 b .. 18 b + 17: fp16 scale, then 16 bytes of nibbles
+                            const int o0 = 18 * b;  // even b: dword aligned; odd b: 2 bytes in
+                            uint32_t sc, q0, q1, q2, q3;
+                            if ((o0 & 3) == 0) {
+                                const int wd = o0 / 4;
+                                sc = row[wd] & 0xFFFFu;
+                                q0 = (row[wd] >> 16) | (row[wd + 1] << 16);
+                                q1 = (row[wd + 1] >> 16) | (row[wd + 2] << 16);
+                                q2 = (row[wd + 2] >> 16) | (row[wd + 3] << 16);
+                                q3 = (row[wd + 3] >> 16) | (row[wd + 4] << 16);
+                            } else {
+                                const int wd = o0 / 4;  // scale in the high half of row[wd]
+                                sc = row[wd] >> 16;
+                                q0 = row[wd + 1]; q1 = row[wd + 2]; q2 = row[wd + 3]; q3 = row[wd + 4];
+                            }
+                            const float   dk = static_cast<float>(sycl::bit_cast<sycl::half>((uint16_t) sc));
+                            const dp_int4 bv = { (int) (q0 ^ 0x88888888u), (int) (q1 ^ 0x88888888u),
+                                                 (int) (q2 ^ 0x88888888u), (int) (q3 ^ 0x88888888u) };
+#pragma unroll
+                            for (int tt = 0; tt < TC; ++tt) {
+                                const int t = ch * TC + tt;
+                                if (t < RT) {
+                                    const dp_int8   ia = intel_sub_group_i8_i4_matrix_mad_k32(sQ8[(t * NB + b) * 16 + lane], bv, (dp_int8) (0));
+                                    const dp_float8 sc8 = sDQ[t * NB + b] * dk;  // one broadcast vector load per tile and block
+                                    s[tt] += __builtin_convertvector(ia, dp_float8) * sc8;
+                                }
+                            }
+                        }
+#pragma unroll
+                        for (int tt = 0; tt < TC; ++tt) {
+                            const int t = ch * TC + tt;
+                            if (t < RT) {
+#pragma unroll
+                                for (int m = 0; m < 8; ++m) {
+                                    const int r = t * 8 + m, c = c0 + r / G;
+                                    if (r < R) {
+                                        const bool ok = jv && c < ne01;
+                                        const float mv = (ok && mrow) ? static_cast<float>(mrow[((int64_t) c * nb31) / (int64_t) sizeof(sycl::half) + j]) : 0.0f;
+                                        sS[r * TK + kg * 16 + lane] = ok ? s[tt][m] + mv : -INFINITY;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    it.barrier(sycl::access::fence_space::local_space);
+
+                    // ---- online softmax per row -> P (f16, DPAS A layout)
+                    for (int r = w; r < ((probe & 4) ? 0 : R); r += NSG) {
+                        float sv[KG];
+                        float mt = -INFINITY;
+#pragma unroll
+                        for (int i = 0; i < KG; ++i) {
+                            sv[i] = sS[r * TK + i * 16 + lane];
+                            mt    = sycl::fmax(mt, sv[i]);
+                        }
+                        mt = sycl::reduce_over_group(sg, mt, sycl::maximum<float>());
+                        const float m_old = sM[r];
+                        const float m_new = sycl::fmax(m_old, mt);
+                        float       lt    = 0.0f;
+#pragma unroll
+                        for (int i = 0; i < KG; ++i) {
+                            const float pv = sycl::native::exp(sv[i] - m_new);
+                            sPs[r * PS + i * 16 + lane] = (short) sycl::bit_cast<uint16_t>(sycl::half(pv));
+                            lt += pv;
+                        }
+                        lt = sycl::reduce_over_group(sg, lt, sycl::plus<float>());
+                        if (lane == 0) {
+                            const float a = sycl::native::exp(m_old - m_new);
+                            sA[r] = a;
+                            sL[r] = sL[r] * a + lt;
+                            sM[r] = m_new;
+                        }
+                    }
+                    it.barrier(sycl::access::fence_space::local_space);
+
+                    // ---- O^T = diag(alpha) O^T + V^T P^T: A = V^T (8 dims x 16 keys, lane = key), B = P^T (16 keys x 16 rows)
+#pragma unroll
+                    for (int t = 0; t < RT16; ++t) {
+                        const float a = sA[t * 16 + lane];
+                        o[t][0] *= a;
+                        o[t][1] *= a;
+                    }
+#pragma unroll 1
+                    for (int kg = 0; kg < ((probe & 2) ? 0 : KG); ++kg) {
+                        const int  j  = t0 + kg * 16 + lane;
+                        const bool jv = j < k_end;
+                        const uint32_t * vr = (const uint32_t *) (Vh + (int64_t) (jv ? j : k_begin) * nb21);
+                        const int o0 = 18 * vb, wd = o0 / 4;  // block start; even block: dword aligned, odd: 2 bytes in
+                        const uint32_t w0 = vr[wd], w1 = vr[wd + 1], w2 = vr[wd + 2], w3 = vr[wd + 3], w4 = vr[wd + 4];
+                        uint32_t sc, q[4];
+                        if ((o0 & 3) == 0) {
+                            sc = w0 & 0xFFFFu;
+                            q[0] = (w0 >> 16) | (w1 << 16); q[1] = (w1 >> 16) | (w2 << 16);
+                            q[2] = (w2 >> 16) | (w3 << 16); q[3] = (w3 >> 16) | (w4 << 16);
+                        } else {
+                            sc = w0 >> 16;
+                            q[0] = w1; q[1] = w2; q[2] = w3; q[3] = w4;
+                        }
+                        const float dv = jv ? static_cast<float>(sycl::bit_cast<sycl::half>((uint16_t) sc)) : 0.0f;
+                        dp_short8 va[2];
+#pragma unroll
+                        for (int x = 0; x < 2; ++x) {
+#pragma unroll
+                            for (int m = 0; m < 8; ++m) {
+                                const int byte = x * 8 + m;  // dim 16 w + byte
+                                const int nib  = (q[byte / 4] >> (8 * (byte % 4) + vsh)) & 0xF;
+                                va[x][m] = (short) sycl::bit_cast<uint16_t>(sycl::half((float) (nib - 8) * dv));
+                            }
+                        }
+#pragma unroll
+                        for (int t = 0; t < RT16; ++t) {
+                            const dp_int8 pb = sP[((t * 16 + lane) * PS + kg * 16) / 16];
+                            o[t][0] = intel_sub_group_f16_f16_matrix_mad_k16(va[0], pb, o[t][0]);
+                            o[t][1] = intel_sub_group_f16_f16_matrix_mad_k16(va[1], pb, o[t][1]);
+                        }
+                    }
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
+
+                // write: lane = row r = 16 t + lane -> (token c, head kvh * G + g); dims 16 w + 8 x + m
+#pragma unroll
+                for (int t = 0; t < RT16; ++t) {
+                    const int r = t * 16 + lane, c = c0 + r / G;
+                    if (r < R && c < ne01) {
+                        const int64_t jdu = ((int64_t) seq * ne01 + c) * ne02 + kvh * G + r % G;
+                        const float   l   = sL[r];
+#pragma unroll
+                        for (int x = 0; x < 2; ++x) {
+#pragma unroll
+                            for (int m = 0; m < 8; ++m) {
+                                const int d = w * 16 + x * 8 + m;
+                                if (nsplit == 1) {
+                                    dst[jdu * DEC_D + d] = l > 0.0f ? o[t][x][m] / l : 0.0f;
+                                } else {
+                                    parts[(jdu * nsplit + split) * DEC_D + d] = o[t][x][m];
+                                }
+                            }
+                        }
+                    }
+                }
+                if (nsplit > 1 && tid < R && c0 + tid / G < ne01) {
+                    const int64_t jdu = ((int64_t) seq * ne01 + c0 + tid / G) * ne02 + kvh * G + tid % G;
+                    meta[jdu * nsplit + split] = sycl::float2(sM[tid], sL[tid]);
+                }
+            });
+    });
+}
+
+static int fattn_dec_dpas_maxq() {  // 0 = DPAS kernel off; else it serves 1 .. maxq query tokens
+    static const int v = [] {
+        const char * e = getenv("GGML_SYCL_FA_DEC_DPAS");
+        return e ? atoi(e) : 0;
+    }();
+    return v == 1 ? 32 : v;  // =1 -> default cap
+}
+
 bool ggml_sycl_flash_attn_ext_dec_supported(const ggml_tensor * dst) {
     static const bool off = getenv("GGML_SYCL_FA_DEC_OFF") != nullptr;
     if (off) {
         return false;
     }
+    const int maxq = fattn_dec_dpas_maxq();
     const ggml_tensor * Q     = dst->src[0];
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
@@ -697,13 +989,14 @@ bool ggml_sycl_flash_attn_ext_dec_supported(const ggml_tensor * dst) {
     return K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0 && Q->type == GGML_TYPE_F32 &&
            K->ne[0] == DEC_D && V->ne[0] == DEC_D && Q->ne[0] == DEC_D &&
            Q->ne[2] == 6 * K->ne[2] && V->ne[2] == K->ne[2] &&
-           Q->ne[1] >= 1 && Q->ne[1] <= 4 && Q->ne[3] == K->ne[3] && V->ne[3] == K->ne[3] &&  // 5-8: TILE is faster (v3<6,8> 1172-1240 vs 1049 us @16K)
+           Q->ne[1] >= 1 && Q->ne[1] <= (maxq ? maxq : 4) && Q->ne[3] == K->ne[3] && V->ne[3] == K->ne[3] &&  // 5-8: TILE is faster (v3<6,8> 1172-1240 vs 1049 us @16K)
            !sinks && max_bias == 0.0f && softcap == 0.0f &&
            (!mask || (mask->type == GGML_TYPE_F16 && mask->ne[2] == 1)) &&
            Q->nb[0] == sizeof(float) && K->nb[0] == ggml_type_size(K->type) && V->nb[0] == ggml_type_size(V->type) &&
            K->nb[1] % 4 == 0 && K->nb[2] % 4 == 0 && K->nb[3] % 4 == 0 && ((uintptr_t) K->data) % 4 == 0 &&
            V->nb[1] % 4 == 0 && V->nb[2] % 4 == 0 && V->nb[3] % 4 == 0 && ((uintptr_t) V->data) % 4 == 0 &&
-           Q->nb[1] % 16 == 0 && Q->nb[2] % 16 == 0 && Q->nb[3] % 16 == 0 && ((uintptr_t) Q->data) % 16 == 0;
+           Q->nb[1] % 16 == 0 && Q->nb[2] % 16 == 0 && Q->nb[3] % 16 == 0 && ((uintptr_t) Q->data) % 16 == 0 &&
+           (!maxq || (K->nb[1] % 16 == 0 && K->nb[2] % 16 == 0 && K->nb[3] % 16 == 0 && ((uintptr_t) K->data) % 16 == 0));
 }
 
 void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
@@ -716,8 +1009,10 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
 
     const int ne01 = Q->ne[1];
+    const bool dpas = fattn_dec_dpas_maxq() > 0;
     const int nq   = ne01 <= 1 ? 1 : ne01 <= 2 ? 2 : ne01 <= 4 ? 4 : 8;
-    const int tk   = nq == 8 ? 32 : nq == 4 ? 64 : 128;  // keys per tile (must match the instantiations below)
+    // keys per tile (must match the instantiations below); DPAS: 16 x KG
+    const int tk   = dpas ? (nq == 1 ? 256 : nq == 2 ? 128 : nq == 4 ? 256 : 128) : nq == 8 ? 32 : nq == 4 ? 64 : 128;
     const int ne11 = K->ne[1];
 
     // slices: enough work-groups to fill the GPU (~64 slices per KV head), at least one tile each
@@ -740,11 +1035,24 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
     const int64_t   nb33   = mask ? mask->nb[3] : 0;
     const int       ne33   = mask ? (int) mask->ne[3] : 1;
 
+#define FATTN_DEC_DPAS(NQ_, KG_, TC_) fattn_dec_q4_0_dpas<6, NQ_, KG_, TC_>((const char *) Q->data, (const char *) K->data, \
+        (const char *) V->data, mdata, (float *) dst->data, parts.get(), meta.get(), scale, ne01, (int) Q->ne[2], ne11,      \
+        (int) K->ne[2], (int) Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2],     \
+        V->nb[3], nb31, nb33, ne33, nsplit, chunk, stream)
+    if (dpas) {
+        switch (nq) {
+            case 1: FATTN_DEC_DPAS(1, 16, 1); break;
+            case 2: FATTN_DEC_DPAS(2, 8, 1); break;
+            case 4: FATTN_DEC_DPAS(4, 16, 3); break;
+            default: FATTN_DEC_DPAS(8, 8, 3); break;  // 8-token chunks, one work-group row per chunk
+        }
+    }
+#undef FATTN_DEC_DPAS
 #define FATTN_DEC_CALL(NQ_) fattn_dec_q4_0<6, NQ_, (NQ_ == 4 ? 64 : 128), (NQ_ != 4)>(  /* PIPE: see v4 notes */(const char *) Q->data, (const char *) K->data, (const char *) V->data, \
         mdata, (float *) dst->data, parts.get(), meta.get(), scale, ne01, (int) Q->ne[2], ne11, (int) K->ne[2],           \
         (int) Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3], nb31,    \
         nb33, ne33, nsplit, chunk, stream)
-    switch (nq) {
+    if (!dpas) switch (nq) {
         case 1: FATTN_DEC_CALL(1); break;
         case 2: FATTN_DEC_CALL(2); break;
         case 8:  // 5-8 tokens (MTP depth 4+, short n-gram drafts): v3 kernel, 48 rows, 32-key tiles, ~59 KB SLM
