@@ -475,6 +475,23 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        // Quantized-KV decode with wide GQA (up to 8 queries: single-token decode and speculative verify):
+        // the vector kernel runs one block per Q head, so every K/V row is fetched gqa_ratio times (6x for
+        // Qwen3.5/Bonsai 2: 24 Q heads over 4 KV heads). The MMA kernel packs the GQA heads of one KV head
+        // into one tile and reads q4_0/q8_0 K/V in place once. Same rule the F16 path already uses.
+        // RTX 4070, Bonsai 2 27B, q8_0 K/V, MTP draft: 4k 78.1 -> 86.9 tok/s, 16k 77.7 -> 111.6, 32k 54.5 -> 103.6.
+        // GGML_CUDA_FA_MMA_DECODE_MIN_KV = shortest KV length that takes this route (default 256, 0 = never).
+        {
+            static const int min_kv = [] {
+                const char * e = getenv("GGML_CUDA_FA_MMA_DECODE_MIN_KV");
+                return e ? atoi(e) : 256;
+            }();
+            if (min_kv > 0 && ggml_is_quantized(K->type) && K->type == V->type &&
+                    ggml_cuda_fattn_mma_kv_native_supported(dst) &&
+                    gqa_opt_applies && gqa_ratio > 4 && Q->ne[1] <= 8 && Q->ne[3] == 1 && K->ne[1] >= min_kv) {
+                return BEST_FATTN_KERNEL_MMA_F16;
+            }
+        }
         if (can_use_vector_kernel) {
             // batch-invariant mode: the same (vector) kernel for 1 to 8 queries, so a token verified in a
             // speculative batch attends with the same arithmetic as a token decoded alone
