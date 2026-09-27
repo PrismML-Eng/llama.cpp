@@ -117,6 +117,12 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
         layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
         layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), { n_embd },              mtp_flags|TENSOR_NOT_REQUIRED);
+        // ARC-LAB: optional trimmed draft head (FR-Spec style): the draft only proposes the K most frequent tokens
+        if (const ggml_tensor * dh = ml.get_tensor_meta(tn(LLM_TENSOR_NEXTN_DRAFT_HEAD, "weight", il).str().c_str())) {
+            const int64_t n_draft_vocab = dh->ne[1];
+            layer.nextn.draft_head     = create_tensor(tn(LLM_TENSOR_NEXTN_DRAFT_HEAD,     "weight", il), { n_embd, n_draft_vocab }, mtp_flags|TENSOR_NOT_REQUIRED);
+            layer.nextn.draft_head_ids = create_tensor(tn(LLM_TENSOR_NEXTN_DRAFT_HEAD_IDS, "weight", il), { n_draft_vocab },         mtp_flags|TENSOR_NOT_REQUIRED);
+        }
     };
 
     for (int i = 0; i < n_layer; ++i) {
@@ -777,7 +783,22 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+    static const bool draft_head_off = getenv("LLAMA_MTP_DRAFT_HEAD_OFF") != nullptr;
+    if (layer.nextn.draft_head && layer.nextn.draft_head_ids && !layer.nextn.shared_head_head && !draft_head_off) {
+        // ARC-LAB: logits for the top-K frequent tokens only, scattered into a full-vocab row of -inf; the target
+        // model still verifies every draft, so this changes only which tokens can be drafted, not the output
+        const int64_t n_k   = layer.nextn.draft_head->ne[1];
+        const int64_t n_out = cur->ne[1];
+        const int64_t n_voc = head_w->ne[1];
+        ggml_tensor * lk   = build_lora_mm(layer.nextn.draft_head, cur, nullptr);                   // [K, n_out]
+        ggml_tensor * full = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_voc, n_out);
+        full = ggml_fill(ctx0, full, -INFINITY);
+        full = ggml_set_rows(ctx0, full, ggml_reshape_3d(ctx0, lk, 1, n_k, n_out),
+                             ggml_reshape_2d(ctx0, layer.nextn.draft_head_ids, n_k, 1));
+        cur = ggml_reshape_2d(ctx0, full, n_voc, n_out);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

@@ -223,6 +223,8 @@ struct llama_layer_nextn {
     struct ggml_tensor * enorm                 = nullptr;
     struct ggml_tensor * hnorm                 = nullptr;
     struct ggml_tensor * shared_head_head      = nullptr;
+    struct ggml_tensor * draft_head            = nullptr;  // ARC-LAB: [n_embd, K] rows of the LM head for top-K tokens
+    struct ggml_tensor * draft_head_ids        = nullptr;  // ARC-LAB: I32 [K] vocab id of each row
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;

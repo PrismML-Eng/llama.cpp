@@ -1291,6 +1291,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps", "ffn_gate_up_exps",
                 "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",
                 "ssm_out",
+                "nextn.draft_head",  // ARC-LAB: row subset of output.weight, same input-side rotation
             };
             if (name == "output.weight") {
                 return true; // the output head is built through build_lora_mm in every arch

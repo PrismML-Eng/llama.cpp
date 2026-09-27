@@ -948,6 +948,13 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
                 ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 512);
                 op_tensor = ggml_get_rows(ctx, w, b);
             } break;
+        case GGML_OP_SET_ROWS:
+            {
+                // ARC-LAB: w = I32 row indices (MTP draft-head vocab ids), scattered into a full logits row
+                ggml_tensor * dst = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, w->ne[0], 1);
+                ggml_tensor * src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, w->ne[0], 1);
+                op_tensor = ggml_set_rows(ctx, dst, src, w);
+            } break;
         case GGML_OP_MUL_MAT:
             {
                 ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], 512, w->ne[2], w->ne[3]);

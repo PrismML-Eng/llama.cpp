@@ -562,6 +562,8 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_NEXTN_HNORM,                            "blk.%d.nextn.hnorm" },
     { LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,                 "blk.%d.nextn.shared_head_head" },
     { LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,                 "blk.%d.nextn.shared_head_norm" },
+    { LLM_TENSOR_NEXTN_DRAFT_HEAD,                       "blk.%d.nextn.draft_head" },
+    { LLM_TENSOR_NEXTN_DRAFT_HEAD_IDS,                   "blk.%d.nextn.draft_head_ids" },
     { LLM_TENSOR_ATTN_SUB_NORM,                          "blk.%d.attn_sub_norm" },
     { LLM_TENSOR_FFN_SUB_NORM,                           "blk.%d.ffn_sub_norm" },
     { LLM_TENSOR_DEC_OUTPUT_NORM,                        "dec.output_norm" },
@@ -957,6 +959,8 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     { LLM_TENSOR_NEXTN_HNORM,              { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL }        },
     { LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,   { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT }    },
     { LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,   { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL }        },
+    { LLM_TENSOR_NEXTN_DRAFT_HEAD,         { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT }    },
+    { LLM_TENSOR_NEXTN_DRAFT_HEAD_IDS,     { LLM_TENSOR_LAYER_REPEATING, GGML_OP_SET_ROWS }   },
     // dspark drafter extras. fc / markov factors are matmuls; the two norms are
     // elementwise muls. All output-side (non-repeating) so the loader does not
     // require a per-block index.
