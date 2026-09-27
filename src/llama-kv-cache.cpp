@@ -80,7 +80,8 @@ llama_kv_cache::llama_kv_cache(
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) :
+    const  layer_share_cb & share,
+                 uint32_t   n_kv_vram_cells) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -163,6 +164,12 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    const uint32_t tier_cells = GGML_PAD(n_kv_vram_cells, n_pad);
+    if (tier_cells > 0 && tier_cells < kv_size) {
+        LLAMA_LOG_INFO("%s: tiered KV: cells [0, %u) in VRAM, [%u, %u) in host memory\n",
+                __func__, tier_cells, tier_cells, kv_size);
+    }
+
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -219,6 +226,31 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+
+            // n_kv_vram_cells = N: tiered KV. Cells [0, N) of this layer's K and V stay in VRAM, cells
+            // [N, kv_size) live in pinned system RAM mapped into the same device range (CUDA VMM), so the
+            // window can exceed VRAM and the extra positions cost PCIe reads only once a sequence reaches
+            // them. Kernels are unchanged and results are identical to an all-VRAM cache. Backends without
+            // ggml_backend_cuda_tier_buffer_type (or without VMM) keep the ordinary device buffer.
+            if (tier_cells > 0 && tier_cells < kv_size && n_stream == 1 && !is_mla &&
+                    n_embd_k_gqa == n_embd_v_gqa && type_k == type_v) {
+                using tier_fn_t = ggml_backend_buffer_type_t (*)(int, double, int, const char *);
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                auto * fn = reg ? (tier_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_tier_buffer_type") : nullptr;
+                const char * dn = ggml_backend_dev_name(dev);
+                int dev_idx = -1;
+                if (dn && strncmp(dn, "CUDA", 4) == 0) {
+                    dev_idx = atoi(dn + 4);
+                }
+                if (fn && dev_idx >= 0) {
+                    char tag[32];
+                    snprintf(tag, sizeof(tag), "kv%p_l%u", (void *) this, il);
+                    ggml_backend_buffer_type_t tb = fn(dev_idx, (double) tier_cells / (double) kv_size, 2, tag);
+                    if (tb) {
+                        buft = tb;
+                    }
+                }
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
