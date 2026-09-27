@@ -228,10 +228,9 @@ void gemv(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const uint32_
                    Kern{ nullptr, (const signed char *) Aq, SA, B, SB, C, epi, M, N, K });
 }
 
-template <int NS = 1>
-void gemm(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const uint32_t * B, const uint16_t * SB, float * C,
-          int M, int N, int K) {
-    constexpr int   MT_M = 8, MT_N = 128, WG_M = 8, WG_N = 2;
+template <int NS, int MT_M, int MT_N, int WG_M, int WG_N>
+void gemm_tile(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const uint32_t * B, const uint16_t * SB, float * C,
+               int M, int N, int K) {
     const size_t    tm = MT_M * WG_M, tn = MT_N * WG_N;
     const Epi       epi{ nullptr, nullptr, 0, 1 };
     const sycl::range<2> local(1, 16 * WG_M * WG_N);
@@ -239,6 +238,26 @@ void gemm(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const uint32_
     q.parallel_for(sycl::nd_range<2>(global, local),
                    int8dpas::GemmMT<false, 0, MT_M, MT_N, WG_M, WG_N, 0, true, NS>{
                        nullptr, (const signed char *) Aq, SA, B, SB, C, epi, M, N, K });
+}
+
+// ARC-LAB lab knob GGML_SYCL_PTQ1_T2_TILE = index into TernSYCL's large-M tile table (mt_m, mt_n, wg_m, wg_n):
+// 0 {8,128,8,2} (default) 1 {8,128,4,2} 2 {8,128,4,4} 3 {8,128,16,1} 4 {8,128,2,4} 5 {16,64,4,2} 6 {16,64,8,2}
+// 7 {8,64,8,2} 8 {32,32,4,2}
+template <int NS = 1>
+void gemm(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const uint32_t * B, const uint16_t * SB, float * C,
+          int M, int N, int K) {
+    static const int tile = getenv("GGML_SYCL_PTQ1_T2_TILE") ? atoi(getenv("GGML_SYCL_PTQ1_T2_TILE")) : 0;
+    switch (tile) {
+        case 1: gemm_tile<NS, 8, 128, 4, 2>(q, Aq, SA, B, SB, C, M, N, K); break;
+        case 2: gemm_tile<NS, 8, 128, 4, 4>(q, Aq, SA, B, SB, C, M, N, K); break;
+        case 3: gemm_tile<NS, 8, 128, 16, 1>(q, Aq, SA, B, SB, C, M, N, K); break;
+        case 4: gemm_tile<NS, 8, 128, 2, 4>(q, Aq, SA, B, SB, C, M, N, K); break;
+        case 5: gemm_tile<NS, 16, 64, 4, 2>(q, Aq, SA, B, SB, C, M, N, K); break;
+        case 6: gemm_tile<NS, 16, 64, 8, 2>(q, Aq, SA, B, SB, C, M, N, K); break;
+        case 7: gemm_tile<NS, 8, 64, 8, 2>(q, Aq, SA, B, SB, C, M, N, K); break;
+        case 8: gemm_tile<NS, 32, 32, 4, 2>(q, Aq, SA, B, SB, C, M, N, K); break;
+        default: gemm_tile<NS, 8, 128, 8, 2>(q, Aq, SA, B, SB, C, M, N, K); break;
+    }
 }
 
 }  // namespace
