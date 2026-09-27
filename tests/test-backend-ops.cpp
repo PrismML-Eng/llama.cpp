@@ -4692,13 +4692,14 @@ struct test_fwht_signed : public test_case {
     const int64_t width;
     const int64_t n_tokens;
     const ggml_type type_x;
+    const bool swiglu; // x is the SwiGLU of a gate and an up projection (the ffn_down input)
 
     test_fwht_signed(int64_t blk = 1024, int64_t width = 5120, int64_t n_tokens = 7,
-                     ggml_type type_x = GGML_TYPE_F32)
-        : blk(blk), width(width), n_tokens(n_tokens), type_x(type_x) {}
+                     ggml_type type_x = GGML_TYPE_F32, bool swiglu = false)
+        : blk(blk), width(width), n_tokens(n_tokens), type_x(type_x), swiglu(swiglu) {}
 
     std::string vars() override {
-        return VARS_TO_STR4(blk, width, n_tokens, type_x);
+        return VARS_TO_STR5(blk, width, n_tokens, type_x, swiglu);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -4706,10 +4707,23 @@ struct test_fwht_signed : public test_case {
         return "MUL_MAT_HADAMARD";
     }
 
+    // the point of this case is the fused sign/SwiGLU + transform path, which a
+    // node-by-node comparison never reaches
+    bool run_whole_graph() override { return true; }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, blk, blk);
         ggml_set_name(a, "a");
-        ggml_tensor * x = ggml_new_tensor_2d(ctx, type_x, width, n_tokens);
+        ggml_tensor * x;
+        if (swiglu) {
+            ggml_tensor * g = ggml_new_tensor_2d(ctx, type_x, width, n_tokens);
+            ggml_set_name(g, "g");
+            ggml_tensor * u = ggml_new_tensor_2d(ctx, type_x, width, n_tokens);
+            ggml_set_name(u, "u");
+            x = ggml_swiglu_split(ctx, g, u);
+        } else {
+            x = ggml_new_tensor_2d(ctx, type_x, width, n_tokens);
+        }
         ggml_set_name(x, "x");
         ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
         ggml_set_name(s, "s");
@@ -9258,6 +9272,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fwht_signed(1024, 5120, 32));
     test_cases.emplace_back(new test_fwht_signed(1024, 6144, 7, GGML_TYPE_F16));
     test_cases.emplace_back(new test_fwht_signed(1024, 17408, 3));
+    // SwiGLU -> sign flip -> FWHT, the ffn_down input of a rotated model
+    test_cases.emplace_back(new test_fwht_signed(1024, 17408, 1,   GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_fwht_signed(1024, 17408, 8,   GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_fwht_signed(1024, 17408, 512, GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_fwht_signed(128,  1024,  5,   GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_fwht_signed(2048, 8192,  3,   GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_fwht_signed(1024, 5120,  4,   GGML_TYPE_F16, true));
     // Block widths above the register path's reach, plus a couple below it as controls. 4096 and
     // 8192 exercise the shared-memory kernel; before it existed the CUDA backend declined them and
     // the op fell back, which cost both speed and (measurably) a little accuracy.
@@ -10483,6 +10504,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 2048, 128));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 256, 2048, 256));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 512, 2048, 512));
+    // SwiGLU -> signed FWHT at an ffn_down width (1024 blocks): decode, verify, prefill
+    for (bool swiglu : {false, true}) {
+        for (int64_t n_tokens : {1, 8, 512}) {
+            test_cases.emplace_back(new test_fwht_signed(1024, 17408, n_tokens, GGML_TYPE_F32, swiglu));
+        }
+    }
 
     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 64, 64, 4, 4 }, { 32, 64, 4, 4 }));
     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 128, 128, 4, 2 }, { 32, 128, 4, 2 }));

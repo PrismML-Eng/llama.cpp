@@ -1428,11 +1428,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort_merge(gg
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht(ggml_metal_library_t lib, int n, bool src_f16) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht(ggml_metal_library_t lib, int n, bool src_f16, bool swiglu) {
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_fwht_%s_%d", src_f16 ? "f16" : "f32", n);
+    GGML_ASSERT(!(swiglu && src_f16));
+    snprintf(base, 256, "kernel_fwht_%s%s_%d", swiglu ? "swiglu_" : "", src_f16 ? "f16" : "f32", n);
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

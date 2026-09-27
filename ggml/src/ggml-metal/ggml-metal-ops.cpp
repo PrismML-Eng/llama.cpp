@@ -889,7 +889,14 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+static bool ggml_metal_op_can_fuse_fwht_swiglu(ggml_metal_op_t ctx, int idx);
+static int  ggml_metal_op_fwht_swiglu(ggml_metal_op_t ctx, int idx);
+
 int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
+    if (ctx->use_fusion && ggml_metal_op_can_fuse_fwht_swiglu(ctx, idx)) {
+        return ggml_metal_op_fwht_swiglu(ctx, idx);
+    }
+
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -2451,7 +2458,8 @@ int ggml_metal_op_pool_1d(ggml_metal_op_t ctx, int idx) {
 // kernel_fwht_f32_<N> templates in ggml-metal.metal
 // src is the transform input (the matmul's src1, or the un-flipped activation when the
 // preceding sign-flip MUL is fused in); signs is that MUL's sign vector or nullptr.
-static int ggml_metal_op_fwht_impl(ggml_metal_op_t ctx, ggml_tensor * op, ggml_tensor * src, ggml_tensor * signs) {
+// When up is set, src is a SwiGLU gate and the transform input is swiglu(src, up).
+static int ggml_metal_op_fwht_impl(ggml_metal_op_t ctx, ggml_tensor * op, ggml_tensor * src, ggml_tensor * signs, ggml_tensor * up = nullptr) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
@@ -2466,7 +2474,9 @@ static int ggml_metal_op_fwht_impl(ggml_metal_op_t ctx, ggml_tensor * op, ggml_t
     GGML_ASSERT(src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16);
     GGML_ASSERT(op->type == GGML_TYPE_F32);
 
-    auto pipeline = ggml_metal_library_get_pipeline_fwht(lib, n, src->type == GGML_TYPE_F16);
+    GGML_ASSERT(up == nullptr || (src->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32));
+
+    auto pipeline = ggml_metal_library_get_pipeline_fwht(lib, n, src->type == GGML_TYPE_F16, up != nullptr);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
@@ -2474,6 +2484,8 @@ static int ggml_metal_op_fwht_impl(ggml_metal_op_t ctx, ggml_tensor * op, ggml_t
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 2);
     // buffer 3 is never read when n_blk == 0; bind src so the slot is always valid
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(signs ? signs : src), 3);
+    // buffer 4 is only read by the SwiGLU variants
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(up ? up : src), 4);
 
     const int th_max = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
     const int simd_size = 32;
@@ -2570,6 +2582,75 @@ static int ggml_metal_op_fwht_signed(ggml_metal_op_t ctx, int idx) {
     ggml_metal_op_fwht_impl(ctx, mm, x, signs);
 
     return 2;
+}
+
+// SwiGLU + Hadamard sign flip + reshape + FWHT-hint matmul (the ffn_down input of a rotated
+// model): the GLU is evaluated while the transform loads its row, so neither the GLU output
+// nor the sign-flipped copy is written. Encode list: GLU, MUL, MUL_MAT (the RESHAPE is empty).
+static bool ggml_metal_op_can_fuse_fwht_swiglu(ggml_metal_op_t ctx, int idx) {
+    static constexpr ggml_op ops[4] = { GGML_OP_GLU, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+
+    if (idx + 2 >= ctx->n_nodes() || ctx->node(idx)->op != GGML_OP_GLU) {
+        return false;
+    }
+
+    const ggml_tensor * glu = ctx->node(idx);
+    const ggml_tensor * mul = ctx->node(idx + 1);
+
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr ||
+        ggml_get_op_params_i32(glu, 1) != 0 ||
+        glu->type != GGML_TYPE_F32 || glu->src[0]->type != GGML_TYPE_F32 || glu->src[1]->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(glu) || !ggml_is_contiguous(glu->src[0]) || !ggml_is_contiguous(glu->src[1]) ||
+        !ggml_are_same_shape(glu, glu->src[0]) || !ggml_are_same_shape(glu, glu->src[1])) {
+        return false;
+    }
+
+    // the MUL must flip the GLU output itself, and the rest must be the signed pattern
+    if (mul->op != GGML_OP_MUL || (mul->src[0] != glu && mul->src[1] != glu) || !ggml_are_same_shape(mul, glu) ||
+        !ggml_metal_op_can_fuse_fwht_signed(ctx, idx + 1)) {
+        return false;
+    }
+
+    const ggml_tensor * mm = ctx->node(idx + 2);
+
+    const int gi_glu = ctx->gf_index(idx);
+    const int gi_mul = ctx->gf_index(idx + 1);
+    const int gi_mm  = ctx->gf_index(idx + 2);
+
+    int gi_rs = -1;
+    for (int k = gi_mul + 1; k < gi_mm; ++k) {
+        if (ctx->graph()->nodes[k] == mm->src[1]) {
+            gi_rs = k;
+            break;
+        }
+    }
+    if (gi_rs < 0) {
+        return false;
+    }
+
+    const int quad[4] = { gi_glu, gi_mul, gi_rs, gi_mm };
+    return ggml_can_fuse_subgraph_ext(ctx->graph(), quad, 4, ops, &gi_mm, 1);
+}
+
+static int ggml_metal_op_fwht_swiglu(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * glu = ctx->node(idx + 0);
+    ggml_tensor * mul = ctx->node(idx + 1);
+    ggml_tensor * mm  = ctx->node(idx + 2);
+
+    ggml_tensor * signs = (mul->src[0] == glu) ? mul->src[1] : mul->src[0];
+
+    // the encode loop only checked the GLU's ranges; the fused kernel writes mm
+    if (!ggml_metal_op_concurrency_check(ctx, mm)) {
+        ggml_metal_op_concurrency_reset(ctx);
+    }
+
+    ggml_metal_op_fwht_impl(ctx, mm, glu->src[0], signs, glu->src[1]);
+
+    if (ctx->debug_fusion > 1) {
+        GGML_LOG_DEBUG("%s: fuse: GLU + MUL + MUL_MAT(hadamard)\n", __func__);
+    }
+
+    return 3;
 }
 
 int ggml_metal_op_pool_2d(ggml_metal_op_t ctx, int idx) {
