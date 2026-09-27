@@ -4140,6 +4140,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_depth_max = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_DEPTH_MAX"));
+    add_opt(common_arg(
+        {"--spec-draft-window"}, "N",
+        string_format("draft (MTP) context keeps only the last N rows, so its cache stays small and a draft pass costs\n"
+                      "the same at any depth; 0 = full history (default: %d)", params.speculative.draft.n_window),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_window = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_WINDOW"));
+    add_opt(common_arg(
+        {"--spec-draft-n-max-tail"}, "N",
+        string_format("draft size once the sequence reaches --kv-vram-cells, where a wider verify reads the host tail\n"
+                      "once for all columns; 0 = --spec-draft-n-max (default: %d)", params.speculative.draft.n_max_tail),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_max_tail = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_TAIL"));
 
     add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",
