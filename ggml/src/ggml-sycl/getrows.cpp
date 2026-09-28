@@ -277,10 +277,16 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
             src1_i32, (float *)dst->data, ctx.stream());
             break;
         case GGML_TYPE_PTQ1_0:
+            GGML_ASSERT(!(dst->src[0]->extra &&
+                          ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.xe2_pq2) &&
+                        "PTQ1_0 in the Xe2 layout reached get_rows");
             get_rows_sycl<QK_PTQ1_0, 1, dequantize_ptq1_0>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
             src1_i32, (float *)dst->data, ctx.stream());
             break;
         case GGML_TYPE_PQ2_0:
+            GGML_ASSERT(!(dst->src[0]->extra &&
+                          ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.xe2_pq2) &&
+                        "PQ2_0 in the Xe2 layout reached get_rows");
             get_rows_sycl<QK_PQ2_0, 1, dequantize_pq2_0>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
             src1_i32, (float *)dst->data, ctx.stream());
             break;

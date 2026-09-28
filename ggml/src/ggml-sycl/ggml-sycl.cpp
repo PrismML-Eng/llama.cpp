@@ -56,6 +56,7 @@
 
 #include "ggml-sycl/add-id.hpp"
 #include "ggml-sycl/backend.hpp"
+#include "ggml-sycl/pq2_xe2.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/element_wise.hpp"
 #include "ggml-sycl/fwht.hpp"
@@ -593,7 +594,9 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_Q4_K:
             case GGML_TYPE_Q5_K:
-            case GGML_TYPE_Q6_K:{
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_PQ2_0:
+            case GGML_TYPE_PTQ1_0:{
                 ggml_tensor_extra_gpu * extra = new ggml_tensor_extra_gpu{};
                 tensor->extra                 = extra;
                 ctx->tensor_extras.push_back(extra);
@@ -954,6 +957,26 @@ static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_typ
     GGML_UNUSED(buft);
 }
 
+static bool ggml_sycl_device_has_xe2_xmx(int device);
+
+// GGML_SYCL_DISABLE_XMX=1 keeps PQ2_0/PTQ1_0 off the Xe2 path (and its layout)
+static bool ggml_sycl_xe2_xmx_disabled() {
+    static const bool disabled = ggml_sycl_get_env("GGML_SYCL_DISABLE_XMX", 0);
+    return disabled;
+}
+
+// PTQ1_0 weights are expanded into the 34-byte PQ2_0 Xe2 blocks on first use (pq2_xe2.hpp), so on devices
+// that run that path their allocation reserves room for the expanded form
+static bool ggml_sycl_ptq1_xe2_expands(int device, const ggml_tensor * tensor) {
+    return tensor->type == GGML_TYPE_PTQ1_0 && g_ggml_sycl_enable_optimize && !ggml_sycl_xe2_xmx_disabled() &&
+           tensor->ne[2] == 1 && tensor->ne[3] == 1 && ggml_sycl_pq2_xe2_supports_ne0(tensor->ne[0]) &&
+           ggml_sycl_device_has_xe2_xmx(device);
+}
+
+static size_t ggml_sycl_ptq1_xe2_bytes(const ggml_tensor * tensor) {
+    return (size_t) (ggml_nelements(tensor) / QK_PTQ1_0) * sizeof(block_pq2_0);
+}
+
 static size_t ggml_backend_sycl_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     size_t size = ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
@@ -964,9 +987,12 @@ static size_t ggml_backend_sycl_buffer_type_get_alloc_size(ggml_backend_buffer_t
         }
     }
 
-    return size;
+    const auto * buft_ctx = (const ggml_backend_sycl_buffer_type_context *) buft->context;
+    if (ggml_sycl_ptq1_xe2_expands(buft_ctx->device, tensor)) {
+        size = std::max(size, ggml_sycl_ptq1_xe2_bytes(tensor));
+    }
 
-    GGML_UNUSED(buft);
+    return size;
 }
 
 static const ggml_backend_buffer_type_i ggml_backend_sycl_buffer_type_interface = {
@@ -3764,6 +3790,14 @@ inline bool ggml_sycl_supports_mmq(enum ggml_type type) {
     return false;
 }
 
+// The PQ2_0/PTQ1_0 Xe2 path feeds 2-bit weights to ESIMD XMX DPAS at SIMD16, which is Xe2-only.
+static bool ggml_sycl_device_has_xe2_xmx(int device) {
+    const gpu_arch arch = ggml_sycl_info().devices[device].hw_info.arch;
+    return arch == gpu_arch::intel_gpu_bmg_g21 ||
+           arch == gpu_arch::intel_gpu_bmg_g31 ||
+           arch == gpu_arch::intel_gpu_lnl_m;
+}
+
 inline bool ggml_sycl_supports_reorder_mul_mat_sycl(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:
@@ -4529,6 +4563,50 @@ static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * 
            src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 }
 
+// PQ2_0/PTQ1_0 weights on Xe2 are rewritten into the Xe2 layout on first use. From then on every mul_mat
+// on them has to take that path, so the layout flag alone decides once it is set.
+static bool ggml_sycl_pq2_xe2_use(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                                  const ggml_tensor * dst) {
+    if (src0->type != GGML_TYPE_PQ2_0 && src0->type != GGML_TYPE_PTQ1_0) {
+        return false;
+    }
+    // MUL_MAT_ID passes each expert as a 2D copy of the 3D weight that shares its extra, and a view shares
+    // its parent's data: rewriting either in place would corrupt the rest of the tensor
+    if (dst->op != GGML_OP_MUL_MAT || src0->view_src != nullptr) {
+        return false;
+    }
+    ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+    if (extra && extra->optimized_feature.xe2_pq2) {
+        return true;
+    }
+    if (!g_ggml_sycl_enable_optimize || ggml_sycl_xe2_xmx_disabled() || !ggml_sycl_device_has_xe2_xmx(ctx.device)) {
+        return false;
+    }
+    // op offload refills COMPUTE buffers from host memory every time, so an in-place layout there goes stale
+    if (!extra || ggml_backend_buffer_is_sycl_split(src0->buffer) ||
+        src0->buffer->usage == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        return false;
+    }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || !ggml_is_contiguous(src0) ||
+        !ggml_sycl_pq2_xe2_supports_ne0(src0->ne[0]) || (uintptr_t) src0->data % 64 != 0) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || src1->nb[0] != sizeof(float) || dst->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    // PTQ1_0 expands to 34 bytes a block, which only fits where the buffer reserved room for it
+    if (src0->type == GGML_TYPE_PTQ1_0 &&
+        ggml_backend_buft_get_alloc_size(src0->buffer->buft, src0) < ggml_sycl_ptq1_xe2_bytes(src0)) {
+        return false;
+    }
+    if (!ggml_sycl_pq2_xe2_reorder(const_cast<ggml_tensor *>(src0), ctx.stream())) {
+        return false;
+    }
+    extra->optimized_feature.xe2_pq2 = true;
+    return true;
+}
+
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
 
@@ -4540,6 +4618,11 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // asserts GGML_OP_MUL_MAT for the same reason.
     if (dst->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
         ggml_sycl_op_fwht(ctx, src1, dst)) {
+        return;
+    }
+
+    if (ggml_sycl_pq2_xe2_use(ctx, src0, src1, dst)) {
+        ggml_sycl_pq2_xe2_mul_mat(ctx, src0, src1, dst);
         return;
     }
 
