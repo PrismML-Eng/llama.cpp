@@ -68,8 +68,140 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     }
 }
 
+// Decode each weight group once and dot it with all ncols_dst columns.
+// Integer and FP ops per column match vec_dot_iq4_xs_q8_1, so results are bit-exact.
+template<int ncols_dst>
+static __device__ __forceinline__ void vec_dot_iq4_xs_q8_1_multi(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ y,
+        const int stride_col_y, const int kby, const int kbx, const int iqs,
+        float (&dots)[ncols_dst]) {
+    const block_iq4_xs * bq4 = (const block_iq4_xs *) vbq + kbx;
+
+    int sumi[ncols_dst];
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+        sumi[col] = 0;
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
+        const int2 v = get_int_from_table_16_interleaved(aux_q4, kvalues_iq4nl);
+#pragma unroll
+        for (int col = 0; col < ncols_dst; ++col) {
+            const block_q8_1 * bq8 = y + col*stride_col_y + kby + iqs/4;
+            sumi[col] = ggml_cuda_dp4a(v.x, get_int_b4(bq8->qs, 2*j + 0), sumi[col]);
+            sumi[col] = ggml_cuda_dp4a(v.y, get_int_b4(bq8->qs, 2*j + 1), sumi[col]);
+        }
+    }
+
+    const int ls = vec_dot_iq4_xs_q8_1_scale(bq4, iqs);
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+        int s = sumi[col];
+        s *= ls - 32;
+        const float d = __half2float(bq4->d) * __low2float((y + col*stride_col_y + kby + iqs/4)->ds);
+        dots[col] = d * s;
+    }
+}
+
+// Same as above for PQ2_0 (group 128, iqs selects one 32-element chunk), the ops per column match vec_dot_pq2_0_q8_1.
+template<int ncols_dst>
+static __device__ __forceinline__ void vec_dot_pq2_0_q8_1_multi(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ y,
+        const int stride_col_y, const int kby, const int kbx, const int iqs,
+        float (&dots)[ncols_dst]) {
+    const block_pq2_0 * bq2_0 = (const block_pq2_0 *) vbq + kbx;
+    const int16_t * qs = (const int16_t *) bq2_0->qs + iqs * 4;
+
+    int sumi[ncols_dst];
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+        sumi[col] = 0;
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int q  = qs[j];
+        const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
+        const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
+        const int qx = __byte_perm(qe, qo, 0x5140);
+        const int qy = __byte_perm(qe, qo, 0x7362);
+#pragma unroll
+        for (int col = 0; col < ncols_dst; ++col) {
+            const block_q8_1 * bq8 = y + col*stride_col_y + kby + iqs;
+            sumi[col] = ggml_cuda_dp4a(get_int_b4(bq8->qs, j*2 + 0), qx, sumi[col]);
+            sumi[col] = ggml_cuda_dp4a(get_int_b4(bq8->qs, j*2 + 1), qy, sumi[col]);
+        }
+    }
+
+    const float d2 = bq2_0->d;
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+        const float d8 = __low2float((y + col*stride_col_y + kby + iqs)->ds);
+        dots[col] = d2 * d8 * sumi[col];
+    }
+}
+
+// Same as above for Q5_0, the ops per column match vec_dot_q5_0_q8_1_impl.
+template<int ncols_dst>
+static __device__ __forceinline__ void vec_dot_q5_0_q8_1_multi(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ y,
+        const int stride_col_y, const int kby, const int kbx, const int iqs,
+        float (&dots)[ncols_dst]) {
+    const block_q5_0 * bq5_0 = (const block_q5_0 *) vbq + kbx;
+
+    int sumi[ncols_dst];
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+        sumi[col] = 0;
+    }
+
+    const int qh = get_int_b2(bq5_0->qh, 0);
+#pragma unroll
+    for (int i = 0; i < VDR_Q5_0_Q8_1_MMVQ; ++i) {
+        const int vl = get_int_b2(bq5_0->qs, iqs + i);
+        const int vh = qh >> (4 * (iqs + i));
+
+        int vi0 = (vl >>  0) & 0x0F0F0F0F; // lower 4 qs bits, still need qh as 5th bits
+        vi0    |= (vh <<  4) & 0x00000010; // 0 ->  4
+        vi0    |= (vh << 11) & 0x00001000; // 1 -> 12
+        vi0    |= (vh << 18) & 0x00100000; // 2 -> 20
+        vi0    |= (vh << 25) & 0x10000000; // 3 -> 28
+
+        int vi1 = (vl >>  4) & 0x0F0F0F0F; // upper 4 qs bits, still need qh as 5th bits
+        vi1    |= (vh >> 12) & 0x00000010; // 16 ->  4
+        vi1    |= (vh >>  5) & 0x00001000; // 17 -> 12
+        vi1    |= (vh <<  2) & 0x00100000; // 18 -> 20
+        vi1    |= (vh <<  9) & 0x10000000; // 19 -> 28
+
+#pragma unroll
+        for (int col = 0; col < ncols_dst; ++col) {
+            const block_q8_1 * bq8 = y + col*stride_col_y + kby;
+            sumi[col] = ggml_cuda_dp4a(vi0, get_int_b4(bq8->qs, iqs + i),         sumi[col]);
+            sumi[col] = ggml_cuda_dp4a(vi1, get_int_b4(bq8->qs, iqs + i + QI5_0), sumi[col]);
+        }
+    }
+
+    const float d5 = bq5_0->d;
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+        const float2 ds8f = __half22float2((y + col*stride_col_y + kby)->ds);
+        // second part effectively subtracts 16 from each quant value
+        dots[col] = d5 * (sumi[col] * ds8f.x - (16*VDR_Q5_0_Q8_1_MMVQ/QI5_0) * ds8f.y);
+    }
+}
+
+// GGML_CUDA_MMVQ_REUSE=0 disables the multi-column vec_dot path
+static bool ggml_cuda_mmvq_reuse_enabled() {
+    static const bool value = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_REUSE");
+        return env == nullptr || env[0] != '0';
+    }();
+    return value;
+}
+
 enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
+    MMVQ_PARAMETERS_AMPERE,
     MMVQ_PARAMETERS_TURING,
     MMVQ_PARAMETERS_GCN,
     MMVQ_PARAMETERS_RDNA2,
@@ -89,6 +221,8 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_GCN;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
     return MMVQ_PARAMETERS_TURING;
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE && __CUDA_ARCH__ < GGML_CUDA_CC_ADA_LOVELACE
+    return MMVQ_PARAMETERS_AMPERE;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
     return MMVQ_PARAMETERS_GB10;
 #else
@@ -111,6 +245,9 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
         return MMVQ_PARAMETERS_TURING;
+    }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_ADA_LOVELACE) {
+        return MMVQ_PARAMETERS_AMPERE;
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_DGX_SPARK) {
         return MMVQ_PARAMETERS_GB10;
@@ -404,7 +541,7 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 }
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_AMPERE) {
         switch (ncols_dst) {
             case 1:
             case 2:
@@ -534,8 +671,18 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+// PQ2_0 at 2 columns: 4 rows per block measured faster than 8 on Bonsai 2 27B shapes (RTX 3060)
+#ifndef GGML_CUDA_MMVQ_AMPERE_PQ2_0_RPB_NCOLS2
+#define GGML_CUDA_MMVQ_AMPERE_PQ2_0_RPB_NCOLS2 4
+#endif
+
+static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1,
+        ggml_type type = GGML_TYPE_COUNT) {
+    // Ampere: 8 rows per block for the speculative verify widths
+    if (table_id == MMVQ_PARAMETERS_AMPERE && ncols_dst >= 2 && ncols_dst <= 4) {
+        return type == GGML_TYPE_PQ2_0 && ncols_dst == 2 ? GGML_CUDA_MMVQ_AMPERE_PQ2_0_RPB_NCOLS2 : 8;
+    }
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_AMPERE ||table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
                 return small_k ? nwarps : 1;
@@ -554,7 +701,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool has_gate, bool small_k = false, bool halve_iters = false>
+template <ggml_type type, int ncols_dst, bool has_fusion, bool has_gate, bool small_k = false, bool halve_iters = false, bool reuse_weights = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -573,7 +720,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps, type);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -715,6 +862,23 @@ static __global__ void mul_mat_vec_q(
             // x block quant index when casting the quants to int
             const int kqs = vdr * (tid % (qi/vdr));
 
+        if constexpr (reuse_weights && (type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_PQ2_0)) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                float dots[ncols_dst];
+                if constexpr (type == GGML_TYPE_IQ4_XS) {
+                    vec_dot_iq4_xs_q8_1_multi<ncols_dst>(vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
+                } else if constexpr (type == GGML_TYPE_PQ2_0) {
+                    vec_dot_pq2_0_q8_1_multi<ncols_dst>(vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
+                } else {
+                    vec_dot_q5_0_q8_1_multi<ncols_dst>(vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
+                }
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    tmp[j][i] += dots[j];
+                }
+            }
+        } else
 #if !defined(GGML_USE_HIP)
         if constexpr (type == GGML_TYPE_PTQ1_0 && ncols_dst > 1 && ncols_dst <= 3) {
 #    pragma unroll
@@ -922,7 +1086,7 @@ static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps, type);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -962,6 +1126,16 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+    if constexpr ((type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_PQ2_0) && c_ncols_dst >= 2 && c_ncols_dst <= 5) {
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        if (get_device_table_id(cc) == MMVQ_PARAMETERS_AMPERE && ggml_cuda_mmvq_reuse_enabled()) {
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, false, small_k, halve_iters, true>, launch_params,
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            return;
+        }
+    }
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, false, small_k, halve_iters>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
