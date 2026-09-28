@@ -426,6 +426,26 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_q1_0_planes(ggml
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_pq2_0_fewrow(ggml_metal_library_t lib, int ncb, int nks) {
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_mul_mm_pq2_0_f32_fewrow_cb%d_ks%d", ncb, nks);
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    res.nr0  = 32*ncb;
+    res.nr1  = 16;
+    res.nsg  = ncb*nks;
+    res.smem = nks > 1 ? (size_t) ncb*(nks - 1)*16*32*sizeof(float) : 0;
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_q1_0_pc(ggml_metal_library_t lib, const ggml_tensor * op, int nr1) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);

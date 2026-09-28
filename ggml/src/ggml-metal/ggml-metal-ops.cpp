@@ -2792,6 +2792,64 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         return 1;
     }
 
+    // PQ2_0 at speculative verify widths: a register-resident tensor-unit tile of 16 src1
+    // rows by 32 weight rows (see kernel_mul_mm_pq2_0_f32_fewrow). The generic tensor
+    // mul_mm tile is 64 x 128 and mul_mv_ext is ALU-bound at 2..8 columns.
+    // M5 Pro, 17408 x 5120: 1.24x over the 3-column mul_mv at n = 3, 1.6-3.1x over mul_mv_ext at
+    // n = 4..8 and ~5x over mul_mm at n = 9..16; slower at n = 1..2, so it starts at 3.
+    // GGML_METAL_PQ2_0_FEWROW=0 disables it; GGML_METAL_PQ2_0_FEWROW_MIN/_MAX set the src1
+    // row range; GGML_METAL_PQ2_0_FEWROW_CFG=<ncb><nks> (14 default, 22, 41, 12, 21) picks the split.
+    {
+        static const bool fewrow_on  = !getenv("GGML_METAL_PQ2_0_FEWROW") || atoi(getenv("GGML_METAL_PQ2_0_FEWROW")) != 0;
+        static const int  fewrow_min = getenv("GGML_METAL_PQ2_0_FEWROW_MIN") ? atoi(getenv("GGML_METAL_PQ2_0_FEWROW_MIN")) : 3;
+        static const int  fewrow_max = getenv("GGML_METAL_PQ2_0_FEWROW_MAX") ? atoi(getenv("GGML_METAL_PQ2_0_FEWROW_MAX")) : 32;
+        static const int  fewrow_cfg = getenv("GGML_METAL_PQ2_0_FEWROW_CFG") ? atoi(getenv("GGML_METAL_PQ2_0_FEWROW_CFG")) : 0;
+
+        if (fewrow_on && props_dev->has_tensor &&
+            op->src[0]->type == GGML_TYPE_PQ2_0 && op->src[1]->type == GGML_TYPE_F32 &&
+            ne11 >= fewrow_min && ne11 <= fewrow_max &&
+            ne00 % 128 == 0 && // QK_PQ2_0
+            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            nb10 == sizeof(float) && nb11 % 16 == 0 &&
+            ggml_is_contiguous(op)) {
+            int ncb = 1;
+            int nks = 4;
+            switch (fewrow_cfg) {
+                case 14: ncb = 1; nks = 4; break;
+                case 22: ncb = 2; nks = 2; break;
+                case 41: ncb = 4; nks = 1; break;
+                case 12: ncb = 1; nks = 2; break;
+                case 21: ncb = 2; nks = 1; break;
+                default: break;
+            }
+
+            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_pq2_0_fewrow(lib, ncb, nks);
+
+            ggml_metal_kargs_mul_mm_fewrow args = {
+                /*.ne00 =*/ ne00,
+                /*.ne01 =*/ ne01,
+                /*.ne11 =*/ ne11,
+                /*.nb01 =*/ nb01,
+                /*.nb11 =*/ nb11,
+                /*.ne0  =*/ ne0,
+            };
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+            if (pipeline.smem > 0) {
+                ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+            }
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + pipeline.nr0 - 1)/pipeline.nr0, (ne11 + 15)/16, 1, 32, pipeline.nsg, 1);
+
+            return 1;
+        }
+    }
+
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
     if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
