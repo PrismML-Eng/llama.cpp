@@ -4983,6 +4983,12 @@ static bool ggml_sycl_t2_mul_mat_try(ggml_backend_sycl_context & ctx, const ggml
     }
     // tokens: ne[1] x ne[2] rows of K floats (row stride nb[1]; planes back to back)
     const int64_t M = src1->ne[1] * src1->ne[2];
+    // ARC-LAB: large prompt batches through oneDNN's int8 GEMM (faster than GemmMT there), GGML_SYCL_T2_W8A8_MIN (0 = off)
+    static const int64_t w8a8_min = getenv("GGML_SYCL_T2_W8A8_MIN") ? atoll(getenv("GGML_SYCL_T2_W8A8_MIN")) : 0;
+    if (w8a8_min > 0 && M >= w8a8_min && g_ggml_sycl_enable_dnn && src1->nb[1] == (size_t) K * sizeof(float) &&
+        ggml_sycl_w8a8_mul_mat_t2(ctx, src0->data, (const float *) src1->data, K, (float *) dst->data, N, M, K, stream)) {
+        return true;
+    }
     ggml_sycl_t2_mul_mat(*stream, src0->data, (const float *) src1->data, src1->nb[1] / sizeof(float), (float *) dst->data,
                          M, N, K);
     return true;

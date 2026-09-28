@@ -8,3 +8,7 @@
 bool ggml_sycl_w8a8_mul_mat(ggml_backend_sycl_context & ctx, ggml_type type, bool reordered, const void * w,
                             const float * x, float * dst, int64_t nrows, int64_t ncols_x, int64_t K,
                             dpct::queue_ptr stream);
+
+// ARC-LAB: int8 oneDNN GEMM straight from the TernSYCL 2-bit layout (large prompt batches)
+bool ggml_sycl_w8a8_mul_mat_t2(ggml_backend_sycl_context & ctx, const void * w, const float * x, int64_t x_stride,
+                               float * dst, int64_t nrows, int64_t ntok, int64_t K, dpct::queue_ptr stream);
