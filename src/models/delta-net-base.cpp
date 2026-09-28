@@ -577,6 +577,114 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     ggml_tensor * gg = raw ? gdn_raw_alpha : g;
     ggml_tensor * bb = raw ? gdn_raw_beta  : b;
 
+    // GDN verify tape (llama_memory_recurrent::tape_mode). A verify ubatch of
+    // 1 < T <= n_rs_seq + 1 rows writes the final state (plane 0), the pre-window
+    // state (plane 1) and its own op inputs (plane 2 or 3) instead of T state
+    // snapshots. A later partial rollback replays the kept rows from the pre-window
+    // state at the start of the next graph. The op walks tokens one at a time, so
+    // the replayed state equals the snapshot the old path stored, bit for bit.
+    // Larger ubatches (prefill) keep the snapshot path and record no tape.
+    ggml_tensor * s_tape = nullptr; // starting state after a replay, when tape_mode
+    if (mctx_cur->get_tape_mode() && state_rows == nullptr && n_seqs == 1) {
+        const size_t  row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+        const int64_t Tmax     = K;
+        const size_t  esz      = ggml_element_size(ssm_states_all);
+
+        // fixed layout inside one state row: q | k | v | g | b, each with Tmax rows of capacity
+        const int64_t nq = q->ne[0] * q->ne[1];
+        const int64_t nk = k->ne[0] * k->ne[1];
+        const int64_t nv = v->ne[0] * v->ne[1];
+        const int64_t ng = gg->ne[0] * gg->ne[1];
+        const int64_t nb = bb->ne[0] * bb->ne[1];
+        GGML_ASSERT((nq + nk + nv + ng + nb) * Tmax <= (int64_t) hparams.n_embd_s() &&
+                    "GDN verify tape does not fit one state row; run with LLAMA_GDN_TAPE_REPLAY=0");
+        const int64_t off_q = 0;
+        const int64_t off_k = off_q + nq * Tmax;
+        const int64_t off_v = off_k + nk * Tmax;
+        const int64_t off_g = off_v + nv * Tmax;
+        const int64_t off_b = off_g + ng * Tmax;
+
+        auto base = [&](uint32_t plane) { return ((size_t) plane * mem_size + kv_head) * row_size; };
+
+        auto field = [&](uint32_t plane, const ggml_tensor * like, int64_t per, int64_t off, int64_t rows) {
+            return ggml_view_4d(ctx0, ssm_states_all, like->ne[0], like->ne[1], rows, 1,
+                (size_t) like->ne[0] * esz, (size_t) per * esz, (size_t) per * rows * esz,
+                base(plane) + (size_t) off * esz);
+        };
+
+        auto state_view = [&](uint32_t plane) {
+            return ggml_view_4d(ctx0, ssm_states_all, S_v, S_v, H_v, 1,
+                (size_t) S_v * esz, (size_t) S_v * S_v * esz, (size_t) D * esz, base(plane));
+        };
+
+        // 1) starting state
+        ggml_tensor * s_start = s;
+        const int32_t n_replay = mctx_cur->get_tape_replay();
+        if (n_replay == 0) {
+            s_start = state_view(1);
+        } else if (n_replay > 0) {
+            const uint32_t pr = mctx_cur->get_tape_plane_read();
+            ggml_tensor * rep = ggml_gated_delta_net(ctx0,
+                field(pr, q,  nq, off_q, n_replay),
+                field(pr, k,  nk, off_k, n_replay),
+                field(pr, v,  nv, off_v, n_replay),
+                field(pr, gg, ng, off_g, n_replay),
+                field(pr, bb, nb, off_b, n_replay),
+                state_view(1), 1);
+            if (raw) {
+                ggml_gated_delta_net_set_raw_gates(rep, gdn_raw_dt_bias, gdn_raw_a);
+            }
+            s_start = ggml_view_4d(ctx0, rep, S_v, S_v, H_v, 1,
+                ggml_row_size(rep->type, S_v), ggml_row_size(rep->type, S_v * S_v), ggml_row_size(rep->type, D),
+                ggml_row_size(rep->type, S_v * H_v * n_replay));
+            // run the replay before this graph overwrites the planes it reads
+            ggml_build_forward_expand(gf, s_start);
+        }
+        if (n_replay >= 0) {
+            cb(s_start, "tape_state_start", il);
+        }
+
+        if (n_seq_tokens > 1 && n_seq_tokens <= Tmax) {
+            // 2) record: pre-window state and this window's inputs
+            const uint32_t pw = mctx_cur->get_tape_plane_write();
+            ggml_tensor * pre = s_start;
+            if (n_replay != 0) { // n_replay == 0 already starts from plane 1
+                pre = ggml_cpy(ctx0, s_start, state_view(1));
+                ggml_build_forward_expand(gf, pre);
+            }
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, q,  field(pw, q,  nq, off_q, n_seq_tokens)));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, k,  field(pw, k,  nk, off_k, n_seq_tokens)));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, v,  field(pw, v,  nv, off_v, n_seq_tokens)));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, gg, field(pw, gg, ng, off_g, n_seq_tokens)));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, bb, field(pw, bb, nb, off_b, n_seq_tokens)));
+
+            // 3) verify with the final state only
+            ggml_tensor * out = ggml_gated_delta_net(ctx0, q, k, v, gg, bb, pre, 1);
+            if (raw) {
+                ggml_gated_delta_net_set_raw_gates(out, gdn_raw_dt_bias, gdn_raw_a);
+            }
+            res->add_fused_node({LLM_FUSED_OP_GDN_CH, out, il});
+
+            ggml_tensor * output = ggml_view_4d(ctx0, out,
+                S_v, H_v, n_seq_tokens, n_seqs,
+                ggml_row_size(out->type, S_v),
+                ggml_row_size(out->type, S_v * H_v),
+                ggml_row_size(out->type, S_v * H_v * n_seq_tokens),
+                0);
+            cb(output, "attn_output", il);
+
+            ggml_tensor * fin = ggml_view_1d(ctx0, out, D, ggml_row_size(out->type, S_v * H_v * n_seq_tokens));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, fin, ggml_view_1d(ctx0, ssm_states_all, D, base(0))));
+
+            return output;
+        }
+
+        s_tape = s_start;
+    }
+    if (s_tape) {
+        s = s_tape;
+    }
+
     ggml_tensor * gdn_out;
     if (state_rows) {
         // rows mode: the fused op reads each seq's live state directly from the

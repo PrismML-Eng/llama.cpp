@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -34,6 +35,24 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
+
+    {
+        // GDN verify tape: single sequence, FP32 state, at least 3 spare planes
+        // (pre-window state + two alternating tape planes). Opt-in with
+        // LLAMA_GDN_TAPE_REPLAY=1: bit-exact, but on M5 Pro Metal it measured 3.4%
+        // slower end to end than the snapshot path, which keeps the fused rows-mode
+        // state read and write that this path gives up.
+        const char * env = getenv("LLAMA_GDN_TAPE_REPLAY");
+        const bool   on  = env != nullptr && atoi(env) != 0;
+        tape_mode = on && n_seq_max == 1 && n_rs_seq >= 3 && type_s == GGML_TYPE_F32 &&
+                    (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE);
+        tape_rows.assign(n_seq_max, 0);
+        tape_parity.assign(n_seq_max, 0);
+        tape_replay.assign(n_seq_max, -1);
+        if (tape_mode) {
+            LLAMA_LOG_INFO("%s: GDN verify tape on (final state + tape instead of %u state snapshots per verify)\n", __func__, n_rs_seq + 1);
+        }
+    }
 
     cells.clear();
     cells.resize(mem_size);
@@ -127,7 +146,13 @@ llama_memory_recurrent::llama_memory_recurrent(
     }
 }
 
+void llama_memory_recurrent::tape_invalidate() {
+    std::fill(tape_rows.begin(),   tape_rows.end(),   0);
+    std::fill(tape_replay.begin(), tape_replay.end(), -1);
+}
+
 void llama_memory_recurrent::clear(bool data) {
+    tape_invalidate();
     for (int32_t i = 0; i < (int32_t) size; ++i) {
         cells[i].pos = -1;
         cells[i].seq_id.clear();
@@ -166,6 +191,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
     if (rm_all) {
         set_rs_idx(seq_id, 0);
+        if (tape_mode && seq_id >= 0 && (size_t) seq_id < tape_rows.size()) {
+            tape_rows[seq_id]   = 0;
+            tape_replay[seq_id] = -1;
+        }
     }
 
     // models like Mamba or RWKV can't have a state partially erased at the end
@@ -239,6 +268,7 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
     if (seq_id_src == seq_id_dst) {
         return;
     }
+    tape_invalidate();
 
     if (p0 < 0) {
         p0 = 0;
@@ -823,6 +853,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     GGML_UNUSED(flags);
+    tape_invalidate();
 
     uint32_t cell_count;
     io.read(&cell_count, sizeof(cell_count));
@@ -1214,7 +1245,43 @@ bool llama_memory_recurrent_context::apply() {
 
     mem->find_slot(ubatches[i_next]);
 
+    if (mem->tape_mode) {
+        const llama_ubatch & ub = ubatches[i_next];
+        const llama_seq_id seq = 0; // tape_mode implies n_seq_max == 1
+        const uint32_t rb  = mem->rs_idx[seq];
+        const uint32_t cnt = mem->tape_rows[seq];
+        // a pending rollback of rb rows keeps the first (cnt - rb) rows of the last tape
+        mem->tape_replay[seq] = (rb > 0 && cnt >= rb) ? (int32_t) (cnt - rb) : -1;
+        if (rb > 0 && cnt < rb) {
+            LLAMA_LOG_WARN("%s: rollback of %u rows without a tape covering it (tape rows %u)\n", __func__, rb, cnt);
+        }
+        // the ubatch about to run records a new tape when it verifies more than one row
+        if (ub.n_seq_tokens > 1 && ub.n_seq_tokens <= mem->n_rs_seq + 1 && ub.n_seqs == 1) {
+            mem->tape_parity[seq] ^= 1u;
+            mem->tape_rows[seq] = ub.n_seq_tokens;
+        } else {
+            mem->tape_rows[seq] = 0;
+        }
+    }
+
     return true;
+}
+
+bool llama_memory_recurrent_context::get_tape_mode() const {
+    return mem->tape_mode;
+}
+
+int32_t llama_memory_recurrent_context::get_tape_replay() const {
+    return mem->tape_mode ? mem->tape_replay[0] : -1;
+}
+
+uint32_t llama_memory_recurrent_context::get_tape_plane_write() const {
+    return 2u + mem->tape_parity[0];
+}
+
+uint32_t llama_memory_recurrent_context::get_tape_plane_read() const {
+    // the tape being replayed was written by the previous ubatch, before this ubatch flipped the parity
+    return 2u + (mem->tape_parity[0] ^ (mem->tape_rows[0] > 0 ? 1u : 0u));
 }
 
 llama_memory_status llama_memory_recurrent_context::get_status() const {

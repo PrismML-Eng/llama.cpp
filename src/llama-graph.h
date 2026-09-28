@@ -346,6 +346,12 @@ public:
     ggml_tensor * s_write_rows = nullptr;
     int64_t       s_write_K    = 0;
 
+    // GDN verify tape: replay count and tape planes the graph was built for (-1 = none);
+    // the planes alternate every recorded ubatch, and the graph bakes them into views
+    int32_t       tape_replay  = -1;
+    uint32_t      tape_plane_r = 0;
+    uint32_t      tape_plane_w = 0;
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse

@@ -76,6 +76,20 @@ public:
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
+    // GDN verify tape (single-sequence speculative verify):
+    //   instead of writing one recurrent-state snapshot per verified row, a
+    //   verify ubatch writes only the final state (plane 0), the pre-window
+    //   state (plane 1) and the window's gated-delta-net inputs (plane 2 or 3,
+    //   alternating). A later partial rollback is resolved by replaying the
+    //   first kept rows from the pre-window state in the next graph.
+    //   Only the S (ssm) state uses the tape; conv state keeps its snapshots.
+    bool tape_mode = false;
+    std::vector<uint32_t> tape_rows;   // rows recorded by the last ubatch of the seq (0 = no tape)
+    std::vector<uint32_t> tape_parity; // plane holding the latest tape: 2 + parity
+    std::vector<int32_t>  tape_replay; // rows to replay before the current ubatch (-1 = none, 0 = pre-window state as is)
+
+    void tape_invalidate(); // after clear, seq_cp or state load the tape no longer matches the cache
+
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
     // computed before each graph build
@@ -172,6 +186,12 @@ public:
     ggml_tensor * get_s_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // GDN verify tape (see llama_memory_recurrent::tape_mode)
+    bool     get_tape_mode() const;
+    int32_t  get_tape_replay() const;      // rows to replay from the tape before this ubatch (seq 0), -1 = none
+    uint32_t get_tape_plane_read() const;  // plane holding the tape to replay
+    uint32_t get_tape_plane_write() const; // plane receiving this ubatch's tape
 
 private:
     const llama_memory_status status;
