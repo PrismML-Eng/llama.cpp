@@ -5040,6 +5040,23 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         min_compute_capability = ggml_sycl_info().devices[ctx.device].cc;
     }
 
+    // ARC-LAB: reordered q4_0 with 5..64 columns on XMX (weights streamed once for all columns), GGML_SYCL_Q4_0_DPAS=1
+    {
+        static const bool q4d_on = getenv("GGML_SYCL_Q4_0_DPAS") && atoi(getenv("GGML_SYCL_Q4_0_DPAS")) != 0 &&
+                                   ggml_sycl_device_is_xe2();
+        static const int  q4d_min = getenv("GGML_SYCL_Q4_0_DPAS_MIN") ? atoi(getenv("GGML_SYCL_Q4_0_DPAS_MIN")) : 5;
+        static const int  q4d_max = getenv("GGML_SYCL_Q4_0_DPAS_MAX") ? atoi(getenv("GGML_SYCL_Q4_0_DPAS_MAX")) : 256;
+        const auto * ex = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+        if (q4d_on && !split && src0->type == GGML_TYPE_Q4_0 && ex && ex->optimized_feature.reorder &&
+            ggml_is_contiguous(src0) && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->type == GGML_TYPE_F32 &&
+            dst->type == GGML_TYPE_F32 && src1->ne[2] == 1 && src1->ne[3] == 1 && src1->nb[0] == sizeof(float) &&
+            src1->ne[1] >= q4d_min && src1->ne[1] <= q4d_max && ggml_is_contiguous(dst) &&
+            ggml_sycl_q4_0_dpas_gemm(ctx, src0->data, (const float *) src1->data, src1->nb[1] / (int64_t) sizeof(float),
+                                     (float *) dst->data, (int) src0->ne[1], (int) src0->ne[0], (int) src1->ne[1], ctx.stream())) {
+            return;
+        }
+    }
+
     // Small batches (e.g. speculative verify) on quantized weights: run MMVQ on chunks of columns
     // instead of dequantizing all of src0 to fp32 (the output matrix is ~5 GB as fp32).
     if (!split && ggml_is_quantized(src0->type) && ggml_is_contiguous(src0) && src0->ne[2] == 1 && src0->ne[3] == 1 &&

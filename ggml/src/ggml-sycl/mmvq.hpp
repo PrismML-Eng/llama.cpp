@@ -84,4 +84,7 @@ bool ggml_sycl_ptq1_0_mul_mat_vec_multi_ncols(const void * const * vx, float * c
                                               const int nm, const void * vy, const int ncols, const int ncols_dst,
                                               const int stride_col_y_bytes, dpct::queue_ptr stream);
 
+// ARC-LAB: reordered q4_0 x f32, 1..64 columns, weights streamed once on XMX (s8 x s4 DPAS, Xe2)
+bool ggml_sycl_q4_0_dpas_gemm(ggml_backend_sycl_context & ctx, const void * vx, const float * x, int64_t x_stride,
+                              float * dst, int nrows, int ncols, int ntok, dpct::queue_ptr stream);
 #endif // GGML_SYCL_MMVQ_HPP

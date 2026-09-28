@@ -4016,3 +4016,120 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu
             return false;
     }
 }
+
+// ARC-LAB: reordered q4_0 x f32 for 5..64 columns (speculative verify / n-gram drafts) on XMX via the s8 x s4 DPAS builtin
+// (intel_sub_group_i8_i4_matrix_mad_k32, Xe2). The MMVQ column kernels re-read the weights per 8 columns and the dequantize
+// + GEMM path converts the whole matrix; here each weight row streams once for all columns. One lane per weight row: B =
+// the row's 16 q4_0 bytes of a block XOR 0x88888888 (u4 n+8 -> s4 n), A = 8 activation rows as int8 (per row and 32-block
+// RNE scale; q4_0 byte i holds elements i and i+16, so A's k = 2i+h pairs elements l and l+16). GGML_SYCL_Q4_0_DPAS=1.
+namespace {
+typedef short    q4d_short8 __attribute__((ext_vector_type(8)));
+typedef int      q4d_int4   __attribute__((ext_vector_type(4)));
+typedef int      q4d_int8   __attribute__((ext_vector_type(8)));
+typedef float    q4d_float8 __attribute__((ext_vector_type(8)));
+typedef unsigned q4d_uint4  __attribute__((ext_vector_type(4)));
+}
+#ifdef __SYCL_DEVICE_ONLY__
+SYCL_EXTERNAL q4d_int8 intel_sub_group_i8_i4_matrix_mad_k32(q4d_short8 a, q4d_int4 b, q4d_int8 acc);
+#else
+inline q4d_int8 intel_sub_group_i8_i4_matrix_mad_k32(q4d_short8, q4d_int4, q4d_int8) { __builtin_unreachable(); }
+#endif
+
+template <int MT>
+static void q4_0_dpas_gemm_launch(const void * vx, const q4d_short8 * xq, const q4d_float8 * xd, float * dst, const int nrows,
+                                  const int ncols, const int ntok, dpct::queue_ptr stream) {
+    const int NB = ncols / QK4_0;
+    constexpr int WG = 256;
+    const size_t nsg = (size_t) nrows / 16;
+    const size_t gsz = (nsg + WG / 16 - 1) / (WG / 16) * WG;
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<1>(gsz, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const auto sg   = it.get_sub_group();
+            const int  lane = sg.get_local_linear_id();
+            const int  sgi  = (int) (it.get_group(0) * (WG / 16) + sg.get_group_linear_id());
+            if (sgi * 16 >= nrows) {
+                return;
+            }
+            const int n = sgi * 16 + lane;  // this lane's weight row
+            const uint8_t *   qs = (const uint8_t *) vx + (size_t) n * NB * (QK4_0 / 2);
+            const sycl::half * dw = (const sycl::half *) ((const uint8_t *) vx + (size_t) ncols / 2 * nrows) + (size_t) n * NB;
+            q4d_float8 acc[MT];
+#pragma unroll
+            for (int t = 0; t < MT; ++t) {
+                acc[t] = 0.0f;
+            }
+            for (int b = 0; b < NB; ++b) {
+                const q4d_uint4 q  = *(const q4d_uint4 *) (qs + b * (QK4_0 / 2));
+                const q4d_int4  bv = { (int) (q[0] ^ 0x88888888u), (int) (q[1] ^ 0x88888888u),
+                                       (int) (q[2] ^ 0x88888888u), (int) (q[3] ^ 0x88888888u) };
+                const float     d  = static_cast<float>(dw[b]);
+#pragma unroll
+                for (int t = 0; t < MT; ++t) {
+                    const q4d_int8 ia = intel_sub_group_i8_i4_matrix_mad_k32(xq[((size_t) t * NB + b) * 16 + lane], bv, (q4d_int8) (0));
+                    acc[t] += __builtin_convertvector(ia, q4d_float8) * (xd[(size_t) t * NB + b] * d);
+                }
+            }
+#pragma unroll
+            for (int t = 0; t < MT; ++t) {
+#pragma unroll
+                for (int m = 0; m < 8; ++m) {
+                    const int tok = t * 8 + m;
+                    if (tok < ntok) {
+                        dst[(size_t) tok * nrows + n] = acc[t][m];
+                    }
+                }
+            }
+        });
+    });
+}
+
+bool ggml_sycl_q4_0_dpas_gemm(ggml_backend_sycl_context & ctx, const void * vx, const float * x, int64_t x_stride,
+                              float * dst, const int nrows, const int ncols, const int ntok, dpct::queue_ptr stream) {
+    if (ntok < 1 || nrows % 16 != 0 || ncols % QK4_0 != 0) {
+        return false;
+    }
+    if (ntok > 64) {  // longer n-gram verify batches: chunks of 64 columns, the weights stream once per chunk
+        for (int c0 = 0; c0 < ntok; c0 += 64) {
+            if (!ggml_sycl_q4_0_dpas_gemm(ctx, vx, x + (size_t) c0 * x_stride, x_stride, dst + (size_t) c0 * nrows, nrows,
+                                          ncols, std::min(64, ntok - c0), stream)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    const int MT = (ntok + 7) / 8, NB = ncols / QK4_0;
+    ggml_sycl_pool_alloc<q4d_short8> xq(ctx.pool(), (size_t) MT * NB * 16);
+    ggml_sycl_pool_alloc<q4d_float8> xd(ctx.pool(), (size_t) MT * NB);
+    q4d_short8 * xq_p = xq.get();
+    q4d_float8 * xd_p = xd.get();
+    // activations -> int8 A layout: [tile][block][lane] -> 8 rows, one scale per row and block; padded rows are zero
+    stream->parallel_for(sycl::range<1>((size_t) MT * 8 * NB), [=](sycl::item<1> it) {
+        const int e = (int) it[0], m = e / NB, b = e % NB, t = m / 8, mm = m % 8;
+        float     v[QK4_0];
+        float     amax = 0.0f;
+#pragma unroll
+        for (int i = 0; i < QK4_0; ++i) {
+            v[i] = m < ntok ? x[(size_t) m * x_stride + b * QK4_0 + i] : 0.0f;
+            amax = sycl::fmax(amax, sycl::fabs(v[i]));
+        }
+        const float iq = amax > 0.0f ? 127.0f / amax : 0.0f;
+        ((float *) &xd_p[(size_t) t * NB + b])[mm] = amax / 127.0f;
+        short * row = (short *) &xq_p[((size_t) t * NB + b) * 16];
+#pragma unroll
+        for (int l = 0; l < 16; ++l) {
+            const int lo = (int) sycl::rint(v[l] * iq), hi = (int) sycl::rint(v[l + 16] * iq);
+            row[l * 8 + mm] = (short) ((lo & 0xFF) | ((hi & 0xFF) << 8));
+        }
+    });
+    switch (MT) {
+        case 1: q4_0_dpas_gemm_launch<1>(vx, xq_p, xd_p, dst, nrows, ncols, ntok, stream); break;
+        case 2: q4_0_dpas_gemm_launch<2>(vx, xq_p, xd_p, dst, nrows, ncols, ntok, stream); break;
+        case 3: q4_0_dpas_gemm_launch<3>(vx, xq_p, xd_p, dst, nrows, ncols, ntok, stream); break;
+        case 4: q4_0_dpas_gemm_launch<4>(vx, xq_p, xd_p, dst, nrows, ncols, ntok, stream); break;
+        case 5: q4_0_dpas_gemm_launch<5>(vx, xq_p, xd_p, dst, nrows, ncols, ntok, stream); break;
+        case 6: q4_0_dpas_gemm_launch<6>(vx, xq_p, xd_p, dst, nrows, ncols, ntok, stream); break;
+        case 7: q4_0_dpas_gemm_launch<7>(vx, xq_p, xd_p, dst, nrows, ncols, ntok, stream); break;
+        default: q4_0_dpas_gemm_launch<8>(vx, xq_p, xd_p, dst, nrows, ncols, ntok, stream); break;
+    }
+    return true;
+}

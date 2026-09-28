@@ -10355,6 +10355,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {16, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
         }
     }
+    // ARC-LAB: reordered q4_0 small-batch XMX GEMM (GGML_SYCL_Q4_0_DPAS): Gemma 4 shapes, 5..64 columns
+    for (auto mk : std::vector<std::array<int64_t, 2>>{{4096, 3840}, {3840, 15360}}) {
+        for (int64_t n : {1, 5, 8, 9, 16, 33, 64, 65, 129, 256}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
+        }
+    }
     // ARC-LAB: Gemma 4 sliding layers on the DPAS decode kernel (head 256, 8 KV heads x 2 query heads, q4_0 cache)
     for (int64_t kv : {512, 1024}) {
         for (int64_t nb : {1, 2, 5, 8, 12}) {
@@ -10936,6 +10942,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
+    // ARC-LAB: Gemma 4 12B QAT q4_0 weight shapes at decode / verify batch sizes (q4_0 weight-kernel work)
+    for (auto mk : std::vector<std::array<int64_t, 2>>{{15360, 3840}, {3840, 15360}, {4096, 3840}, {2048, 3840}, {3840, 4096}}) {
+        for (int64_t n : {1, 2, 4, 8, 16}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
+        }
+    }
     for (int64_t kv : {16384, 49152}) {  // ARC-LAB: Bonsai 27B decode / MTP verify on a q4_0 cache
         for (int64_t nb : {1, 4, 5, 8}) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
