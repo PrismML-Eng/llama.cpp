@@ -184,6 +184,11 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     // capture order, then concatenate them along dim0 after the layer loop.
     std::vector<ggml_tensor *> h_capture(cparams.n_capture_layers, nullptr);
 
+    // Only unmasked nextn extraction needs a hidden row for every token; otherwise the
+    // last layer runs on the output rows alone (capture taps and layer inputs are taken
+    // before it, or sliced to the same rows).
+    const bool narrow_last = inp_out_ids && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
+
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
@@ -204,7 +209,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked && cparams.n_capture_layers == 0) {
+        if (il == n_layer - 1 && narrow_last) {
             cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -242,7 +247,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         for (uint32_t c = 0; c < cparams.n_capture_layers; ++c) {
             if (cparams.capture_layer_idx[c] == il) {
                 ggml_tensor * cap = cur;
-                if (cparams.embeddings_nextn_masked && inp_out_ids) {
+                if (cparams.embeddings_nextn_masked && inp_out_ids && !(narrow_last && il == n_layer - 1)) {
                     cap = ggml_get_rows(ctx0, cap, inp_out_ids);
                 }
                 cb(cap, "h_capture", il);
@@ -276,7 +281,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
-    if ((!cparams.embeddings_nextn_masked || cparams.n_capture_layers > 0) && inp_out_ids) {
+    if (inp_out_ids && !narrow_last) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
@@ -755,9 +760,18 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
 
     cb(cur, "h_nextn", -1);
-    res->t_h_nextn = cur;
 
-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    // llama_context copies the first n_outputs rows of t_h_nextn when embeddings_nextn_masked is set,
+    // so publish the output rows only (as the trunk graph does); unmasked readers index by token.
+    // Matters as soon as an MTP batch has more tokens than outputs, e.g. catch-up rows decoded
+    // together with the first draft row.
+    if (cparams.embeddings_nextn_masked) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        res->t_h_nextn = cur;
+    } else {
+        res->t_h_nextn = cur;
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
     cb(cur, "mtp_shared_head_norm", -1);
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;

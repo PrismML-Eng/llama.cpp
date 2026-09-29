@@ -167,49 +167,7 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
         }
     }
 
-    // stages within a warp: partner differs in the lane bits
-#pragma unroll
-    for (int h = 1; h < warp_size; h *= 2) {
-#pragma unroll
-        for (int j = 0; j < NE; j++) {
-            const float val  = reg[j];
-            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
-            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
-        }
-    }
-
-    // stages across warps: partner differs in the thread-index bits above the lane
-#pragma unroll
-    for (int h = warp_size; h < NT; h *= 2) {
-#pragma unroll
-        for (int j = 0; j < NE; j++) {
-            s[j * NT + tid] = reg[j];
-        }
-        __syncthreads();
-#pragma unroll
-        for (int j = 0; j < NE; j++) {
-            const float val  = reg[j];
-            const float val2 = s[j * NT + (tid ^ h)];
-            reg[j] = (tid & h) == 0 ? val + val2 : val2 - val;
-        }
-        __syncthreads();
-    }
-
-    // stages above the block width: partner is another register of the same thread
-#pragma unroll
-    for (int h = NT; h < N; h *= 2) {
-        const int step = h / NT;
-#pragma unroll
-        for (int j = 0; j < NE; j += 2 * step) {
-#pragma unroll
-            for (int k = 0; k < step; k++) {
-                const float x = reg[j + k];
-                const float y = reg[j + k + step];
-                reg[j + k]        = x + y;
-                reg[j + k + step] = x - y;
-            }
-        }
-    }
+    ggml_cuda_fwht_block_butterfly<N, NT>(reg, s, tid, lane);
 
 #pragma unroll
     for (int i = 0; i < NE; ++i) {

@@ -6,6 +6,8 @@
 extern "C" {
 #endif
 
+bool ggml_metal_ptq1_multicol_enabled(const struct ggml_tensor * op);
+
 struct ggml_metal_buffer_id {
     void * metal; // id<MTLBuffer>
     size_t offs;
@@ -123,6 +125,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_glu      
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_sum               (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_sum_rows          (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cumsum_blk        (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_pq2_0_fewrow (ggml_metal_library_t lib, int ncb, int nks);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_q1_0_planes         (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_q1_0_pc      (ggml_metal_library_t lib, const struct ggml_tensor * op, int nr1);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cumsum_add        (ggml_metal_library_t lib, const struct ggml_tensor * op);
@@ -145,7 +148,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort           (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort_merge     (ggml_metal_library_t lib, const struct ggml_tensor * op);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht              (ggml_metal_library_t lib, int n, bool src_f16);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht              (ggml_metal_library_t lib, int n, bool src_f16, bool swiglu);
 
 // FWHT block widths with dedicated Metal kernels; the Hadamard matmul hint
 // falls back to a plain mul_mat for other widths, which has no F16-input pipeline.

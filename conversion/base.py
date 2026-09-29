@@ -642,7 +642,7 @@ class ModelBase:
             manifest = json.load(f)
 
         schema_version = manifest.get("schema_version")
-        if schema_version not in (1, 2) or manifest.get("kind") != "hadamard-weight-fold":
+        if schema_version not in (1, 2, 3) or manifest.get("kind") != "hadamard-weight-fold":
             raise ValueError(f"Unsupported Hadamard manifest: {manifest_path}")
         if manifest.get("status") != "requires-matching-runtime":
             raise ValueError(f"Unexpected Hadamard manifest status: {manifest.get('status')!r}")
@@ -738,7 +738,24 @@ class ModelBase:
                     )
                 weight_names.append(mapped)
 
-        self.gguf_writer.add_uint32("prism.hadamard.version", 1)
+        tied_output = manifest.get("tied_output", False)
+        if not isinstance(tied_output, bool) or (schema_version == 3) != tied_output:
+            raise ValueError("Hadamard schema 3 requires tied_output=true; older schemas forbid it")
+        if tied_output:
+            if inverse_weight_names != ["token_embd.weight"]:
+                raise ValueError("Tied Hadamard output requires one latent token embedding")
+            if not self.hparams.get("tie_word_embeddings", False):
+                raise ValueError("Tied Hadamard output requires tie_word_embeddings=true")
+            if "output.weight" in weight_names or any(
+                self.tensor_map.get_name(name, try_suffixes=(".weight", ".bias")) == "output.weight"
+                for name in self.model_tensors
+            ):
+                raise ValueError("Tied Hadamard output must not carry a separate output head")
+            self.gguf_writer.add_bool("prism.hadamard.tied_output", True)
+        elif "token_embd.weight" in inverse_weight_names and self.hparams.get("tie_word_embeddings", False):
+            raise ValueError("A tied latent embedding requires Hadamard schema 3 and tied_output=true")
+
+        self.gguf_writer.add_uint32("prism.hadamard.version", 2 if tied_output else 1)
         self.gguf_writer.add_uint32("prism.hadamard.block_size", block_size)
         self.gguf_writer.add_string("prism.hadamard.transform", "normalized-sylvester-walsh-hadamard")
         self.gguf_writer.add_string("prism.hadamard.axis", "input-last-dimension")

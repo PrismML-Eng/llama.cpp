@@ -266,6 +266,10 @@ static int ggml_backend_cpu_x86_score() {
     int score = 1;
     cpuid_x86 is;
 
+#ifdef GGML_SSSE3
+    if (!is.SSSE3()) { return 0; }
+    score += 1;
+#endif
 #ifdef GGML_FMA
     if (!is.FMA()) { return 0; }
     score += 1;

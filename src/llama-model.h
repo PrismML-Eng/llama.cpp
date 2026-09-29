@@ -363,6 +363,11 @@ struct llama_layer {
     struct ggml_tensor * ffn_exp_probs_b = nullptr;
     struct ggml_tensor * ffn_gate_tid2eid = nullptr;
 
+    struct ggml_tensor * dflash_attn_conv_base = nullptr;
+    struct ggml_tensor * dflash_attn_conv_proj = nullptr;
+    struct ggml_tensor * dflash_ffn_conv_base  = nullptr;
+    struct ggml_tensor * dflash_ffn_conv_proj  = nullptr;
+
     // mamba proj
     struct ggml_tensor * ssm_in  = nullptr;
     struct ggml_tensor * ssm_x   = nullptr;
@@ -665,6 +670,9 @@ struct llama_model {
     struct ggml_tensor * dfly_hc_gate        = nullptr; // [2*n_embd, n_ff_hc]
     struct ggml_tensor * dfly_hc_up          = nullptr; // [2*n_embd, n_ff_hc]
     struct ggml_tensor * dfly_hc_down        = nullptr; // [n_ff_hc, n_embd]
+    struct ggml_tensor * dflash_selector_prev   = nullptr;
+    struct ggml_tensor * dflash_selector_next   = nullptr;
+    struct ggml_tensor * dflash_selector_hidden = nullptr;
 
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
@@ -707,6 +715,7 @@ struct llama_model {
     std::unordered_map<std::string, uint32_t> hadamard_inverse_blocks;
     std::map<uint32_t, std::vector<int32_t>> hadamard_sign_data;
     bool hadamard_gdn_v_grouped = false;
+    bool hadamard_tied_output = false;
     llama_hadamard_rotations hadamard_rotations;
     llama_hadamard_rotations hadamard_inverses;
 
