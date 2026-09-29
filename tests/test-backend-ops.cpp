@@ -9338,8 +9338,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 97, n, k, {1, 1}, {1, 1}));
         }
     }
-    for (int64_t n : {9, 16, 17, 32, 64, 512}) {
+    // PQ2_0 multi-column verify widths (2 to 8 columns) and few-row tensor tile sizes
+    for (int64_t n : {2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 32, 64, 512}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 4096, n, 17408, {1, 1}, {1, 1}));
+    }
+    for (int64_t n = 2; n <= 8; ++n) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
     }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
