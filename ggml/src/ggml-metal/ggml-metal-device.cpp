@@ -882,6 +882,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     return res;
 }
 
+// PQ2_0 two-column mat-vec (GGML_METAL_PQ2_MULTICOL=1); from three columns mul_mv_ext is faster
+bool ggml_metal_pq2_multicol_enabled(const ggml_tensor * op) {
+    static const bool enabled = getenv("GGML_METAL_PQ2_MULTICOL") && atoi(getenv("GGML_METAL_PQ2_MULTICOL")) == 1;
+    return enabled && op->src[0]->type == GGML_TYPE_PQ2_0 && op->src[1]->type == GGML_TYPE_F32 &&
+           op->src[0]->ne[0] % ggml_blck_size(GGML_TYPE_PQ2_0) == 0 && op->src[1]->nb[0] == sizeof(float) &&
+           op->src[1]->ne[1] == 2;
+}
+
 bool ggml_metal_ptq1_multicol_enabled(const ggml_tensor * op) {
     static const bool enabled = getenv("GGML_METAL_PTQ1_MULTICOL") && atoi(getenv("GGML_METAL_PTQ1_MULTICOL")) == 1;
     return enabled && op->src[0]->type == GGML_TYPE_PTQ1_0 && op->src[1]->type == GGML_TYPE_F32 &&
@@ -953,6 +961,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_PQ2_0;
                 nr0 = N_R0_PQ2_0;
+                if (ggml_metal_pq2_multicol_enabled(op)) {
+                    nr0 = 2;
+                    nsg = 1;
+                    nr1 = 2;
+                    suffix = "_mc_c2";
+                }
             } break;
         case GGML_TYPE_PTQ1_0:
             {
