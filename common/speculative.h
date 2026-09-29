@@ -37,6 +37,10 @@ struct common_speculative_output_limits {
 common_speculative_output_limits common_speculative_get_output_limits(
         int32_t n_batch, int32_t n_parallel, int32_t n_draft);
 
+// True if deferred catch-up rows plus one first-draft anchor per sequence fit in one llama_decode.
+// Used by draft-mtp so a full-prefill stash (n_tokens == n_batch) does not add a 33rd row.
+bool common_speculative_mtp_first_decode_fits(int32_t n_batch, int32_t catchup_rows, int32_t n_anchors);
+
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 
 void common_speculative_free(common_speculative * spec);
@@ -88,6 +92,9 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
+
+// types of the implementations that were actually initialized, in priority order
+std::vector<enum common_speculative_type> common_speculative_get_types(const common_speculative * spec);
 
 // TEST/DEBUG ONLY: directly stage target-tap context rows for the dspark
 // implementation (if registered), bypassing the normal process()-driven

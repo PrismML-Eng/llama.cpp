@@ -889,7 +889,14 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+static bool ggml_metal_op_can_fuse_fwht_swiglu(ggml_metal_op_t ctx, int idx);
+static int  ggml_metal_op_fwht_swiglu(ggml_metal_op_t ctx, int idx);
+
 int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
+    if (ctx->use_fusion && ggml_metal_op_can_fuse_fwht_swiglu(ctx, idx)) {
+        return ggml_metal_op_fwht_swiglu(ctx, idx);
+    }
+
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -2137,7 +2144,8 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
 
     const int nsg = pipeline.nsg;
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0] / (4 * nsg), op->src[2]->ne[1], op->src[2]->ne[3],
+                                             32, nsg, 1);
 
     return n_fuse;
 }
@@ -2451,7 +2459,8 @@ int ggml_metal_op_pool_1d(ggml_metal_op_t ctx, int idx) {
 // kernel_fwht_f32_<N> templates in ggml-metal.metal
 // src is the transform input (the matmul's src1, or the un-flipped activation when the
 // preceding sign-flip MUL is fused in); signs is that MUL's sign vector or nullptr.
-static int ggml_metal_op_fwht_impl(ggml_metal_op_t ctx, ggml_tensor * op, ggml_tensor * src, ggml_tensor * signs) {
+// When up is set, src is a SwiGLU gate and the transform input is swiglu(src, up).
+static int ggml_metal_op_fwht_impl(ggml_metal_op_t ctx, ggml_tensor * op, ggml_tensor * src, ggml_tensor * signs, ggml_tensor * up = nullptr) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
@@ -2466,7 +2475,9 @@ static int ggml_metal_op_fwht_impl(ggml_metal_op_t ctx, ggml_tensor * op, ggml_t
     GGML_ASSERT(src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16);
     GGML_ASSERT(op->type == GGML_TYPE_F32);
 
-    auto pipeline = ggml_metal_library_get_pipeline_fwht(lib, n, src->type == GGML_TYPE_F16);
+    GGML_ASSERT(up == nullptr || (src->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32));
+
+    auto pipeline = ggml_metal_library_get_pipeline_fwht(lib, n, src->type == GGML_TYPE_F16, up != nullptr);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
@@ -2474,6 +2485,8 @@ static int ggml_metal_op_fwht_impl(ggml_metal_op_t ctx, ggml_tensor * op, ggml_t
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 2);
     // buffer 3 is never read when n_blk == 0; bind src so the slot is always valid
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(signs ? signs : src), 3);
+    // buffer 4 is only read by the SwiGLU variants
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(up ? up : src), 4);
 
     const int th_max = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
     const int simd_size = 32;
@@ -2570,6 +2583,75 @@ static int ggml_metal_op_fwht_signed(ggml_metal_op_t ctx, int idx) {
     ggml_metal_op_fwht_impl(ctx, mm, x, signs);
 
     return 2;
+}
+
+// SwiGLU + Hadamard sign flip + reshape + FWHT-hint matmul (the ffn_down input of a rotated
+// model): the GLU is evaluated while the transform loads its row, so neither the GLU output
+// nor the sign-flipped copy is written. Encode list: GLU, MUL, MUL_MAT (the RESHAPE is empty).
+static bool ggml_metal_op_can_fuse_fwht_swiglu(ggml_metal_op_t ctx, int idx) {
+    static constexpr ggml_op ops[4] = { GGML_OP_GLU, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+
+    if (idx + 2 >= ctx->n_nodes() || ctx->node(idx)->op != GGML_OP_GLU) {
+        return false;
+    }
+
+    const ggml_tensor * glu = ctx->node(idx);
+    const ggml_tensor * mul = ctx->node(idx + 1);
+
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr ||
+        ggml_get_op_params_i32(glu, 1) != 0 ||
+        glu->type != GGML_TYPE_F32 || glu->src[0]->type != GGML_TYPE_F32 || glu->src[1]->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(glu) || !ggml_is_contiguous(glu->src[0]) || !ggml_is_contiguous(glu->src[1]) ||
+        !ggml_are_same_shape(glu, glu->src[0]) || !ggml_are_same_shape(glu, glu->src[1])) {
+        return false;
+    }
+
+    // the MUL must flip the GLU output itself, and the rest must be the signed pattern
+    if (mul->op != GGML_OP_MUL || (mul->src[0] != glu && mul->src[1] != glu) || !ggml_are_same_shape(mul, glu) ||
+        !ggml_metal_op_can_fuse_fwht_signed(ctx, idx + 1)) {
+        return false;
+    }
+
+    const ggml_tensor * mm = ctx->node(idx + 2);
+
+    const int gi_glu = ctx->gf_index(idx);
+    const int gi_mul = ctx->gf_index(idx + 1);
+    const int gi_mm  = ctx->gf_index(idx + 2);
+
+    int gi_rs = -1;
+    for (int k = gi_mul + 1; k < gi_mm; ++k) {
+        if (ctx->graph()->nodes[k] == mm->src[1]) {
+            gi_rs = k;
+            break;
+        }
+    }
+    if (gi_rs < 0) {
+        return false;
+    }
+
+    const int quad[4] = { gi_glu, gi_mul, gi_rs, gi_mm };
+    return ggml_can_fuse_subgraph_ext(ctx->graph(), quad, 4, ops, &gi_mm, 1);
+}
+
+static int ggml_metal_op_fwht_swiglu(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * glu = ctx->node(idx + 0);
+    ggml_tensor * mul = ctx->node(idx + 1);
+    ggml_tensor * mm  = ctx->node(idx + 2);
+
+    ggml_tensor * signs = (mul->src[0] == glu) ? mul->src[1] : mul->src[0];
+
+    // the encode loop only checked the GLU's ranges; the fused kernel writes mm
+    if (!ggml_metal_op_concurrency_check(ctx, mm)) {
+        ggml_metal_op_concurrency_reset(ctx);
+    }
+
+    ggml_metal_op_fwht_impl(ctx, mm, glu->src[0], signs, glu->src[1]);
+
+    if (ctx->debug_fusion > 1) {
+        GGML_LOG_DEBUG("%s: fuse: GLU + MUL + MUL_MAT(hadamard)\n", __func__);
+    }
+
+    return 3;
 }
 
 int ggml_metal_op_pool_2d(ggml_metal_op_t ctx, int idx) {
@@ -2709,6 +2791,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     static const bool q1_0_ext_enable = getenv("GGML_METAL_Q1_0_EXT_ENABLE") != nullptr;
     static const int  q1_0_mv_max     = getenv("GGML_METAL_Q1_0_MV_MAX") ? atoi(getenv("GGML_METAL_Q1_0_MV_MAX")) : 16;
 
+    // PQ2_0: the multi-column mul_mv variant wins at 2-3 columns only (measured M5 Pro);
+    // 4-8 stay on mul_mv_ext. GGML_METAL_PQ2_0_NR1=1 restores mul_mv_ext for 2-3 as well.
+    static const bool pq2_0_ext_enable = getenv("GGML_METAL_PQ2_0_NR1") && atoi(getenv("GGML_METAL_PQ2_0_NR1")) == 1;
+
     const int ne11_mm_min = op->src[0]->type == GGML_TYPE_Q1_0 ? std::max(8, q1_0_mv_max) : 8;
 
     if (ggml_metal_op_mul_mat_q1_0_pc_supported(op)) {
@@ -2788,6 +2874,64 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         return 1;
     }
 
+    // PQ2_0 at speculative verify widths: a register-resident tensor-unit tile of 16 src1
+    // rows by 32 weight rows (see kernel_mul_mm_pq2_0_f32_fewrow). The generic tensor
+    // mul_mm tile is 64 x 128 and mul_mv_ext is ALU-bound at 2..8 columns.
+    // M5 Pro, 17408 x 5120: 1.24x over the 3-column mul_mv at n = 3, 1.6-3.1x over mul_mv_ext at
+    // n = 4..8 and ~5x over mul_mm at n = 9..16; slower at n = 1..2, so it starts at 3.
+    // GGML_METAL_PQ2_0_FEWROW=0 disables it; GGML_METAL_PQ2_0_FEWROW_MIN/_MAX set the src1
+    // row range; GGML_METAL_PQ2_0_FEWROW_CFG=<ncb><nks> (14 default, 22, 41, 12, 21) picks the split.
+    {
+        static const bool fewrow_on  = !getenv("GGML_METAL_PQ2_0_FEWROW") || atoi(getenv("GGML_METAL_PQ2_0_FEWROW")) != 0;
+        static const int  fewrow_min = getenv("GGML_METAL_PQ2_0_FEWROW_MIN") ? atoi(getenv("GGML_METAL_PQ2_0_FEWROW_MIN")) : 3;
+        static const int  fewrow_max = getenv("GGML_METAL_PQ2_0_FEWROW_MAX") ? atoi(getenv("GGML_METAL_PQ2_0_FEWROW_MAX")) : 32;
+        static const int  fewrow_cfg = getenv("GGML_METAL_PQ2_0_FEWROW_CFG") ? atoi(getenv("GGML_METAL_PQ2_0_FEWROW_CFG")) : 0;
+
+        if (fewrow_on && props_dev->has_tensor &&
+            op->src[0]->type == GGML_TYPE_PQ2_0 && op->src[1]->type == GGML_TYPE_F32 &&
+            ne11 >= fewrow_min && ne11 <= fewrow_max &&
+            ne00 % 128 == 0 && // QK_PQ2_0
+            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            nb10 == sizeof(float) && nb11 % 16 == 0 &&
+            ggml_is_contiguous(op)) {
+            int ncb = 1;
+            int nks = 4;
+            switch (fewrow_cfg) {
+                case 14: ncb = 1; nks = 4; break;
+                case 22: ncb = 2; nks = 2; break;
+                case 41: ncb = 4; nks = 1; break;
+                case 12: ncb = 1; nks = 2; break;
+                case 21: ncb = 2; nks = 1; break;
+                default: break;
+            }
+
+            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_pq2_0_fewrow(lib, ncb, nks);
+
+            ggml_metal_kargs_mul_mm_fewrow args = {
+                /*.ne00 =*/ ne00,
+                /*.ne01 =*/ ne01,
+                /*.ne11 =*/ ne11,
+                /*.nb01 =*/ nb01,
+                /*.nb11 =*/ nb11,
+                /*.ne0  =*/ ne0,
+            };
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+            if (pipeline.smem > 0) {
+                ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+            }
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + pipeline.nr0 - 1)/pipeline.nr0, (ne11 + 15)/16, 1, 32, pipeline.nsg, 1);
+
+            return 1;
+        }
+    }
+
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
     if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
@@ -2799,8 +2943,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_BF16 ||
            (op->src[0]->type == GGML_TYPE_Q1_0 && q1_0_ext_enable) ||
            op->src[0]->type == GGML_TYPE_Q2_0 ||
-           op->src[0]->type == GGML_TYPE_PQ2_0 ||
-           op->src[0]->type == GGML_TYPE_PTQ1_0 ||
+           (op->src[0]->type == GGML_TYPE_PQ2_0 && (pq2_0_ext_enable || ne11 >= 4)) ||
+           (op->src[0]->type == GGML_TYPE_PTQ1_0 && !ggml_metal_ptq1_multicol_enabled(op)) ||
            op->src[0]->type == GGML_TYPE_Q4_0 ||
            op->src[0]->type == GGML_TYPE_Q4_1 ||
            op->src[0]->type == GGML_TYPE_Q5_0 ||

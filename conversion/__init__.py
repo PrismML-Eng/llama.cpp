@@ -60,6 +60,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "DFlashDraftModel": "qwen",
     "Qwen3DFlyModel": "qwen",
     "Qwen3DSparkDFlareV2Model": "qwen",
+    "DFlash2DraftModel": "qwen",
     "Qwen3DSparkModel": "qwen",
     "DSparkDraftModel": "qwen",
     "DSparkSpeculator": "qwen",

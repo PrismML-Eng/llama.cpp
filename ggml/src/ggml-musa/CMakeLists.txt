@@ -32,8 +32,10 @@ if (MUSAToolkit_FOUND)
     file(GLOB   GGML_SOURCES_MUSA "../ggml-cuda/*.cu")
     file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_MUSA ${SRCS})
-    file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
-    list(APPEND GGML_SOURCES_MUSA ${SRCS})
+file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
+# Native q4_0/q8_0 K/V MMA instances are NVIDIA-only (ggml_cuda_fattn_mma_kv_native_supported).
+list(FILTER SRCS EXCLUDE REGEX "fattn-mma-f16-instance-q[48]_0-")
+list(APPEND GGML_SOURCES_MUSA ${SRCS})
     file(GLOB   SRCS "../ggml-cuda/template-instances/mmq*.cu")
     list(APPEND GGML_SOURCES_MUSA ${SRCS})
 

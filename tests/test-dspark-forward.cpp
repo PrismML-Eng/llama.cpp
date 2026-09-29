@@ -38,6 +38,20 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+// the Windows CRT has no POSIX setenv/unsetenv
+static int setenv(const char * name, const char * value, int overwrite) {
+    if (!overwrite && std::getenv(name)) {
+        return 0;
+    }
+    return _putenv_s(name, value);
+}
+
+static int unsetenv(const char * name) {
+    return _putenv_s(name, ""); // an empty value removes the variable
+}
+#endif
+
 static std::map<std::string, std::vector<float>> trace_values;
 
 static bool trace_node(ggml_tensor * tensor, bool ask, void *) {

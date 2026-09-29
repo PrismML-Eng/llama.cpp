@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
+#include <iterator>
 #include <memory>
 #include <filesystem>
 #include <utility>
@@ -205,6 +206,7 @@ struct server_slot {
 
     // speculative decoding
     common_speculative * spec;
+    int32_t spec_depth_max = 0; // no drafting once the sequence is longer than this (0 = always draft)
 
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
@@ -347,6 +349,7 @@ struct server_slot {
 
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
+        stats.speculative = can_speculate();
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
@@ -438,6 +441,12 @@ struct server_slot {
         GGML_ASSERT(task);
 
         if (!can_speculate()) {
+            return 0;
+        }
+
+        // deep in the context the draft passes and the multi-column verify cost more than the
+        // accepted tokens save (see --spec-draft-depth-max); decode one token per step from here
+        if (spec_depth_max > 0 && prompt.n_tokens() > spec_depth_max) {
             return 0;
         }
 
@@ -1194,9 +1203,35 @@ private:
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
         }
 
+        std::vector<common_speculative_type> spec_types_requested;
+        std::copy_if(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                std::back_inserter(spec_types_requested),
+                [](common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
+
         if (spec) {
-            SRV_TRC("%s", "speculative decoding context initialized\n");
+            const auto spec_types_active = common_speculative_get_types(spec.get());
+            SRV_INF("speculative decoding enabled: %s\n",
+                    common_speculative_type_name_str(spec_types_active).c_str());
+
+            std::vector<common_speculative_type> spec_types_skipped;
+            for (const auto t : spec_types_requested) {
+                if (std::find(spec_types_active.begin(), spec_types_active.end(), t) == spec_types_active.end()) {
+                    spec_types_skipped.push_back(t);
+                }
+            }
+            if (!spec_types_skipped.empty()) {
+                SRV_WRN("speculative types requested but not initialized (e.g. no draft model): %s\n",
+                        common_speculative_type_name_str(spec_types_skipped).c_str());
+            }
         } else {
+            if (!spec_types_requested.empty()) {
+                SRV_WRN("speculative decoding (%s) was requested but is disabled: %s\n",
+                        common_speculative_type_name_str(spec_types_requested).c_str(),
+                        ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO
+                            ? "the target context cannot remove tokens from a sequence"
+                            : "no speculative implementation could be initialized");
+            }
+
             spec_init.reset();
             ctx_dft   = nullptr;
             model_dft = nullptr;
@@ -1210,7 +1245,10 @@ private:
             slot.ctx_dft = ctx_dft;
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
+            slot.spec_depth_max = params_base.speculative.draft.n_depth_max;
             slot.n_ctx   = n_ctx_slot;
+
+            slot.stats.speculative = slot.can_speculate();
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -3625,7 +3663,19 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (spec) {
+        // past --spec-draft-depth-max a slot does not draft, so its draft context has no use for
+        // these rows: skip the hook (and the draft-model decode it implies) when every token of this
+        // view sits beyond the cutoff. Positions, not the slot's token count, decide it, so the early
+        // ubatches of a long prompt still reach the draft context and stay reusable as a prefix.
+        bool spec_process = spec != nullptr;
+        if (spec_process && params_base.speculative.draft.n_depth_max > 0) {
+            spec_process = false;
+            for (int i = 0; i < batch_view.n_tokens && !spec_process; ++i) {
+                spec_process = batch_view.pos[i] <= params_base.speculative.draft.n_depth_max;
+            }
+        }
+
+        if (spec_process) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);

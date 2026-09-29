@@ -357,6 +357,146 @@ kernel void kernel_mul_mm(
     }
 }
 
+
+#endif // GGML_METAL_HAS_TENSOR
+
+#ifdef GGML_METAL_HAS_TENSOR
+// PQ2_0 x F32 for a few src1 rows (speculative verify widths). One simdgroup owns a
+// 16 x 32 output tile (16 src1 rows by 32 weight rows) in a matmul2d destination
+// cooperative tensor for its whole K range. Weights are decoded straight into the
+// right-hand cooperative tensor, so the K loop has no threadgroup staging and no
+// barriers; the generic tensor mul_mm tile is 64 x 128 and would compute 8x more
+// columns than a 16-row verify needs. NCB simdgroups cover NCB column blocks and NKS
+// simdgroups split K for each block; the split partials are summed once at the end.
+//
+// Operand layout (probed on M5 with get_multidimensional_index): lane L holds A rows
+// fm, fm+8 at k fn..fn+3, B (transposed) weight rows fm+8j (j = 0..3) at the same k,
+// and C rows fm, fm+8 at columns fn..fn+3 and fn+16..fn+19.
+//
+// Adapted from the few-row qmm core in the Yukon MLX.fast promoted submissions
+// (Apache-2.0); the PQ2_0 block layout is different, so the decode is new.
+template <short NCB, short NKS>
+kernel void kernel_mul_mm_pq2_0_f32_fewrow(
+        constant ggml_metal_kargs_mul_mm_fewrow & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const int K = args.ne00;
+    const int N = args.ne01;
+    const int M = args.ne11;
+
+    const short cb = sgitg / NKS;
+    const short ks = sgitg % NKS;
+
+    const int col0 = (tgpig.x*NCB + cb)*32;
+    const int row0 = tgpig.y*16;
+
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+            16, 32, 16, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, execution_simdgroup> mm;
+
+    auto cA = mm.get_left_input_cooperative_tensor<half, half, float>();
+    auto cB = mm.get_right_input_cooperative_tensor<half, half, float>();
+    auto cC = mm.get_destination_cooperative_tensor<remove_addrspace_t<decltype(cA)>, remove_addrspace_t<decltype(cB)>, float>();
+
+    FOR_UNROLL (short i = 0; i < 16; ++i) {
+        cC[i] = 0.0f;
+    }
+
+    const short fn = 4*(tiisg & 1) + 8*((tiisg >> 3) & 1);
+    const short fm = ((tiisg >> 1) & 3) | (((tiisg >> 4) & 1) << 2);
+    const short fb = fn >> 2; // this lane's byte within a 16-value word
+
+    // the quad (same fm) shares one 32-byte qs run per weight row and block: quad lane w
+    // loads bytes [8w, 8w+8), i.e. the words of steps 2w and 2w+1
+    ushort qlane[4];
+    FOR_UNROLL (short w = 0; w < 4; ++w) {
+        qlane[w] = ushort((tiisg & ~9) | (w & 1) | ((w >> 1) << 3));
+    }
+
+    device const block_pq2_0 * wrow[4];
+    FOR_UNROLL (short j = 0; j < 4; ++j) {
+        wrow[j] = (device const block_pq2_0 *) (src0 + args.nb01*min(col0 + fm + 8*j, N - 1));
+    }
+
+    device const float * x0 = (device const float *) (src1 + args.nb11*min(row0 + fm,     M - 1)) + fn;
+    device const float * x1 = (device const float *) (src1 + args.nb11*min(row0 + fm + 8, M - 1)) + fn;
+
+    const int nb = K/QK_PQ2_0;
+
+    for (int ib = ks; ib < nb; ib += NKS) {
+        uint  wq[4][2];
+        half  d[4];
+        FOR_UNROLL (short j = 0; j < 4; ++j) {
+            device const ushort * q = (device const ushort *) (wrow[j][ib].qs) + 4*fb;
+            wq[j][0] = uint(q[0]) | (uint(q[1]) << 16);
+            wq[j][1] = uint(q[2]) | (uint(q[3]) << 16);
+            d[j] = wrow[j][ib].d;
+        }
+
+        FOR_UNROLL (short st = 0; st < 8; ++st) {
+            const int k = ib*QK_PQ2_0 + st*16;
+
+            const float4 xa = *((device const float4 *) (x0 + k));
+            const float4 xb = *((device const float4 *) (x1 + k));
+            FOR_UNROLL (short q = 0; q < 4; ++q) {
+                cA[q]     = (half) xa[q];
+                cA[4 + q] = (half) xb[q];
+            }
+
+            FOR_UNROLL (short j = 0; j < 4; ++j) {
+                const uint  word = simd_shuffle(wq[j][st & 1], qlane[st >> 1]);
+                const uint  by   = (word >> (8*fb)) & 0xffu;
+                FOR_UNROLL (short q = 0; q < 4; ++q) {
+                    cB[4*j + q] = (half(float((by >> (2*q)) & 3u)) - (half) 1.0h)*d[j];
+                }
+            }
+
+            mm.run(cA, cB, cC);
+        }
+    }
+
+    if (NKS > 1) {
+        threadgroup float * red = (threadgroup float *) shmem + cb*(NKS - 1)*16*32;
+        if (ks > 0) {
+            FOR_UNROLL (short i = 0; i < 16; ++i) {
+                red[((ks - 1)*16 + i)*32 + tiisg] = cC[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (ks > 0) {
+            return;
+        }
+        FOR_UNROLL (short s = 1; s < NKS; ++s) {
+            FOR_UNROLL (short i = 0; i < 16; ++i) {
+                cC[i] += red[((s - 1)*16 + i)*32 + tiisg];
+            }
+        }
+    }
+
+    device float * y = (device float *) dst;
+    FOR_UNROLL (short i = 0; i < 16; ++i) {
+        const int m = row0 + fm + 8*((i >> 2) & 1);
+        const int n = col0 + fn + (i & 3) + 16*(i >> 3);
+        if (m < M && n < N) {
+            y[m*args.ne0 + n] = cC[i];
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_pq2_0_f32_fewrow<1, 4>) mul_mm_pq2_0_fewrow_t;
+
+template [[host_name("kernel_mul_mm_pq2_0_f32_fewrow_cb1_ks4")]] kernel mul_mm_pq2_0_fewrow_t kernel_mul_mm_pq2_0_f32_fewrow<1, 4>;
+template [[host_name("kernel_mul_mm_pq2_0_f32_fewrow_cb2_ks2")]] kernel mul_mm_pq2_0_fewrow_t kernel_mul_mm_pq2_0_f32_fewrow<2, 2>;
+template [[host_name("kernel_mul_mm_pq2_0_f32_fewrow_cb4_ks1")]] kernel mul_mm_pq2_0_fewrow_t kernel_mul_mm_pq2_0_f32_fewrow<4, 1>;
+template [[host_name("kernel_mul_mm_pq2_0_f32_fewrow_cb1_ks2")]] kernel mul_mm_pq2_0_fewrow_t kernel_mul_mm_pq2_0_f32_fewrow<1, 2>;
+template [[host_name("kernel_mul_mm_pq2_0_f32_fewrow_cb2_ks1")]] kernel mul_mm_pq2_0_fewrow_t kernel_mul_mm_pq2_0_f32_fewrow<2, 1>;
+
 #endif // GGML_METAL_HAS_TENSOR
 
 template<short ne20> // n_expert_used
