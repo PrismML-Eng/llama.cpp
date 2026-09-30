@@ -289,6 +289,7 @@ struct ggml_metal_device_props {
     bool has_unified_memory;
     bool has_bfloat;
     bool has_tensor;
+    bool has_tensor_direct;
     bool use_residency_sets;
     bool use_shared_buffers;
 
