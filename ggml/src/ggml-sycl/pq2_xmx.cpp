@@ -1,7 +1,8 @@
-#include "pq2_xe2.hpp"
+#include "pq2_xmx.hpp"
 #include "dequantize.hpp"
 
-#if defined(__INTEL_LLVM_COMPILER)
+// GGML_SYCL_NO_PQ2_XMX: an AOT build for a device without 16-wide DPAS, which cannot compile these kernels
+#if defined(__INTEL_LLVM_COMPILER) && !defined(GGML_SYCL_NO_PQ2_XMX)
 #include <sycl/ext/intel/esimd.hpp>
 
 namespace {
@@ -9,14 +10,14 @@ namespace {
 namespace esimd = sycl::ext::intel::esimd;
 namespace xmx   = sycl::ext::intel::esimd::xmx;
 
-constexpr int PQ2_XE2_QS_BYTES = QK_PQ2_0 / 4;    // 32 bytes of 2-bit codes per block
-constexpr int PQ2_XE2_QS_DW    = PQ2_XE2_QS_BYTES / 4;
-constexpr int PQ2_XE2_WG       = 16;               // independent tiles per work-group when K is not split
+constexpr int PQ2_XMX_QS_BYTES = QK_PQ2_0 / 4;    // 32 bytes of 2-bit codes per block
+constexpr int PQ2_XMX_QS_DW    = PQ2_XMX_QS_BYTES / 4;
+constexpr int PQ2_XMX_WG       = 16;               // independent tiles per work-group when K is not split
 
 // thread count the K split aims for: the B50 runs 1024 hardware threads, and decode needs several in flight
 // per EU to keep enough loads outstanding
-constexpr int PQ2_XE2_TARGET_THREADS         = 4096;
-constexpr int PQ2_XE2_PREFILL_TARGET_THREADS = 512;
+constexpr int PQ2_XMX_TARGET_THREADS         = 4096;
+constexpr int PQ2_XMX_PREFILL_TARGET_THREADS = 512;
 
 static_assert(QK_PQ2_0 == 128 && sizeof(block_pq2_0) == 34, "PQ2_0 layout changed");
 static_assert(QK_PTQ1_0 == QK_PQ2_0, "PTQ1_0 expands block for block into PQ2_0 codes");
@@ -34,7 +35,7 @@ ESIMD_INLINE esimd::simd<uint32_t, N> pq2_codes_to_s2(esimd::simd<uint32_t, N> x
 // threads of a work-group split K for the same tile and reduce through SLM, so a mat-vec keeps enough threads
 // streaming weights. One DPAS covers 8 tokens x 16 rows x 32 k; the four of a block accumulate in int32.
 template <int MR, int NR, int S>
-ESIMD_INLINE void pq2_xe2_thread(const uint32_t * wq, const uint16_t * wd, const uint32_t * a8, const float * as,
+ESIMD_INLINE void pq2_xmx_thread(const uint32_t * wq, const uint16_t * wd, const uint32_t * a8, const float * as,
                                  float * dst, int K, int nrows, int ncols, int nrows_dst, int n_tiles_n,
                                  int tile, int ks) {
     using namespace esimd;
@@ -52,7 +53,7 @@ ESIMD_INLINE void pq2_xe2_thread(const uint32_t * wq, const uint16_t * wd, const
     const int b1 = (int) ((int64_t) (ks + 1) * nb / S);
 
     // weights: nrows rows of nb*32 bytes; activations: ncols rows of K bytes. Rows past either read as zeros.
-    const uint32_t wsurf_w = (uint32_t) (nb * PQ2_XE2_QS_BYTES) - 1;
+    const uint32_t wsurf_w = (uint32_t) (nb * PQ2_XMX_QS_BYTES) - 1;
     const uint32_t wsurf_h = (uint32_t) nrows - 1;
     const uint32_t asurf_w = (uint32_t) K - 1;
     const uint32_t asurf_h = (uint32_t) ncols - 1;
@@ -88,8 +89,8 @@ ESIMD_INLINE void pq2_xe2_thread(const uint32_t * wq, const uint16_t * wd, const
         simd<float, 16>     dw[NR];
 #pragma unroll
         for (int g = 0; g < NR; ++g) {
-            w[g] = pq2_codes_to_s2<128>(load_2d<uint32_t, PQ2_XE2_QS_DW, 16, 1, true, false>(
-                wq, wsurf_w, wsurf_h, wsurf_w, b * PQ2_XE2_QS_DW, n0 + 16 * g));
+            w[g] = pq2_codes_to_s2<128>(load_2d<uint32_t, PQ2_XMX_QS_DW, 16, 1, true, false>(
+                wq, wsurf_w, wsurf_h, wsurf_w, b * PQ2_XMX_QS_DW, n0 + 16 * g));
             simd<uint16_t, 16>    dbits = gather<uint16_t, 16>(wd, d_off[g] + (uint32_t) (b * sizeof(uint16_t)));
             simd<sycl::half, 16>  dh    = dbits.template bit_cast_view<sycl::half>();
             dw[g] = convert<float>(dh);
@@ -185,7 +186,7 @@ ESIMD_INLINE void pq2_xe2_thread(const uint32_t * wq, const uint16_t * wd, const
 }
 
 template <int MR, int NR, int S>
-static void launch_pq2_xe2(const uint32_t * wq, const uint16_t * wd, const uint32_t * a8, const float * as,
+static void launch_pq2_xmx(const uint32_t * wq, const uint16_t * wd, const uint32_t * a8, const float * as,
                            float * dst, int K, int nrows, int ncols, int nrows_dst, dpct::queue_ptr stream) {
     constexpr int TM = 8 * MR;
     constexpr int TN = 16 * NR;
@@ -198,16 +199,16 @@ static void launch_pq2_xe2(const uint32_t * wq, const uint16_t * wd, const uint3
         if constexpr (S > 1) {
             const sycl::nd_range<1> nd{ sycl::range<1>((size_t) n_tiles * S), sycl::range<1>(S) };
             h.parallel_for(nd, [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                pq2_xe2_thread<MR, NR, S>(wq, wd, a8, as, dst, K, nrows, ncols, nrows_dst, n_tiles_n,
+                pq2_xmx_thread<MR, NR, S>(wq, wd, a8, as, dst, K, nrows, ncols, nrows_dst, n_tiles_n,
                                           (int) it.get_group(0), (int) it.get_local_id(0));
             });
         } else {
-            const size_t global = (size_t) ((n_tiles + PQ2_XE2_WG - 1) / PQ2_XE2_WG) * PQ2_XE2_WG;
-            const sycl::nd_range<1> nd{ sycl::range<1>(global), sycl::range<1>(PQ2_XE2_WG) };
+            const size_t global = (size_t) ((n_tiles + PQ2_XMX_WG - 1) / PQ2_XMX_WG) * PQ2_XMX_WG;
+            const sycl::nd_range<1> nd{ sycl::range<1>(global), sycl::range<1>(PQ2_XMX_WG) };
             h.parallel_for(nd, [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
                 const int tile = (int) it.get_global_id(0);
                 if (tile < n_tiles) {
-                    pq2_xe2_thread<MR, NR, 1>(wq, wd, a8, as, dst, K, nrows, ncols, nrows_dst, n_tiles_n, tile, 0);
+                    pq2_xmx_thread<MR, NR, 1>(wq, wd, a8, as, dst, K, nrows, ncols, nrows_dst, n_tiles_n, tile, 0);
                 }
             });
         }
@@ -216,33 +217,33 @@ static void launch_pq2_xe2(const uint32_t * wq, const uint16_t * wd, const uint3
 
 // K split for a tile count: the smallest power of two reaching the thread target, at least two blocks per thread
 template <int MR, int NR>
-static void launch_pq2_xe2_split(const uint32_t * wq, const uint16_t * wd, const uint32_t * a8, const float * as,
+static void launch_pq2_xmx_split(const uint32_t * wq, const uint16_t * wd, const uint32_t * a8, const float * as,
                                  float * dst, int K, int nrows, int ncols, int nrows_dst, dpct::queue_ptr stream) {
     const int nb      = K / QK_PQ2_0;
     const int n_tiles = ((ncols + 8 * MR - 1) / (8 * MR)) * ((nrows + 16 * NR - 1) / (16 * NR));
     // 32 token tiles (prefill) carry a large SLM reduction, so they split at most in two and only while short
-    const int target    = MR >= 4 ? PQ2_XE2_PREFILL_TARGET_THREADS : PQ2_XE2_TARGET_THREADS;
+    const int target    = MR >= 4 ? PQ2_XMX_PREFILL_TARGET_THREADS : PQ2_XMX_TARGET_THREADS;
     const int max_split = MR >= 4 ? 2 : 16;
     int       split     = 1;
     while (split < max_split && n_tiles * split < target && nb >= 4 * split) {
         split *= 2;
     }
     switch (split) {
-        case 1:  launch_pq2_xe2<MR, NR, 1>(wq, wd, a8, as, dst, K, nrows, ncols, nrows_dst, stream);  break;
-        case 2:  launch_pq2_xe2<MR, NR, 2>(wq, wd, a8, as, dst, K, nrows, ncols, nrows_dst, stream);  break;
-        case 4:  launch_pq2_xe2<MR, NR, 4>(wq, wd, a8, as, dst, K, nrows, ncols, nrows_dst, stream);  break;
-        case 8:  launch_pq2_xe2<MR, NR, 8>(wq, wd, a8, as, dst, K, nrows, ncols, nrows_dst, stream);  break;
-        default: launch_pq2_xe2<MR, NR, 16>(wq, wd, a8, as, dst, K, nrows, ncols, nrows_dst, stream); break;
+        case 1:  launch_pq2_xmx<MR, NR, 1>(wq, wd, a8, as, dst, K, nrows, ncols, nrows_dst, stream);  break;
+        case 2:  launch_pq2_xmx<MR, NR, 2>(wq, wd, a8, as, dst, K, nrows, ncols, nrows_dst, stream);  break;
+        case 4:  launch_pq2_xmx<MR, NR, 4>(wq, wd, a8, as, dst, K, nrows, ncols, nrows_dst, stream);  break;
+        case 8:  launch_pq2_xmx<MR, NR, 8>(wq, wd, a8, as, dst, K, nrows, ncols, nrows_dst, stream);  break;
+        default: launch_pq2_xmx<MR, NR, 16>(wq, wd, a8, as, dst, K, nrows, ncols, nrows_dst, stream); break;
     }
 }
 
 } // namespace
 
-bool ggml_sycl_pq2_xe2_supports_ne0(int64_t ne0) {
-    return ne0 % QK_PQ2_0 == 0 && (ne0 / QK_PQ2_0) * PQ2_XE2_QS_BYTES >= 64;
+bool ggml_sycl_pq2_xmx_supports_ne0(int64_t ne0) {
+    return ne0 % QK_PQ2_0 == 0 && (ne0 / QK_PQ2_0) * PQ2_XMX_QS_BYTES >= 64;
 }
 
-bool ggml_sycl_pq2_xe2_reorder(ggml_tensor * src0, dpct::queue_ptr stream) {
+bool ggml_sycl_pq2_xmx_reorder(ggml_tensor * src0, dpct::queue_ptr stream) {
     GGML_ASSERT((src0->type == GGML_TYPE_PQ2_0 || src0->type == GGML_TYPE_PTQ1_0) && ggml_is_contiguous(src0));
 
     const size_t size = ggml_nbytes(src0);
@@ -251,19 +252,19 @@ bool ggml_sycl_pq2_xe2_reorder(ggml_tensor * src0, dpct::queue_ptr stream) {
 
     void * tmp = sycl::malloc_device(size, *stream);
     if (!tmp) {
-        GGML_LOG_WARN("%s: failed to allocate %zu bytes for the PQ2_0 Xe2 reorder, skipping it\n", __func__, size);
+        GGML_LOG_WARN("%s: failed to allocate %zu bytes for the PQ2_0 XMX reorder, skipping it\n", __func__, size);
         return false;
     }
     stream->memcpy(tmp, data, size).wait();
 
     uint8_t *    qs = data;
-    sycl::half * d  = (sycl::half *) (data + nblk * PQ2_XE2_QS_BYTES);
+    sycl::half * d  = (sycl::half *) (data + nblk * PQ2_XMX_QS_BYTES);
     if (src0->type == GGML_TYPE_PQ2_0) {
         stream->parallel_for(sycl::range<1>(nblk), [=](sycl::id<1> i) {
             const block_pq2_0 * x = (const block_pq2_0 *) tmp + i;
 #pragma unroll
-            for (int j = 0; j < PQ2_XE2_QS_BYTES; ++j) {
-                qs[i * PQ2_XE2_QS_BYTES + j] = x->qs[j];
+            for (int j = 0; j < PQ2_XMX_QS_BYTES; ++j) {
+                qs[i * PQ2_XMX_QS_BYTES + j] = x->qs[j];
             }
             d[i] = x->d;
         }).wait();
@@ -272,13 +273,13 @@ bool ggml_sycl_pq2_xe2_reorder(ggml_tensor * src0, dpct::queue_ptr stream) {
         // the caller made sure the buffer holds 34 bytes a block
         stream->parallel_for(sycl::range<1>(nblk), [=](sycl::id<1> i) {
             const block_ptq1_0 * x = (const block_ptq1_0 *) tmp + i;
-            for (int j = 0; j < PQ2_XE2_QS_BYTES; ++j) {
+            for (int j = 0; j < PQ2_XMX_QS_BYTES; ++j) {
                 uint8_t byte = 0;
 #pragma unroll
                 for (int k = 0; k < 4; ++k) {
                     byte |= (uint8_t) ((ptq1_0_trit(x, 4 * j + k) + 1) << (2 * k));
                 }
-                qs[i * PQ2_XE2_QS_BYTES + j] = byte;
+                qs[i * PQ2_XMX_QS_BYTES + j] = byte;
             }
             d[i] = x->d;
         }).wait();
@@ -288,13 +289,13 @@ bool ggml_sycl_pq2_xe2_reorder(ggml_tensor * src0, dpct::queue_ptr stream) {
     return true;
 }
 
-void ggml_sycl_pq2_xe2_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+void ggml_sycl_pq2_xmx_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                                ggml_tensor * dst) {
     GGML_ASSERT((src0->type == GGML_TYPE_PQ2_0 || src0->type == GGML_TYPE_PTQ1_0) && src0->ne[2] == 1 &&
                 src0->ne[3] == 1);
     GGML_ASSERT(src1->type == GGML_TYPE_F32 && src1->nb[0] == sizeof(float));
     GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst));
-    GGML_ASSERT(ggml_sycl_pq2_xe2_supports_ne0(src0->ne[0]));
+    GGML_ASSERT(ggml_sycl_pq2_xmx_supports_ne0(src0->ne[0]));
 
     const int K     = (int) src0->ne[0];
     const int nrows = (int) src0->ne[1];
@@ -351,31 +352,31 @@ void ggml_sycl_pq2_xe2_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tenso
     }
 
     const uint32_t * wq = (const uint32_t *) src0->data;
-    const uint16_t * wd = (const uint16_t *) ((const uint8_t *) src0->data + (size_t) nrows * nb * PQ2_XE2_QS_BYTES);
+    const uint16_t * wd = (const uint16_t *) ((const uint8_t *) src0->data + (size_t) nrows * nb * PQ2_XMX_QS_BYTES);
     float *          dd = (float *) dst->data;
     const int        nrows_dst = (int) dst->ne[0];
 
     if (ncols <= 8) {
-        launch_pq2_xe2_split<1, 2>(wq, wd, (const uint32_t *) a8, as, dd, K, nrows, ncols, nrows_dst, stream);
+        launch_pq2_xmx_split<1, 2>(wq, wd, (const uint32_t *) a8, as, dd, K, nrows, ncols, nrows_dst, stream);
     } else if (ncols <= 16) {
-        launch_pq2_xe2_split<2, 2>(wq, wd, (const uint32_t *) a8, as, dd, K, nrows, ncols, nrows_dst, stream);
+        launch_pq2_xmx_split<2, 2>(wq, wd, (const uint32_t *) a8, as, dd, K, nrows, ncols, nrows_dst, stream);
     } else {
-        launch_pq2_xe2_split<4, 2>(wq, wd, (const uint32_t *) a8, as, dd, K, nrows, ncols, nrows_dst, stream);
+        launch_pq2_xmx_split<4, 2>(wq, wd, (const uint32_t *) a8, as, dd, K, nrows, ncols, nrows_dst, stream);
     }
 }
 
 #else
 
-bool ggml_sycl_pq2_xe2_supports_ne0(int64_t) {
+bool ggml_sycl_pq2_xmx_supports_ne0(int64_t) {
     return false;
 }
 
-bool ggml_sycl_pq2_xe2_reorder(ggml_tensor *, dpct::queue_ptr) {
+bool ggml_sycl_pq2_xmx_reorder(ggml_tensor *, dpct::queue_ptr) {
     return false;
 }
 
-void ggml_sycl_pq2_xe2_mul_mat(ggml_backend_sycl_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) {
-    GGML_ABORT("PQ2_0 Xe2 path needs the Intel compiler");
+void ggml_sycl_pq2_xmx_mul_mat(ggml_backend_sycl_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) {
+    GGML_ABORT("PQ2_0 XMX path is not built in");
 }
 
-#endif // __INTEL_LLVM_COMPILER
+#endif // __INTEL_LLVM_COMPILER && !GGML_SYCL_NO_PQ2_XMX

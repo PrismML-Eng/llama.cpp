@@ -224,7 +224,7 @@ inline dpct::err0 ggml_sycl_set_device(const int device) try {
 //////////////////////
 struct optimize_feature {
     bool reorder=false;
-    bool xe2_pq2=false; // PQ2_0 rewritten into the Xe2 layout (pq2_xe2.hpp); only that path can read it
+    bool xmx_pq2=false; // PQ2_0 rewritten into the XMX layout (pq2_xmx.hpp); only that path can read it
 };
 
 struct sycl_device_info {
@@ -244,6 +244,7 @@ struct sycl_device_info {
     sycl_hw_info hw_info;
     optimize_feature opt_feature;
     bool    usm_system_support; // support for USM system allocations
+    int     dpas_exec_size;     // XMX DPAS width (8 or 16) for int8, 0 without XMX
 };
 
 

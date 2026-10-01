@@ -215,4 +215,22 @@ if (GGML_SYCL_DEVICE_ARCH)
         "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${GGML_SYCL_DEVICE_ARCH}\""
         -fsycl-max-parallel-link-jobs=${GGML_SYCL_MAX_PARALLEL_LINK_JOBS}
     )
+
+    # The PQ2_0/PTQ1_0 XMX kernels (pq2_xmx.cpp) need 16-wide DPAS and 2D block loads, and AOT compiles them for
+    # every listed device, so they are only built when all of them are Xe-HPC, Xe2 or later. Otherwise those
+    # types keep the existing paths.
+    string(REPLACE "," ";" _ggml_sycl_aot_devices "${GGML_SYCL_DEVICE_ARCH}")
+    set(_ggml_sycl_pq2_xmx ON)
+    foreach (_ggml_sycl_dev IN LISTS _ggml_sycl_aot_devices)
+        string(STRIP "${_ggml_sycl_dev}" _ggml_sycl_dev)
+        string(TOLOWER "${_ggml_sycl_dev}" _ggml_sycl_dev)
+        # the -vg parts of Xe-HPC have no XMX
+        if (NOT _ggml_sycl_dev MATCHES "^(pvc|bmg|lnl|ptl|wcl|nvl|cri|xe-hpc|xe2|xe3)" OR _ggml_sycl_dev MATCHES "-vg")
+            set(_ggml_sycl_pq2_xmx OFF)
+        endif()
+    endforeach()
+    if (NOT _ggml_sycl_pq2_xmx)
+        message(STATUS "GGML_SYCL_DEVICE_ARCH includes a device without 16-wide DPAS, not building the PQ2_0/PTQ1_0 XMX path")
+        set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/pq2_xmx.cpp APPEND PROPERTY COMPILE_DEFINITIONS GGML_SYCL_NO_PQ2_XMX)
+    endif()
 endif()
