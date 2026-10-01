@@ -81,3 +81,5 @@ endif()
 
 target_include_directories(ggml-webgpu PRIVATE ${SHADER_OUTPUT_DIR})
 target_link_libraries(ggml-webgpu PRIVATE ${DawnWebGPU_TARGET})
+
+target_compile_features(ggml-webgpu PRIVATE cxx_std_20)
