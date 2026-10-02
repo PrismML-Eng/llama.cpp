@@ -221,11 +221,18 @@ void quant_a(sycl::queue & q, const float * x, int64_t x_stride, int64_t M, int6
                    });
 }
 
-template <int SGM, int LS, int NS = 1>
+// GGML_SYCL_PTQ1_T2_NSG: sub-groups per GEMV work-group for 2..8 rows (verify batches); 2 (default) or 4. The B580 tile
+// sweep (TernSYCL main, Bonsai 27B shapes, M=4, qmode 0) had 4 fastest on 5 of 6 shapes (+0-8%); M=1 keeps 2.
+int t2_nsg() {
+    static const int v = getenv("GGML_SYCL_PTQ1_T2_NSG") && atoi(getenv("GGML_SYCL_PTQ1_T2_NSG")) == 4 ? 4 : 2;
+    return v;
+}
+
+template <int SGM, int LS, int NS = 1, int NSG = 2>
 void gemv(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const uint32_t * B, const uint16_t * SB, float * C,
           int M, int N, int K) {
-    using Kern          = int8dpas::Gemv<false, 0, SGM, 2, LS, 2, NS>;
-    const size_t    wgn = 16 * 2;
+    using Kern          = int8dpas::Gemv<false, 0, SGM, NSG, LS, 2, NS>;
+    const size_t    wgn = 16 * NSG;
     const Epi       epi{ nullptr, nullptr, 0, 1 };
     const sycl::range<2> local(1, Kern::WG);
     const sycl::range<2> global((M + SGM - 1) / SGM, (N + wgn - 1) / wgn * Kern::WG);
@@ -275,6 +282,14 @@ void t2_dispatch(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const 
         gemm<NS>(q, Aq, SA, B, SB, dst, m, n, k);
     } else if (m == 1) {
         n <= 8192 ? gemv<1, 4, NS>(q, Aq, SA, B, SB, dst, m, n, k) : gemv<1, 2, NS>(q, Aq, SA, B, SB, dst, m, n, k);
+    } else if (t2_nsg() == 4) {
+        if (m == 2) {
+            n <= 8192 ? gemv<2, 4, NS, 4>(q, Aq, SA, B, SB, dst, m, n, k) : gemv<2, 2, NS, 4>(q, Aq, SA, B, SB, dst, m, n, k);
+        } else if (m <= 4) {
+            n <= 8192 ? gemv<4, 4, NS, 4>(q, Aq, SA, B, SB, dst, m, n, k) : gemv<4, 2, NS, 4>(q, Aq, SA, B, SB, dst, m, n, k);
+        } else {
+            n <= 8192 ? gemv<8, 4, NS, 4>(q, Aq, SA, B, SB, dst, m, n, k) : gemv<8, 2, NS, 4>(q, Aq, SA, B, SB, dst, m, n, k);
+        }
     } else if (m == 2) {
         n <= 8192 ? gemv<2, 4, NS>(q, Aq, SA, B, SB, dst, m, n, k) : gemv<2, 2, NS>(q, Aq, SA, B, SB, dst, m, n, k);
     } else if (m <= 4) {
@@ -345,6 +360,11 @@ void t2_precompile(sycl::queue & q) {
     gemv<2, 2, 4>(q, aq, sa, B, SB, d, 2, N, K);
     gemv<4, 2, 4>(q, aq, sa, B, SB, d, 4, N, K);
     gemv<8, 2, 4>(q, aq, sa, B, SB, d, 8, N, K);
+    if (t2_nsg() == 4) {  // the N > 8192 GEMV tiles with 4 sub-groups (t2_dispatch above covered the N <= 8192 ones)
+        gemv<2, 2, 1, 4>(q, aq, sa, B, SB, d, 2, N, K);
+        gemv<4, 2, 1, 4>(q, aq, sa, B, SB, d, 4, N, K);
+        gemv<8, 2, 1, 4>(q, aq, sa, B, SB, d, 8, N, K);
+    }
     q.wait();
     sycl::free(w, q);
     sycl::free(x, q);

@@ -705,7 +705,11 @@ inline dp_int8   intel_sub_group_i8_i4_matrix_mad_k32(dp_short8, dp_int4, dp_int
 inline dp_float8 intel_sub_group_f16_f16_matrix_mad_k16(dp_short8, dp_int8, dp_float8) { __builtin_unreachable(); }
 #endif
 
-template <int D, int G, int NQ, int KG, int TC>
+// ST = 1 (GGML_SYCL_FA_DEC_STAGE, D 256 only): each key tile of K, then of V, is first copied into SLM with coalesced loads
+// (consecutive work-items read consecutive dwords of a key row) and the lane = key reads come from there (row stride 37
+// dwords: conflict-free). Without it every lane reads its own key straight from memory: 16 cache lines per load
+// instruction, ~90-110 GB/s per phase at 48K. The V copy is issued before the softmax and shares its barrier.
+template <int D, int G, int NQ, int KG, int TC, int ST = 0>
 static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, const char * mask, float * dst,
                                 float * parts, sycl::float2 * meta, float scale, int ne01, int ne02, int ne11,
                                 int nkvh, int ne03, int64_t nb01, int64_t nb02, int64_t nb03, int64_t nb11,
@@ -724,9 +728,12 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
     constexpr int RT16 = R16 / 16;
     constexpr int PS   = TK + 16;            // f16 row stride of P ([row][key]); 32-byte aligned rows, fewer bank conflicts
     static_assert(D % 256 == 0 && DPS % 16 == 0 && DPS <= QK4_0, "shape");
+    constexpr int RW   = NB * 18 / 4;        // dwords per q4_0 key row (36 at D 256)
+    constexpr int SW   = RW + 1;             // SLM row stride (odd: no bank conflicts on lane = key reads)
+    static_assert(ST == 0 || (D == 256 && RW % 4 == 0), "staging is sized for D 256");
     const int nqc = (ne01 + NQ - 1) / NQ;    // token chunks
     static const int probe_env = getenv("GGML_SYCL_FA_DEC_DPAS_PROBE") ? atoi(getenv("GGML_SYCL_FA_DEC_DPAS_PROBE")) : 0;
-    const int        probe     = probe_env;  // phase probe: bit0 skip Q.K, bit1 skip P.V, bit2 skip softmax
+    const int        probe     = probe_env;  // phase probe: bit0 skip Q.K, bit1 skip P.V, bit2 skip softmax, bit3 Q.K loads only (no DPAS / scale math)
 
     stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<dp_short8, 1> sQ8(sycl::range<1>(RT * NB * 16), cgh);   // [tile][block][lane] -> 8 rows
@@ -736,6 +743,7 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
         sycl::local_accessor<float, 1>     sM(sycl::range<1>(R16), cgh);
         sycl::local_accessor<float, 1>     sL(sycl::range<1>(R16), cgh);
         sycl::local_accessor<float, 1>     sA(sycl::range<1>(R16), cgh);
+        sycl::local_accessor<uint32_t, 1>  sKV(sycl::range<1>(ST ? TK * SW : 1), cgh);  // staged K or V tile
         cgh.parallel_for(
             sycl::nd_range<3>(sycl::range<3>((size_t) ne03 * nqc, nkvh, (size_t) nsplit * DEC_WG), sycl::range<3>(1, 1, DEC_WG)),
             [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] {
@@ -800,7 +808,35 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
                 // those dims lie in V block (DPS w) / 32; dim d of the block = nibble (d / 16) of qs byte d % 16
                 const int vb = (DPS * w) / QK4_0, vd0 = (DPS * w) % QK4_0;
 
+                // coalesced copy of the tile's key rows (keys past k_end repeat key k_begin, as the direct path)
+                // 16-byte loads (a 144-byte row = 9, rows 16-byte aligned), all issued before any SLM store so they overlap
+                auto stage = [&](const char * base, int64_t nb, int t0) {
+                    constexpr int RV = RW / 4, NV = TK * RV, PER = (NV + DEC_WG - 1) / DEC_WG;
+                    sycl::uint4 v[PER];
+#pragma unroll
+                    for (int i = 0; i < PER; ++i) {
+                        const int e = tid + i * DEC_WG;
+                        if (e < NV) {
+                            const int key = e / RV, q = e - key * RV;
+                            const int j   = t0 + key < k_end ? t0 + key : k_begin;
+                            v[i] = ((const sycl::uint4 *) (base + (int64_t) j * nb))[q];
+                        }
+                    }
+#pragma unroll
+                    for (int i = 0; i < PER; ++i) {
+                        const int e = tid + i * DEC_WG;
+                        if (e < NV) {
+                            const int key = e / RV, q = e - key * RV, o = key * SW + 4 * q;
+                            sKV[o] = v[i][0]; sKV[o + 1] = v[i][1]; sKV[o + 2] = v[i][2]; sKV[o + 3] = v[i][3];
+                        }
+                    }
+                };
+
                 for (int t0 = k_begin; t0 < k_end; t0 += TK) {
+                    if constexpr (ST) {
+                        stage(Kh, nb11, t0);
+                        it.barrier(sycl::access::fence_space::local_space);
+                    }
                     // ---- S = Q K^T: job = (key group, chunk of TC row tiles)
                     for (int job = w; job < ((probe & 1) ? 0 : KG * NCH); job += NSG) {
                         const int  kg = job % KG, ch = job / KG;
@@ -817,7 +853,13 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
                             // block b = bytes 18 b .. 18 b + 17: fp16 scale, then 16 bytes of nibbles
                             const int o0 = 18 * b;  // even b: dword aligned; odd b: 2 bytes in
                             const int      wd = o0 / 4;  // the block's 18 bytes lie in these 5 dwords
-                            const uint32_t k0 = kr[wd], k1 = kr[wd + 1], k2 = kr[wd + 2], k3 = kr[wd + 3], k4 = kr[wd + 4];
+                            uint32_t k0, k1, k2, k3, k4;
+                            if constexpr (ST) {
+                                const int sb = (kg * 16 + lane) * SW + wd;
+                                k0 = sKV[sb]; k1 = sKV[sb + 1]; k2 = sKV[sb + 2]; k3 = sKV[sb + 3]; k4 = sKV[sb + 4];
+                            } else {
+                                k0 = kr[wd]; k1 = kr[wd + 1]; k2 = kr[wd + 2]; k3 = kr[wd + 3]; k4 = kr[wd + 4];
+                            }
                             uint32_t sc, q0, q1, q2, q3;
                             if ((o0 & 3) == 0) {
                                 sc = k0 & 0xFFFFu;
@@ -832,6 +874,10 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
                             const float   dk = static_cast<float>(sycl::bit_cast<sycl::half>((uint16_t) sc));
                             const dp_int4 bv = { (int) (q0 ^ 0x88888888u), (int) (q1 ^ 0x88888888u),
                                                  (int) (q2 ^ 0x88888888u), (int) (q3 ^ 0x88888888u) };
+                            if (probe & 8) {  // keep the loads live, skip the math
+                                s[0][0] += (float) (int) ((q0 ^ q1 ^ q2 ^ q3 ^ sc) & 1u);
+                                continue;
+                            }
 #pragma unroll
                             for (int tt = 0; tt < TC; ++tt) {
                                 const int t = ch * TC + tt;
@@ -859,6 +905,9 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
                         }
                     }
                     it.barrier(sycl::access::fence_space::local_space);
+                    if constexpr (ST) {
+                        stage(Vh, nb21, t0);  // K is done; the softmax below does not touch sKV
+                    }
 
                     // ---- online softmax per row -> P (f16, DPAS A layout)
                     for (int r = w; r < ((probe & 4) ? 0 : R); r += NSG) {
@@ -904,7 +953,13 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
                         const bool jv = j < k_end;
                         const uint32_t * vr = (const uint32_t *) (Vh + (int64_t) (jv ? j : k_begin) * nb21);
                         const int o0 = 18 * vb, wd = o0 / 4;  // block start; even block: dword aligned, odd: 2 bytes in
-                        const uint32_t w0 = vr[wd], w1 = vr[wd + 1], w2 = vr[wd + 2], w3 = vr[wd + 3], w4 = vr[wd + 4];
+                        uint32_t w0, w1, w2, w3, w4;
+                        if constexpr (ST) {
+                            const int sb = (kg * 16 + lane) * SW + wd;
+                            w0 = sKV[sb]; w1 = sKV[sb + 1]; w2 = sKV[sb + 2]; w3 = sKV[sb + 3]; w4 = sKV[sb + 4];
+                        } else {
+                            w0 = vr[wd]; w1 = vr[wd + 1]; w2 = vr[wd + 2]; w3 = vr[wd + 3]; w4 = vr[wd + 4];
+                        }
                         uint32_t sc, q[4];
                         if ((o0 & 3) == 0) {
                             sc = w0 & 0xFFFFu;
@@ -1027,13 +1082,25 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
     const bool g2   = !d512 && Q->ne[2] == 2 * K->ne[2];  // Gemma 4 sliding layers: DPAS kernel only, token chunks of 8
     const int nq   = d512 ? (ne01 <= 1 ? 1 : 2) : g2 ? (ne01 <= 1 ? 1 : 8) : ne01 <= 1 ? 1 : ne01 <= 2 ? 2 : ne01 <= 4 ? 4 : 8;
     // keys per tile (must match the instantiations below); DPAS: 16 x KG
+    // SLM-staged K/V tiles (128 keys) for single-token decode: 48K 432 -> 247 us with the split count below. For 2+ tokens
+    // the extra SLM halves the work-groups per core and it loses (4 tok 48K 458 unstaged vs ~593 staged). GGML_SYCL_FA_DEC_STAGE=0 off.
+    static const bool stage_env = !(getenv("GGML_SYCL_FA_DEC_STAGE") && atoi(getenv("GGML_SYCL_FA_DEC_STAGE")) == 0);
+    const bool stage = dpas && stage_env && !d512 && !g2 && nq == 1;
     const int tk   = (d512 || g2) ? (nq == 1 ? 256 : 128)
+                   : stage ? 128
                    : dpas ? (nq == 1 ? 256 : nq == 2 ? 128 : nq == 4 ? 256 : 128) : nq == 8 ? 32 : nq == 4 ? 64 : 128;
     const int ne11 = K->ne[1];
 
     // slices: enough work-groups to fill the GPU (~64 slices per KV head, ~256 in all), at least one tile each
     static const int target_env = getenv("GGML_SYCL_FA_DEC_SPLITS") ? atoi(getenv("GGML_SYCL_FA_DEC_SPLITS")) : 0;
-    const int target = target_env ? target_env : std::max(64, 256 / std::max(1, (int) K->ne[2]));
+    // DPAS (D 256, 6 rows): one wave of work-groups - Xe cores x the work-groups that fit per core (SLM-bound: 4 for 1-2
+    // query tokens, 2 for 4-8) - over the KV heads. A fixed 64 per head ran 3-6 waves with a mostly idle last one: B580
+    // 48K 1 tok 432 -> 302 us (247 staged), 4 tok 648 -> 458 us. Xe2: 8 EUs per core, nsm = EUs / 16.
+    const int xe_cores = std::max(1, ggml_sycl_info().devices[ctx.device].nsm * 2);
+    const int wave     = xe_cores * (nq <= 2 ? 4 : 2);
+    const int target = target_env ? target_env
+                     : (dpas && !d512 && !g2) ? std::max(1, wave / std::max(1, (int) K->ne[2]))
+                     : std::max(64, 256 / std::max(1, (int) K->ne[2]));
     const int ntiles = (ne11 + tk - 1) / tk;
     int nsplit       = std::max(1, std::min(target, ntiles));
     const int chunk  = ((ntiles + nsplit - 1) / nsplit) * tk;
@@ -1078,6 +1145,18 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
             FATTN_DEC_DPASG2(8, 8, 1);     // 16 rows = 2 tiles, 8 key groups x 2
         }
 #undef FATTN_DEC_DPASG2
+    } else if (stage) {
+#define FATTN_DEC_DPAS_ST(NQ_, KG_, TC_) fattn_dec_q4_0_dpas<DEC_D, 6, NQ_, KG_, TC_, 1>((const char *) Q->data, (const char *) K->data, \
+        (const char *) V->data, mdata, (float *) dst->data, parts.get(), meta.get(), scale, ne01, (int) Q->ne[2], ne11,         \
+        (int) K->ne[2], (int) Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2],        \
+        V->nb[3], nb31, nb33, ne33, nsplit, chunk, stream)
+        switch (nq) {
+            case 1: FATTN_DEC_DPAS_ST(1, 8, 1); break;
+            case 2: FATTN_DEC_DPAS_ST(2, 8, 1); break;
+            case 4: FATTN_DEC_DPAS_ST(4, 8, 3); break;
+            default: FATTN_DEC_DPAS_ST(8, 8, 3); break;
+        }
+#undef FATTN_DEC_DPAS_ST
     } else if (dpas) {
         switch (nq) {
             case 1: FATTN_DEC_DPAS(1, 16, 1); break;
