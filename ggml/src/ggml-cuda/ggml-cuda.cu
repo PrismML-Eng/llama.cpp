@@ -2825,7 +2825,8 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
         const char * b1 = b0 + ggml_nbytes(b);
         return a0 < b1 && b0 < a1;
     };
-    const bool out_aliases_in = overlaps(x, mm) || (signs && overlaps(signs, mm));
+    bool out_aliases_in = overlaps(x, mm) || (signs && overlaps(signs, mm));
+    static const bool glu_pool = getenv("GGML_CUDA_FWHT_GLU_POOL") ? atoi(getenv("GGML_CUDA_FWHT_GLU_POOL")) != 0 : true;
 
     // every use of the transform output (directly or through a reshape view of the whole tensor)
     // must be src1 of a PTQ1_0 MUL_MAT that ggml_cuda_mul_mat routes to ggml_cuda_mul_mat_vec_q.
@@ -2876,6 +2877,16 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
             }
             K     = src->ne[0];
             ncols = src->ne[1];
+            // a gate/up pair that the mat-vec fuses with its SwiGLU writes that GLU output while other blocks still read the q8 rows:
+            // when the allocator put the GLU output over this buffer, the rows have to go to a pool block (see out_aliases_in)
+            if (glu_pool) {
+                for (int j2 = j + 1; j2 < std::min(j + 4, cgraph->n_nodes); ++j2) {
+                    const ggml_tensor * g = cgraph->nodes[j2];
+                    if (g->op == GGML_OP_GLU && (g->src[0] == t || g->src[1] == t) && overlaps(g, mm)) {
+                        out_aliases_in = true;
+                    }
+                }
+            }
             // ggml_cuda_mul_mat sends a padded compute-buffer view to cuBLAS instead
             const ggml_tensor * w = t->src[0];
             if (ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
@@ -3201,6 +3212,10 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
 }
 
 // returns whether the write (out) nodes overwrite the read nodes in operation
+// the evaluating context's q8 rows registry, set while a graph is evaluated; lets the fusion memory check see that an input's
+// quantized rows live in a pool block and not in the tensor's own buffer
+static thread_local const ggml_cuda_fwht_q8_context * g_fwht_q8_ctx = nullptr;
+
 static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_idx,
                                                  const int           node_count,
@@ -3243,6 +3258,13 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                 }
 
                 if (nodes_overlap(dst, src)) {
+                    // the mat-vec reads the q8 rows from a pool block, not from this tensor: overlapping it is harmless
+                    if (g_fwht_q8_ctx != nullptr) {
+                        const auto it = g_fwht_q8_ctx->entries.find(src);
+                        if (it != g_fwht_q8_ctx->entries.end() && it->second.data != src->data) {
+                            continue;
+                        }
+                    }
                     bool found = false;
 
                     for (int k = node_idx; k < j; ++k) {
@@ -4372,6 +4394,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+    g_fwht_q8_ctx = &cuda_ctx->fwht_q8();
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
