@@ -140,6 +140,83 @@ kernel void kernel_mul_mm(
     cT.store(tD.slice(ra, rb));
 }
 
+// Q1_0 products made only of full tiles (M % 64, N % 128, K % 32 all zero): kernel_mul_mm with a static K32 extent and no bounds handling
+kernel void kernel_mul_mm_q1_0_f32_k32(
+        constant ggml_metal_kargs_mul_mm & args,
+        device const char * srcA,
+        device const char * srcB,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    (void) sgitg;
+
+    constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
+    constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
+    constexpr int NK  = N_MM_NK_TOTAL;
+    constexpr int NUM_THREADS = N_SIMDWIDTH * N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
+    static_assert(NUM_THREADS == NRA * N_MM_NK, "one 16-weight chunk per thread");
+
+    const int K = args.ne00;
+    const int M = args.ne0;
+    const int N = args.ne1;
+
+    const int im  = tgpig.z;
+    const int i12 = im % FC_mul_mm_ne12;
+    const int i13 = im / FC_mul_mm_ne12;
+
+    const uint64_t offset0 = (i12/FC_mul_mm_r2)*args.nb02 + (i13/FC_mul_mm_r3)*args.nb03;
+
+    const int ra = tgpig.y * NRA;
+    const int rb = tgpig.x * NRB;
+
+    // same work mapping as kernel_mul_mm: row = tiitg / N_MM_NK, chunk = tiitg % N_MM_NK
+    const int   row    = tiitg / N_MM_NK;
+    const short k_base = (tiitg % N_MM_NK) * 16;
+
+    threadgroup half * sa = (threadgroup half *) shmem;
+
+    device const block_q1_0 * row_ptr = (device const block_q1_0 *)(srcA + args.nb01 * (ra + row) + offset0);
+    device float * ptrB = (device float *)(srcB + args.nb12*i12 + args.nb13*i13);
+    const int strideB = args.nb11 / sizeof(float);
+
+    auto tA = tensor(sa, dextents<int32_t, 2>(NK, NRA));
+    auto tB = tensor(ptrB + rb * strideB, dextents<int32_t, 2>(NK, NRB), array<int, 2>({1, strideB}));
+
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(
+            NRB, NRA, NK, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y>> mm;
+
+    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+
+    for (int loop_k = 0; loop_k < K; loop_k += NK) {
+        const int k_pos = loop_k + k_base;
+
+        half4x4 temp_a;
+        dequantize_q1_0(row_ptr + k_pos / QK1_0, (k_pos / 16) % (QK1_0 / 16), temp_a);
+
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            sa[row * NK + k_base + i] = temp_a[i/4][i%4];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto tBv = tensor(ptrB + loop_k + rb * strideB, dextents<int32_t, 2>(NK, NRB), array<int, 2>({1, strideB}));
+
+        mm.run(tBv, tA, cT);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    device float * dstTile = (device float *)dst + (uint64_t) im * N * M + (uint64_t) rb * M + ra;
+
+    auto tD = tensor(dstTile, dextents<int32_t, 2>(NRA, NRB), array<int, 2>({1, M}));
+    cT.store(tD);
+}
+
 #else
 
 template<
