@@ -182,6 +182,12 @@ llama_context::llama_context(
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
     }
 
+    {
+        const char * rows_plain = getenv("GGML_GDN_ROWS_PLAIN");
+        const char * rows_plain_max = getenv("GGML_GDN_ROWS_PLAIN_MAX_TOKENS");
+        cparams.gdn_rows_plain            = rows_plain && atoi(rows_plain) == 1;
+        cparams.gdn_rows_plain_max_tokens = rows_plain_max ? std::max(0, atoi(rows_plain_max)) : 0;
+    }
     cparams.n_rs_seq = params.n_rs_seq;
     if (cparams.n_rs_seq > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
         LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model does not support recurrent partial rollback; clamping to 0\n",
