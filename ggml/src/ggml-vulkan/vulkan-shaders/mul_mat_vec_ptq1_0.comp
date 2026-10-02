@@ -1,0 +1,182 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+#include "mul_mat_vec_base.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// Dedicated PTQ1_0 matrix-vector kernel.
+//
+// The generic mul_mat_vec path reaches PTQ1_0 through dequantize()/dequantize4(),
+// which call ptq1_0_trit() once per weight: an 8-bit load plus a loop of up to
+// four multiplies to skip the earlier trits in the same byte. Every packed byte
+// is therefore re-read and re-decoded five times.
+//
+// This kernel reads each 28-byte block as seven 32-bit words and peels the five
+// trits off a byte with the base-3 recurrence, two bytes at a time in 16-bit
+// lanes (255*3 = 765 stays inside a lane, so lanes never interfere), which is
+// 10 multiplies per 20 weights instead of ~60.
+//
+// Block layout (see ptq1_0.glsl / block_ptq1_0), 128 weights, 7 words:
+//   words 0..3 : qs[0..15]  byte j, trit t -> element 16*t + j
+//   words 4..5 : qs[16..23] byte j, trit t -> element 80 + 8*t + (j - 16)
+//   word  6    : qh[0], qh[1] (4 trits each, element 120 + 2*t + h), d (f16)
+// Weight = (trit - 1) * d, so sum_e w_e*y_e = d * (sum_e trit_e*y_e - sum_e y_e),
+// and the second term is gathered once per work item as ysum.
+//
+// A work item is half a block (half 0 = words 0..2 plus the qh word, half 1 =
+// words 3..5) so that rows of 5120 still spread over the workgroup. Activations
+// are loaded once per item and reused across the NUM_ROWS rows.
+
+layout (binding = 0) readonly buffer A_U32 {uint data_a_u32[];};
+
+FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+
+#define PTQ1_0_WORDS 7u
+#define LANE_MASK    0x00FF00FFu
+#define TRIT_MASK    0x00030003u
+
+// Element offset (within the block) of byte 0 of main word k, for trit t.
+uint word_base(const uint k, const uint t) {
+    return k < 4u ? 4u*k + 16u*t : 80u + 4u*(k - 4u) + 8u*t;
+}
+
+// One main word = 4 bytes x 5 trits = 20 weights. Consecutive bytes of a word map
+// to consecutive elements for a fixed trit, so each trit step is one vec4 of
+// activations.
+void decode_word(const uint w, out vec4 q[5]) {
+    uint ev = w & LANE_MASK;          // bytes 0 and 2
+    uint od = (w >> 8u) & LANE_MASK;  // bytes 1 and 3
+    [[unroll]] for (uint t = 0u; t < 5u; ++t) {
+        const uint me = ev * 3u;
+        const uint mo = od * 3u;
+        const uint te = (me >> 8u) & TRIT_MASK;
+        const uint to = (mo >> 8u) & TRIT_MASK;
+        ev = me & LANE_MASK;
+        od = mo & LANE_MASK;
+        q[t] = vec4(float(te & 3u), float(to & 3u), float(te >> 16u), float(to >> 16u));
+    }
+}
+
+// Word 6: qh[0] and qh[1] hold four trits each and interleave into elements
+// 120..127 (element 120 + 2*t + h).
+void decode_qh(const uint w6, out vec4 qa, out vec4 qb) {
+    uint x = (w6 & 0xFFu) | (((w6 >> 8u) & 0xFFu) << 16u);
+    vec2 q[4];
+    [[unroll]] for (uint t = 0u; t < 4u; ++t) {
+        const uint m = x * 3u;
+        const uint tr = (m >> 8u) & TRIT_MASK;
+        x = m & LANE_MASK;
+        q[t] = vec2(float(tr & 3u), float(tr >> 16u));
+    }
+    qa = vec4(q[0], q[1]);
+    qb = vec4(q[2], q[3]);
+}
+
+vec4 load_y4(const uint j, const uint b_offset, const uint e) {
+    return vec4(data_b_v4[(j*p.batch_stride_b + b_offset + e) / 4u]);
+}
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    uint a_offset, b_offset, d_offset;
+    get_offsets(a_offset, b_offset, d_offset);
+
+    const uint num_blocks_per_row = p.ncols / QUANT_K;
+    const uint tid = gl_LocalInvocationID.x;
+
+    [[unroll]] for (uint j = 0u; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+            temp[j][n] = FLOAT_TYPE(0);
+        }
+    }
+
+    const uint num_items = 2u * num_blocks_per_row;
+    for (uint item = tid; item < num_items; item += BLOCK_SIZE) {
+        const uint ib = item >> 1u;
+        const uint h = item & 1u;
+        const uint y_blk = ib * QUANT_K;
+
+        FLOAT_TYPE ysum[NUM_COLS];
+        FLOAT_TYPE acc[NUM_COLS][NUM_ROWS];
+        [[unroll]] for (uint j = 0u; j < NUM_COLS; ++j) {
+            ysum[j] = FLOAT_TYPE(0);
+            [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+                acc[j][n] = FLOAT_TYPE(0);
+            }
+        }
+
+        FLOAT_TYPE d[NUM_ROWS];
+        [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+            if (n < num_rows) {
+                const uint wb = (a_offset + (first_row + n) * num_blocks_per_row + ib) * PTQ1_0_WORDS;
+                d[n] = FLOAT_TYPE(unpackHalf2x16(data_a_u32[wb + 6u] >> 16u).x);
+            }
+        }
+
+        [[unroll]] for (uint kk = 0u; kk < 3u; ++kk) {
+            const uint k = 3u*h + kk;
+            vec4 q[NUM_ROWS][5];
+            [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+                if (n < num_rows) {
+                    const uint wb = (a_offset + (first_row + n) * num_blocks_per_row + ib) * PTQ1_0_WORDS;
+                    decode_word(data_a_u32[wb + k], q[n]);
+                }
+            }
+            [[unroll]] for (uint j = 0u; j < NUM_COLS; ++j) {
+                [[unroll]] for (uint t = 0u; t < 5u; ++t) {
+                    const vec4 yv = load_y4(j, b_offset, y_blk + word_base(k, t));
+                    ysum[j] += FLOAT_TYPE(yv.x + yv.y + yv.z + yv.w);
+                    [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+                        if (n < num_rows) {
+                            acc[j][n] += FLOAT_TYPE(dot(q[n][t], yv));
+                        }
+                    }
+                }
+            }
+        }
+
+        if (h == 0u) {
+            vec4 qh0[NUM_ROWS], qh1[NUM_ROWS];
+            [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+                if (n < num_rows) {
+                    const uint wb = (a_offset + (first_row + n) * num_blocks_per_row + ib) * PTQ1_0_WORDS;
+                    decode_qh(data_a_u32[wb + 6u], qh0[n], qh1[n]);
+                }
+            }
+            [[unroll]] for (uint j = 0u; j < NUM_COLS; ++j) {
+                const vec4 y0 = load_y4(j, b_offset, y_blk + 120u);
+                const vec4 y1 = load_y4(j, b_offset, y_blk + 124u);
+                ysum[j] += FLOAT_TYPE(y0.x + y0.y + y0.z + y0.w + y1.x + y1.y + y1.z + y1.w);
+                [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+                    if (n < num_rows) {
+                        acc[j][n] += FLOAT_TYPE(dot(qh0[n], y0) + dot(qh1[n], y1));
+                    }
+                }
+            }
+        }
+
+        [[unroll]] for (uint j = 0u; j < NUM_COLS; ++j) {
+            [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+                if (n < num_rows) {
+                    temp[j][n] = fma(d[n], acc[j][n] - ysum[j], temp[j][n]);
+                }
+            }
+        }
+    }
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    // do NUM_ROWS at a time, unless there aren't enough remaining rows
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}
