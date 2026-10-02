@@ -10906,6 +10906,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64,  1, 1));   // smaller model
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, true)); // KDA
     // PP: n_seq_tokens=64,256 (prompt processing)
+    // speculative verify window of a 16/48-head, d128 model (T = 16): final state only (GDN verify tape)
+    // vs one snapshot per row (snapshot rollback)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 16, 1, 3, false, false, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 16, 1, 3, false, false, 16));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1));  // PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1)); // PP-256
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1)); // PP-512

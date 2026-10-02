@@ -161,6 +161,9 @@ endif()
 llama_build_and_test(test-dspark-logsnr-meta.cpp LABEL "model"
     ARGS "${CMAKE_CURRENT_BINARY_DIR}/dspark-logsnr-variants")
 
+# GDN verify tape: replaying the kept rows reproduces the per-row snapshot bit for bit
+llama_build_and_test(test-gdn-tape-replay.cpp)
+
 # Requires a fixture model and reference JSON; run manually.
 llama_build(test-dspark-loop.cpp)
 

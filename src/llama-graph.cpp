@@ -417,6 +417,13 @@ bool llm_graph_input_rs::can_reuse_rs(const llama_memory_recurrent_context * mct
     res &= head == mctx_cur->get_head();
     res &= rs_z == mctx_cur->get_rs_z();
 
+    // the replay graph slices the tape by the kept-row count, so it is shape-dependent
+    res &= tape_replay == mctx_cur->get_tape_replay();
+    if (mctx_cur->get_tape_mode()) {
+        res &= tape_plane_r == mctx_cur->get_tape_plane_read();
+        res &= tape_plane_w == mctx_cur->get_tape_plane_write();
+    }
+
     return res;
 }
 
@@ -3578,6 +3585,11 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+    inp->tape_replay = mctx_cur->get_tape_replay();
+    if (mctx_cur->get_tape_mode()) {
+        inp->tape_plane_r = mctx_cur->get_tape_plane_read();
+        inp->tape_plane_w = mctx_cur->get_tape_plane_write();
+    }
 
     return inp;
 }
