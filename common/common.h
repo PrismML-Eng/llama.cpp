@@ -329,11 +329,21 @@ struct common_params_speculative_draft {
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
-    // stop drafting once the sequence is this long (0 = never). Deep in the context a step is bound
-    // by reading the KV cache, and the draft passes plus the multi-column verify add to that read
-    // without shortening it: on a 4070 with Bonsai 2 27B the draft is +85% at zero depth, breaks
-    // even near 24k tokens and costs 30% at 64k. Past the cutoff the slot decodes one token per step.
+    // stop drafting once the sequence is this long (0 = never). Measured when a deep verify batch ran on the
+    // vector FA kernel and the draft context grew with the conversation (Bonsai 2 27B on a 4070: +85% at zero
+    // depth, even near 24k, -30% at 64k). With quantized-KV decode on the MMA FA kernel and n_window below,
+    // drafting pays at every depth (64k: 48 -> 90 tok/s), so the server default is 0.
     int32_t n_depth_max = 0;
+
+    // draft (MTP) context window (0 = full history): it keeps only the last n_window rows and is sized for
+    // them, so its cells are reused, its cache stays small and on the device, and a draft pass costs the same
+    // at any depth. The MTP head predicts the next few tokens from recent context: 16k rows accept as many
+    // drafts as the full history at 131k.
+    int32_t n_window = 0;
+
+    // draft size once the sequence reaches the tiered-KV line (--kv-vram-cells; 0 = n_max). Past it a step
+    // is bound by reading the host tail over PCIe and a wider verify batch reads it once for all columns.
+    int32_t n_max_tail = 0;
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
@@ -588,6 +598,9 @@ struct common_params {
     // only takes effect when cache_type_k == GGML_TYPE_Q4_0; see docs/kv-mean-center.md
     std::string kv_mean_center_path = "";
 
+    // tiered KV cache: cells past this many live in pinned host memory (0 = all in device memory)
+    int32_t n_kv_vram_cells = 0;
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)
@@ -643,6 +656,12 @@ struct common_params {
     bool force_pure_content_parser = false;
     common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     int enable_reasoning = -1; // -1 = auto, 0 = disable, 1 = enable
+
+    // server: reasoning_effort words passed to the chat template (empty = any); others become the fallback
+    std::vector<std::string> reasoning_effort_allow;
+    std::string              reasoning_effort_fallback = "medium";
+    // server: with thinking on, raise a client output cap below this (0 = off)
+    int32_t reasoning_max_tokens_floor = 0;
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
 

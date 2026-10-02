@@ -2458,6 +2458,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_MEAN_CENTER"));
     add_opt(common_arg(
+        {"--kv-vram-cells"}, "N",
+        "tiered KV cache: keep the first N cells of each layer's K/V in VRAM and the rest in pinned system RAM\n"
+        "mapped into the same device range (CUDA VMM), so the context can exceed VRAM. Positions past N are\n"
+        "read over PCIe once a sequence is that deep; output is identical to an all-VRAM cache. 0 = off (default)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.n_kv_vram_cells = value;
+        }
+    ).set_env("LLAMA_ARG_KV_VRAM_CELLS"));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {
@@ -3702,6 +3714,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_MESSAGE"));
     add_opt(common_arg(
+        {"--reasoning-effort-allow"}, "LIST",
+        "comma-separated reasoning_effort values to pass to the chat template; any other value in a request (or\n"
+        "chat_template_kwargs) is replaced by --reasoning-effort-fallback instead of reaching a template that\n"
+        "raises on it (e.g. \"high\" -> HTTP 500). Empty = pass everything (default)",
+        [](common_params & params, const std::string & value) {
+            params.reasoning_effort_allow = string_split<std::string>(value, ',');
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_EFFORT_ALLOW"));
+    add_opt(common_arg(
+        {"--reasoning-effort-fallback"}, "WORD",
+        string_format("reasoning_effort used in place of a value --reasoning-effort-allow rejects (default: %s)", params.reasoning_effort_fallback.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.reasoning_effort_fallback = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_EFFORT_FALLBACK"));
+    add_opt(common_arg(
+        {"--reasoning-max-tokens-floor"}, "N",
+        "with thinking on, raise a client max_tokens below N to N, so a small app cap does not end the request\n"
+        "inside the thinking block with no answer; --reasoning-budget still bounds the thinking. 0 = off (default)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.reasoning_max_tokens_floor = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_MAX_TOKENS_FLOOR"));
+    add_opt(common_arg(
         {"--reasoning-preserve"},
         {"--no-reasoning-preserve"},
         "preserve reasoning trace in the full history, not just the last assistant message (default: template default)\n"
@@ -4128,6 +4167,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_depth_max = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_DEPTH_MAX"));
+    add_opt(common_arg(
+        {"--spec-draft-window"}, "N",
+        string_format("draft (MTP) context keeps only the last N rows, so its cache stays small and a draft pass costs\n"
+                      "the same at any depth; 0 = full history (default: %d)", params.speculative.draft.n_window),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_window = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_WINDOW"));
+    add_opt(common_arg(
+        {"--spec-draft-n-max-tail"}, "N",
+        string_format("draft size once the sequence reaches --kv-vram-cells, where a wider verify reads the host tail\n"
+                      "once for all columns; 0 = --spec-draft-n-max (default: %d)", params.speculative.draft.n_max_tail),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_max_tail = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX_TAIL"));
 
     add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",

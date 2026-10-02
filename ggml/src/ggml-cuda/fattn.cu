@@ -475,6 +475,23 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        // Quantized-KV decode with wide GQA (up to 8 queries: single-token decode and speculative verify):
+        // the vector kernel runs one block per Q head, so every K/V row is fetched gqa_ratio times (6x for
+        // Qwen3.5/Bonsai 2: 24 Q heads over 4 KV heads). The MMA kernel packs the GQA heads of one KV head
+        // into one tile and reads q4_0/q8_0 K/V in place once. Same rule the F16 path already uses.
+        // RTX 4070, Bonsai 2 27B, q8_0 K/V, MTP draft: 4k 78.1 -> 86.9 tok/s, 16k 77.7 -> 111.6, 32k 54.5 -> 103.6.
+        // GGML_CUDA_FA_MMA_DECODE_MIN_KV = shortest KV length that takes this route (default 256, 0 = never).
+        {
+            static const int min_kv = [] {
+                const char * e = getenv("GGML_CUDA_FA_MMA_DECODE_MIN_KV");
+                return e ? atoi(e) : 256;
+            }();
+            if (min_kv > 0 && ggml_is_quantized(K->type) && K->type == V->type &&
+                    ggml_cuda_fattn_mma_kv_native_supported(dst) &&
+                    gqa_opt_applies && gqa_ratio > 4 && Q->ne[1] <= 8 && Q->ne[3] == 1 && K->ne[1] >= min_kv) {
+                return BEST_FATTN_KERNEL_MMA_F16;
+            }
+        }
         if (can_use_vector_kernel) {
             // batch-invariant mode: the same (vector) kernel for 1 to 8 queries, so a token verified in a
             // speculative batch attends with the same arithmetic as a token decoded alone
@@ -595,8 +612,31 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// ggml-cuda.cu: host-tail staging of tiered buffers (ggml_backend_cuda_tier_buffer_type)
+void * ggml_cuda_tier_stage(const void * ptr, size_t nbytes, cudaStream_t stream);
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    // K/V in a tiered buffer whose host tail this op reaches: copy the used host rows into the VRAM staging
+    // buffer with the copy engine and point K/V at the all-VRAM alias of the same range for this op. Prefill
+    // kernels read each K/V row once per query tile, which for host rows would be PCIe traffic every time;
+    // decode reads each row once, but DMA moves it faster than SMs reading host memory from inside the
+    // kernel (RTX 4070, 180k context, 86k cells in host memory: +28% decode). Nothing is copied for ops
+    // that stay below the tier line. The staged bytes are the same bytes, so results are unchanged.
+    ggml_tensor * K = dst->src[1];
+    ggml_tensor * V = dst->src[2];
+    void * K_data = K ? K->data : nullptr;
+    void * V_data = V ? V->data : nullptr;
+    if (K && V && V != K) {
+        if (void * a = ggml_cuda_tier_stage(K->data, ggml_nbytes(K), ctx.stream())) {
+            K->data = a;
+        }
+        if (void * a = ggml_cuda_tier_stage(V->data, ggml_nbytes(V), ctx.stream())) {
+            V->data = a;
+        }
+    }
+
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
@@ -609,6 +649,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
+    }
+
+    if (K) {
+        K->data = K_data;
+    }
+    if (V) {
+        V->data = V_data;
     }
 }
 
