@@ -346,6 +346,10 @@ public:
     ggml_tensor * s_write_rows = nullptr;
     int64_t       s_write_K    = 0;
 
+    // every ubatch seq reads its own cell and n_rs == n_seqs: the GDN op may
+    // update the cache rows in place (rs_inplace_ok); part of the reuse key
+    bool rs_inplace = false;
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
@@ -1443,11 +1447,14 @@ struct llm_graph_context {
     // (state_size, n_rows) cache view. For consumers that read per-seq state
     // rows directly via inp->s_copy_main (e.g. ggml_gated_delta_net_rows),
     // saving a get_rows per layer per decode.
+    // inplace: the consumer is the cache-writing op (ggml_gated_delta_net_cache);
+    // requires inp->rs_inplace, i.e. an empty extra range and identity main rows.
     ggml_tensor * build_rs_cache_view(
             llm_graph_input_rs * inp,
             ggml_tensor * s,
                 int32_t   state_size,
-                int32_t   n_seqs) const;
+                int32_t   n_seqs,
+                   bool   inplace = false) const;
 
     // I64 cache-row indices for the rows-mode snapshot scatter: row of
     // (slot s, seq i) = s*mem_size + head + i, matching the strided-cpy

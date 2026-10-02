@@ -2620,6 +2620,31 @@ extern "C" {
             struct ggml_tensor  * rows,
             int                   n_snap_slots);
 
+    // cache-writing form (CPU backend only): like ggml_gated_delta_net_rows, but
+    // the op MUTATES `states` instead of returning state planes -- the result is
+    // the attention scores only, [S_v*H_v, n_tokens*n_seqs]. For sequence i the
+    // kernel reads cache row rows_in[i] (I32, n_seqs entries), updates the live
+    // state in place in row rows_out[0*n_seqs + i] (I64, min(n_tokens, K)*n_seqs
+    // entries; no copy at all when rows_in[i] == rows_out[i]) and writes snapshot
+    // slot s (state s tokens back) for s in 1..min(n_tokens, K)-1 straight into
+    // row rows_out[s*n_seqs + i]. The caller guarantees that rows_in[i] and every
+    // rows_out[s*n_seqs + i] are planes of ONE cell (row % mem_size equal, checked
+    // by the kernel) and that the cells of different sequences are pairwise
+    // distinct, so no work unit ever reads a row another unit writes. Removes the
+    // gather, the dst state planes and the write-back copy from recurrent decode.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_cache(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * states,   // 2D cache view [S_v*S_v*H_v, n_rows], mutated
+            struct ggml_tensor  * rows_in,  // I32 [n_seqs]
+            struct ggml_tensor  * rows_out, // I64 [min(n_tokens, K)*n_seqs]
+            int                   n_snap_slots,
+            int                   mem_size);
+
     // fold the per-head gate activations into a gated_delta_net op (scalar gate only):
     //   beta -> sigmoid(beta),  g -> a[h] * softplus(g + dt_bias[h])
     // dt_bias and a are F32 with H_v elements; removes four elementwise ops per layer
