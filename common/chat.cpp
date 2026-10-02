@@ -8,6 +8,7 @@
 #include "json-schema-to-grammar.h"
 #include "json.h"
 #include "log.h"
+#include "unicode.h"
 
 #include "jinja/value.h"
 #include "jinja/runtime.h"
@@ -3845,6 +3846,29 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     common_peg_parse_context ctx(effective_input, flags);
     auto result = parser.parse(ctx);
 
+    // Kept alive in outer scope: on a recovered parse its AST text views
+    // (std::string_view into ctx.input) must stay valid until mapping is done.
+    common_peg_parse_context retry_ctx(flags);
+    bool                     recovered_malformed_utf8 = false;
+    if (result.fail()) {
+        // The model can emit malformed UTF-8 (e.g. a truncated multi-byte
+        // character), which makes any/chars/until parsers fail the whole
+        // message. Retry once on a copy where malformed sequences are
+        // replaced by U+FFFD; a trailing truncated sequence is kept so that
+        // partial input can still complete.
+        std::string sanitized;
+        if (common_utf8_sanitize(effective_input, sanitized)) {
+            retry_ctx.input  = std::move(sanitized);
+            auto retry_result = parser.parse(retry_ctx);
+            if (!retry_result.fail()) {
+                result                   = retry_result;
+                recovered_malformed_utf8 = true;
+            }
+        }
+    }
+
+    common_peg_parse_context & active_ctx = recovered_malformed_utf8 ? retry_ctx : ctx;
+
     if (result.fail()) {
         // During partial parsing, return partial results if any AST nodes were captured
         // This allows streaming to work correctly for formats like FUNC_MARKDOWN_CODE_BLOCK
@@ -3884,10 +3908,24 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     } else {
         mapper = std::make_unique<common_chat_peg_mapper>(msg);
     }
-    mapper->from_ast(ctx.ast, result);
+    mapper->from_ast(active_ctx.ast, result);
 
-    if (ctx.is_debug()) {
-        fprintf(stderr, "\nAST for %s parse:\n%s\n", is_partial ? "partial" : "full", ctx.ast.dump().c_str());
+    if (recovered_malformed_utf8) {
+        // Recovery must not turn a corrupted tool call into an executable one:
+        // malformed bytes inside a tool call surface as U+FFFD in its fields.
+        for (const auto & tool_call : msg.tool_calls) {
+            if (tool_call.id.find("\xef\xbf\xbd") != std::string::npos ||
+                tool_call.name.find("\xef\xbf\xbd") != std::string::npos ||
+                tool_call.arguments.find("\xef\xbf\xbd") != std::string::npos) {
+                LOG_WRN("%s: malformed UTF-8 inside %s tool call\n", __func__, common_chat_format_name(params.format));
+                throw std::runtime_error(std::string("The model produced output that does not match the expected ") +
+                                         common_chat_format_name(params.format) + " format");
+            }
+        }
+    }
+
+    if (active_ctx.is_debug()) {
+        fprintf(stderr, "\nAST for %s parse:\n%s\n", is_partial ? "partial" : "full", active_ctx.ast.dump().c_str());
         fflush(stderr);
     }
 
