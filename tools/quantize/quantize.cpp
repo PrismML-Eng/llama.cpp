@@ -36,6 +36,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q2_0",     LLAMA_FTYPE_MOSTLY_Q2_0,     " 2.25 bpw quantization (group 64)",  },
     { "PQ2_0", LLAMA_FTYPE_MOSTLY_PQ2_0, " 2.13 bpw quantization (group 128, Prism)", },
     { "PTQ1_0", LLAMA_FTYPE_MOSTLY_PTQ1_0, " 1.75 bpw ternarization (group 128, Prism)", },
+    { "PQ1_0",  LLAMA_FTYPE_MOSTLY_PQ1_0,  " 1.25 bpw binary (group 64, Prism)", },
     { "Q4_0",     LLAMA_FTYPE_MOSTLY_Q4_0,     " 4.34G, +0.4685 ppl @ Llama-3-8B",  },
     { "Q4_1",     LLAMA_FTYPE_MOSTLY_Q4_1,     " 4.78G, +0.4511 ppl @ Llama-3-8B",  },
     { "MXFP4_MOE",LLAMA_FTYPE_MOSTLY_MXFP4_MOE," MXFP4 MoE",  },

@@ -23,6 +23,28 @@ static __device__ __forceinline__ void dequantize_q1_0(const void * vx, const in
     v.y = (2*bit_1 - 1) * d;
 }
 
+static __device__ __forceinline__ void dequantize_pq1_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_pq1_0 * x = (const block_pq1_0 *) vx;
+
+    const float d = x[ib].d;
+
+    const int bit_index_0 = iqs;
+    const int bit_index_1 = iqs + 1;
+
+    const int byte_index_0 = bit_index_0 / 8;
+    const int bit_offset_0 = bit_index_0 % 8;
+
+    const int byte_index_1 = bit_index_1 / 8;
+    const int bit_offset_1 = bit_index_1 % 8;
+
+    // Extract bits: 1 = +d, 0 = -d (branchless)
+    const int bit_0 = (x[ib].qs[byte_index_0] >> bit_offset_0) & 1;
+    const int bit_1 = (x[ib].qs[byte_index_1] >> bit_offset_1) & 1;
+
+    v.x = (2*bit_0 - 1) * d;
+    v.y = (2*bit_1 - 1) * d;
+}
+
 static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q2_0 * x = (const block_q2_0 *) vx;
 

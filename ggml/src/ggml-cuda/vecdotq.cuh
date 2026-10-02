@@ -108,6 +108,7 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 
 #define VDR_Q1_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time for parallelism
 #define VDR_Q1_0_Q8_1_MMQ  4  // Q1_0 has 128 bits (4 ints) per block
+#define VDR_PQ1_0_Q8_1_MMVQ 1 // one 32-element chunk per call, as Q1_0
 
 #define VDR_Q2_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time for parallelism
 #define VDR_Q2_0_Q8_1_MMQ  2  // Q2_0 group 64: 128 bits (4 ints) per block, 2 32-element chunks
@@ -757,6 +758,63 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     }
 
     // Apply Q1_0's single scale and this chunk's Q8_1 scale
+    const float d8 = __low2float(bq8_1_chunk->ds);
+    return d1 * d8 * sumi;
+}
+
+static __device__ __forceinline__ float vec_dot_pq1_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_pq1_0 * bpq1_0 = (const block_pq1_0 *) vbq + kbx;
+
+    // PQ1_0: 64 elements with ONE scale
+    // Q8_1: 32 elements per block with individual scales
+    // iqs selects which of the 2 chunks of 32 elements to process (0-1)
+
+    const float     d1 = bpq1_0->d;
+    const int16_t * qs = (const int16_t *) bpq1_0->qs + iqs * 2;
+
+    // Process only the chunk specified by iqs
+    const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
+
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int q  = qs[j];
+
+        const int u0 = get_int_b4(bq8_1_chunk->qs, j*4+0);
+        const int u1 = get_int_b4(bq8_1_chunk->qs, j*4+1);
+        const int u2 = get_int_b4(bq8_1_chunk->qs, j*4+2);
+        const int u3 = get_int_b4(bq8_1_chunk->qs, j*4+3);
+
+#if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
+        const int v0 = q1_0_unpack4_hip((uint32_t) q, 0);
+        const int v1 = q1_0_unpack4_hip((uint32_t) q, 1);
+        const int v2 = q1_0_unpack4_hip((uint32_t) q, 2);
+        const int v3 = q1_0_unpack4_hip((uint32_t) q, 3);
+#else
+        // unpack crumbs into nibble indices
+        const int n0 = __byte_perm(0x11100100, 0x11100100, q >> 0); // [0, 1, 4, 5] [ 8,  9, 12, 13]
+        const int n1 = __byte_perm(0x11100100, 0x11100100, q >> 2); // [2, 3, 6, 7] [10, 11, 14, 15]
+        // unpack nibbles into byte values
+        const int s0 = __byte_perm(0x01FF, 0x01FF, n0 >>  0);
+        const int s1 = __byte_perm(0x01FF, 0x01FF, n1 >>  0);
+        const int s2 = __byte_perm(0x01FF, 0x01FF, n0 >> 16);
+        const int s3 = __byte_perm(0x01FF, 0x01FF, n1 >> 16);
+        // unshuffle values
+        const int v0 = __byte_perm(s0, s1, 0x5410);
+        const int v1 = __byte_perm(s0, s1, 0x7632);
+        const int v2 = __byte_perm(s2, s3, 0x5410);
+        const int v3 = __byte_perm(s2, s3, 0x7632);
+#endif
+
+        sumi = ggml_cuda_dp4a(v0, u0, sumi);
+        sumi = ggml_cuda_dp4a(v1, u1, sumi);
+        sumi = ggml_cuda_dp4a(v2, u2, sumi);
+        sumi = ggml_cuda_dp4a(v3, u3, sumi);
+    }
+
+    // Apply PQ1_0's single scale and this chunk's Q8_1 scale
     const float d8 = __low2float(bq8_1_chunk->ds);
     return d1 * d8 * sumi;
 }
