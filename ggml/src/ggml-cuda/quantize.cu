@@ -154,7 +154,7 @@ static __global__ void quantize_q8_1(
 // Hadamard transform folded into the activation quantizer (see ggml_cuda_fwht_skip): one block per
 // (transform width N, row), the same butterfly as fwht_cuda_block, then the same per-32 quantization
 // and stores as quantize_q8_1<layout> above. Element i*NT + tid of the transform sits in reg[i], so
-// warp w holds the complete 32-blocks kb = i*(NT/32) + w and reduces them with the usual warp reductions.
+// each 32-block kb = i*(NT/32) + tid/32 lies in one warp and is reduced with 32-wide warp reductions.
 // Rows of x are contiguous (ne00 elements); row index = ((i3*ne2 + i2)*ne1 + i1) like a contiguous src1.
 template <int N, int NT, ggml_cuda_q8_1_layout layout, typename T, bool has_signs>
 __launch_bounds__(NT, 1)
@@ -164,7 +164,7 @@ static __global__ void fwht_quantize_q8_1(
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int NE        = N / NT;
     static_assert(NE >= 1 && N % NT == 0 && NT % warp_size == 0 && NT % QK8_1 == 0, "bad fused FWHT shape");
-    static_assert(QK8_1 == warp_size, "fused quantizer reduces one 32-block per warp");
+    static_assert(warp_size % QK8_1 == 0, "a 32-block must not span two warps");
 
     __shared__ float s[N];
 
@@ -207,7 +207,7 @@ static __global__ void fwht_quantize_q8_1(
 #pragma unroll
     for (int i = 0; i < NE; ++i) {
         const float xi = reg[i];
-        const int64_t i0 = base + i * NT + tid;   // element within the row (i0 % 32 == lane)
+        const int64_t i0 = base + i * NT + tid;   // element within the row (i0 % 32 == tid % 32)
 
         float amax = fabsf(xi);
         float sum  = xi;
@@ -217,7 +217,7 @@ static __global__ void fwht_quantize_q8_1(
         const float  d = amax / 127.0f;
         const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
 
-        const int iqs = lane;
+        const int iqs = lane % QK8_1;
 
         if constexpr (layout == GGML_CUDA_Q8_1_PT) {
             char * ycol = (char *) vy + row * (ne0 * 9 / 8);
