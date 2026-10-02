@@ -960,6 +960,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_concat_i8, pipeline_concat_i16, pipeline_concat_i32, pipeline_concat_i64;
     vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bicubic_f32, pipeline_upscale_bilinear_antialias_f32;
     vk_pipeline pipeline_scale_f32;
+    vk_pipeline pipeline_scale_bf16;
     vk_pipeline pipeline_log[2];
     vk_pipeline pipeline_tri[2];
     vk_pipeline pipeline_diag[2];
@@ -1081,6 +1082,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_gated_linear_attn_f32;
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
+    vk_pipeline pipeline_gated_delta_net_rows[4][2];
+    vk_pipeline pipeline_gated_delta_net_rows_bf16state[4][2];
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -5669,6 +5672,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_upscale_bilinear_antialias_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_scale_f32, "scale_f32", scale_f32_len, scale_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_scale_bf16, "scale_bf16", scale_bf16_len, scale_bf16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_log[0], "log_f32", log_f32_len, log_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_log[1], "log_f16", log_f16_len, log_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
@@ -5960,6 +5964,24 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
+            }
+            size_t gdnr_len; const void * gdnr_data;
+            if (use_clustered_reduce)      { gdnr_len = gated_delta_net_rows_f32_len;          gdnr_data = (const void *)gated_delta_net_rows_f32_data; }
+            else if (use_subgroup_reduce)  { gdnr_len = gated_delta_net_rows_f32_nocluster_len; gdnr_data = (const void *)gated_delta_net_rows_f32_nocluster_data; }
+            else                           { gdnr_len = gated_delta_net_rows_f32_shmem_len;      gdnr_data = (const void *)gated_delta_net_rows_f32_shmem_data; }
+            for (uint32_t kda = 0; kda < 2; kda++) {
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_rows[si][kda],
+                    gdn_names[si][kda], gdnr_len, gdnr_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
+                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
+            }
+            size_t gdnrb_len; const void * gdnrb_data;
+            if (use_clustered_reduce)      { gdnrb_len = gated_delta_net_rows_bf16state_f32_len;          gdnrb_data = (const void *)gated_delta_net_rows_bf16state_f32_data; }
+            else if (use_subgroup_reduce)  { gdnrb_len = gated_delta_net_rows_bf16state_f32_nocluster_len; gdnrb_data = (const void *)gated_delta_net_rows_bf16state_f32_nocluster_data; }
+            else                           { gdnrb_len = gated_delta_net_rows_bf16state_f32_shmem_len;      gdnrb_data = (const void *)gated_delta_net_rows_bf16state_f32_shmem_data; }
+            for (uint32_t kda = 0; kda < 2; kda++) {
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_rows_bf16state[si][kda],
+                    gdn_names[si][kda], gdnrb_len, gdnrb_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
             }
         }
@@ -11390,6 +11412,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_scale_f32;
         }
+        if (src0->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
+            return ctx->device->pipeline_scale_bf16;
+        }
         return nullptr;
     case GGML_OP_SQR:
         if (src0->type == dst->type &&
@@ -11791,6 +11816,12 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 case 64:  si = 2; break;
                 case 128: si = 3; break;
                 default: return nullptr;
+            }
+            if (dst->src[5]->type == GGML_TYPE_BF16) {
+                return ctx->device->pipeline_gated_delta_net_rows_bf16state[si][kda];
+            }
+            if (dst->src[6] != nullptr) {
+                return ctx->device->pipeline_gated_delta_net_rows[si][kda];
             }
             return ctx->device->pipeline_gated_delta_net[si][kda];
         }
@@ -12882,6 +12913,12 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     for (int i = 0; i < 6; i++) {
         src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
     }
+    // rows mode: extra index buffer at binding 7 (dst->src[6])
+    const bool gdn_rows = dst->src[6] != nullptr;
+    vk_subbuffer rows_buf = {};
+    if (gdn_rows) {
+        rows_buf = ggml_vk_tensor_subbuffer(ctx, dst->src[6]);
+    }
 
     const uint32_t sq1 = (uint32_t)(src_q->nb[1] / sizeof(float));
     const uint32_t sq2 = (uint32_t)(src_q->nb[2] / sizeof(float));
@@ -12907,9 +12944,15 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         K
     };
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
-        pc, { H, n_seqs, S_v });
+    if (gdn_rows) {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, rows_buf},
+            pc, { H, n_seqs, S_v });
+    } else {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+            pc, { H, n_seqs, S_v });
+    }
 }
 
 static void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -18661,14 +18704,25 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (ggml_get_op_params_i32(op, 1) != 0) {
                     return false;
                 }
+                // rows-indexed state read (src[6]) requires an int32 index tensor
+                if (op->src[6] != nullptr && op->src[6]->type != GGML_TYPE_I32) {
+                    return false;
+                }
+                if (op->src[6] != nullptr && op->src[5]->type != GGML_TYPE_F32 && op->src[5]->type != GGML_TYPE_BF16) {
+                    return false;
+                }
                 const uint32_t S_v = op->src[2]->ne[0];
                 if (S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) {
                     return false;
                 }
-                for (int i = 0; i < 6; i++) {
+for (int i = 0; i < 6; i++) {
+                    if (i == 5 && op->src[5]->type == GGML_TYPE_BF16) {
+                        continue; // bf16 state handled by the dedicated rows pipeline
+                    }
                     if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32) {
                         return false;
                     }
+                }
                 }
                 return op->type == GGML_TYPE_F32;
             }
