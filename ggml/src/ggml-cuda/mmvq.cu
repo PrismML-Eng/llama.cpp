@@ -612,6 +612,9 @@ static __global__ void mul_mat_vec_q(
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
 
+    // one-column MUL_MAT_ID keeps the expert slots in channels: stride_col_dst spans all of them, the row count is the channel stride
+    const uint32_t nrows_dst = ncols_dst == 1 && ids ? stride_channel_dst : stride_col_dst;
+
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
 
