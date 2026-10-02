@@ -5,6 +5,7 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
 #include <type_traits>
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
@@ -1579,6 +1580,23 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// true when a gate (SwiGLU) fused mat-vec with 2..4 columns runs on the dedicated PTQ1_0 kernel: plain 2D, K a multiple of 128,
+// shared memory (twice the partials with a gate) within the limit. The graph check and the launcher use the same rule.
+bool ggml_cuda_mmvq_ptq1_0_can_fuse_mc(const ggml_tensor * src0, const int ncols_dst) {
+#if defined(GGML_USE_HIP)
+    GGML_UNUSED(src0); GGML_UNUSED(ncols_dst);
+    return false;
+#else
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_PTQ1_FUSE_MC"); return e ? atoi(e) != 0 : true; }();
+    if (!enabled || src0->type != GGML_TYPE_PTQ1_0 || ncols_dst < 2 || ncols_dst > 4 || src0->ne[2] != 1 || src0->ne[3] != 1 ||
+        src0->ne[0] % QK_PTQ1_0 != 0 || !ptq1_0_pt_enabled()) {
+        return false;
+    }
+    const size_t smem = ptq1_0_pt_smem_bytes((int) (src0->ne[0] / QK_PTQ1_0), ncols_dst, (int) src0->ne[1], true);
+    return smem <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
+#endif
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1609,7 +1627,7 @@ void ggml_cuda_mul_mat_vec_q(
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || dst->ne[1] == 1 || ggml_cuda_mmvq_ptq1_0_can_fuse_mc(src0, (int) dst->ne[1]));
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);

@@ -1804,8 +1804,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+    //we only support fusion for ncols_dst = 1, except the dedicated PTQ1_0 kernel (2..4 columns)
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 && !ggml_cuda_mmvq_ptq1_0_can_fuse_mc(src0, (int) dst->ne[1])) {
         return false;
     }
 
