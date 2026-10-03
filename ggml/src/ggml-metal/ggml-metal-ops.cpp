@@ -2795,7 +2795,13 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     // 4-8 stay on mul_mv_ext. GGML_METAL_PQ2_0_NR1=1 restores mul_mv_ext for 2-3 as well.
     static const bool pq2_0_ext_enable = getenv("GGML_METAL_PQ2_0_NR1") && atoi(getenv("GGML_METAL_PQ2_0_NR1")) == 1;
 
-    const int ne11_mm_min = op->src[0]->type == GGML_TYPE_Q1_0 ? std::max(8, q1_0_mv_max) : 8;
+    const char * direct_env     = getenv("GGML_METAL_Q2_DIRECT_MAX");
+    const char * direct_min_env = getenv("GGML_METAL_Q2_DIRECT_MIN");
+    const int    direct_min     = direct_min_env ? atoi(direct_min_env) : 8;
+    const bool direct = props_dev->has_tensor_direct && direct_env && ne11 >= direct_min && ne11 <= atoi(direct_env) &&
+                        (op->src[0]->type == GGML_TYPE_Q2_0 || op->src[0]->type == GGML_TYPE_PQ2_0) &&
+                        (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16);
+    const int  ne11_mm_min = direct ? 0 : op->src[0]->type == GGML_TYPE_Q1_0 ? std::max(8, q1_0_mv_max) : 8;
 
     if (ggml_metal_op_mul_mat_q1_0_pc_supported(op)) {
         const int32_t nblk = ne00/128;
@@ -2887,7 +2893,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         static const int  fewrow_max = getenv("GGML_METAL_PQ2_0_FEWROW_MAX") ? atoi(getenv("GGML_METAL_PQ2_0_FEWROW_MAX")) : 32;
         static const int  fewrow_cfg = getenv("GGML_METAL_PQ2_0_FEWROW_CFG") ? atoi(getenv("GGML_METAL_PQ2_0_FEWROW_CFG")) : 0;
 
-        if (fewrow_on && props_dev->has_tensor &&
+        if (!direct && fewrow_on && props_dev->has_tensor &&
             op->src[0]->type == GGML_TYPE_PQ2_0 && op->src[1]->type == GGML_TYPE_F32 &&
             ne11 >= fewrow_min && ne11 <= fewrow_max &&
             ne00 % 128 == 0 && // QK_PQ2_0
@@ -2934,7 +2940,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
-    if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
+    if (!direct && op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
         (
          (
           (
