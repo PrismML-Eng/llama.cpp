@@ -34,8 +34,11 @@
 
 #define N_R0_PQ2_0 8
 #define N_SG_PQ2_0 2
-#define N_R0_PTQ1_0 4
+// The dense kernel can amortize each activation load across five output rows.
+// Keep MUL_MAT_ID at four: its five-row specialization fails numerical validation.
+#define N_R0_PTQ1_0 5
 #define N_SG_PTQ1_0 1
+#define N_R0_ID_PTQ1_0 4
 
 #define N_R0_Q4_0 4
 #define N_SG_Q4_0 2
