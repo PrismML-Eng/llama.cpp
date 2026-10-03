@@ -27,3 +27,8 @@ void   ggml_sycl_t2_new_graph();
 // key = the tensor they will read it through (see x_key). false: shape not served (K % 1024, M > 512) or knob off.
 bool   ggml_sycl_t2_fwht_quant(sycl::queue & q, const float * x, const float * signs, float * dst, int64_t M, int64_t K,
                                const void * key);
+// [add_out =] a (+ b); normed = rms_norm(.) * w; [mm = rotation of normed * signs, quantized as above]. b, add_out,
+// normed, signs (and then mm, key) may be null. One work-group per token: K % 1024 == 0, K <= 8192, M <= 512.
+bool   ggml_sycl_t2_add_norm_rot(sycl::queue & q, const float * a, const float * b, float * add_out, const float * w,
+                                 float eps, float * normed, const float * signs, float * mm, int64_t M, int64_t K,
+                                 const void * key);

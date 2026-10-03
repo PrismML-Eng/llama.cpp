@@ -319,6 +319,74 @@ void scratch_aq(sycl::queue & q, int64_t M, int64_t K, int8_t *& Aq, uint16_t *&
 }
 }  // namespace
 
+namespace {
+// one 1024 block of the rotation, already loaded and signed: v[j] = element lane + 16 j + 128 sgi (sgi = sub-group 0..7 of
+// the block's 128 lanes), s = the block's 1024 floats of SLM. Writes the rotated block to dst (1024 floats) and its 8
+// quant groups to Aq (1024 int8) + SA (column m, groups g0..g0+7). Butterflies in fwht.cpp's order (h = 1, 2, 4 ... 512).
+// Every lane of the work-group must call it (barriers).
+template <typename Item>
+inline void rot_quant_block(float (&v)[8], float * s, const Item & it, const sycl::sub_group & sg, int lane, int sgi,
+                            float * dst, int8_t * aq, uint16_t * SA, int64_t g0, int lda, int64_t m) {
+#pragma unroll
+    for (int h = 1; h < 16; h *= 2) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float o = sycl::permute_group_by_xor(sg, v[j], h);
+            v[j]          = (lane & h) == 0 ? v[j] + o : o - v[j];
+        }
+    }
+#pragma unroll
+    for (int st = 1; st < 8; st *= 2) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if ((j & st) == 0) {
+                const float a = v[j], b = v[j + st];
+                v[j] = a + b; v[j + st] = a - b;
+            }
+        }
+    }
+    // layout 2: element t + 128 i (t = 16 sgi + lane); butterflies h = 128, 256, 512 in registers
+    const int t = 16 * sgi + lane;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) s[lane + 16 * j + 128 * sgi] = v[j];
+    it.barrier(sycl::access::fence_space::local_space);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) v[i] = s[t + 128 * i];
+#pragma unroll
+    for (int st = 1; st < 8; st *= 2) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            if ((i & st) == 0) {
+                const float a = v[i], b = v[i + st];
+                v[i] = a + b; v[i + st] = a - b;
+            }
+        }
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) s[t + 128 * i] = v[i];
+    it.barrier(sycl::access::fence_space::local_space);
+    // layout 1 again: sub-group sgi holds quant group sgi (128 values, 8 per lane) -> quant_a's numbers
+    float mx = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        v[j] = s[lane + 16 * j + 128 * sgi];
+        mx   = sycl::fmax(mx, sycl::fabs(v[j]));
+        dst[lane + 16 * j + 128 * sgi] = v[j];
+    }
+    mx                  = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
+    const sycl::half sh = sycl::half(127.0f / sycl::fmax(mx, int8dpas::EPS));
+    const float      sc = (float) sh;
+    if (lane == 0) {
+        SA[(g0 + sgi) * lda + m] = sycl::bit_cast<uint16_t>(sh);
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        aq[128 * sgi + lane + 16 * j] = (int8_t) sycl::rint(sycl::clamp(v[j] * sc, -128.0f, 127.0f));
+    }
+}
+}  // namespace
+
 // signed 1024-point Hadamard rotation (as fwht.cpp: dst = H (x * signs) / 32, same butterfly order, so the same floats)
 // that also quantizes its output for the T2 mat-vecs which read it next: one 128-lane work-group per 1024 block where
 // fwht.cpp gives a block one 16-lane sub-group (5 sub-groups in all for a decode token), and no quant_a launch after it.
@@ -343,76 +411,80 @@ bool ggml_sycl_t2_fwht_quant(sycl::queue & q, const float * x, const float * sig
             const int64_t m = r / nblk, kb = r % nblk;
             const float * src = x + r * N;
             const float * sgn = signs + kb * N;
-            float * const s   = sl.get_multi_ptr<sycl::access::decorated::no>().get();
             float         v[8];
-            // layout 1: element lane + 16 j + 128 sgi; butterflies h = 1..8 across lanes, then 16, 32, 64 in registers
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 const int e = lane + 16 * j + 128 * sgi;
                 v[j]        = src[e] * (1.0f / 32.0f) * sgn[e];
             }
-#pragma unroll
-            for (int h = 1; h < 16; h *= 2) {
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const float o = sycl::permute_group_by_xor(sg, v[j], h);
-                    v[j]          = (lane & h) == 0 ? v[j] + o : o - v[j];
-                }
-            }
-#pragma unroll
-            for (int st = 1; st < 8; st *= 2) {
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    if ((j & st) == 0) {
-                        const float a = v[j], b = v[j + st];
-                        v[j] = a + b; v[j + st] = a - b;
-                    }
-                }
-            }
-            // layout 2: element t + 128 i (t = 16 sgi + lane); butterflies h = 128, 256, 512 in registers
-            const int t = 16 * sgi + lane;
-#pragma unroll
-            for (int j = 0; j < 8; ++j) s[lane + 16 * j + 128 * sgi] = v[j];
-            it.barrier(sycl::access::fence_space::local_space);
-#pragma unroll
-            for (int i = 0; i < 8; ++i) v[i] = s[t + 128 * i];
-#pragma unroll
-            for (int st = 1; st < 8; st *= 2) {
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    if ((i & st) == 0) {
-                        const float a = v[i], b = v[i + st];
-                        v[i] = a + b; v[i + st] = a - b;
-                    }
-                }
-            }
-            it.barrier(sycl::access::fence_space::local_space);
-#pragma unroll
-            for (int i = 0; i < 8; ++i) s[t + 128 * i] = v[i];
-            it.barrier(sycl::access::fence_space::local_space);
-            // layout 1 again: sub-group sgi holds quant group sgi (128 values, 8 per lane) -> quant_a's numbers
-            float mx = 0.0f;
-#pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                v[j] = s[lane + 16 * j + 128 * sgi];
-                mx   = sycl::fmax(mx, sycl::fabs(v[j]));
-                dst[r * N + lane + 16 * j + 128 * sgi] = v[j];
-            }
-            mx                   = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
-            const sycl::half sh  = sycl::half(127.0f / sycl::fmax(mx, int8dpas::EPS));
-            const float      scl = (float) sh;
-            const int64_t    g   = kb * (N / QK) + sgi;
-            if (lane == 0) {
-                SA[g * lda + m] = sycl::bit_cast<uint16_t>(sh);
-            }
-            int8_t * aq = Aq + m * K + g * QK;
-#pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                aq[lane + 16 * j] = (int8_t) sycl::rint(sycl::clamp(v[j] * scl, -128.0f, 127.0f));
-            }
+            rot_quant_block(v, sl.get_multi_ptr<sycl::access::decorated::no>().get(), it, sg, lane, sgi, dst + r * N,
+                            Aq + m * K + kb * N, SA, kb * (N / QK), lda, m);
         });
     });
     g_quant_have = quant_key{ key, dst, K, M, K, g_graph.load() };
+    return true;
+}
+
+// residual add + RMS norm + norm weight (+ the signed rotation + quantize of ggml_sycl_t2_fwht_quant): one work-group
+// per token, K / 1024 blocks of 128 lanes. Every read of a and b happens before the row's sum of squares is reduced
+// (a work-group barrier), so outputs may reuse an input's memory within a token; the caller checks across tokens.
+bool ggml_sycl_t2_add_norm_rot(sycl::queue & q, const float * a, const float * b, float * add_out, const float * w,
+                               float eps, float * normed, const float * signs, float * mm, int64_t M, int64_t K,
+                               const void * key) {
+    constexpr int N = 1024;
+    if (K % N != 0 || K > 8 * N || M <= 0 || M > 512 || !ggml_sycl_knob("GGML_SYCL_PTQ1_T2_NORMQ", 1)) {
+        return false;
+    }
+    const bool rot = signs != nullptr;
+    int8_t *   Aq  = nullptr;
+    uint16_t * SA  = nullptr;
+    if (rot) {
+        scratch_aq(q, M, K, Aq, SA);
+    }
+    const int lda = int8dpas::ldsa((int) M);
+    const int nt  = (int) (K / N) * 128;
+    q.submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> sl(sycl::range<1>(rot ? K : 1), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(M * nt, nt), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const auto    sg   = it.get_sub_group();
+            const int     lane = sg.get_local_linear_id();
+            const int     sgid = sg.get_group_linear_id();
+            const int     kb = sgid / 8, sgi = sgid % 8;
+            const int64_t m    = it.get_group(0);
+            const int64_t base = m * K + kb * N;
+            float         v[8], ss = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int64_t e = base + lane + 16 * j + 128 * sgi;
+                v[j]            = b ? a[e] + b[e] : a[e];
+                ss += v[j] * v[j];
+            }
+            ss                = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+            const float scale = sycl::rsqrt(ss / K + eps);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int     c = kb * N + lane + 16 * j + 128 * sgi;
+                const int64_t e = m * K + c;
+                if (add_out) {
+                    add_out[e] = v[j];
+                }
+                v[j] = scale * v[j] * w[c];
+                if (normed) {
+                    normed[e] = v[j];
+                }
+                if (rot) {
+                    v[j] = v[j] * (1.0f / 32.0f) * signs[c];
+                }
+            }
+            if (rot) {
+                rot_quant_block(v, sl.get_multi_ptr<sycl::access::decorated::no>().get() + kb * N, it, sg, lane, sgi,
+                                mm + base, Aq + base, SA, (int64_t) kb * (N / QK), lda, m);
+            }
+        });
+    });
+    if (rot) {
+        g_quant_have = quant_key{ key, mm, K, M, K, g_graph.load() };
+    }
     return true;
 }
 
