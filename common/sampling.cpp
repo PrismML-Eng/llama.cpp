@@ -279,11 +279,9 @@ std::string common_params_sampling::print() const {
     return std::string(result);
 }
 
-// k > 0 if the sampler chain starts with top-k (every sampler before it does nothing with these settings); LLAMA_SAMPLER_FAST_TOPK=0 turns it off
+// k > 0 if the sampler chain starts with top-k (every sampler before it does nothing with these settings)
 static int32_t common_sampler_fast_topk(const common_params_sampling & params, bool has_logit_bias) {
-    static const bool enabled = [] { const char * e = getenv("LLAMA_SAMPLER_FAST_TOPK"); return !e || atoi(e) != 0; }();
-
-    if (!enabled || has_logit_bias || params.mirostat != 0 || params.backend_sampling || params.top_k <= 0 || params.top_k > 128) {
+    if (has_logit_bias || params.mirostat != 0 || params.backend_sampling || params.top_k <= 0 || params.top_k > 128) {
         return 0;
     }
 
