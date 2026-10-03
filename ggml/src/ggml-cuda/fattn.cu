@@ -4,7 +4,6 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
-#include <cstdlib>
 
 template <int DKQ, int DV, int ncols2, ggml_type type_KV = GGML_TYPE_F16>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -490,10 +489,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     // The vector kernel loses to the MMA kernel on Ada once the GQA ratio is above 4 (same rule as for
                     // F16 K/V above): measured on Bonsai 2 27B (GQA 6, head size 256, q4_0 K/V), 1-2 queries at 32k-120k keys.
-                    // GGML_CUDA_FATTN_GQA_MMA=0 restores the old choice, GGML_CUDA_FATTN_VEC_MAXQ changes the query limit.
-                    static const bool gqa_mma = [] { const char * s = getenv("GGML_CUDA_FATTN_GQA_MMA"); return s ? atoi(s) != 0 : true; }();
-                    static const int vec_max_q = [] { const char * s = getenv("GGML_CUDA_FATTN_VEC_MAXQ"); return s ? atoi(s) : 2; }();
-                    if (Q->ne[1] <= vec_max_q && !(gqa_mma && gqa_ratio > 4)) {
+                    if (Q->ne[1] <= 2 && gqa_ratio <= 4) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {
