@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <mutex>
 
 namespace {
@@ -291,24 +292,149 @@ void t2_dispatch(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const 
 }
 }  // namespace
 
+namespace {
+// what the activation scratch holds: the tensor it was quantized from and in which graph (one queue, in order)
+struct quant_key {
+    const void * key = nullptr; const float * x = nullptr; int64_t stride = 0, M = 0, K = 0; uint64_t graph = 0;
+    bool operator==(const quant_key & o) const {
+        return key == o.key && x == o.x && stride == o.stride && M == o.M && K == o.K && graph == o.graph;
+    }
+};
+quant_key             g_quant_have;
+std::atomic<uint64_t> g_graph{ 1 };
+}  // namespace
+
+void ggml_sycl_t2_new_graph() { g_graph.fetch_add(1); }
+
+namespace {
+// the activation scratch: int8 Aq [M, K], then fp16 SA [K/QK, ldsa(M)]
+void scratch_aq(sycl::queue & q, int64_t M, int64_t K, int8_t *& Aq, uint16_t *& SA) {
+    const int    lda      = int8dpas::ldsa((int) M);
+    const size_t aq_bytes = (size_t) M * K;
+    const size_t sa_off   = (aq_bytes + 255) & ~(size_t) 255;
+    const size_t sa_bytes = (size_t) (K / QK) * lda * 2 + 256;
+    char *       s        = (char *) scratch_get(q, sa_off + sa_bytes);
+    Aq                    = (int8_t *) s;
+    SA                    = (uint16_t *) (s + sa_off);
+}
+}  // namespace
+
+// signed 1024-point Hadamard rotation (as fwht.cpp: dst = H (x * signs) / 32, same butterfly order, so the same floats)
+// that also quantizes its output for the T2 mat-vecs which read it next: one 128-lane work-group per 1024 block where
+// fwht.cpp gives a block one 16-lane sub-group (5 sub-groups in all for a decode token), and no quant_a launch after it.
+bool ggml_sycl_t2_fwht_quant(sycl::queue & q, const float * x, const float * signs, float * dst, int64_t M, int64_t K,
+                             const void * key) {
+    constexpr int N = 1024;
+    if (K % N != 0 || M <= 0 || M > 512 || !ggml_sycl_knob("GGML_SYCL_PTQ1_T2_FWHTQ", 1)) {
+        return false;
+    }
+    int8_t *   Aq;
+    uint16_t * SA;
+    scratch_aq(q, M, K, Aq, SA);
+    const int     lda  = int8dpas::ldsa((int) M);
+    const int64_t nblk = K / N, rows = M * nblk;
+    q.submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> sl(sycl::range<1>(N), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(rows * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const auto    sg   = it.get_sub_group();
+            const int     lane = sg.get_local_linear_id();
+            const int     sgi  = sg.get_group_linear_id();
+            const int64_t r    = it.get_group(0);
+            const int64_t m = r / nblk, kb = r % nblk;
+            const float * src = x + r * N;
+            const float * sgn = signs + kb * N;
+            float * const s   = sl.get_multi_ptr<sycl::access::decorated::no>().get();
+            float         v[8];
+            // layout 1: element lane + 16 j + 128 sgi; butterflies h = 1..8 across lanes, then 16, 32, 64 in registers
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int e = lane + 16 * j + 128 * sgi;
+                v[j]        = src[e] * (1.0f / 32.0f) * sgn[e];
+            }
+#pragma unroll
+            for (int h = 1; h < 16; h *= 2) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float o = sycl::permute_group_by_xor(sg, v[j], h);
+                    v[j]          = (lane & h) == 0 ? v[j] + o : o - v[j];
+                }
+            }
+#pragma unroll
+            for (int st = 1; st < 8; st *= 2) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    if ((j & st) == 0) {
+                        const float a = v[j], b = v[j + st];
+                        v[j] = a + b; v[j + st] = a - b;
+                    }
+                }
+            }
+            // layout 2: element t + 128 i (t = 16 sgi + lane); butterflies h = 128, 256, 512 in registers
+            const int t = 16 * sgi + lane;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) s[lane + 16 * j + 128 * sgi] = v[j];
+            it.barrier(sycl::access::fence_space::local_space);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) v[i] = s[t + 128 * i];
+#pragma unroll
+            for (int st = 1; st < 8; st *= 2) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    if ((i & st) == 0) {
+                        const float a = v[i], b = v[i + st];
+                        v[i] = a + b; v[i + st] = a - b;
+                    }
+                }
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) s[t + 128 * i] = v[i];
+            it.barrier(sycl::access::fence_space::local_space);
+            // layout 1 again: sub-group sgi holds quant group sgi (128 values, 8 per lane) -> quant_a's numbers
+            float mx = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                v[j] = s[lane + 16 * j + 128 * sgi];
+                mx   = sycl::fmax(mx, sycl::fabs(v[j]));
+                dst[r * N + lane + 16 * j + 128 * sgi] = v[j];
+            }
+            mx                   = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
+            const sycl::half sh  = sycl::half(127.0f / sycl::fmax(mx, int8dpas::EPS));
+            const float      scl = (float) sh;
+            const int64_t    g   = kb * (N / QK) + sgi;
+            if (lane == 0) {
+                SA[g * lda + m] = sycl::bit_cast<uint16_t>(sh);
+            }
+            int8_t * aq = Aq + m * K + g * QK;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                aq[lane + 16 * j] = (int8_t) sycl::rint(sycl::clamp(v[j] * scl, -128.0f, 127.0f));
+            }
+        });
+    });
+    g_quant_have = quant_key{ key, dst, K, M, K, g_graph.load() };
+    return true;
+}
+
 void ggml_sycl_t2_mul_mat(sycl::queue & q, const void * w, const float * x, int64_t x_stride, float * dst, int64_t M,
-                          int64_t N, int64_t K) {
+                          int64_t N, int64_t K, const void * x_key) {
     // batches > 8 (n-gram verify, prompts): GemmMT reads each weight once per 64 rows (TernSYCL main: the 2D block I/O
     // that misbehaved in the JIT build with the old IGC builtins validates under inline vISA, so it is upstream's kernel).
     const bool gemm_off = ggml_sycl_knob("GGML_SYCL_PTQ1_T2_GEMM_OFF", 0) != 0;
     const bool use_gemm = M > 8 && !gemm_off;
 
-    const int      lda      = int8dpas::ldsa((int) M);
-    const size_t   aq_bytes = (size_t) M * K;
-    const size_t   sa_off   = (aq_bytes + 255) & ~(size_t) 255;
-    const size_t   sa_bytes = (size_t) (K / QK) * lda * 2 + 256;
-    char *         s        = (char *) scratch_get(q, sa_off + sa_bytes);
-    int8_t *       Aq       = (int8_t *) s;
-    uint16_t *     SA       = (uint16_t *) (s + sa_off);
+    int8_t *       Aq;
+    uint16_t *     SA;
+    scratch_aq(q, M, K, Aq, SA);
     const uint32_t * B      = (const uint32_t *) w;
     const uint16_t * SB     = (const uint16_t *) ((const char *) w + (size_t) (K / 16) * N * 4);
 
-    quant_a(q, x, x_stride, M, K, Aq, SA, QK);
+    // GGML_SYCL_PTQ1_T2_QCACHE=0: quantize for every call
+    const quant_key want{ x_key, x, x_stride, M, K, g_graph.load() };
+    if (!x_key || !ggml_sycl_knob("GGML_SYCL_PTQ1_T2_QCACHE", 1) || !(g_quant_have == want)) {
+        quant_a(q, x, x_stride, M, K, Aq, SA, QK);
+        g_quant_have = x_key ? want : quant_key{};
+    }
     t2_dispatch(q, Aq, SA, B, SB, dst, (int) M, (int) N, (int) K, use_gemm);
 }
 

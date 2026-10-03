@@ -4994,7 +4994,7 @@ static bool ggml_sycl_t2_mul_mat_try(ggml_backend_sycl_context & ctx, const ggml
         return true;
     }
     ggml_sycl_t2_mul_mat(*stream, src0->data, (const float *) src1->data, src1->nb[1] / sizeof(float), (float *) dst->data,
-                         M, N, K);
+                         M, N, K, src1->view_src && src1->view_offs == 0 ? src1->view_src : src1);
     return true;
 }
 
@@ -6498,6 +6498,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 (x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16) && node->type == x->type &&
                 ggml_is_contiguous(x) && ggml_is_contiguous(signs) && signs->ne[0] == x->ne[0] &&
                 signs->ne[0] % mm->src[0]->ne[0] == 0;
+            // ARC-LAB: the rotation that feeds T2 mat-vecs also quantizes for them (they read mm through a reshape)
+            if (pattern_ok && x->type == GGML_TYPE_F32 && mm->src[0]->ne[0] == 1024 && x->ne[3] == 1 &&
+                ggml_is_contiguous(mm) &&
+                ggml_sycl_t2_fwht_quant(*sycl_ctx->stream(), (const float *) x->data, (const float *) signs->data,
+                                        (float *) mm->data, ggml_nrows(x), x->ne[0], mm)) {
+                i += 2;
+                continue;
+            }
             if (pattern_ok && ggml_sycl_op_fwht_signed(*sycl_ctx, x, signs, mm)) {
                 i += 2;
                 continue;
@@ -6641,6 +6649,7 @@ void ggml_sycl_knobs_refresh() {
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
     ggml_sycl_knobs_refresh();
+    ggml_sycl_t2_new_graph();
 
 #ifdef GGML_SYCL_GRAPH
     bool use_sycl_graph = false;

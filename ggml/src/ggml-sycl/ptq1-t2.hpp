@@ -16,6 +16,14 @@ size_t ggml_sycl_t2_bytes(int64_t K, int64_t N);
 // in place: data holds N rows of K/128 block_ptq1_0 (pq2 = false) or block_pq2_0 (pq2 = true) as uploaded, and at least
 // ggml_sycl_t2_bytes(K, N) bytes. PQ2_0 code 3 (+2) has no 2-bit two's-complement form: returns false if one is found.
 bool   ggml_sycl_t2_repack(sycl::queue & q, void * data, int64_t K, int64_t N, bool pq2 = false);
-// dst[m * N + n] = sum_k x[m * x_stride + k] * w[n, k], M tokens (fp32 in and out)
+// dst[m * N + n] = sum_k x[m * x_stride + k] * w[n, k], M tokens (fp32 in and out). x_key (optional) names the
+// activation within the current graph (its tensor + ggml_sycl_t2_new_graph epoch): back-to-back calls on the same x_key
+// reuse the int8 activations instead of quantizing again (q/k/v, gate/up, the DeltaNet input projections).
 void   ggml_sycl_t2_mul_mat(sycl::queue & q, const void * w, const float * x, int64_t x_stride, float * dst, int64_t M,
-                            int64_t N, int64_t K);
+                            int64_t N, int64_t K, const void * x_key = nullptr);
+// a new graph compute starts: activations quantized for the previous one are stale
+void   ggml_sycl_t2_new_graph();
+// dst [M, K] = 1024-point Hadamard of (x * signs) per block / 32 (signs: K floats), quantized for the T2 mat-vecs at once;
+// key = the tensor they will read it through (see x_key). false: shape not served (K % 1024, M > 512) or knob off.
+bool   ggml_sycl_t2_fwht_quant(sycl::queue & q, const float * x, const float * signs, float * dst, int64_t M, int64_t K,
+                               const void * key);
