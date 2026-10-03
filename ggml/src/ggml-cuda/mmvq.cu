@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "l2-hint.cuh"
 #include "mmvq-ptq1_0.cuh"
 #include "mmvq-pq2_0.cuh"
 #include "quantize.cuh"
@@ -36,6 +37,7 @@ static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
     asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
 }
 #endif
+thread_local ggml_cuda_l2_hint_t g_ggml_cuda_l2_hint;
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
