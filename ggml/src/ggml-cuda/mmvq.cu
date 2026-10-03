@@ -5,7 +5,6 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
-#include <cstdlib>
 #include <type_traits>
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
@@ -1587,8 +1586,7 @@ bool ggml_cuda_mmvq_ptq1_0_can_fuse_mc(const ggml_tensor * src0, const int ncols
     GGML_UNUSED(src0); GGML_UNUSED(ncols_dst);
     return false;
 #else
-    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_PTQ1_FUSE_MC"); return e ? atoi(e) != 0 : true; }();
-    if (!enabled || src0->type != GGML_TYPE_PTQ1_0 || ncols_dst < 2 || ncols_dst > 4 || src0->ne[2] != 1 || src0->ne[3] != 1 ||
+    if (src0->type != GGML_TYPE_PTQ1_0 || ncols_dst < 2 || ncols_dst > 4 || src0->ne[2] != 1 || src0->ne[3] != 1 ||
         src0->ne[0] % QK_PTQ1_0 != 0 || !ptq1_0_pt_enabled()) {
         return false;
     }

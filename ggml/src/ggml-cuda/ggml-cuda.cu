@@ -2826,7 +2826,6 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
         return a0 < b1 && b0 < a1;
     };
     bool out_aliases_in = overlaps(x, mm) || (signs && overlaps(signs, mm));
-    static const bool glu_pool = getenv("GGML_CUDA_FWHT_GLU_POOL") ? atoi(getenv("GGML_CUDA_FWHT_GLU_POOL")) != 0 : true;
 
     // every use of the transform output (directly or through a reshape view of the whole tensor)
     // must be src1 of a PTQ1_0 MUL_MAT that ggml_cuda_mul_mat routes to ggml_cuda_mul_mat_vec_q.
@@ -2879,12 +2878,10 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
             ncols = src->ne[1];
             // a gate/up pair that the mat-vec fuses with its SwiGLU writes that GLU output while other blocks still read the q8 rows:
             // when the allocator put the GLU output over this buffer, the rows have to go to a pool block (see out_aliases_in)
-            if (glu_pool) {
-                for (int j2 = j + 1; j2 < std::min(j + 4, cgraph->n_nodes); ++j2) {
-                    const ggml_tensor * g = cgraph->nodes[j2];
-                    if (g->op == GGML_OP_GLU && (g->src[0] == t || g->src[1] == t) && overlaps(g, mm)) {
-                        out_aliases_in = true;
-                    }
+            for (int j2 = j + 1; j2 < std::min(j + 4, cgraph->n_nodes); ++j2) {
+                const ggml_tensor * g = cgraph->nodes[j2];
+                if (g->op == GGML_OP_GLU && (g->src[0] == t || g->src[1] == t) && overlaps(g, mm)) {
+                    out_aliases_in = true;
                 }
             }
             // ggml_cuda_mul_mat sends a padded compute-buffer view to cuBLAS instead
