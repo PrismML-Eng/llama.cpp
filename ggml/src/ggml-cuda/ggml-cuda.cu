@@ -4394,7 +4394,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
-    g_fwht_q8_ctx = &cuda_ctx->fwht_q8();
+    // the q8 rows registry is only valid while this graph is evaluated
+    struct fwht_q8_ctx_scope {
+        explicit fwht_q8_ctx_scope(const ggml_cuda_fwht_q8_context * c) { g_fwht_q8_ctx = c; }
+        ~fwht_q8_ctx_scope() { g_fwht_q8_ctx = nullptr; }
+    } fwht_q8_ctx_guard(&cuda_ctx->fwht_q8());
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
