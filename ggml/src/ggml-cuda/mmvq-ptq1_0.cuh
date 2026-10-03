@@ -30,7 +30,6 @@
 #include "vecdotq.cuh"
 
 #include <algorithm>
-#include <cstdlib>
 
 #define PTQ1_0_PT_PLANES 9
 
@@ -39,6 +38,13 @@
 #define PTQ1_0_PT_MAX_ROWS     16
 #define PTQ1_0_PT_MAX_COLS     8    // equals MMVQ_MAX_BATCH_SIZE, checked in mmvq.cu
 #define PTQ1_0_PT_SMEM_FLOATS  4096 // 16 KiB target when choosing rows per CTA; the launch may request more for one item
+
+// L2 prefetch of the next mat-vec's weights by the last CTAs of the running kernel (see mul_mat_vec_ptq1_0_pt and
+// ggml_cuda_l2_hint_for_node): percent of the next tensor, upper bound in bytes, number of prefetching CTAs.
+// Measured on an RTX 4070: more CTAs or more bytes take DRAM bandwidth from the running kernel and are slower.
+#define PTQ1_0_L2_PREFETCH_PCT   50
+#define PTQ1_0_L2_PREFETCH_BYTES (16u << 20)
+#define PTQ1_0_L2_PREFETCH_CTAS  46
 
 // the PT path is CUDA only; HIP keeps the block_q8_1 layout and the old vec_dot
 static constexpr __host__ __device__ bool ptq1_0_pt_enabled() {
@@ -518,15 +524,12 @@ static void mul_mat_vec_ptq1_0_pt_launch(
     const size_t smem = ptq1_0_pt_smem_bytes(bpr, ncols, nrows_x, has_gate);
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, smem, stream);
 
-    // L2 prefetch of the next mat-vec's weights (hint from the node loop; GGML_CUDA_L2_PREFETCH_PCT/_MAX_KB/_CTAS, PCT=0 turns it off; defaults 50 / 16384 / 46)
-    static const int pf_pct = [] { const char * e = getenv("GGML_CUDA_L2_PREFETCH_PCT"); return e ? atoi(e) : 50; }();
-    static const int pf_max_kb = [] { const char * e = getenv("GGML_CUDA_L2_PREFETCH_MAX_KB"); return e ? atoi(e) : 16384; }();
-    static const int pf_cta_cfg = [] { const char * e = getenv("GGML_CUDA_L2_PREFETCH_CTAS"); return e ? atoi(e) : 46; }();
+    // L2 prefetch of the next mat-vec's weights (hint from the node loop)
     const char * pf_ptr = nullptr;
     int pf_lines_per_cta = 0;
-    const int pf_ctas = std::min(pf_cta_cfg, (int) block_nums.x);
-    if (pf_pct > 0 && g_ggml_cuda_l2_hint.ptr != nullptr && pf_ctas > 0) {
-        const size_t pf_bytes = std::min(g_ggml_cuda_l2_hint.bytes / 100 * pf_pct, (size_t) pf_max_kb * 1024);
+    const int pf_ctas = std::min(PTQ1_0_L2_PREFETCH_CTAS, (int) block_nums.x);
+    if (g_ggml_cuda_l2_hint.ptr != nullptr) {
+        const size_t pf_bytes = std::min(g_ggml_cuda_l2_hint.bytes / 100 * PTQ1_0_L2_PREFETCH_PCT, (size_t) PTQ1_0_L2_PREFETCH_BYTES);
         pf_lines_per_cta = (int) (pf_bytes / 128 / pf_ctas);
         if (pf_lines_per_cta > 0) {
             pf_ptr = g_ggml_cuda_l2_hint.ptr;

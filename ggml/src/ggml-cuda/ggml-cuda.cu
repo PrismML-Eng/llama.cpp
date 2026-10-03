@@ -3204,10 +3204,9 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
 // L2 prefetch hint (see mmvq-ptq1_0.cuh): the weights of the next PTQ1_0 mat-vec after node i. Gate/up pairs feeding one GLU
 // count as one op, so the partner of a fused gate/up kernel is skipped.
 static ggml_cuda_l2_hint_t ggml_cuda_l2_hint_for_node(const ggml_cgraph * cgraph, const int i) {
-    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_L2_PREFETCH_PCT"); return !e || atoi(e) > 0; }();
     ggml_cuda_l2_hint_t hint;
     const ggml_tensor * cur = cgraph->nodes[i];
-    if (!enabled || cur->op != GGML_OP_MUL_MAT || cur->src[0]->type != GGML_TYPE_PTQ1_0) {
+    if (cur->op != GGML_OP_MUL_MAT || cur->src[0]->type != GGML_TYPE_PTQ1_0) {
         return hint;
     }
     const int last = std::min(i + 64, cgraph->n_nodes - 1);
