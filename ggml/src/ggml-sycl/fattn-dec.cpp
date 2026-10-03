@@ -689,7 +689,7 @@ static void fattn_dec_q4_0_xmx(const char * Q, const char * K, const char * V, c
 //        A = Q rows as int8 (one RNE scale per row per 32-dim block, computed once per call), B = the raw 16 bytes of a key's
 //        q4_0 block XOR 0x88888888 (u4 n+8 -> s4 n), one key per lane. q4_0 byte i holds dims i and i+16, so A's k = 2i+h
 //        is dim i + 16h: lane l's A short = (Q[l], Q[l + 16]). S += int result * dq[row] * dk[key].
-//   P.V: f16 DPAS (k16) with P from SLM (A layout) and V dequantized in registers by the subgroup that owns 16 head dims.
+//   P.V: f16 DPAS (k16, inline vISA) with P from SLM (A layout) and V dequantized in registers by the subgroup that owns 16 head dims.
 // Query tokens beyond NQ are handled by extra work-groups (grid dim 0 = sequence x token chunk), each reading the KV again.
 namespace {
 typedef short    dp_short8 __attribute__((ext_vector_type(8)));
@@ -698,11 +698,6 @@ typedef int      dp_int8   __attribute__((ext_vector_type(8)));
 typedef float    dp_float8 __attribute__((ext_vector_type(8)));
 typedef unsigned dp_uint4  __attribute__((ext_vector_type(4)));
 }
-#ifdef __SYCL_DEVICE_ONLY__
-SYCL_EXTERNAL dp_float8 intel_sub_group_f16_f16_matrix_mad_k16(dp_short8 a, dp_int8 b, dp_float8 acc);
-#else
-inline dp_float8 intel_sub_group_f16_f16_matrix_mad_k16(dp_short8, dp_int8, dp_float8) { __builtin_unreachable(); }
-#endif
 
 // ST = 1 (GGML_SYCL_FA_DEC_STAGE, D 256 only): each key tile of K, then of V, is first copied into SLM with coalesced loads
 // (consecutive work-items read consecutive dwords of a key row) and the lane = key reads come from there (row stride 37
@@ -985,7 +980,7 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
                             const dp_int8 pb = sP[((t * 16 + lane) * PS + kg * 16) / 16];
 #pragma unroll
                             for (int x = 0; x < XT; ++x) {
-                                o[t][x] = intel_sub_group_f16_f16_matrix_mad_k16(va[x], pb, o[t][x]);
+                                o[t][x] = xe2dp::dpas_hf_r8(va[x], pb, o[t][x]);
                             }
                         }
                     }

@@ -151,8 +151,7 @@ template <int SGM, class V, class T> inline void set_el(V &v, int r, T x) {
 //   SGM rows per sub-group (1, 2, 4, 8)   NSG_N sub-groups along N
 //   LS  K-slices per column block, reduced through SLM
 //   U   128-steps whose loads are issued before any compute
-// ARC-LAB: NS = activation scales per 128-step (1 = TernSYCL; 4 = one per 32, like q8_1; QMODE 0 only, SA [K/32, ldsa])
-template <bool BF16, int QMODE, int SGM, int NSG_N, int LS, int U, int NS = 1>
+template <bool BF16, int QMODE, int SGM, int NSG_N, int LS, int U>
 struct Gemv {
     const unsigned short *A;
     const signed char *Aq;
@@ -175,17 +174,16 @@ struct Gemv {
 #pragma unroll
         for (int r = 0; r < SGM; ++r) {
             const bool ok = m0 + r < M;
+            const size_t row = (size_t)sycl::min(m0 + r, M - 1) * K + s * GS;
             if constexpr (QMODE == 0) {
-                const ushort4 v = ok ? intel_sub_group_block_read_us4(
-                        gptr((const unsigned short *)(Aq + (size_t)(m0 + r) * K + s * GS))) : ushort4{};
+                const ushort4 l = sg_rd_us4((const unsigned short *)(Aq + row));
+                const ushort4 v = ok ? l : ushort4{};
 #pragma unroll
                 for (int c = 0; c < 4; ++c) set_el<SGM>(aq[c], r, (short)v[c]);
-#pragma unroll
-                for (int cs = 0; cs < NS; ++cs)
-                    inv[cs * SGM + r] = ok ? sycl::native::recip(D::tof(SA[(size_t)(s * NS + cs) * lda + m0 + r])) : 0.0f;
+                inv[r] = ok ? sycl::native::recip(D::tof(SA[(size_t)s * lda + m0 + r])) : 0.0f;
             } else {
-                const uint4 v = ok ? intel_sub_group_block_read4(
-                        gptr((const unsigned *)(A + (size_t)(m0 + r) * K + s * GS))) : uint4{};
+                const uint4 l = sg_rd_u4((const unsigned *)(A + row));
+                const uint4 v = ok ? l : uint4{};
                 const float sa = ok ? D::tof(SA[(size_t)s * lda + m0 + r]) : 0.0f;
 #pragma unroll
                 for (int c = 0; c < 4; ++c) set_el<SGM>(aq[c], r, q2<BF16>(v[c], sa));
@@ -195,21 +193,10 @@ struct Gemv {
     }
 
     static fa_t step(fa_t acc, const uint8 &w, float sb, const a_t *aq, const float *inv) {
-        if constexpr (NS == 4) {
+        ia_t ia = dpas_s2s8_z(aq[0], int2{(int)w[0], (int)w[1]});
 #pragma unroll
-            for (int c = 0; c < 4; ++c) {
-                ia_t ia = 0;
-                ia = intel_sub_group_i8_i2_matrix_mad_k32(aq[c], int2{(int)w[2 * c], (int)w[2 * c + 1]}, ia);
-#pragma unroll
-                for (int r = 0; r < SGM; ++r)
-                    set_el<SGM>(acc, r, el<SGM>(acc, r) + (float)el<SGM>(ia, r) * (sb * inv[c * SGM + r]));
-            }
-            return acc;
-        }
-        ia_t ia = 0;
-#pragma unroll
-        for (int c = 0; c < 4; ++c)
-            ia = intel_sub_group_i8_i2_matrix_mad_k32(aq[c], int2{(int)w[2 * c], (int)w[2 * c + 1]}, ia);
+        for (int c = 1; c < 4; ++c)
+            ia = dpas_s2s8(aq[c], int2{(int)w[2 * c], (int)w[2 * c + 1]}, ia);
 #pragma unroll
         for (int r = 0; r < SGM; ++r)
             set_el<SGM>(acc, r, el<SGM>(acc, r) + (float)el<SGM>(ia, r) * (sb * inv[r]));
@@ -233,25 +220,27 @@ struct Gemv {
         fa_t acc = 0.0f;
         if (n0 < N) {
             int s = s_begin;
+#pragma unroll 1
             for (; s + U <= s_end; s += U) {
                 uint8 w[U];
                 float sb[U];
                 a_t aq[U][4];
-                float inv[U][NS * SGM];
+                float inv[U][SGM];
 #pragma unroll
                 for (int u = 0; u < U; ++u) {
                     w[u] = rd_32b_8r16(sbs, n0, (s + u) * 8);
-                    sb[u] = D::tof(intel_sub_group_block_read_us(gptr(SB + (size_t)(s + u) * N + n0)));
+                    sb[u] = D::tof(sg_rd_us(SB + (size_t)(s + u) * N + n0));
                     load_a(m0, s + u, aq[u], inv[u]);
                 }
 #pragma unroll
                 for (int u = 0; u < U; ++u) acc = step(acc, w[u], sb[u], aq[u], inv[u]);
             }
+            if constexpr (U > 1)
             for (; s < s_end; ++s) {
                 a_t aq[4];
-                float inv[NS * SGM];
+                float inv[SGM];
                 const uint8 w = rd_32b_8r16(sbs, n0, s * 8);
-                const float sb = D::tof(intel_sub_group_block_read_us(gptr(SB + (size_t)s * N + n0)));
+                const float sb = D::tof(sg_rd_us(SB + (size_t)s * N + n0));
                 load_a(m0, s, aq, inv);
                 acc = step(acc, w, sb, aq, inv);
             }
@@ -295,7 +284,7 @@ struct Gemv {
 // zero-fills out-of-range reads and clips writes, so any M works. 256 GRF.
 // The epilogue is a template parameter here (as in the OpenCL -D build): a
 // runtime-selected one costs ~3% in this kernel.
-template <bool BF16, int QMODE, int MT_M, int MT_N, int WG_M, int WG_N, int POSTOP, bool F32, int NS = 1>
+template <bool BF16, int QMODE, int MT_M, int MT_N, int WG_M, int WG_N, int POSTOP, bool F32>
 struct GemmMT {
     const unsigned short *A;
     const signed char *Aq;
@@ -324,106 +313,86 @@ struct GemmMT {
 #pragma unroll
             for (int j = 0; j < NB; ++j) acc[i][j] = 0.0f;
 
+        // 2D payloads built once; each K step only moves y (B, SB, SA) or x (A)
+        unsigned pb = pl2d<b32_16x8>(sbs, n0, 0), psb2 = pl2d<b16_32x1>(ssb, n0, 0),
+                 psb1 = pl2d<b16_16x1>(ssb, n0, 0), psa = pl2d<b16_16x1>(ssa, m0, 0), pq;
+        if constexpr (QMODE == 0) pq = pl2d<b16_2x16x8>(surf(Aq, K, M, K), 0, m0);
+        else pq = pl2d<b32_16x8>(surf(A, K * 2, M, K * 2), 0, m0);
+
         for (int s = 0; s < K / GS; ++s) {
+            // A (and SA) loads first: they feed the quantization / unpacking that the
+            // first dpas waits on (the asm reads are issued in source order). Row
+            // block 0 before B and SB, block I + 1 at the start of block I.
+            pl2d_y(psa, s);
+            pl2d_x(pq, s * GS / 2);
+            unsigned short sar[MB];
+            std::conditional_t<QMODE == 0, ushort16[2], uint8[4]> ar[MB];
+            auto load_a = [&](auto ii) {
+                constexpr int I = decltype(ii)::value;
+                sar[I] = rd2d<b16_16x1, 8 * I, 0, unsigned short>(psa);
+                if constexpr (QMODE == 0)
+                    static_for<2>([&](auto h) { ar[I][h] = rd2d<b16_2x16x8, 32 * decltype(h)::value, 8 * I, ushort16>(pq); });
+                else
+                    static_for<4>([&](auto c) { ar[I][c] = rd2d<b32_16x8, 16 * decltype(c)::value, 8 * I, uint8>(pq); });
+            };
+            load_a(std::integral_constant<int, 0>{});
             uint8 w[NB];
             float sb[NB];
-#pragma unroll
-            for (int j = 0; j < NB; ++j) w[j] = rd_32b_8r16(sbs, n0 + 16 * j, s * 8);
+            pl2d_y(pb, s * 8);
+            static_for<NB>([&](auto j) { w[j] = rd2d<b32_16x8, 16 * decltype(j)::value, 0, uint8>(pb); });
             // all SB loads first, then convert: converting each (bf16: via acc0) before the
             // next load let IGC reuse one load register and serialize the loads
             ushort2 sbr[(NB + 1) / 2];
-#pragma unroll
-            for (int j = 0; j < NB; j += 2)
-                sbr[j / 2] = j + 1 < NB ? rd_16b_1r16x2(ssb, n0 + 16 * j, s)
-                                        : ushort2{rd_16b_1r16(ssb, n0 + 16 * j, s), 0};
+            pl2d_y(psb2, s);
+            pl2d_y(psb1, s);
+            static_for<(NB + 1) / 2>([&](auto h) {
+                constexpr int J = 2 * decltype(h)::value;
+                if constexpr (J + 1 < NB) sbr[h] = rd2d<b16_32x1, 16 * J, 0, ushort2>(psb2);
+                else sbr[h] = ushort2{rd2d<b16_16x1, 16 * J, 0, unsigned short>(psb1), 0};
+            });
 #pragma unroll
             for (int j = 0; j < NB; ++j) sb[j] = D::tof(sbr[j / 2][j % 2]);
-#pragma unroll
-            for (int i = 0; i < MB; ++i) {
-                const int mr = m0 + 8 * i;
+            static_for<MB>([&](auto ii) {
+                constexpr int I = decltype(ii)::value;
+                if constexpr (I + 1 < MB) load_a(std::integral_constant<int, I + 1>{});
                 short8 aq[4];
-                float inv[NS][8];
-                // ARC-LAB: plain load; the 2D block read of SA gave junk past lane 0 in the llama.cpp JIT build
-                const float sal = D::tof(SA[(size_t)s * NS * ldsa(M) + mr + (int)sgp.get_local_linear_id()]);
+                float inv[8];
+                const float sal = D::tof(sar[I]);
                 if constexpr (QMODE == 0) {
-                    // ARC-LAB: sub-group block reads per row (as Gemv::load_a); the 2D block read of Aq gave NaN from
-                    // row 1 on in the llama.cpp JIT build
 #pragma unroll
-                    for (int r = 0; r < 8; ++r) {
-                        const bool ok = mr + r < M;
-                        const ushort4 v = ok ? intel_sub_group_block_read_us4(
-                                gptr((const unsigned short *)(Aq + (size_t)(mr + r) * K + s * GS))) : ushort4{};
+                    for (int h = 0; h < 2; ++h)
 #pragma unroll
-                        for (int c = 0; c < 4; ++c) aq[c][r] = (short)v[c];
-                    }
+                        for (int r = 0; r < 8; ++r) {
+                            aq[2 * h][r] = (short)ar[I][h][r];
+                            aq[2 * h + 1][r] = (short)ar[I][h][8 + r];
+                        }
                 } else {
-                    const surf sa(A, K * 2, M, K * 2);
-                    // all loads before the (volatile, so unreorderable) quant asm
-                    uint8 a[4];
 #pragma unroll
-                    for (int c = 0; c < 4; ++c) a[c] = rd_32b_8r16(sa, s * GS / 2 + 16 * c, mr);
-#pragma unroll
-                    for (int c = 0; c < 4; ++c) aq[c] = quant8x32<BF16>(a[c], sal);
+                    for (int c = 0; c < 4; ++c) aq[c] = quant8x32<BF16>(ar[I][c], sal);
                 }
                 // rows >= M get inf here, but their int32 dot is 0 and the store clips them
 #pragma unroll
-                for (int r = 0; r < 8; ++r) inv[0][r] = sycl::native::recip(sycl::group_broadcast(sgp, sal, r));
-                if constexpr (NS == 4) {
-#pragma unroll
-                    for (int cs = 1; cs < 4; ++cs) {
-                        const float salc = D::tof(SA[(size_t)(s * NS + cs) * ldsa(M) + mr + (int)sgp.get_local_linear_id()]);
-#pragma unroll
-                        for (int r = 0; r < 8; ++r) inv[cs][r] = sycl::native::recip(sycl::group_broadcast(sgp, salc, r));
-                    }
-                }
+                for (int r = 0; r < 8; ++r) inv[r] = sycl::native::recip(sycl::group_broadcast(sgp, sal, r));
 #pragma unroll
                 for (int j = 0; j < NB; ++j) {
-                    if constexpr (NS == 4) {
+                    int8 ia = dpas_s2s8_z(aq[0], int2{(int)w[j][0], (int)w[j][1]});
 #pragma unroll
-                        for (int c = 0; c < 4; ++c) {
-                            int8 ia = 0;
-                            ia = intel_sub_group_i8_i2_matrix_mad_k32(aq[c],
-                                    int2{(int)w[j][2 * c], (int)w[j][2 * c + 1]}, ia);
-                            const float8 fi = __builtin_convertvector(ia, float8);
-#pragma unroll
-                            for (int r = 0; r < 8; ++r) acc[i][j][r] += fi[r] * (sb[j] * inv[c][r]);
-                        }
-                        continue;
-                    }
-                    int8 ia = 0;
-#pragma unroll
-                    for (int c = 0; c < 4; ++c)
-                        ia = intel_sub_group_i8_i2_matrix_mad_k32(aq[c],
-                                int2{(int)w[j][2 * c], (int)w[j][2 * c + 1]}, ia);
+                    for (int c = 1; c < 4; ++c)
+                        ia = dpas_s2s8(aq[c], int2{(int)w[j][2 * c], (int)w[j][2 * c + 1]}, ia);
                     // whole-vector convert (OpenCL's convert_float8): per-element casts
                     // are emitted through one scratch register and stall every mad
                     const float8 fi = __builtin_convertvector(ia, float8);
 #pragma unroll
-                    for (int r = 0; r < 8; ++r) acc[i][j][r] += fi[r] * (sb[j] * inv[0][r]);
+                    for (int r = 0; r < 8; ++r) acc[I][j][r] += fi[r] * (sb[j] * inv[r]);
                 }
-            }
+            });
         }
 
-        if constexpr (POSTOP == 0 && F32) {
-            // ARC-LAB: plain stores; the 2D block write misplaced rows (junk rows past M landed on real ones) in the
-            // llama.cpp JIT build
-            const int lane = (int)sgp.get_local_linear_id();
 #pragma unroll
-            for (int i = 0; i < MB; ++i)
+        for (int i = 0; i < MB; ++i)
 #pragma unroll
-                for (int j = 0; j < NB; ++j)
-#pragma unroll
-                    for (int r = 0; r < 8; ++r) {
-                        const int m = m0 + 8 * i + r, n = n0 + 16 * j + lane;
-                        if (m < M && n < N) ((float *)C)[(size_t)m * N + n] = acc[i][j][r];
-                    }
-        } else {
-#pragma unroll
-            for (int i = 0; i < MB; ++i)
-#pragma unroll
-                for (int j = 0; j < NB; ++j)
-                    epi_dev<BF16>::template store8x16<POSTOP, F32>(C, epi, M, N, m0 + 8 * i, n0 + 16 * j, acc[i][j]);
-        }
+            for (int j = 0; j < NB; ++j)
+                epi_dev<BF16>::template store8x16<POSTOP, F32>(C, epi, M, N, m0 + 8 * i, n0 + 16 * j, acc[i][j]);
     }
 
     auto get(syclex::properties_tag) const {

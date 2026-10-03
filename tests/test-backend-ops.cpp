@@ -10957,9 +10957,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {16, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 2, 1, 3}));
             }
         }
-        for (int64_t nb : {1, 4, 16, 32}) {  // real cache layout (DPAS kernel targets)
+        for (int64_t nb : {1, 4, 16, 32, 64, 128, 256}) {  // real cache layout (DPAS kernel targets; 64+ = long n-gram drafts)
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
         }
+    }
+    for (int64_t nb : {1, 4, 64, 256}) {  // ARC-LAB: ~115K history (Bonsai at 128K context), real cache layout
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 114688, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
     }
     for (ggml_type t : {GGML_TYPE_Q4_0, GGML_TYPE_F16}) {  // ARC-LAB: Bonsai 27B prompt batch at 16K history
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 16384, 512, true, false, 0, 0, GGML_PREC_F32, t, t));

@@ -29,4 +29,22 @@ inline i32x8 dpas_s4s8_r8(s8x8 a, s4x4 b) {
 #endif
     return d;
 }
+// f16 x f16 -> f32, repeat count 8: A = 8 rows of K16 halves (one short per lane per row), B = K16 x 16 (VNNI: 8 dwords
+// per lane), accumulate. Replaces intel_sub_group_f16_f16_matrix_mad_k16 (public, but one builtin fewer to resolve).
+typedef float f32x8 __attribute__((ext_vector_type(8)));
+inline f32x8 dpas_hf_r8(s8x8 a, i32x8 b, f32x8 acc) {
+#ifdef __SYCL_DEVICE_ONLY__
+    __asm__("{\n"
+            ".decl DB v_type=G type=ud num_elts=128 align=GRF alias=<%1,0>\n"
+            ".decl DA v_type=G type=ud num_elts=64 align=GRF alias=<%2,0>\n"
+            "dpas.hf.hf.8.8 (M1, 16) %0.0 %0.0 DB.0 DA(0,0)\n"
+            "}\n"
+            : "+rw"(acc)
+            : "rw"(b), "rw"(a));
+#else
+    (void) a;
+    (void) b;
+#endif
+    return acc;
+}
 }  // namespace xe2dp

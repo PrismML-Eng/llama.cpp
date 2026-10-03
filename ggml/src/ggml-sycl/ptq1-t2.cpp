@@ -1,5 +1,5 @@
 // ARC-LAB: PTQ1_0 on XMX through the TernSYCL int2 x int8 DPAS kernels (ternsycl/, BSD 3-Clause, libxsmm/TernSYCL
-// @5e162d8). The base-3 PTQ1_0 packing (1.625 + 0.125 bits/weight) has to be decoded on the ALUs before any DPAS, which
+// @11484da + the long long address fix of libxsmm/TernSYCL#3: inline vISA only, no IGC builtins). The base-3 PTQ1_0 packing (1.625 + 0.125 bits/weight) has to be decoded on the ALUs before any DPAS, which
 // makes the 4-column verify mat-vec compute-bound (~190 GB/s on the B580); 2-bit two's-complement codes (2.125 bits)
 // feed the s8 x s2 DPAS directly. B580 standalone, 2 GiB rotating weights: 17408x5120 m=1 56 us, m=4 61 us (vs 70 /
 // ~100 in-model for PTQ1_0). The weight grows 31%; activations become int8 with one fp16 scale per 128 (q8_1 is per 32).
@@ -174,13 +174,6 @@ bool ggml_sycl_t2_repack(sycl::queue & q, void * data, int64_t K, int64_t N, boo
 
 namespace {
 
-// GGML_SYCL_PTQ1_T2_S32: activation scales per 32 (q8_1 granularity) instead of per 128: 1 = GEMV (<= 8 tokens) only,
-// 2 = GEMV + GEMM; 0 = TernSYCL's per 128
-int t2_s32() {
-    static const int v = getenv("GGML_SYCL_PTQ1_T2_S32") ? atoi(getenv("GGML_SYCL_PTQ1_T2_S32")) : 0;
-    return v;
-}
-
 // fp32 activations -> int8 Aq [M, K] + fp16 SA [K/128, ldsa(M)] (TernSYCL QMODE 0: SA = 127 / absmax, saturate)
 // G = 128 (one scale per 16 lanes x 8 values) or 32 (a scale per 4 lanes); SA [K/G, ldsa(M)]
 void quant_a(sycl::queue & q, const float * x, int64_t x_stride, int64_t M, int64_t K, int8_t * Aq, uint16_t * SA,
@@ -228,10 +221,10 @@ int t2_nsg() {
     return v;
 }
 
-template <int SGM, int LS, int NS = 1, int NSG = 2>
+template <int SGM, int LS, int NSG = 2>
 void gemv(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const uint32_t * B, const uint16_t * SB, float * C,
           int M, int N, int K) {
-    using Kern          = int8dpas::Gemv<false, 0, SGM, NSG, LS, 2, NS>;
+    using Kern          = int8dpas::Gemv<false, 0, SGM, NSG, LS, 2>;
     const size_t    wgn = 16 * NSG;
     const Epi       epi{ nullptr, nullptr, 0, 1 };
     const sycl::range<2> local(1, Kern::WG);
@@ -240,7 +233,7 @@ void gemv(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const uint32_
                    Kern{ nullptr, (const signed char *) Aq, SA, B, SB, C, epi, M, N, K });
 }
 
-template <int NS, int MT_M, int MT_N, int WG_M, int WG_N>
+template <int MT_M, int MT_N, int WG_M, int WG_N>
 void gemm_tile(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const uint32_t * B, const uint16_t * SB, float * C,
                int M, int N, int K) {
     const size_t    tm = MT_M * WG_M, tn = MT_N * WG_N;
@@ -248,82 +241,75 @@ void gemm_tile(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const ui
     const sycl::range<2> local(1, 16 * WG_M * WG_N);
     const sycl::range<2> global((M + tm - 1) / tm, (N + tn - 1) / tn * local[1]);
     q.parallel_for(sycl::nd_range<2>(global, local),
-                   int8dpas::GemmMT<false, 0, MT_M, MT_N, WG_M, WG_N, 0, true, NS>{
+                   int8dpas::GemmMT<false, 0, MT_M, MT_N, WG_M, WG_N, 0, true>{
                        nullptr, (const signed char *) Aq, SA, B, SB, C, epi, M, N, K });
 }
 
 // ARC-LAB lab knob GGML_SYCL_PTQ1_T2_TILE = index into TernSYCL's large-M tile table (mt_m, mt_n, wg_m, wg_n):
 // 0 {8,128,8,2} (default) 1 {8,128,4,2} 2 {8,128,4,4} 3 {8,128,16,1} 4 {8,128,2,4} 5 {16,64,4,2} 6 {16,64,8,2}
 // 7 {8,64,8,2} 8 {32,32,4,2}
-template <int NS = 1>
 void gemm(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const uint32_t * B, const uint16_t * SB, float * C,
           int M, int N, int K) {
     static const int tile = getenv("GGML_SYCL_PTQ1_T2_TILE") ? atoi(getenv("GGML_SYCL_PTQ1_T2_TILE")) : 0;
     switch (tile) {
-        case 1: gemm_tile<NS, 8, 128, 4, 2>(q, Aq, SA, B, SB, C, M, N, K); break;
-        case 2: gemm_tile<NS, 8, 128, 4, 4>(q, Aq, SA, B, SB, C, M, N, K); break;
-        case 3: gemm_tile<NS, 8, 128, 16, 1>(q, Aq, SA, B, SB, C, M, N, K); break;
-        case 4: gemm_tile<NS, 8, 128, 2, 4>(q, Aq, SA, B, SB, C, M, N, K); break;
-        case 5: gemm_tile<NS, 16, 64, 4, 2>(q, Aq, SA, B, SB, C, M, N, K); break;
-        case 6: gemm_tile<NS, 16, 64, 8, 2>(q, Aq, SA, B, SB, C, M, N, K); break;
-        case 7: gemm_tile<NS, 8, 64, 8, 2>(q, Aq, SA, B, SB, C, M, N, K); break;
-        case 8: gemm_tile<NS, 32, 32, 4, 2>(q, Aq, SA, B, SB, C, M, N, K); break;
-        default: gemm_tile<NS, 8, 128, 8, 2>(q, Aq, SA, B, SB, C, M, N, K); break;
+        case 1: gemm_tile<8, 128, 4, 2>(q, Aq, SA, B, SB, C, M, N, K); break;
+        case 2: gemm_tile<8, 128, 4, 4>(q, Aq, SA, B, SB, C, M, N, K); break;
+        case 3: gemm_tile<8, 128, 16, 1>(q, Aq, SA, B, SB, C, M, N, K); break;
+        case 4: gemm_tile<8, 128, 2, 4>(q, Aq, SA, B, SB, C, M, N, K); break;
+        case 5: gemm_tile<16, 64, 4, 2>(q, Aq, SA, B, SB, C, M, N, K); break;
+        case 6: gemm_tile<16, 64, 8, 2>(q, Aq, SA, B, SB, C, M, N, K); break;
+        case 7: gemm_tile<8, 64, 8, 2>(q, Aq, SA, B, SB, C, M, N, K); break;
+        case 8: gemm_tile<32, 32, 4, 2>(q, Aq, SA, B, SB, C, M, N, K); break;
+        default: gemm_tile<8, 128, 8, 2>(q, Aq, SA, B, SB, C, M, N, K); break;
     }
 }
 
 }  // namespace
 
 namespace {
-template <int NS>
 void t2_dispatch(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const uint32_t * B, const uint16_t * SB,
                  float * dst, int m, int n, int k, bool use_gemm) {
     if (use_gemm) {
-        gemm<NS>(q, Aq, SA, B, SB, dst, m, n, k);
+        gemm(q, Aq, SA, B, SB, dst, m, n, k);
     } else if (m == 1) {
-        n <= 8192 ? gemv<1, 4, NS>(q, Aq, SA, B, SB, dst, m, n, k) : gemv<1, 2, NS>(q, Aq, SA, B, SB, dst, m, n, k);
+        n <= 8192 ? gemv<1, 4>(q, Aq, SA, B, SB, dst, m, n, k) : gemv<1, 2>(q, Aq, SA, B, SB, dst, m, n, k);
     } else if (t2_nsg() == 4) {
         if (m == 2) {
-            n <= 8192 ? gemv<2, 4, NS, 4>(q, Aq, SA, B, SB, dst, m, n, k) : gemv<2, 2, NS, 4>(q, Aq, SA, B, SB, dst, m, n, k);
+            n <= 8192 ? gemv<2, 4, 4>(q, Aq, SA, B, SB, dst, m, n, k) : gemv<2, 2, 4>(q, Aq, SA, B, SB, dst, m, n, k);
         } else if (m <= 4) {
-            n <= 8192 ? gemv<4, 4, NS, 4>(q, Aq, SA, B, SB, dst, m, n, k) : gemv<4, 2, NS, 4>(q, Aq, SA, B, SB, dst, m, n, k);
+            n <= 8192 ? gemv<4, 4, 4>(q, Aq, SA, B, SB, dst, m, n, k) : gemv<4, 2, 4>(q, Aq, SA, B, SB, dst, m, n, k);
         } else {
-            n <= 8192 ? gemv<8, 4, NS, 4>(q, Aq, SA, B, SB, dst, m, n, k) : gemv<8, 2, NS, 4>(q, Aq, SA, B, SB, dst, m, n, k);
+            n <= 8192 ? gemv<8, 4, 4>(q, Aq, SA, B, SB, dst, m, n, k) : gemv<8, 2, 4>(q, Aq, SA, B, SB, dst, m, n, k);
         }
     } else if (m == 2) {
-        n <= 8192 ? gemv<2, 4, NS>(q, Aq, SA, B, SB, dst, m, n, k) : gemv<2, 2, NS>(q, Aq, SA, B, SB, dst, m, n, k);
+        n <= 8192 ? gemv<2, 4>(q, Aq, SA, B, SB, dst, m, n, k) : gemv<2, 2>(q, Aq, SA, B, SB, dst, m, n, k);
     } else if (m <= 4) {
-        n <= 8192 ? gemv<4, 4, NS>(q, Aq, SA, B, SB, dst, m, n, k) : gemv<4, 2, NS>(q, Aq, SA, B, SB, dst, m, n, k);
+        n <= 8192 ? gemv<4, 4>(q, Aq, SA, B, SB, dst, m, n, k) : gemv<4, 2>(q, Aq, SA, B, SB, dst, m, n, k);
     } else {
-        n <= 8192 ? gemv<8, 4, NS>(q, Aq, SA, B, SB, dst, m, n, k) : gemv<8, 2, NS>(q, Aq, SA, B, SB, dst, m, n, k);
+        n <= 8192 ? gemv<8, 4>(q, Aq, SA, B, SB, dst, m, n, k) : gemv<8, 2>(q, Aq, SA, B, SB, dst, m, n, k);
     }
 }
 }  // namespace
 
 void ggml_sycl_t2_mul_mat(sycl::queue & q, const void * w, const float * x, int64_t x_stride, float * dst, int64_t M,
                           int64_t N, int64_t K) {
-    // batches > 8 (n-gram verify, prompts): GemmMT reads each weight once per 64 rows. Its SA read, A read and C write
-    // were switched from 2D block I/O to plain / sub-group block access (the 2D forms misbehaved in this JIT build).
+    // batches > 8 (n-gram verify, prompts): GemmMT reads each weight once per 64 rows (TernSYCL main: the 2D block I/O
+    // that misbehaved in the JIT build with the old IGC builtins validates under inline vISA, so it is upstream's kernel).
     static const bool gemm_off = getenv("GGML_SYCL_PTQ1_T2_GEMM_OFF") != nullptr;
     const bool use_gemm = M > 8 && !gemm_off;
-    const bool s32      = use_gemm ? t2_s32() >= 2 : t2_s32() >= 1;
 
     const int      lda      = int8dpas::ldsa((int) M);
     const size_t   aq_bytes = (size_t) M * K;
     const size_t   sa_off   = (aq_bytes + 255) & ~(size_t) 255;
-    const size_t   sa_bytes = (size_t) (K / 32) * lda * 2 + 256;
+    const size_t   sa_bytes = (size_t) (K / QK) * lda * 2 + 256;
     char *         s        = (char *) scratch_get(q, sa_off + sa_bytes);
     int8_t *       Aq       = (int8_t *) s;
     uint16_t *     SA       = (uint16_t *) (s + sa_off);
     const uint32_t * B      = (const uint32_t *) w;
     const uint16_t * SB     = (const uint16_t *) ((const char *) w + (size_t) (K / 16) * N * 4);
 
-    quant_a(q, x, x_stride, M, K, Aq, SA, s32 ? 32 : QK);
-    if (s32) {
-        t2_dispatch<4>(q, Aq, SA, B, SB, dst, (int) M, (int) N, (int) K, use_gemm);
-    } else {
-        t2_dispatch<1>(q, Aq, SA, B, SB, dst, (int) M, (int) N, (int) K, use_gemm);
-    }
+    quant_a(q, x, x_stride, M, K, Aq, SA, QK);
+    t2_dispatch(q, Aq, SA, B, SB, dst, (int) M, (int) N, (int) K, use_gemm);
 }
 
 namespace {
@@ -341,29 +327,17 @@ void t2_precompile(sycl::queue & q) {
     const uint32_t * B  = (const uint32_t *) w;
     const uint16_t * SB = (const uint16_t *) (w + (K / 16) * N * 4);
     quant_a(q, x, K, M, K, aq, sa, QK);
-    quant_a(q, x, K, M, K, aq, sa, 32);
-    for (int m : { 1, 2, 4, 8, M }) {
-        for (int ns = 0; ns < 2; ++ns) {
-            // both GEMV tiles (the N > 8192 one is picked by n, so call the templates directly)
-            if (ns == 0) {
-                t2_dispatch<1>(q, aq, sa, B, SB, d, m, N, K, m > 8);
-            } else {
-                t2_dispatch<4>(q, aq, sa, B, SB, d, m, N, K, m > 8);
-            }
-        }
+    for (int m : { 1, 2, 4, 8, M }) {  // the N <= 8192 GEMV tiles + GemmMT (the N > 8192 ones are called below)
+        t2_dispatch(q, aq, sa, B, SB, d, m, N, K, m > 8);
     }
     gemv<1, 2>(q, aq, sa, B, SB, d, 1, N, K);
     gemv<2, 2>(q, aq, sa, B, SB, d, 2, N, K);
     gemv<4, 2>(q, aq, sa, B, SB, d, 4, N, K);
     gemv<8, 2>(q, aq, sa, B, SB, d, 8, N, K);
-    gemv<1, 2, 4>(q, aq, sa, B, SB, d, 1, N, K);
-    gemv<2, 2, 4>(q, aq, sa, B, SB, d, 2, N, K);
-    gemv<4, 2, 4>(q, aq, sa, B, SB, d, 4, N, K);
-    gemv<8, 2, 4>(q, aq, sa, B, SB, d, 8, N, K);
     if (t2_nsg() == 4) {  // the N > 8192 GEMV tiles with 4 sub-groups (t2_dispatch above covered the N <= 8192 ones)
-        gemv<2, 2, 1, 4>(q, aq, sa, B, SB, d, 2, N, K);
-        gemv<4, 2, 1, 4>(q, aq, sa, B, SB, d, 4, N, K);
-        gemv<8, 2, 1, 4>(q, aq, sa, B, SB, d, 8, N, K);
+        gemv<2, 2, 4>(q, aq, sa, B, SB, d, 2, N, K);
+        gemv<4, 2, 4>(q, aq, sa, B, SB, d, 4, N, K);
+        gemv<8, 2, 4>(q, aq, sa, B, SB, d, 8, N, K);
     }
     q.wait();
     sycl::free(w, q);
