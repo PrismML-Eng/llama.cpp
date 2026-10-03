@@ -1082,9 +1082,15 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
     // SLM-staged K/V tiles (128 keys) for single-token decode: 48K 432 -> 247 us with the split count below. For 2+ tokens
     // the extra SLM halves the work-groups per core and it loses (4 tok 48K 458 unstaged vs ~593 staged). GGML_SYCL_FA_DEC_STAGE=0 off.
     static const bool stage_env = !(getenv("GGML_SYCL_FA_DEC_STAGE") && atoi(getenv("GGML_SYCL_FA_DEC_STAGE")) == 0);
-    const bool stage = dpas && stage_env && !d512 && !g2 && nq == 1;
+    // ARC-LAB: 5-token query chunks (default, GGML_SYCL_FA_DEC_NQ5=1): MTP 4 drafts + 1 = 5-token verifies otherwise run the
+    // 8-token kernel with 3 empty tokens (48 rows of Q.K / softmax for 30). B580 per layer: 16K 215 -> 175 us, 48K 637 ->
+    // 502 us. =0 off, =2 SLM-staged (slower: 48K 579), =3 256-key tiles (48K 513).
+    static const int nq5_env = getenv("GGML_SYCL_FA_DEC_NQ5") ? atoi(getenv("GGML_SYCL_FA_DEC_NQ5")) : 1;
+    const int nq5 = (dpas && !d512 && !g2 && ne01 == 5) ? nq5_env : 0;
+    const bool stage = dpas && stage_env && !d512 && !g2 && (nq == 1 || nq5 == 2);
     const int tk   = (d512 || g2) ? (nq == 1 ? 256 : 128)
-                   : stage ? 128
+                   : nq5 == 3 ? 256
+                   : (stage || nq5) ? 128
                    : dpas ? (nq == 1 ? 256 : nq == 2 ? 128 : nq == 4 ? 256 : 128) : nq == 8 ? 32 : nq == 4 ? 64 : 128;
     const int ne11 = K->ne[1];
 
@@ -1142,6 +1148,10 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
             FATTN_DEC_DPASG2(8, 8, 1);     // 16 rows = 2 tiles, 8 key groups x 2
         }
 #undef FATTN_DEC_DPASG2
+    } else if (nq5 == 1) {
+        FATTN_DEC_DPAS(5, 8, 2);
+    } else if (nq5 == 3) {
+        FATTN_DEC_DPAS(5, 16, 2);  // 256-key tiles, as the 4-token kernel
     } else if (stage) {
 #define FATTN_DEC_DPAS_ST(NQ_, KG_, TC_) fattn_dec_q4_0_dpas<DEC_D, 6, NQ_, KG_, TC_, 1>((const char *) Q->data, (const char *) K->data, \
         (const char *) V->data, mdata, (float *) dst->data, parts.get(), meta.get(), scale, ne01, (int) Q->ne[2], ne11,         \
@@ -1149,6 +1159,7 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
         V->nb[3], nb31, nb33, ne33, nsplit, chunk, stream)
         switch (nq) {
             case 1: FATTN_DEC_DPAS_ST(1, 8, 1); break;
+            case 8: FATTN_DEC_DPAS_ST(5, 8, 2); break;  // only with nq5 == 2 (stage is otherwise 1-token only)
             case 2: FATTN_DEC_DPAS_ST(2, 8, 1); break;
             case 4: FATTN_DEC_DPAS_ST(4, 8, 3); break;
             default: FATTN_DEC_DPAS_ST(8, 8, 3); break;
