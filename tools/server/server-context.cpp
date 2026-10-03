@@ -2248,15 +2248,11 @@ private:
         const int id_task = slot.task->id;
 
         // the buffers of an evicted checkpoint go to the new one: a fresh vector is zero-filled by resize()
-        // (LLAMA_CKPT_REUSE=0 turns this off)
-        static const bool reuse = [] { const char * e = getenv("LLAMA_CKPT_REUSE"); return !e || atoi(e) != 0; }();
         std::vector<uint8_t> spare_tgt;
         std::vector<uint8_t> spare_dft;
         const auto keep_spare = [&](common_prompt_checkpoint & ckpt) {
-            if (reuse) {
-                spare_tgt = std::move(ckpt.data_tgt);
-                spare_dft = std::move(ckpt.data_dft);
-            }
+            spare_tgt = std::move(ckpt.data_tgt);
+            spare_dft = std::move(ckpt.data_dft);
         };
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
