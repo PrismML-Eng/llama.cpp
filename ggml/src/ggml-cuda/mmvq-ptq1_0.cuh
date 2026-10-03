@@ -25,8 +25,12 @@
 #pragma once
 
 #include "common.cuh"
+#include "l2-hint.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+
+#include <algorithm>
+#include <cstdlib>
 
 #define PTQ1_0_PT_PLANES 9
 
@@ -298,7 +302,8 @@ static __global__ void mul_mat_vec_ptq1_0_pt(
         const void * vx_, const void * vy_, const ggml_cuda_mm_fusion_args_device fusion,
         float * dst_,
         const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
-        const int rows_per_cta, const uint3 bpr_fd, const uint3 rpc_fd, const bool invariant) {
+        const int rows_per_cta, const uint3 bpr_fd, const uint3 rpc_fd, const bool invariant,
+        const char * pf_ptr, const int pf_lines_per_cta, const int pf_ctas) {
     // GGML_CUDA_RESTRICT stays off the formal parameters: cudafe's host stub drops __restrict
     // from the explicit specialization and MSVC/GCC then reject it (C2912 / "does not match
     // any template declaration") when compiling sm_90/sm_120. Same pattern as mul_mat_vec_q.
@@ -363,6 +368,15 @@ static __global__ void mul_mat_vec_ptq1_0_pt(
                     partials_gate[(j*rows_per_cta + rg*ROWS + i)*bprp + kbx] = dots[j][i];
                 }
             }
+        }
+    }
+
+    // the last CTAs have finished their loads and the DRAM is about to go idle: pull the head of the next
+    // mat-vec's weights into L2 (prefetch.global.L2 keeps the loads off the critical path of this kernel)
+    if (pf_ptr != nullptr && (int) blockIdx.x + pf_ctas >= (int) gridDim.x) {
+        const char * pf = pf_ptr + (size_t) ((int) blockIdx.x - ((int) gridDim.x - pf_ctas)) * pf_lines_per_cta * 128;
+        for (int i = tid; i < pf_lines_per_cta; i += PTQ1_0_PT_THREADS) {
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(pf + (size_t) i * 128));
         }
     }
 
@@ -504,10 +518,25 @@ static void mul_mat_vec_ptq1_0_pt_launch(
     const size_t smem = ptq1_0_pt_smem_bytes(bpr, ncols, nrows_x, has_gate);
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, smem, stream);
 
+    // L2 prefetch of the next mat-vec's weights (hint from the node loop; GGML_CUDA_L2_PREFETCH_PCT/_MAX_KB/_CTAS, PCT=0 turns it off; defaults 50 / 16384 / 46)
+    static const int pf_pct = [] { const char * e = getenv("GGML_CUDA_L2_PREFETCH_PCT"); return e ? atoi(e) : 50; }();
+    static const int pf_max_kb = [] { const char * e = getenv("GGML_CUDA_L2_PREFETCH_MAX_KB"); return e ? atoi(e) : 16384; }();
+    static const int pf_cta_cfg = [] { const char * e = getenv("GGML_CUDA_L2_PREFETCH_CTAS"); return e ? atoi(e) : 46; }();
+    const char * pf_ptr = nullptr;
+    int pf_lines_per_cta = 0;
+    const int pf_ctas = std::min(pf_cta_cfg, (int) block_nums.x);
+    if (pf_pct > 0 && g_ggml_cuda_l2_hint.ptr != nullptr && pf_ctas > 0) {
+        const size_t pf_bytes = std::min(g_ggml_cuda_l2_hint.bytes / 100 * pf_pct, (size_t) pf_max_kb * 1024);
+        pf_lines_per_cta = (int) (pf_bytes / 128 / pf_ctas);
+        if (pf_lines_per_cta > 0) {
+            pf_ptr = g_ggml_cuda_l2_hint.ptr;
+        }
+    }
+
 #define PTQ1_0_PT_LAUNCH(FUS, GATE)                                                                                      \
     ggml_cuda_kernel_launch(mul_mat_vec_ptq1_0_pt<ncols, ROWS, FUS, GATE>, lp,                                           \
         vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, rows_per_cta, bpr_fd, rpc_fd, \
-        ggml_cuda_batch_invariant())
+        ggml_cuda_batch_invariant(), pf_ptr, pf_lines_per_cta, pf_ctas)
 
     if (has_fusion) {
         GGML_ASSERT(ncols == 1 && "fusion only supported for ncols_dst=1");
