@@ -2984,9 +2984,23 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         // consecutive accept rounds with low acceptance fraction (< 0.5)
         int n_low = 0;
+
+        // ARC-LAB adaptive draft length: drafts are cut to n_cur tokens; n_cur doubles after a fully accepted draft
+        // (up to n_max) and halves after a rejected one (down to n_start). A copy ends where the model stops, but the
+        // context continues, so a fixed n_max of 256 threw away ~200 drafted tokens per short copy - at 48K context
+        // verifying those costs ~0.3 s each.
+        int n_cur = 0;
     };
 
     std::vector<seq_info> sinfos;
+
+    // LLAMA_ARG_SPEC_NGRAM_ADAPT=0 disables it (fixed n_max as upstream); other values = starting length (default 64).
+    // B580, n_max 256, t/s fixed vs 16 / 64 / 128: 48K short copy 38.6 / 60.7 / 57.3 / 45.7, 48K long copy 161.6 / 165 /
+    // 172.9 / 178.9, short rename 428 / 394 / 411 / 416, edit 305 / 296 / 299 / 316 (same outputs).
+    int n_start = [] {
+        const char * e = std::getenv("LLAMA_ARG_SPEC_NGRAM_ADAPT");
+        return e ? std::atoi(e) : 64;
+    }();
 
     common_speculative_impl_ngram_mod(
             const common_params_speculative & params,
@@ -3016,6 +3030,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
+        sinfo.n_cur = n_start > 0 ? std::min(n_start, params.n_max) : params.n_max;
 
         const size_t n = mod.get_n();
         if (prompt.size() < n) {
@@ -3091,6 +3106,11 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
         result.resize(result.size() - n);
 
+        // adaptive length: the n_min check above still sees the whole chain; only the returned draft is cut
+        if (sinfo.n_cur > 0 && result.size() > (size_t) sinfo.n_cur) {
+            result.resize(sinfo.n_cur);
+        }
+
         // store length of drafted n-gram for later acceptance analysis
         sinfo.n_draft_last = result.size();
     }
@@ -3119,6 +3139,11 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
 
         auto & sinfo = sinfos[seq_id];
+
+        if (n_start > 0 && sinfo.n_draft_last > 0) {
+            sinfo.n_cur = n_accepted >= sinfo.n_draft_last ? std::min(2 * sinfo.n_cur, (int) params.n_max)
+                                                            : std::max(std::min(n_start, (int) params.n_max), sinfo.n_cur / 2);
+        }
 
         // compute acceptance fraction if we have a recorded draft length
         if (sinfo.n_draft_last > 0) {
