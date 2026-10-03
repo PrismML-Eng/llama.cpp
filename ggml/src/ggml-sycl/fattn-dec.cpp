@@ -726,7 +726,7 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
     constexpr int SW   = RW + 1;             // SLM row stride (odd: no bank conflicts on lane = key reads)
     static_assert(ST == 0 || (D == 256 && RW % 4 == 0), "staging is sized for D 256");
     const int nqc = (ne01 + NQ - 1) / NQ;    // token chunks
-    static const int probe_env = getenv("GGML_SYCL_FA_DEC_DPAS_PROBE") ? atoi(getenv("GGML_SYCL_FA_DEC_DPAS_PROBE")) : 0;
+    const int probe_env = ggml_sycl_knob("GGML_SYCL_FA_DEC_DPAS_PROBE", 0);
     const int        probe     = probe_env;  // phase probe: bit0 skip Q.K, bit1 skip P.V, bit2 skip softmax, bit3 Q.K loads only (no DPAS / scale math)
 
     stream->submit([&](sycl::handler & cgh) {
@@ -1017,18 +1017,18 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
 }
 
 static int fattn_dec_dpas_maxq() {  // 0 = DPAS kernel off; else it serves 1 .. maxq query tokens
-    static const int v = [] {
-        const char * e = getenv("GGML_SYCL_FA_DEC_DPAS");
-        int          n = e ? atoi(e) : 0;
+    static const bool ok = [] {
         // the kernel needs Xe2's 16-lane int8 x int4 DPAS; elsewhere fall back instead of failing at the first launch
-        if (n && !getenv("GGML_SYCL_FA_DEC_DPAS_ANYGPU") && !ggml_sycl_device_is_xe2()) {
+        if (getenv("GGML_SYCL_FA_DEC_DPAS") && atoi(getenv("GGML_SYCL_FA_DEC_DPAS")) && !getenv("GGML_SYCL_FA_DEC_DPAS_ANYGPU") &&
+            !ggml_sycl_device_is_xe2()) {
             GGML_LOG_WARN("%s: GGML_SYCL_FA_DEC_DPAS needs an Xe2 or newer GPU (Arc B-series, Lunar Lake, Panther Lake); "
                           "%s is not one, using the regular decode attention\n", __func__,
                           ggml_sycl_info().devices[ggml_sycl_get_device()].hw_info.name.c_str());
-            n = 0;
+            return false;
         }
-        return n;
+        return getenv("GGML_SYCL_FA_DEC_DPAS_ANYGPU") != nullptr || ggml_sycl_device_is_xe2();
     }();
+    const int v = ok ? ggml_sycl_knob("GGML_SYCL_FA_DEC_DPAS", 0) : 0;
     // =1 -> default cap 256: long n-gram verify batches stay on this kernel instead of oneDNN's f16 copy of the whole KV
     // cache (B580, per layer: 48K 64 tok 28.8 -> 4.9 ms, 115K 256 tok 253 -> 44 ms; KLD 0.01270 vs 0.01280, same within
     // error; whole model MTP 48K 73.2 -> 76.1 t/s, 115K 60.3 -> 65.1). =32 restores the old cap.
@@ -1081,11 +1081,11 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
     // keys per tile (must match the instantiations below); DPAS: 16 x KG
     // SLM-staged K/V tiles (128 keys) for single-token decode: 48K 432 -> 247 us with the split count below. For 2+ tokens
     // the extra SLM halves the work-groups per core and it loses (4 tok 48K 458 unstaged vs ~593 staged). GGML_SYCL_FA_DEC_STAGE=0 off.
-    static const bool stage_env = !(getenv("GGML_SYCL_FA_DEC_STAGE") && atoi(getenv("GGML_SYCL_FA_DEC_STAGE")) == 0);
+    const bool stage_env = ggml_sycl_knob("GGML_SYCL_FA_DEC_STAGE", 1) != 0;
     // ARC-LAB: 5-token query chunks (default, GGML_SYCL_FA_DEC_NQ5=1): MTP 4 drafts + 1 = 5-token verifies otherwise run the
     // 8-token kernel with 3 empty tokens (48 rows of Q.K / softmax for 30). B580 per layer: 16K 215 -> 175 us, 48K 637 ->
     // 502 us. =0 off, =2 SLM-staged (slower: 48K 579), =3 256-key tiles (48K 513).
-    static const int nq5_env = getenv("GGML_SYCL_FA_DEC_NQ5") ? atoi(getenv("GGML_SYCL_FA_DEC_NQ5")) : 1;
+    const int nq5_env = ggml_sycl_knob("GGML_SYCL_FA_DEC_NQ5", 1);
     const int nq5 = (dpas && !d512 && !g2 && ne01 == 5) ? nq5_env : 0;
     const bool stage = dpas && stage_env && !d512 && !g2 && (nq == 1 || nq5 == 2);
     const int tk   = (d512 || g2) ? (nq == 1 ? 256 : 128)
@@ -1095,7 +1095,7 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
     const int ne11 = K->ne[1];
 
     // slices: enough work-groups to fill the GPU (~64 slices per KV head, ~256 in all), at least one tile each
-    static const int target_env = getenv("GGML_SYCL_FA_DEC_SPLITS") ? atoi(getenv("GGML_SYCL_FA_DEC_SPLITS")) : 0;
+    const int target_env = ggml_sycl_knob("GGML_SYCL_FA_DEC_SPLITS", 0);
     // DPAS (D 256, 6 rows): one wave of work-groups - Xe cores x the work-groups that fit per core (SLM-bound: 4 for 1-2
     // query tokens, 2 for 4-8) - over the KV heads. A fixed 64 per head ran 3-6 waves with a mostly idle last one: B580
     // 48K 1 tok 432 -> 302 us (247 staged), 4 tok 648 -> 458 us. Xe2: 8 EUs per core, nsm = EUs / 16.

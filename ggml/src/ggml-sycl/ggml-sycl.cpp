@@ -10,6 +10,10 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 
+#include <filesystem>
+#include <mutex>
+#include <unordered_map>
+#include <cstring>
 #include <algorithm>
 #include <map>
 #include <array>
@@ -6570,8 +6574,73 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
 }
 #endif
 
+namespace {
+std::mutex                           g_knob_mtx;
+std::unordered_map<std::string, int> g_knob_file;   // from GGML_SYCL_KNOBS_FILE (wins)
+std::unordered_map<std::string, int> g_knob_env;    // environment, read once per name
+}  // namespace
+
+int ggml_sycl_knob(const char * name, int def) {
+    std::lock_guard<std::mutex> lock(g_knob_mtx);
+    auto f = g_knob_file.find(name);
+    if (f != g_knob_file.end()) {
+        return f->second;
+    }
+    auto e = g_knob_env.find(name);
+    if (e != g_knob_env.end()) {
+        return e->second;
+    }
+    const char * v = getenv(name);
+    const int    r = v ? atoi(v) : def;
+    g_knob_env[name] = r;
+    return r;
+}
+
+void ggml_sycl_knobs_refresh() {
+    static const char * path = getenv("GGML_SYCL_KNOBS_FILE");
+    if (!path) {
+        return;
+    }
+    static std::filesystem::file_time_type last_time{};
+    static std::uintmax_t                  last_size = 0;
+    std::error_code                        ec;
+    const auto                             t  = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        return;
+    }
+    const auto sz = std::filesystem::file_size(path, ec);
+    if (ec || (t == last_time && sz == last_size)) {
+        return;
+    }
+    last_time = t;
+    last_size = sz;
+    std::unordered_map<std::string, int> m;
+    if (FILE * fp = fopen(path, "r")) {
+        char line[256];
+        while (fgets(line, sizeof(line), fp)) {
+            char * eq = strchr(line, '=');
+            if (!eq || line[0] == '#') {
+                continue;
+            }
+            *eq = 0;
+            std::string k(line);
+            k.erase(k.find_last_not_of(" \t") + 1);
+            m[k] = atoi(eq + 1);
+        }
+        fclose(fp);
+    }
+    std::string desc;
+    for (auto & kv : m) {
+        desc += " " + kv.first + "=" + std::to_string(kv.second);
+    }
+    GGML_LOG_INFO("%s: knobs reloaded from %s:%s\n", __func__, path, desc.c_str());
+    std::lock_guard<std::mutex> lock(g_knob_mtx);
+    g_knob_file = std::move(m);
+}
+
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    ggml_sycl_knobs_refresh();
 
 #ifdef GGML_SYCL_GRAPH
     bool use_sycl_graph = false;

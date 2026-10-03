@@ -217,7 +217,7 @@ void quant_a(sycl::queue & q, const float * x, int64_t x_stride, int64_t M, int6
 // GGML_SYCL_PTQ1_T2_NSG: sub-groups per GEMV work-group for 2..8 rows (verify batches); 2 (default) or 4. The B580 tile
 // sweep (TernSYCL main, Bonsai 27B shapes, M=4, qmode 0) had 4 fastest on 5 of 6 shapes (+0-8%); M=1 keeps 2.
 int t2_nsg() {
-    static const int v = getenv("GGML_SYCL_PTQ1_T2_NSG") && atoi(getenv("GGML_SYCL_PTQ1_T2_NSG")) == 4 ? 4 : 2;
+    const int v = ggml_sycl_knob("GGML_SYCL_PTQ1_T2_NSG", 2) == 4 ? 4 : 2;
     return v;
 }
 
@@ -250,7 +250,7 @@ void gemm_tile(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const ui
 // 7 {8,64,8,2} 8 {32,32,4,2}
 void gemm(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const uint32_t * B, const uint16_t * SB, float * C,
           int M, int N, int K) {
-    static const int tile = getenv("GGML_SYCL_PTQ1_T2_TILE") ? atoi(getenv("GGML_SYCL_PTQ1_T2_TILE")) : 0;
+    const int tile = ggml_sycl_knob("GGML_SYCL_PTQ1_T2_TILE", 0);
     switch (tile) {
         case 1: gemm_tile<8, 128, 4, 2>(q, Aq, SA, B, SB, C, M, N, K); break;
         case 2: gemm_tile<8, 128, 4, 4>(q, Aq, SA, B, SB, C, M, N, K); break;
@@ -295,7 +295,7 @@ void ggml_sycl_t2_mul_mat(sycl::queue & q, const void * w, const float * x, int6
                           int64_t N, int64_t K) {
     // batches > 8 (n-gram verify, prompts): GemmMT reads each weight once per 64 rows (TernSYCL main: the 2D block I/O
     // that misbehaved in the JIT build with the old IGC builtins validates under inline vISA, so it is upstream's kernel).
-    static const bool gemm_off = getenv("GGML_SYCL_PTQ1_T2_GEMM_OFF") != nullptr;
+    const bool gemm_off = ggml_sycl_knob("GGML_SYCL_PTQ1_T2_GEMM_OFF", 0) != 0;
     const bool use_gemm = M > 8 && !gemm_off;
 
     const int      lda      = int8dpas::ldsa((int) M);

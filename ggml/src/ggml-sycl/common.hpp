@@ -1044,4 +1044,10 @@ static __dpct_inline__ float ggml_sycl_ue4m3_to_fp32(uint8_t x) {
     return raw * 0.5f;
 }
 
+// ARC-LAB lab knobs: integer tuning switches read through here can be changed while the process runs. With
+// GGML_SYCL_KNOBS_FILE=<path> set, the file (NAME=VALUE lines) is re-read at the start of a graph compute when its
+// mtime changes and its values override the environment; without it, each knob is read from the environment once.
+int  ggml_sycl_knob(const char * name, int def);
+void ggml_sycl_knobs_refresh();
+
 #endif // GGML_SYCL_COMMON_HPP
