@@ -1029,7 +1029,10 @@ static int fattn_dec_dpas_maxq() {  // 0 = DPAS kernel off; else it serves 1 .. 
         }
         return n;
     }();
-    return v == 1 ? 32 : v;  // =1 -> default cap
+    // =1 -> default cap 256: long n-gram verify batches stay on this kernel instead of oneDNN's f16 copy of the whole KV
+    // cache (B580, per layer: 48K 64 tok 28.8 -> 4.9 ms, 115K 256 tok 253 -> 44 ms; KLD 0.01270 vs 0.01280, same within
+    // error; whole model MTP 48K 73.2 -> 76.1 t/s, 115K 60.3 -> 65.1). =32 restores the old cap.
+    return v == 1 ? 256 : v;
 }
 
 bool ggml_sycl_flash_attn_ext_dec_supported(const ggml_tensor * dst) {
