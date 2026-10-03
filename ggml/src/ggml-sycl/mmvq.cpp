@@ -1,3 +1,4 @@
+#include "xe2-dpas.hpp"
 #include "mmvq.hpp"
 
 #include "ggml.h"
@@ -4017,8 +4018,8 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu
     }
 }
 
-// ARC-LAB: reordered q4_0 x f32 for 5..64 columns (speculative verify / n-gram drafts) on XMX via the s8 x s4 DPAS builtin
-// (intel_sub_group_i8_i4_matrix_mad_k32, Xe2). The MMVQ column kernels re-read the weights per 8 columns and the dequantize
+// ARC-LAB: reordered q4_0 x f32 for 5..64 columns (speculative verify / n-gram drafts) on XMX via s8 x s4 DPAS
+// (inline vISA, xe2-dpas.hpp; Xe2). The MMVQ column kernels re-read the weights per 8 columns and the dequantize
 // + GEMM path converts the whole matrix; here each weight row streams once for all columns. One lane per weight row: B =
 // the row's 16 q4_0 bytes of a block XOR 0x88888888 (u4 n+8 -> s4 n), A = 8 activation rows as int8 (per row and 32-block
 // RNE scale; q4_0 byte i holds elements i and i+16, so A's k = 2i+h pairs elements l and l+16). GGML_SYCL_Q4_0_DPAS=1.
@@ -4029,11 +4030,6 @@ typedef int      q4d_int8   __attribute__((ext_vector_type(8)));
 typedef float    q4d_float8 __attribute__((ext_vector_type(8)));
 typedef unsigned q4d_uint4  __attribute__((ext_vector_type(4)));
 }
-#ifdef __SYCL_DEVICE_ONLY__
-SYCL_EXTERNAL q4d_int8 intel_sub_group_i8_i4_matrix_mad_k32(q4d_short8 a, q4d_int4 b, q4d_int8 acc);
-#else
-inline q4d_int8 intel_sub_group_i8_i4_matrix_mad_k32(q4d_short8, q4d_int4, q4d_int8) { __builtin_unreachable(); }
-#endif
 
 template <int MT>
 static void q4_0_dpas_gemm_launch(const void * vx, const q4d_short8 * xq, const q4d_float8 * xd, float * dst, const int nrows,
@@ -4065,7 +4061,7 @@ static void q4_0_dpas_gemm_launch(const void * vx, const q4d_short8 * xq, const 
                 const float     d  = static_cast<float>(dw[b]);
 #pragma unroll
                 for (int t = 0; t < MT; ++t) {
-                    const q4d_int8 ia = intel_sub_group_i8_i4_matrix_mad_k32(xq[((size_t) t * NB + b) * 16 + lane], bv, (q4d_int8) (0));
+                    const q4d_int8 ia = xe2dp::dpas_s4s8_r8(xq[((size_t) t * NB + b) * 16 + lane], bv);
                     acc[t] += __builtin_convertvector(ia, q4d_float8) * (xd[(size_t) t * NB + b] * d);
                 }
             }

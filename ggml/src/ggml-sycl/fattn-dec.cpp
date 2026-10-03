@@ -10,6 +10,7 @@
 //     tile or slice gets zero weight, never NaN); thread d accumulates P.V for head dim d of every row;
 //   - slices are merged by flash_attn_combine_results (same partial layout as the vec kernel).
 
+#include "xe2-dpas.hpp"
 #include <sycl/sycl.hpp>
 #include "dpct/helper.hpp"
 #include "common.hpp"
@@ -684,7 +685,7 @@ static void fattn_dec_q4_0_xmx(const char * Q, const char * K, const char * V, c
 
 
 // ARC-LAB DPAS kernel (GGML_SYCL_FA_DEC_DPAS=1): the q4_0 cache feeds the XMX units without any dequantization pass.
-//   Q.K: s8 x s4 DPAS (intel_sub_group_i8_i4_matrix_mad_k32, not in the public extension spec but provided by IGC on Xe2).
+//   Q.K: s8 x s4 DPAS (inline vISA, xe2-dpas.hpp; was the IGC builtin intel_sub_group_i8_i4_matrix_mad_k32).
 //        A = Q rows as int8 (one RNE scale per row per 32-dim block, computed once per call), B = the raw 16 bytes of a key's
 //        q4_0 block XOR 0x88888888 (u4 n+8 -> s4 n), one key per lane. q4_0 byte i holds dims i and i+16, so A's k = 2i+h
 //        is dim i + 16h: lane l's A short = (Q[l], Q[l + 16]). S += int result * dq[row] * dk[key].
@@ -698,10 +699,8 @@ typedef float    dp_float8 __attribute__((ext_vector_type(8)));
 typedef unsigned dp_uint4  __attribute__((ext_vector_type(4)));
 }
 #ifdef __SYCL_DEVICE_ONLY__
-SYCL_EXTERNAL dp_int8   intel_sub_group_i8_i4_matrix_mad_k32(dp_short8 a, dp_int4 b, dp_int8 acc);
 SYCL_EXTERNAL dp_float8 intel_sub_group_f16_f16_matrix_mad_k16(dp_short8 a, dp_int8 b, dp_float8 acc);
 #else
-inline dp_int8   intel_sub_group_i8_i4_matrix_mad_k32(dp_short8, dp_int4, dp_int8) { __builtin_unreachable(); }
 inline dp_float8 intel_sub_group_f16_f16_matrix_mad_k16(dp_short8, dp_int8, dp_float8) { __builtin_unreachable(); }
 #endif
 
@@ -882,7 +881,7 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
                             for (int tt = 0; tt < TC; ++tt) {
                                 const int t = ch * TC + tt;
                                 if (t < RT) {
-                                    const dp_int8   ia = intel_sub_group_i8_i4_matrix_mad_k32(sQ8[(t * NB + b) * 16 + lane], bv, (dp_int8) (0));
+                                    const dp_int8   ia = xe2dp::dpas_s4s8_r8(sQ8[(t * NB + b) * 16 + lane], bv);
                                     const dp_float8 sc8 = sDQ[t * NB + b] * dk;  // one broadcast vector load per tile and block
                                     s[tt] += __builtin_convertvector(ia, dp_float8) * sc8;
                                 }
