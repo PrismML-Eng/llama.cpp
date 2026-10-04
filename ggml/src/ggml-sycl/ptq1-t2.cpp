@@ -1,5 +1,5 @@
 // ARC-LAB: PTQ1_0 on XMX through the TernSYCL int2 x int8 DPAS kernels (ternsycl/, BSD 3-Clause, libxsmm/TernSYCL
-// @11484da + the long long address fix of libxsmm/TernSYCL#3: inline vISA only, no IGC builtins). The base-3 PTQ1_0 packing (1.625 + 0.125 bits/weight) has to be decoded on the ALUs before any DPAS, which
+// @8b0ae42: inline vISA only, no IGC builtins; builds with icpx's default -fp-model=fast). The base-3 PTQ1_0 packing (1.625 + 0.125 bits/weight) has to be decoded on the ALUs before any DPAS, which
 // makes the 4-column verify mat-vec compute-bound (~190 GB/s on the B580); 2-bit two's-complement codes (2.125 bits)
 // feed the s8 x s2 DPAS directly. B580 standalone, 2 GiB rotating weights: 17408x5120 m=1 56 us, m=4 61 us (vs 70 /
 // ~100 in-model for PTQ1_0). The weight grows 31%; activations become int8 with one fp16 scale per 128 (q8_1 is per 32).

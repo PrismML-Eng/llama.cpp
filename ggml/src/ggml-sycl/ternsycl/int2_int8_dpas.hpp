@@ -37,8 +37,9 @@ constexpr int GS = 128;
 inline int ldsa(int M) { return (M + 31) & ~31; }
 constexpr float EPS = 1.1920928955078125e-07f;  // FLT_EPSILON, xetla absmax init
 
-// two DT (low, high half of h2) -> two int8 packed in a short; clamp + RTZ
-// convert lowers to one mov.sat per element
+// two DT (low, high half of h2) -> two int8 packed in a short, rounded to nearest
+// even: + 1.5 * 2^23 rounds to nearest even into the low mantissa bits
+// (|f * sa| <= 127.5), whose low byte is the int8
 template <bool BF16> inline short q2(unsigned h2, float sa) {
     float f0, f1;
     if constexpr (BF16) {
@@ -48,18 +49,19 @@ template <bool BF16> inline short q2(unsigned h2, float sa) {
         f0 = dt<false>::tof((unsigned short)h2);
         f1 = dt<false>::tof((unsigned short)(h2 >> 16));
     }
-    const signed char c0 = (signed char)sycl::clamp(f0 * sa, -128.0f, 127.0f);
-    const signed char c1 = (signed char)sycl::clamp(f1 * sa, -128.0f, 127.0f);
-    return (short)((unsigned char)c0 | ((unsigned)(unsigned char)c1 << 8));
+    const unsigned u0 = sycl::bit_cast<unsigned>(sycl::fma(f0, sa, 12582912.0f));
+    const unsigned u1 = sycl::bit_cast<unsigned>(sycl::fma(f1, sa, 12582912.0f));
+    return (short)((u0 & 0xffu) | ((u1 & 0xffu) << 8));
 }
 
 // xetla's elemwise_scale_{fp16,bf16}_to_int8 on one 8-row x 32-K block, on the
 // row-contiguous registers (SIMT code would split and re-pair every pair).
 // a: row r = a[r] (lane l holds K 2l, 2l+1); lane r of sal = scale of row r.
-// SIMD32 NoMask like xetla: call only from convergent code.
-#define TS_QROW(r, g, orow, ocol)                                               \
-    "mul (M1_NM, 32) T(" #g ",0)<1> T(" #g ",0)<1;1,0> %2(0," #r ")<0;1,0>\n"  \
-    "mov.sat (M1_NM, 32) TB(" #g ",0)<4> T(" #g ",0)<1;1,0>\n"                 \
+// SIMD32 NoMask like xetla: call only from convergent code. a * sal + 1.5 * 2^23
+// rounds to nearest even into the low mantissa bits (|a * sal| <= 127.5); the
+// low byte of each float is the int8.
+#define TS_QROW(r, g, orow, ocol)                                                         \
+    "mad (M1_NM, 32) T(" #g ",0)<1> T(" #g ",0)<1;1,0> %2(0," #r ")<0;1,0> 0x4b400000:f\n" \
     "mov (M1_NM, 32) QB(" #orow "," #ocol ")<1> TB(" #g ",0)<4;1,0>\n"
 #define TS_QUANT(A2F)                                                            \
     "{\n"                                                                        \
@@ -118,7 +120,7 @@ struct QuantA {
             unsigned long long q = 0;
 #pragma unroll
             for (int i = 0; i < 8; ++i)
-                q |= (unsigned long long)(unsigned char)(signed char)sycl::clamp(a[i] * s, -128.0f, 127.0f)
+                q |= (unsigned long long)(unsigned char)(signed char)sycl::clamp(sycl::rint(a[i] * s), -128.0f, 127.0f)
                         << (8 * i);
             *(unsigned long long *)(Aq + off) = q;
         }
@@ -371,8 +373,9 @@ struct GemmMT {
                     for (int c = 0; c < 4; ++c) aq[c] = quant8x32<BF16>(ar[I][c], sal);
                 }
                 // rows >= M get inf here, but their int32 dot is 0 and the store clips them
+                const float invl = sycl::native::recip(sal);
 #pragma unroll
-                for (int r = 0; r < 8; ++r) inv[r] = sycl::native::recip(sycl::group_broadcast(sgp, sal, r));
+                for (int r = 0; r < 8; ++r) inv[r] = sycl::group_broadcast(sgp, invl, r);
 #pragma unroll
                 for (int j = 0; j < NB; ++j) {
                     int8 ia = dpas_s2s8_z(aq[0], int2{(int)w[j][0], (int)w[j][1]});

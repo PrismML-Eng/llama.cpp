@@ -286,6 +286,16 @@ XE2_DPAS_Z(dpas_s2s8_z, "s2.s8", short, int2, int, 1, 8, 32)
 XE2_DPAS_Z(dpas_s2s8_z, "s2.s8", short2, int2, int2, 2, 16, 32)
 XE2_DPAS_Z(dpas_s2s8_z, "s2.s8", short4, int2, int4, 4, 32, 32)
 XE2_DPAS_Z(dpas_s2s8_z, "s2.s8", short8, int2, int8, 8, 64, 32)
+// s8 A (K32) x s4 B: 2 weights per byte of B, 16 bytes (32 K) per lane; dword d of a lane's B holds K 8d .. 8d+7,
+// low nibble first. Same result as the IGC builtin intel_sub_group_i8_i4_matrix_mad_k32 (repeat count 8).
+XE2_DPAS(dpas_s4s8, "s4.s8", short, int4, int, 1, 8, 64)
+XE2_DPAS(dpas_s4s8, "s4.s8", short2, int4, int2, 2, 16, 64)
+XE2_DPAS(dpas_s4s8, "s4.s8", short4, int4, int4, 4, 32, 64)
+XE2_DPAS(dpas_s4s8, "s4.s8", short8, int4, int8, 8, 64, 64)
+XE2_DPAS_Z(dpas_s4s8_z, "s4.s8", short, int4, int, 1, 8, 64)
+XE2_DPAS_Z(dpas_s4s8_z, "s4.s8", short2, int4, int2, 2, 16, 64)
+XE2_DPAS_Z(dpas_s4s8_z, "s4.s8", short4, int4, int4, 4, 32, 64)
+XE2_DPAS_Z(dpas_s4s8_z, "s4.s8", short8, int4, int8, 8, 64, 64)
 #undef XE2_DPAS
 #undef XE2_DPAS_Z
 
