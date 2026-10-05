@@ -728,6 +728,9 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
     const int nqc = (ne01 + NQ - 1) / NQ;    // token chunks
     const int probe_env = ggml_sycl_knob("GGML_SYCL_FA_DEC_DPAS_PROBE", 0);
     const int        probe     = probe_env;  // phase probe: bit0 skip Q.K, bit1 skip P.V, bit2 skip softmax, bit3 Q.K loads only (no DPAS / scale math)
+    // ARC-LAB: GGML_SYCL_FA_DEC_PF: prefetch the next phase's key rows while this phase computes (the probes showed Q.K and
+    // P.V serialised behind the loads): 1 = into L1 (default), 2 = into L3, 0 = off
+    const int        pf        = ggml_sycl_knob("GGML_SYCL_FA_DEC_PF", 1);
 
     stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<dp_short8, 1> sQ8(sycl::range<1>(RT * NB * 16), cgh);   // [tile][block][lane] -> 8 rows
@@ -826,10 +829,31 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
                     }
                 };
 
+                // a 144-byte q4_0 row (D 256) spans at most 3 cache lines from its start + 0 / 64 / 128
+                auto prefetch_rows = [&](const char * base, int64_t nb, int t0n) {
+                    if (pf == 0 || t0n >= k_end) {
+                        return;
+                    }
+                    for (int e = tid; e < TK * 3; e += DEC_WG) {
+                        const int j = t0n + e / 3;
+                        if (j < k_end) {
+                            void * pa = (void *) (base + (int64_t) j * nb + (e % 3) * 64);
+                            if (pf == 2) {
+                                sycl::ext::oneapi::experimental::prefetch(pa, sycl::ext::oneapi::experimental::properties{ sycl::ext::oneapi::experimental::prefetch_hint_L3 });
+                            } else {
+                                sycl::ext::oneapi::experimental::prefetch(pa, sycl::ext::oneapi::experimental::properties{ sycl::ext::oneapi::experimental::prefetch_hint_L1 });
+                            }
+                        }
+                    }
+                };
+
                 for (int t0 = k_begin; t0 < k_end; t0 += TK) {
                     if constexpr (ST) {
                         stage(Kh, nb11, t0);
                         it.barrier(sycl::access::fence_space::local_space);
+                    }
+                    if constexpr (D == 256) {
+                        prefetch_rows(Vh, nb21, t0);  // V of this tile is read right after Q.K
                     }
                     // ---- S = Q K^T: job = (key group, chunk of TC row tiles)
                     for (int job = w; job < ((probe & 1) ? 0 : KG * NCH); job += NSG) {
@@ -932,6 +956,9 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
                     }
                     it.barrier(sycl::access::fence_space::local_space);
 
+                    if constexpr (D == 256) {
+                        prefetch_rows(Kh, nb11, t0 + TK);  // next tile's K, read after this P.V
+                    }
                     // ---- O^T = diag(alpha) O^T + V^T P^T: A = V^T (8 dims x 16 keys, lane = key), B = P^T (16 keys x 16 rows)
 #pragma unroll
                     for (int t = 0; t < RT16; ++t) {
