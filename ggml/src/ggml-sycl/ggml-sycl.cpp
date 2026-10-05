@@ -6549,11 +6549,18 @@ static bool ggml_sycl_try_ptq1_multi(ggml_backend_sycl_context & ctx, ggml_cgrap
 // ARC-LAB: same-input T2 mat-vecs (q+k+v, GDN qkv+z, FFN gate+up; <= 8 tokens) in one launch (GGML_SYCL_T2_MULTI,
 // default on). Grouping and safety as ggml_sycl_try_ptq1_multi: a later member computed early must not overlap any node
 // in between, else its result is staged in a slot and copied when the loop reaches it.
-static bool ggml_sycl_t2_multi_eligible(const ggml_tensor * mm) {
+static bool ggml_sycl_t2_multi_eligible(ggml_backend_sycl_context & ctx, const ggml_tensor * mm) {
     if (mm->op != GGML_OP_MUL_MAT || (mm->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !ggml_sycl_t2_tensor(mm->src[0])) {
         return false;
     }
-    const auto *        extra = static_cast<const ggml_tensor_extra_gpu *>(mm->src[0]->extra);
+    auto * extra = static_cast<ggml_tensor_extra_gpu *>(mm->src[0]->extra);
+    if (extra && !extra->optimized_feature.t2 && mm->src[0]->ne[2] == 1) {  // first use: repack here, as the unmerged path
+        const ggml_tensor * w = mm->src[0];
+        if (!ggml_sycl_t2_repack(*ctx.stream(), w->data, w->ne[0], w->ne[1], w->type == GGML_TYPE_PQ2_0)) {
+            return false;
+        }
+        extra->optimized_feature.t2 = true;
+    }
     const ggml_tensor * act   = mm->src[1];
     const int64_t       M     = act->ne[1] * act->ne[2];
     return extra && extra->optimized_feature.t2 && act->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 &&
@@ -6565,7 +6572,7 @@ static bool ggml_sycl_try_t2_multi(ggml_backend_sycl_context & ctx, ggml_cgraph 
                                    std::vector<const void *> & pending) {
     static int    log = getenv("GGML_SYCL_T2_MULTI_LOG") ? atoi(getenv("GGML_SYCL_T2_MULTI_LOG")) : 0;
     ggml_tensor * mm0 = cgraph->nodes[i];
-    if (!ggml_sycl_knob("GGML_SYCL_T2_MULTI", 1) || !ggml_sycl_t2_multi_eligible(mm0)) {
+    if (!ggml_sycl_knob("GGML_SYCL_T2_MULTI", 1) || !ggml_sycl_t2_multi_eligible(ctx, mm0)) {
         return false;
     }
     const ggml_tensor * act = mm0->src[1];
@@ -6576,7 +6583,7 @@ static bool ggml_sycl_try_t2_multi(ggml_backend_sycl_context & ctx, ggml_cgraph 
     for (int j = i + 1; j < jend && nm < 3; ++j) {
         ggml_tensor * mj = cgraph->nodes[j];
         if (done[j] || mj->op != GGML_OP_MUL_MAT || mj->src[1] != act || mj->src[0]->ne[0] != mm0->src[0]->ne[0] ||
-            !ggml_sycl_t2_multi_eligible(mj)) {
+            !ggml_sycl_t2_multi_eligible(ctx, mj)) {
             continue;
         }
         bool safe = true;
@@ -6700,7 +6707,8 @@ static bool ggml_sycl_try_add_norm_rot(ggml_backend_sycl_context & ctx, ggml_cgr
             const ggml_tensor * sg = ms->src[1];
             if (!done[j] && !done[j + 1] && !done[j + 2] && rs->op == GGML_OP_RESHAPE && rs->src[0] == ms &&
                 mt->op == GGML_OP_MUL_MAT && mt->src[1] == rs && ggml_get_op_params_i32(mt, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
-                mt->src[0]->ne[0] == 1024 && f32c(mt) && f32c(ms) && sg && f32c(sg) && sg->ne[0] == K && ggml_nrows(sg) == 1) {
+                mt->src[0]->ne[0] == 1024 && f32c(mt) && f32c(ms) && sg && f32c(sg) && sg->ne[0] == K && ggml_nrows(sg) == 1 &&
+                sg->op == GGML_OP_NONE) {  // the signs are read early: they must be a weight, not computed in between
                 bool clear = true;  // nodes computed between the norm and the rotation must not touch the rotation output
                 for (int k = in + 2; k < j && clear; ++k) {
                     const ggml_tensor * nk = cgraph->nodes[k];
@@ -6773,6 +6781,11 @@ static bool ggml_sycl_try_add_norm_rot(ggml_backend_sycl_context & ctx, ggml_cgr
                                    add ? (const float *) add->src[1]->data : nullptr, add_out, (const float *) w->data, eps,
                                    normed, signs, mm ? (float *) mm->data : nullptr, M, K, mm)) {
         return false;
+    }
+    static bool fired_logged = false;
+    if (!fired_logged && getenv("GGML_SYCL_FUSION_LOG")) {
+        fired_logged = true;
+        fprintf(stderr, "ggml_sycl_try_add_norm_rot: fused (%s%s%s)\n", add ? "add + " : "", "norm", mm ? " + rotation" : "");
     }
     if (ms_far >= 0) {
         done[ms_far] = done[ms_far + 1] = done[ms_far + 2] = 1;  // computed here, skipped when the loop gets there
@@ -6906,15 +6919,24 @@ static bool ggml_sycl_try_conv_chain(ggml_backend_sycl_context & ctx, ggml_cgrap
         if (ggml_sycl_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
+        const int prod[3] = { isilu, il2, ic };  // where each output is produced in the original order
         for (int o = 0; o < 3; ++o) {
             if (o == 1 && !l2_in) {
                 continue;
             }
+            if (j > prod[o] && o == 2) {
+                continue;  // the cache slot is final once the original CPY would have run
+            }
             if (overlap(outs[o], outn[o], n->data, ggml_nbytes(n))) {
                 return why("node in between writes output memory");
             }
+            const ggml_tensor * own[3] = { silu, l2, cpy };
             for (int k = 0; k < GGML_MAX_SRC && n->src[k]; ++k) {
-                if (overlap(outs[o], outn[o], n->src[k]->data, ggml_nbytes(n->src[k]))) {
+                const ggml_tensor * sk = n->src[k];
+                if (j > prod[o] && (sk == own[o] || sk->view_src == own[o])) {
+                    continue;  // a consumer of this output, after its producer: reads the right value
+                }
+                if (overlap(outs[o], outn[o], sk->data, ggml_nbytes(sk))) {
                     return why("node in between reads output memory");
                 }
             }

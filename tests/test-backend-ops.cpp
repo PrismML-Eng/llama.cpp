@@ -4848,6 +4848,195 @@ struct test_fwht_signed : public test_case {
     }
 };
 
+// ARC-LAB fusion tests (arctune, 2026-10-05): each builds the exact node pattern one SYCL fusion matches, at several
+// shapes / token counts, and compares the fused outputs against the CPU backend. The graph's final node only keeps every
+// output alive; its operand order makes the graph come out in the model's node order. `seed` repeats a case with fresh
+// random data. Run with GGML_SYCL_PTQ1_T2=all so the ternary weights take the T2 (XMX) path the fusions feed.
+static void arclab_init_hadamard(ggml_tensor * t) {
+    const int64_t n = t->ne[0];
+    std::vector<float> data(n * n);
+    const float scale = 1.0f / sqrtf((float) n);
+    for (int64_t r = 0; r < n; r++) {
+        for (int64_t i = 0; i < n; i++) {
+            data[r * n + i] = (__builtin_popcountll((unsigned long long) (r & i)) % 2 == 0) ? scale : -scale;
+        }
+    }
+    ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+}
+static void arclab_init_signs(ggml_tensor * t) {
+    std::vector<float> data(ggml_nelements(t));
+    for (size_t i = 0; i < data.size(); i++) {
+        data[i] = ((i * 2654435761u) >> 7) & 1 ? -1.0f : 1.0f;
+    }
+    ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+}
+static void arclab_init(ggml_context * ctx) {
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->op != GGML_OP_NONE) {
+            continue;
+        }
+        if (strcmp(t->name, "hadamard") == 0) {
+            arclab_init_hadamard(t);
+        } else if (strncmp(t->name, "signs", 5) == 0) {
+            arclab_init_signs(t);
+        } else {
+            init_tensor_uniform(t);
+        }
+    }
+}
+// rotated input -> T2 mat-vec, as llama_mul_mat_hadamard + build_lora_mm build it
+static ggml_tensor * arclab_rot_matmul(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * signs, ggml_tensor * had,
+                                       ggml_tensor * w, ggml_tensor ** mm_out) {
+    const int64_t K = cur->ne[0], M = cur->ne[1];
+    ggml_tensor * ms = ggml_mul(ctx, cur, signs);
+    ggml_tensor * rs = ggml_reshape_2d(ctx, ms, had->ne[0], ggml_nelements(ms) / had->ne[0]);
+    ggml_tensor * mm = ggml_mul_mat(ctx, had, rs);
+    ggml_mul_mat_set_hint(mm, GGML_HINT_SRC0_IS_HADAMARD);
+    ggml_set_name(mm, "rotated");
+    *mm_out = mm;
+    ggml_tensor * back = ggml_reshape_2d(ctx, mm, K, M);
+    ggml_tensor * out  = ggml_mul_mat(ctx, w, back);
+    ggml_set_name(out, "t2_out");
+    return out;
+}
+
+// SWIGLU -> MUL(signs) -> RESHAPE -> Hadamard MUL_MAT -> T2 mat-vec  (GGML_SYCL_GLU_ROT)
+struct test_arclab_glu_rot : public test_case {
+    const int64_t K, M, N; const int seed;
+    std::vector<ggml_tensor *> outs;
+    test_arclab_glu_rot(int64_t K, int64_t M, int64_t N, int seed) : K(K), M(M), N(N), seed(seed) {}
+    std::string op_desc(ggml_tensor *) override { return "ARCLAB_GLU_ROT"; }
+    std::string vars() override { return VARS_TO_STR4(K, M, N, seed); }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outs; }
+    double max_nmse_err() override { return 5e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * g   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M); ggml_set_name(g, "gate");
+        ggml_tensor * u   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M); ggml_set_name(u, "up");
+        ggml_tensor * sg  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, K); ggml_set_name(sg, "signs");
+        ggml_tensor * had = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, 1024); ggml_set_name(had, "hadamard");
+        ggml_tensor * w   = ggml_new_tensor_2d(ctx, GGML_TYPE_PTQ1_0, K, N); ggml_set_name(w, "w");
+        ggml_tensor * x   = ggml_swiglu_split(ctx, g, u);
+        ggml_tensor * mm;
+        ggml_tensor * out = arclab_rot_matmul(ctx, x, sg, had, w, &mm);
+        outs = { mm, out };
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override { arclab_init(ctx); }
+};
+
+// ADD -> RMS_NORM -> MUL(w) -> MUL(signs) -> RESHAPE -> Hadamard MUL_MAT -> T2 mat-vec (GGML_SYCL_PTQ1_T2_NORMQ). The
+// far variant (GGML_SYCL_NORM_ROT_FAR: cache ops between norm and rotation) cannot be built here: a single-output graph
+// has no node to put in between; it is covered by the whole-model checks (byte-identical outputs).
+struct test_arclab_add_norm_rot : public test_case {
+    const int64_t K, M, N; const bool far; const int seed;
+    std::vector<ggml_tensor *> outs;
+    test_arclab_add_norm_rot(int64_t K, int64_t M, int64_t N, bool far, int seed) : K(K), M(M), N(N), far(far), seed(seed) {}
+    std::string op_desc(ggml_tensor *) override { return "ARCLAB_ADD_NORM_ROT"; }
+    std::string vars() override { return VARS_TO_STR5(K, M, N, far, seed); }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outs; }
+    double max_nmse_err() override { return 5e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M); ggml_set_name(a, "a");
+        ggml_tensor * b   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M); ggml_set_name(b, "b");
+        ggml_tensor * nw  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, K); ggml_set_name(nw, "norm_w");
+        ggml_tensor * sg  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, K); ggml_set_name(sg, "signs");
+        ggml_tensor * had = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1024, 1024); ggml_set_name(had, "hadamard");
+        ggml_tensor * w   = ggml_new_tensor_2d(ctx, GGML_TYPE_PTQ1_0, K, N); ggml_set_name(w, "w");
+        ggml_tensor * sum    = ggml_add(ctx, a, b);
+        ggml_tensor * normed = ggml_mul(ctx, ggml_rms_norm(ctx, sum, 1e-6f), nw);
+        ggml_tensor * mm;
+        ggml_tensor * t2 = arclab_rot_matmul(ctx, normed, sg, had, w, &mm);
+        // keep the residual and the normed rows alive after the chain (the next layer and other mat-vecs read them)
+        ggml_tensor * out = ggml_add(ctx, ggml_sum(ctx, t2), ggml_add(ctx, ggml_sum(ctx, normed), ggml_sum(ctx, sum)));
+        outs = { sum, normed, mm, t2 };
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override { arclab_init(ctx); }
+};
+
+// DeltaNet conv chain for one token: CONCAT(state, qkv^T) -> CPY(newest columns -> cache) -> SSM_CONV -> SILU -> L2_NORM
+// (GGML_SYCL_CONV_CHAIN)
+struct test_arclab_conv_chain : public test_case {
+    const int64_t C, S; const int seed;
+    std::vector<ggml_tensor *> outs;
+    test_arclab_conv_chain(int64_t C, int64_t S, int seed) : C(C), S(S), seed(seed) {}
+    std::string op_desc(ggml_tensor *) override { return "ARCLAB_CONV_CHAIN"; }
+    std::string vars() override { return VARS_TO_STR3(C, S, seed); }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outs; }
+    double max_nmse_err() override { return 1e-6; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t dc = 4, H = 2 * C / (5 * S);  // q and k heads: the first 2 C / 5 channels (Bonsai: 32 heads of 128)
+        ggml_tensor * cs    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dc - 1, C); ggml_set_name(cs, "conv_state");
+        ggml_tensor * x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, 1); ggml_set_name(x, "qkv");
+        ggml_tensor * w     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dc, C); ggml_set_name(w, "conv_w");
+        ggml_tensor * cache = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (dc - 1) * C); ggml_set_name(cache, "cache");
+        ggml_tensor * cat   = ggml_concat(ctx, cs, ggml_transpose(ctx, x), 0);
+        ggml_tensor * last  = ggml_view_2d(ctx, cat, dc - 1, C, cat->nb[1], sizeof(float));
+        ggml_tensor * cpy   = ggml_cpy(ctx, last, cache);
+        ggml_tensor * conv  = ggml_ssm_conv(ctx, cat, w);  // the concat itself, as in the model
+        ggml_tensor * silu  = ggml_silu(ctx, conv);
+        ggml_tensor * qk    = ggml_view_2d(ctx, silu, S, H, S * sizeof(float), 0);
+        ggml_tensor * l2    = ggml_l2_norm(ctx, qk, 1e-6f);
+        ggml_tensor * out   = ggml_add(ctx, ggml_sum(ctx, cpy), ggml_add(ctx, ggml_sum(ctx, l2), ggml_sum(ctx, silu)));
+        outs = { cpy, silu, l2 };
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override { arclab_init(ctx); }
+};
+
+// DeltaNet gate block: bf16 alpha / beta mat-vecs + bias add + softplus + ssm_a mul + sigmoid (GGML_SYCL_DN_GATES)
+struct test_arclab_dn_gates : public test_case {
+    const int64_t K, R, M; const int seed;
+    test_arclab_dn_gates(int64_t K, int64_t R, int64_t M, int seed) : K(K), R(R), M(M), seed(seed) {}
+    std::string op_desc(ggml_tensor *) override { return "ARCLAB_DN_GATES"; }
+    std::string vars() override { return VARS_TO_STR4(K, R, M, seed); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M); ggml_set_name(x, "x");
+        ggml_tensor * wa   = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, K, R); ggml_set_name(wa, "w_alpha");
+        ggml_tensor * wb   = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, K, R); ggml_set_name(wb, "w_beta");
+        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, R); ggml_set_name(bias, "dt_bias");
+        ggml_tensor * sa   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, R); ggml_set_name(sa, "ssm_a");
+        ggml_tensor * alpha = ggml_reshape_2d(ctx, ggml_mul_mat(ctx, wa, x), R, M);
+        ggml_tensor * gate  = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, bias)), sa);
+        ggml_tensor * gate3 = ggml_reshape_3d(ctx, gate, 1, R, M);
+        ggml_tensor * beta  = ggml_sigmoid(ctx, ggml_reshape_3d(ctx, ggml_mul_mat(ctx, wb, x), 1, R, M));
+        ggml_tensor * out   = ggml_concat(ctx, gate3, beta, 0);
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override { arclab_init(ctx); }
+};
+
+// same-input T2 mat-vecs merged into one launch (GGML_SYCL_T2_MULTI): 2 or 3 ternary weights on one activation
+struct test_arclab_t2_multi : public test_case {
+    const int64_t K, M; const std::array<int64_t, 3> N; const int seed;
+    std::vector<ggml_tensor *> outs;
+    test_arclab_t2_multi(int64_t K, int64_t M, std::array<int64_t, 3> N, int seed) : K(K), M(M), N(N), seed(seed) {}
+    std::string op_desc(ggml_tensor *) override { return "ARCLAB_T2_MULTI"; }
+    std::string vars() override { return VARS_TO_STR4(K, M, N, seed); }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outs; }
+    double max_nmse_err() override { return 5e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M); ggml_set_name(x, "x");
+        outs.clear();
+        ggml_tensor * acc = nullptr;
+        for (int m = 0; m < 3; ++m) {
+            if (N[m] == 0) continue;
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_PTQ1_0, K, N[m]);
+            ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+            outs.push_back(y);
+            acc = acc ? ggml_add(ctx, acc, ggml_sum(ctx, y)) : ggml_sum(ctx, y);
+        }
+        return acc;
+    }
+    void initialize_tensors(ggml_context * ctx) override { arclab_init(ctx); }
+};
+
 static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
     std::random_device rd;
     std::default_random_engine rng(rd());
@@ -9427,6 +9616,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fwht_signed(128,  1024,  5,   GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_fwht_signed(2048, 8192,  3,   GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_fwht_signed(1024, 5120,  4,   GGML_TYPE_F16, true));
+    // ARC-LAB fusion tests (arctune): Bonsai 27B shapes and token counts, 3 seeds each
+    for (int seed = 0; seed < 3; ++seed) {
+        for (int64_t M : {1, 4, 5, 8}) {
+            test_cases.emplace_back(new test_arclab_glu_rot(17408, M, 512, seed));
+            test_cases.emplace_back(new test_arclab_add_norm_rot(5120, M, 512, false, seed));
+            test_cases.emplace_back(new test_arclab_dn_gates(5120, 48, M, seed));
+            test_cases.emplace_back(new test_arclab_t2_multi(5120, M, {10240, 6144, 0}, seed));
+            test_cases.emplace_back(new test_arclab_t2_multi(5120, M, {12288, 1024, 1024}, seed));
+        }
+        test_cases.emplace_back(new test_arclab_glu_rot(4096, 16, 256, seed));
+        test_cases.emplace_back(new test_arclab_add_norm_rot(2048, 2, 256, false, seed));
+        test_cases.emplace_back(new test_arclab_dn_gates(2048, 32, 2, seed));
+        test_cases.emplace_back(new test_arclab_conv_chain(10240, 128, seed));
+        test_cases.emplace_back(new test_arclab_conv_chain(3072, 64, seed));
+    }
     // Block widths above the register path's reach, plus a couple below it as controls. 4096 and
     // 8192 exercise the shared-memory kernel; before it existed the CUDA backend declined them and
     // the op fell back, which cost both speed and (measurably) a little accuracy.
