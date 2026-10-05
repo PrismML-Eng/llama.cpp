@@ -257,7 +257,11 @@ void gemm_tile(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const ui
 // 7 {8,64,8,2} 8 {32,32,4,2}
 void gemm(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const uint32_t * B, const uint16_t * SB, float * C,
           int M, int N, int K) {
-    const int tile = ggml_sycl_knob("GGML_SYCL_PTQ1_T2_TILE", 0);
+    // per-batch-size tile (arctune sweep, B580, 2026-10-05): {8,128,2,4} is 7-11% faster for 12-32 rows (n-gram verify
+    // batches), {8,128,8,2} from 48 rows up (prompts). GGML_SYCL_PTQ1_T2_TILE forces one tile for every size;
+    // GGML_SYCL_PTQ1_T2_TILE_SMALL_MAX = largest batch on the small tile (0 = never).
+    const int forced = ggml_sycl_knob("GGML_SYCL_PTQ1_T2_TILE", -1);
+    const int tile   = forced >= 0 ? forced : (M <= ggml_sycl_knob("GGML_SYCL_PTQ1_T2_TILE_SMALL_MAX", 32) ? 4 : 0);
     switch (tile) {
         case 1: gemm_tile<8, 128, 4, 2>(q, Aq, SA, B, SB, C, M, N, K); break;
         case 2: gemm_tile<8, 128, 4, 4>(q, Aq, SA, B, SB, C, M, N, K); break;
@@ -550,7 +554,9 @@ void ggml_sycl_t2_mul_mat(sycl::queue & q, const void * w, const float * x, int6
     // batches > 8 (n-gram verify, prompts): GemmMT reads each weight once per 64 rows (TernSYCL main: the 2D block I/O
     // that misbehaved in the JIT build with the old IGC builtins validates under inline vISA, so it is upstream's kernel).
     const bool gemm_off = ggml_sycl_knob("GGML_SYCL_PTQ1_T2_GEMM_OFF", 0) != 0;
-    const bool use_gemm = M > 8 && !gemm_off;
+    // GGML_SYCL_PTQ1_T2_GEMV_MAX: largest batch on the GEMV (default 8; above it GemmMT). GEMV re-reads the weights once per
+    // 8 rows, GemmMT once per 64 but less efficiently: `arctune sweep` measures the crossover.
+    const bool use_gemm = M > ggml_sycl_knob("GGML_SYCL_PTQ1_T2_GEMV_MAX", 8) && !gemm_off;
 
     int8_t *       Aq;
     uint16_t *     SA;
