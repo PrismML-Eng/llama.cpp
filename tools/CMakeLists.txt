@@ -28,6 +28,7 @@ else()
         add_subdirectory(server)
     endif()
     add_subdirectory(tokenize)
+    add_subdirectory(mtp-export)  # ARC-LAB: MTP head training data
     add_subdirectory(tts)
     add_subdirectory(mtmd)
     if (GGML_RPC)

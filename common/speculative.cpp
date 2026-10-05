@@ -32,6 +32,55 @@
 #include <iomanip>
 #include <map>
 
+// ARC-LAB: lab knobs from GGML_SYCL_KNOBS_FILE (lines NAME=V, re-read when the file changes) so one server can A/B
+// speculative settings: LAB_SPEC_DRAFT_N_MAX caps the MTP draft below --spec-draft-n-max, LAB_SPEC_NGRAM_START replaces
+// LLAMA_ARG_SPEC_NGRAM_ADAPT's starting length (both from the next request on). Unset = command line / env.
+#include <filesystem>
+#include <mutex>
+#include <unordered_map>
+// ARC-LAB: LLAMA_MTP_DRAFT_LOG=<file> appends one JSON line per MTP draft step (position predicted, depth, top 3 candidates
+// with probabilities, whether p_min stopped the draft) plus a "begin" line per request, for offline acceptance / tree
+// simulation (arctune, 2026-10-05).
+static FILE * common_mtp_draft_log() {
+    static FILE * f = [] {
+        const char * p = std::getenv("LLAMA_MTP_DRAFT_LOG");
+        return p ? fopen(p, "a") : nullptr;
+    }();
+    return f;
+}
+static int common_lab_knob(const char * name, int def) {
+    static const char * path = std::getenv("GGML_SYCL_KNOBS_FILE");
+    if (!path) {
+        return def;
+    }
+    static std::mutex                           mtx;
+    static std::filesystem::file_time_type      last{};
+    static std::unordered_map<std::string, int> m;
+    std::lock_guard<std::mutex> lock(mtx);
+    std::error_code ec;
+    const auto      t = std::filesystem::last_write_time(path, ec);
+    if (!ec && t != last) {
+        last = t;
+        m.clear();
+        if (FILE * fp = fopen(path, "r")) {
+            char line[256];
+            while (fgets(line, sizeof(line), fp)) {
+                char * eq = strchr(line, '=');
+                if (!eq || line[0] == '#') {
+                    continue;
+                }
+                *eq = 0;
+                std::string k(line);
+                k.erase(k.find_last_not_of(" \t") + 1);
+                m[k] = atoi(eq + 1);
+            }
+            fclose(fp);
+        }
+    }
+    const auto it = m.find(name);
+    return it == m.end() ? def : it->second;
+}
+
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_INF(fmt, ...) LOG_INF("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -2385,6 +2434,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        if (FILE * lf = common_mtp_draft_log()) {
+            fprintf(lf, "{\"begin\": %zu, \"seq\": %d}\n", prompt.size(), (int) seq_id);
+            fflush(lf);
+        }
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -2765,6 +2818,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
+                if (FILE * lf = common_mtp_draft_log()) {
+                    const auto & dpl = dparams.at(seq_id);
+                    fprintf(lf, "{\"pos\": %d, \"d\": %d, \"c\": [", (int) (dpl.n_past + i + 1), i);
+                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                        fprintf(lf, "%s[%d, %.4f]", k ? ", " : "", cur_p->data[k].id, cur_p->data[k].p);
+                    }
+                    fprintf(lf, "], \"stop\": %d}\n", cur_p->data[0].p < params.p_min ? 1 : 0);
+                }
                 // add drafted token for each sequence
                 const llama_token id = cur_p->data[0].id;
 
@@ -2791,7 +2852,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (std::min((int) params.n_max, common_lab_knob("LAB_SPEC_DRAFT_N_MAX", params.n_max)) <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -2997,10 +3058,11 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     // LLAMA_ARG_SPEC_NGRAM_ADAPT=0 disables it (fixed n_max as upstream); other values = starting length (default 64).
     // B580, n_max 256, t/s fixed vs 16 / 64 / 128: 48K short copy 38.6 / 60.7 / 57.3 / 45.7, 48K long copy 161.6 / 165 /
     // 172.9 / 178.9, short rename 428 / 394 / 411 / 416, edit 305 / 296 / 299 / 316 (same outputs).
-    int n_start = [] {
+    const int n_start_env = [] {
         const char * e = std::getenv("LLAMA_ARG_SPEC_NGRAM_ADAPT");
         return e ? std::atoi(e) : 64;
     }();
+    int n_start = n_start_env;
 
     common_speculative_impl_ngram_mod(
             const common_params_speculative & params,
@@ -3030,6 +3092,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
+        n_start = common_lab_knob("LAB_SPEC_NGRAM_START", n_start_env);
         sinfo.n_cur = n_start > 0 ? std::min(n_start, params.n_max) : params.n_max;
 
         const size_t n = mod.get_n();
