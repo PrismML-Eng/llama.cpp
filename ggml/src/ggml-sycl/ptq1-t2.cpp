@@ -170,6 +170,12 @@ bool ggml_sycl_t2_repack(sycl::queue & q, void * data, int64_t K, int64_t N, boo
     q.memcpy(&bad_h, bad, sizeof(int)).wait();
     sycl::free(bad, q);
     sycl::free(tmp, q);
+    // ARC-LAB experiment: GGML_SYCL_T2_ZERO_WEIGHTS=1 zeroes every T2 weight after the repack (output is garbage). The Xe2
+    // memory compression then makes weight reads almost free, so a profile shows everything else a token costs (2026-10-05).
+    static const bool zero_w = getenv("GGML_SYCL_T2_ZERO_WEIGHTS") && atoi(getenv("GGML_SYCL_T2_ZERO_WEIGHTS"));
+    if (zero_w) {
+        q.memset(B, 0, (size_t) (K / 16) * N * 4).wait();
+    }
     return bad_h == 0;
 }
 
