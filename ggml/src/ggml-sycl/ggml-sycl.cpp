@@ -662,6 +662,10 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+// ARC-LAB: per-token accounting of synchronous buffer_set_tensor calls, printed with the GGML_SYCL_HOST_TIMING report
+static double g_st_ms = 0; static long g_st_calls = 0; static size_t g_st_bytes = 0;
+static void ggml_sycl_note_set_tensor(size_t bytes, double ms) { g_st_ms += ms; g_st_calls++; g_st_bytes += bytes; }
+
 static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                 ggml_tensor *tensor,
                                                 const void *data, size_t offset,
@@ -672,6 +676,29 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
     ggml_sycl_set_device(ctx->device);
     auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
+    // ARC-LAB: GGML_SYCL_HOST_TIMING counts these (llama.cpp writes every per-token input through here, synchronously)
+    struct st_timer {
+        size_t bytes; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~st_timer() { ggml_sycl_note_set_tensor(bytes, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()); }
+    } st_guard{ size };
+    // ARC-LAB: GGML_SYCL_FAST_SET_TENSOR=1: small writes (<= 4 MB, i.e. per-token inputs, not weights) skip the device-wide
+    // wait and the malloc'd bounce buffer (the mmap workaround is for weights loaded from disk): one pinned staging copy and
+    // one wait on this queue. Still synchronous for the caller.
+    const int fast_st = ggml_sycl_knob("GGML_SYCL_FAST_SET_TENSOR", 0);  // 2 = keep the device-wide wait
+    if (size <= (4u << 20) && fast_st) {
+        if (fast_st == 2) {
+            SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
+        }
+        static char * pinned = nullptr;
+        if (!pinned) {
+            pinned = (char *) sycl::malloc_host(4u << 20, *stream);
+        }
+        if (pinned) {
+            memcpy(pinned, data, size);
+            SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, pinned, size).wait()));
+            return;
+        }
+    }
     SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
 #ifndef _WIN32
     // Note: Use host buffer to save the data from mmap(), then copy to device. It's workaround for mmap() issue on PVC GPU.
@@ -6061,6 +6088,19 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// ARC-LAB: pinned upload ring for ggml_backend_sycl_set_tensor_async (GGML_SYCL_PINNED_UPLOAD)
+static char *       g_upload_ring       = nullptr;
+static const size_t g_upload_ring_bytes = 32u << 20;
+static size_t       g_upload_off        = 0;
+// GGML_SYCL_HOST_TIMING=1 also prints the uploads of the first decode-sized graphs (name, bytes)
+static void ggml_sycl_log_upload(const ggml_tensor * t, size_t size) {
+    static const bool on = getenv("GGML_SYCL_HOST_TIMING") && atoi(getenv("GGML_SYCL_HOST_TIMING"));
+    static int        n  = 0;
+    if (on && n < 60) {
+        ++n;
+        fprintf(stderr, "upload: %-28s %zu bytes\n", t->name, size);
+    }
+}
 static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
                                                ggml_tensor *tensor,
                                                const void *data, size_t offset,
@@ -6073,6 +6113,27 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
 
     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+    // ARC-LAB: GGML_SYCL_PINNED_UPLOAD=1 stages small per-token inputs (token embedding, positions, masks, state ids) in a
+    // pinned host ring first: a copy straight from pageable memory goes through the driver's staging path. The ring
+    // restarts at each synchronize (the in-order queue has consumed every staged copy by then).
+    if (ggml_sycl_knob("GGML_SYCL_PINNED_UPLOAD", 0) && size <= g_upload_ring_bytes / 4) {
+        if (!g_upload_ring) {
+            g_upload_ring = (char *) sycl::malloc_host(g_upload_ring_bytes, *stream);
+        }
+        if (g_upload_ring) {
+            if (g_upload_off + size > g_upload_ring_bytes) {
+                stream->wait();
+                g_upload_off = 0;
+            }
+            char * staged = g_upload_ring + g_upload_off;
+            memcpy(staged, data, size);
+            g_upload_off = (g_upload_off + size + 255) & ~(size_t) 255;
+            SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy((char *) tensor->data + offset, staged, size)));
+            ggml_sycl_log_upload(tensor, size);
+            return;
+        }
+    }
+    ggml_sycl_log_upload(tensor, size);
     SYCL_CHECK(CHECK_TRY_ERROR(
         (stream)->memcpy((char *)tensor->data + offset, data, size)));
 }
@@ -6150,6 +6211,9 @@ struct sycl_host_timing {
         if (graphs == 0) return;
         fprintf(stderr, "host-timing: %d graphs, per graph: between %.3f ms, enqueue %.3f ms (%ld nodes), wait %.3f ms, other syncs %.1f\n",
                 graphs, between / graphs, enqueue / graphs, nodes / graphs, wait / graphs, (double) syncs / graphs);
+        fprintf(stderr, "host-timing: set_tensor (sync uploads) per graph: %.3f ms, %.1f calls, %.0f bytes\n", g_st_ms / graphs,
+                (double) g_st_calls / graphs, (double) g_st_bytes / graphs);
+        g_st_ms = 0; g_st_calls = 0; g_st_bytes = 0;
         std::vector<std::pair<double, std::string>> v;
         for (auto & kv : per_op) v.push_back({ kv.second.first, kv.first });
         std::sort(v.rbegin(), v.rend());
@@ -6168,6 +6232,7 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
     const auto      ht_t0  = sycl_host_timing::clk::now();
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->wait()));
+    g_upload_off = 0;
     if (g_ht.on) {
         const auto t1 = sycl_host_timing::clk::now();
         if (g_ht.in_big) {  // first synchronize after a decode graph
@@ -6577,6 +6642,186 @@ static bool ggml_sycl_try_add_norm_rot(ggml_backend_sycl_context & ctx, ggml_cgr
     return true;
 }
 
+// ARC-LAB: DeltaNet conv chain for one token: CONCAT(conv state, new qkv) -> CPY(newest d_conv-1 columns -> conv cache) ->
+// SSM_CONV -> SILU -> L2_NORM(q/k heads) in one kernel (one work-group per head of S channels), instead of 5 launches.
+// The nodes are spread over ~15 graph nodes with cache ops in between; the fused outputs are written at the CONCAT's
+// position, so every node computed in between must not touch their memory (checked), and they must not overlap inputs.
+// GGML_SYCL_CONV_CHAIN=0 turns it off.
+static bool ggml_sycl_try_conv_chain(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i, std::vector<uint8_t> & done) {
+    if (!ggml_sycl_knob("GGML_SYCL_CONV_CHAIN", 1)) {
+        return false;
+    }
+    ggml_tensor * cat = cgraph->nodes[i];
+    if (cat->op != GGML_OP_CONCAT || cat->type != GGML_TYPE_F32 || ggml_get_op_params_i32(cat, 0) != 0) {
+        return false;
+    }
+    const int64_t dc = cat->ne[0], C = cat->ne[1];
+    const ggml_tensor * cs = cat->src[0];
+    const ggml_tensor * x  = cat->src[1];
+    if (cat->ne[2] != 1 || cat->ne[3] != 1 || dc < 2 || dc > 8 || !ggml_is_contiguous(cat) || cs->type != GGML_TYPE_F32 ||
+        x->type != GGML_TYPE_F32 || cs->ne[0] != dc - 1 || cs->ne[1] != C || !ggml_is_contiguous(cs) || x->ne[0] != 1 ||
+        x->ne[1] != C) {
+        return false;
+    }
+    int ic = -1, iv = -1, iconv = -1, isilu = -1, il2 = -1;
+    const int jmax = std::min(cgraph->n_nodes - 1, i + 48);
+    for (int j = i + 1; j <= jmax && il2 < 0; ++j) {
+        ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_CPY && n->src[0]->op == GGML_OP_VIEW && n->src[0]->view_src == cat) {
+            ic = j;
+        } else if (n->op == GGML_OP_SSM_CONV && n->src[0] == cat) {
+            iconv = j;
+        } else if (iconv >= 0 && n->op == GGML_OP_UNARY && ggml_get_unary_op(n) == GGML_UNARY_OP_SILU &&
+                   n->src[0] == cgraph->nodes[iconv]) {
+            isilu = j;
+        } else if (isilu >= 0 && n->op == GGML_OP_L2_NORM && n->src[0]->op == GGML_OP_VIEW &&
+                   n->src[0]->view_src == cgraph->nodes[isilu]) {
+            il2 = j;
+            iv  = j;
+        }
+    }
+    static int reasons = 0;
+    auto why = [&](const char * r) {
+        if (reasons < 3 && getenv("GGML_SYCL_CONV_CHAIN_DEBUG")) {
+            ++reasons;
+            fprintf(stderr, "conv chain: not fused at node %d (%s): %s\n", i, cat->name, r);
+        }
+        return false;
+    };
+    if (ic < 0 || iconv < 0 || isilu < 0 || il2 < 0 || done[ic] || done[iconv] || done[isilu] || done[il2]) {
+        return why("chain nodes not found");
+    }
+    ggml_tensor *       cpy  = cgraph->nodes[ic];
+    ggml_tensor *       conv = cgraph->nodes[iconv];
+    ggml_tensor *       silu = cgraph->nodes[isilu];
+    ggml_tensor *       l2   = cgraph->nodes[il2];
+    const ggml_tensor * cv   = cpy->src[0];  // view: columns 1..dc-1 of the concat
+    const ggml_tensor * dst  = cpy->src[1];  // conv cache slot
+    const ggml_tensor * w    = conv->src[1];
+    const ggml_tensor * l2v  = l2->src[0];
+    const int64_t       S = l2v->ne[0], H = l2v->ne[1];
+    if (cv->ne[0] != dc - 1 || cv->ne[1] != C || cv->view_offs != sizeof(float) || cv->nb[1] != cat->nb[1] ||
+        dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || ggml_nelements(dst) != (dc - 1) * C ||
+        w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || w->ne[0] != dc || w->ne[1] != C ||
+        ggml_nelements(conv) != C || !ggml_is_contiguous(conv) || !ggml_is_contiguous(silu) || silu->type != GGML_TYPE_F32 ||
+        l2v->view_offs != 0 || l2v->nb[1] != (size_t) S * sizeof(float) || l2v->ne[2] != 1 || l2v->ne[3] != 1 ||
+        !ggml_is_contiguous(l2) || S < 16 || S > 1024 || S % 16 != 0 || C % S != 0 || S * H > C ||
+        (cpy->flags & GGML_TENSOR_FLAG_OUTPUT) || (conv->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return why("shapes/types");
+    }
+    // the concat and the raw conv output must have no readers outside the chain
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        for (int k = 0; k < GGML_MAX_SRC && n->src[k]; ++k) {
+            const ggml_tensor * sj = n->src[k];
+            if ((sj == cat && j != iconv && n != cv) || (sj == conv && j != isilu) || (sj->view_src == cat && sj != cv)) {
+                return why("outside reader");
+            }
+        }
+        if (n->view_src == cat && n != cv) {
+            return why("outside view");
+        }
+    }
+    auto overlap = [](const void * a, size_t na, const void * b, size_t nb) {
+        const char * pa = (const char *) a, * pb = (const char *) b;
+        return na && nb && pa < pb + nb && pb < pa + na;
+    };
+    const void * outs[3]  = { silu->data, l2->data, dst->data };
+    const size_t outn[3]  = { ggml_nbytes(silu), ggml_nbytes(l2), ggml_nbytes(dst) };
+    const ggml_tensor * ins[3] = { cs, x, w };
+    // an output may sit exactly on x (the planner reuses its buffer after the concat): x and the silu / l2 outputs keep
+    // channel c at element c, a lane reads x[c] before writing c, and l2 is written after the work-group barrier
+    static const char * out_names[3] = { "silu", "l2", "cache" };
+    static const char * in_names[3]  = { "conv state", "x", "weights" };
+    // l2 on top of the conv state (other lanes still read it): leave L2_NORM to its own kernel after this one
+    const bool l2_in = !overlap(outs[1], outn[1], cs->data, ggml_nbytes(cs));
+    for (int o = 0; o < 3; ++o) {
+        if (o == 1 && !l2_in) {
+            continue;
+        }
+        for (int t = 0; t < 3; ++t) {
+            if (!overlap(outs[o], outn[o], ins[t]->data, ggml_nbytes(ins[t]))) {
+                continue;
+            }
+            const bool same_slot_ok = t == 1 && o < 2 && outs[o] == ins[t]->data && x->nb[1] == sizeof(float);
+            if (!same_slot_ok) {
+                static char msg[96];
+                snprintf(msg, sizeof(msg), "output %s overlaps input %s", out_names[o], in_names[t]);
+                return why(msg);
+            }
+        }
+    }
+    // nodes computed between the concat and the last fused node must not touch the early-written outputs
+    for (int j = i + 1; j <= il2; ++j) {
+        if (j == ic || j == iconv || j == isilu || j == il2) {
+            continue;
+        }
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_sycl_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        for (int o = 0; o < 3; ++o) {
+            if (o == 1 && !l2_in) {
+                continue;
+            }
+            if (overlap(outs[o], outn[o], n->data, ggml_nbytes(n))) {
+                return why("node in between writes output memory");
+            }
+            for (int k = 0; k < GGML_MAX_SRC && n->src[k]; ++k) {
+                if (overlap(outs[o], outn[o], n->src[k]->data, ggml_nbytes(n->src[k]))) {
+                    return why("node in between reads output memory");
+                }
+            }
+        }
+    }
+    float eps;
+    memcpy(&eps, l2->op_params, sizeof(float));
+    const float * csd = (const float *) cs->data;
+    const char *  xd  = (const char *) x->data;
+    const size_t  xnb = x->nb[1];
+    const float * wd  = (const float *) w->data;
+    float *       dd  = (float *) dst->data;
+    float *       sd  = (float *) silu->data;
+    float *       ld  = (float *) l2->data;
+    const int     D   = (int) dc;
+    const int64_t HL  = l2_in ? H : 0;
+    ctx.stream()->parallel_for(sycl::nd_range<1>((size_t) C, (size_t) S), [=](sycl::nd_item<1> it) {
+        const int64_t c = it.get_global_id(0);
+        const int64_t g = it.get_group(0);
+        float         v[8];
+        for (int t = 0; t < D - 1; ++t) {
+            v[t] = csd[c * (D - 1) + t];
+        }
+        v[D - 1] = *(const float *) (xd + c * xnb);
+        float sum = 0.0f;
+        for (int t = 0; t < D; ++t) {
+            sum += v[t] * wd[c * D + t];
+        }
+        for (int t = 1; t < D; ++t) {
+            dd[c * (D - 1) + t - 1] = v[t];
+        }
+        const float y = op_silu(sum);
+        sd[c]         = y;
+        if (g < HL) {  // uniform per work-group
+            const float ss    = sycl::reduce_over_group(it.get_group(), y * y, sycl::plus<float>());
+            const float scale = sycl::rsqrt(sycl::fmax(ss, eps * eps));
+            ld[g * S + it.get_local_id(0)] = scale * y;
+        }
+    });
+    done[ic] = done[iconv] = done[isilu] = 1;
+    if (l2_in) {
+        done[il2] = 1;
+    }
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        fprintf(stderr, "%s: fused DeltaNet conv chain active (C=%lld, d_conv=%lld, %lld heads of %lld for L2)\n", __func__,
+                      (long long) C, (long long) dc, (long long) H, (long long) S);
+    }
+    GGML_UNUSED(iv);
+    return true;
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
     ggml_sycl_gdn_gather_reset(*sycl_ctx);
@@ -6636,6 +6881,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 i += gdn_nodes_to_skip;
                 continue;
             }
+        }
+        if (node->op == GGML_OP_CONCAT && ggml_sycl_try_conv_chain(*sycl_ctx, cgraph, i, done)) {
+            continue;
         }
         // ARC-LAB: [residual ADD +] RMS_NORM + MUL(weight) [+ MUL(signs) + RESHAPE + FWHT-hint MUL_MAT] in one kernel
         // (ggml_sycl_t2_add_norm_rot): the post-attention norm of every layer and the pre-attention norm of the full
