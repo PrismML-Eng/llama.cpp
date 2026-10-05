@@ -21,6 +21,9 @@ bool   ggml_sycl_t2_repack(sycl::queue & q, void * data, int64_t K, int64_t N, b
 // reuse the int8 activations instead of quantizing again (q/k/v, gate/up, the DeltaNet input projections).
 void   ggml_sycl_t2_mul_mat(sycl::queue & q, const void * w, const float * x, int64_t x_stride, float * dst, int64_t M,
                             int64_t N, int64_t K, const void * x_key = nullptr);
+// nm (2..3) weights on the same activations (M <= 8 tokens) in one launch; false = not served (caller runs them singly)
+bool   ggml_sycl_t2_mul_mat_multi(sycl::queue & q, int nm, const void * const * w, float * const * dst, const int64_t * N,
+                                  const float * x, int64_t x_stride, int64_t M, int64_t K, const void * x_key);
 // a new graph compute starts: activations quantized for the previous one are stale
 void   ggml_sycl_t2_new_graph();
 // dst [M, K] = 1024-point Hadamard of (x * signs) per block / 32 (signs: K floats), quantized for the T2 mat-vecs at once;

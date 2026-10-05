@@ -274,6 +274,45 @@ void gemm(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const uint32_
 }  // namespace
 
 namespace {
+// up to 3 weight matrices with the same activations in ONE launch: work-groups [gs[m], gs[m+1]) along dim 1 run
+// matrix m (Gemv::run takes the group indices). All members use the same Gemv instantiation (same SLM, same shape).
+template <int SGM, int LS, int NSG>
+struct GemvMulti {
+    using Kern = int8dpas::Gemv<false, 0, SGM, NSG, LS, 2>;
+    Kern k0, k1, k2;
+    int  gs1, gs2;
+    void operator()(sycl::nd_item<2> it) const {
+        // one call site: three inlined copies of the body spilled (34.6 vs 46.3 t/s)
+        const int  g0 = (int) it.get_group(0), g1 = (int) it.get_group(1);
+        const bool a = g1 < gs1, b = !a && g1 < gs2;
+        const Kern k = a ? k0 : (b ? k1 : k2);
+        k.run(it, g0, g1 - (a ? 0 : (b ? gs1 : gs2)));
+    }
+    auto get(int8dpas::syclex::properties_tag) const { return k0.get(int8dpas::syclex::properties_tag{}); }
+};
+
+template <int SGM, int LS, int NSG = 2>
+void gemv_multi(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, int nm, const uint32_t * const * B,
+                const uint16_t * const * SB, float * const * C, const int * N, int M, int K) {
+    using GM            = GemvMulti<SGM, LS, NSG>;
+    using Kern          = typename GM::Kern;
+    const int       wgn = 16 * NSG;
+    const Epi       epi{ nullptr, nullptr, 0, 1 };
+    int             gs[4] = { 0, 0, 0, 0 };
+    Kern            k[3];
+    for (int m = 0; m < 3; ++m) {
+        const int mm = m < nm ? m : 0;
+        k[m]         = Kern{ nullptr, (const signed char *) Aq, SA, B[mm], SB[mm], C[mm], epi, M, N[mm], K };
+        gs[m + 1]    = gs[m] + (m < nm ? (N[m] + wgn - 1) / wgn : 0);
+    }
+    const GM             f{ k[0], k[1], k[2], gs[1], nm > 2 ? gs[2] : gs[3] + 1 };
+    const sycl::range<2> local(1, Kern::WG);
+    const sycl::range<2> global((M + SGM - 1) / SGM, (size_t) gs[nm] * Kern::WG);
+    q.parallel_for(sycl::nd_range<2>(global, local), f);
+}
+}  // namespace
+
+namespace {
 void t2_dispatch(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const uint32_t * B, const uint16_t * SB,
                  float * dst, int m, int n, int k, bool use_gemm) {
     if (use_gemm) {
@@ -514,6 +553,54 @@ void ggml_sycl_t2_mul_mat(sycl::queue & q, const void * w, const float * x, int6
         g_quant_have = x_key ? want : quant_key{};
     }
     t2_dispatch(q, Aq, SA, B, SB, dst, (int) M, (int) N, (int) K, use_gemm);
+}
+
+// several weights [K, N_m] on the same activations x [M, K] (M <= 8): one quantization (or the cached one) and one launch
+bool ggml_sycl_t2_mul_mat_multi(sycl::queue & q, int nm, const void * const * w, float * const * dst, const int64_t * N,
+                                const float * x, int64_t x_stride, int64_t M, int64_t K, const void * x_key) {
+    if (nm < 2 || nm > 3 || M < 1 || M > 8 || !ggml_sycl_knob("GGML_SYCL_T2_MULTI", 1)) {
+        return false;
+    }
+    int8_t *   Aq;
+    uint16_t * SA;
+    scratch_aq(q, M, K, Aq, SA);
+    const quant_key want{ x_key, x, x_stride, M, K, g_graph.load() };
+    if (!x_key || !ggml_sycl_knob("GGML_SYCL_PTQ1_T2_QCACHE", 1) || !(g_quant_have == want)) {
+        quant_a(q, x, x_stride, M, K, Aq, SA, QK);
+        g_quant_have = x_key ? want : quant_key{};
+    }
+    const uint32_t * B[3];
+    const uint16_t * SB[3];
+    float *          C[3];
+    int              Ni[3];
+    int64_t          nmax = 0;
+    for (int m = 0; m < nm; ++m) {
+        B[m]  = (const uint32_t *) w[m];
+        SB[m] = (const uint16_t *) ((const char *) w[m] + (size_t) (K / 16) * N[m] * 4);
+        C[m]  = dst[m];
+        Ni[m] = (int) N[m];
+        nmax  = std::max(nmax, N[m]);
+    }
+    const int  m_ = (int) M, k_ = (int) K;
+    const bool ls4 = nmax <= 8192;
+    if (M == 1) {
+        ls4 ? gemv_multi<1, 4>(q, Aq, SA, nm, B, SB, C, Ni, m_, k_) : gemv_multi<1, 2>(q, Aq, SA, nm, B, SB, C, Ni, m_, k_);
+    } else if (t2_nsg() == 4) {
+        if (M == 2) {
+            ls4 ? gemv_multi<2, 4, 4>(q, Aq, SA, nm, B, SB, C, Ni, m_, k_) : gemv_multi<2, 2, 4>(q, Aq, SA, nm, B, SB, C, Ni, m_, k_);
+        } else if (M <= 4) {
+            ls4 ? gemv_multi<4, 4, 4>(q, Aq, SA, nm, B, SB, C, Ni, m_, k_) : gemv_multi<4, 2, 4>(q, Aq, SA, nm, B, SB, C, Ni, m_, k_);
+        } else {
+            ls4 ? gemv_multi<8, 4, 4>(q, Aq, SA, nm, B, SB, C, Ni, m_, k_) : gemv_multi<8, 2, 4>(q, Aq, SA, nm, B, SB, C, Ni, m_, k_);
+        }
+    } else if (M == 2) {
+        ls4 ? gemv_multi<2, 4>(q, Aq, SA, nm, B, SB, C, Ni, m_, k_) : gemv_multi<2, 2>(q, Aq, SA, nm, B, SB, C, Ni, m_, k_);
+    } else if (M <= 4) {
+        ls4 ? gemv_multi<4, 4>(q, Aq, SA, nm, B, SB, C, Ni, m_, k_) : gemv_multi<4, 2>(q, Aq, SA, nm, B, SB, C, Ni, m_, k_);
+    } else {
+        ls4 ? gemv_multi<8, 4>(q, Aq, SA, nm, B, SB, C, Ni, m_, k_) : gemv_multi<8, 2>(q, Aq, SA, nm, B, SB, C, Ni, m_, k_);
+    }
+    return true;
 }
 
 namespace {

@@ -6546,6 +6546,103 @@ static bool ggml_sycl_try_ptq1_multi(ggml_backend_sycl_context & ctx, ggml_cgrap
     return true;
 }
 
+// ARC-LAB: same-input T2 mat-vecs (q+k+v, GDN qkv+z, FFN gate+up; <= 8 tokens) in one launch (GGML_SYCL_T2_MULTI,
+// default on). Grouping and safety as ggml_sycl_try_ptq1_multi: a later member computed early must not overlap any node
+// in between, else its result is staged in a slot and copied when the loop reaches it.
+static bool ggml_sycl_t2_multi_eligible(const ggml_tensor * mm) {
+    if (mm->op != GGML_OP_MUL_MAT || (mm->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !ggml_sycl_t2_tensor(mm->src[0])) {
+        return false;
+    }
+    const auto *        extra = static_cast<const ggml_tensor_extra_gpu *>(mm->src[0]->extra);
+    const ggml_tensor * act   = mm->src[1];
+    const int64_t       M     = act->ne[1] * act->ne[2];
+    return extra && extra->optimized_feature.t2 && act->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 &&
+           act->nb[0] == sizeof(float) && act->ne[3] == 1 && (act->ne[2] == 1 || act->nb[2] == act->ne[1] * act->nb[1]) &&
+           M >= 1 && M <= 8 && ggml_is_contiguous(mm) && mm->ne[0] == mm->src[0]->ne[1];
+}
+
+static bool ggml_sycl_try_t2_multi(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i, std::vector<uint8_t> & done,
+                                   std::vector<const void *> & pending) {
+    static int    log = getenv("GGML_SYCL_T2_MULTI_LOG") ? atoi(getenv("GGML_SYCL_T2_MULTI_LOG")) : 0;
+    ggml_tensor * mm0 = cgraph->nodes[i];
+    if (!ggml_sycl_knob("GGML_SYCL_T2_MULTI", 1) || !ggml_sycl_t2_multi_eligible(mm0)) {
+        return false;
+    }
+    const ggml_tensor * act = mm0->src[1];
+    int  members[3] = { i, -1, -1 };
+    bool staged[3]  = { false, false, false };
+    int  nm         = 1;
+    const int jend = std::min(cgraph->n_nodes, i + 512);
+    for (int j = i + 1; j < jend && nm < 3; ++j) {
+        ggml_tensor * mj = cgraph->nodes[j];
+        if (done[j] || mj->op != GGML_OP_MUL_MAT || mj->src[1] != act || mj->src[0]->ne[0] != mm0->src[0]->ne[0] ||
+            !ggml_sycl_t2_multi_eligible(mj)) {
+            continue;
+        }
+        bool safe = true;
+        for (int k = i + 1; k < j && safe; ++k) {
+            const ggml_tensor * nk = cgraph->nodes[k];
+            bool member = false;
+            for (int m = 1; m < nm; ++m) {
+                member = member || members[m] == k;
+            }
+            if (member) {
+                continue;
+            }
+            safe = !ggml_sycl_tensors_overlap(mj, nk);
+            for (int s = 0; s < GGML_MAX_SRC && safe; ++s) {
+                safe = !ggml_sycl_tensors_overlap(mj, nk->src[s]);
+            }
+        }
+        for (int m = 0; m < nm && safe; ++m) {
+            safe = !ggml_sycl_tensors_overlap(mj, cgraph->nodes[members[m]]) && !ggml_sycl_tensors_overlap(mj, act);
+        }
+        if (safe || ggml_nbytes(mj) <= PTQ1_MULTI_SLOT_BYTES) {
+            staged[nm]    = !safe;
+            members[nm++] = j;
+        }
+    }
+    if (nm < 2) {
+        return false;
+    }
+    const queue_ptr stream = ctx.stream();
+    const void *    w[3];
+    float *         dst[3];
+    int64_t         N[3];
+    for (int m = 0; m < nm; ++m) {
+        ggml_tensor * t = cgraph->nodes[members[m]];
+        w[m]   = t->src[0]->data;
+        dst[m] = (float *) t->data;
+        N[m]   = t->src[0]->ne[1];
+        if (staged[m]) {
+            dst[m] = ggml_sycl_ptq1_multi_slot(stream);
+            if (!dst[m]) {
+                return false;
+            }
+        }
+    }
+    const void * key = act->view_src && act->view_offs == 0 ? act->view_src : act;
+    if (!ggml_sycl_t2_mul_mat_multi(*stream, nm, w, dst, N, (const float *) act->data, act->nb[1] / sizeof(float),
+                                    act->ne[1] * act->ne[2], act->ne[0], key)) {
+        return false;
+    }
+    if (log > 0) {
+        fprintf(stderr, "[t2-multi] %s", mm0->name);
+        for (int m = 1; m < nm; ++m) {
+            fprintf(stderr, " + %s (+%d%s)", cgraph->nodes[members[m]]->name, members[m] - i, staged[m] ? ", staged" : "");
+        }
+        fprintf(stderr, "\n");
+        --log;
+    }
+    for (int m = 1; m < nm; ++m) {
+        done[members[m]] = 1;
+        if (staged[m]) {
+            pending[members[m]] = dst[m];
+        }
+    }
+    return true;
+}
+
 // ARC-LAB: see the call in ggml_backend_sycl_graph_compute_impl. Advances i past the nodes it computed.
 static bool ggml_sycl_try_add_norm_rot(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int & i) {
     const int     n0  = i;
@@ -7074,6 +7171,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 
         if (node->op == GGML_OP_MUL_MAT && ggml_sycl_mul_mat_glu_mmvq_fused(*sycl_ctx, cgraph, i)) {
             i += 2;
+            continue;
+        }
+        if (node->op == GGML_OP_MUL_MAT && ggml_sycl_try_t2_multi(*sycl_ctx, cgraph, i, done, pending)) {
             continue;
         }
         if (node->op == GGML_OP_MUL_MAT && ggml_sycl_try_ptq1_multi(*sycl_ctx, cgraph, i, done, pending)) {

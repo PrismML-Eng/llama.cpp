@@ -205,13 +205,17 @@ struct Gemv {
         return acc;
     }
 
-    void operator()(sycl::nd_item<2> it) const {
+    // ARC-LAB (llama.cpp vendored copy): body takes the work-group indices as arguments so one launch can serve several
+    // weight matrices that share the activations (llama.cpp merges q/k/v, qkv/z and gate/up this way)
+    void operator()(sycl::nd_item<2> it) const { run(it, (int)it.get_group(0), (int)it.get_group(1)); }
+
+    void run(sycl::nd_item<2> it, int g0, int g1) const {
         const auto sgp = it.get_sub_group();
         const int lane = sgp.get_local_linear_id();
         const int sg = sgp.get_group_linear_id();
         const int sgn = sg % NSG_N, sgk = sg / NSG_N;
-        const int n0 = ((int)it.get_group(1) * NSG_N + sgn) * 16;
-        const int m0 = (int)it.get_group(0) * SGM;
+        const int n0 = (g1 * NSG_N + sgn) * 16;
+        const int m0 = g0 * SGM;
 
         const int nsteps = K / GS;
         const int per = (nsteps + LS - 1) / LS;
