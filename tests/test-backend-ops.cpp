@@ -10896,6 +10896,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 12288, bs,  5120, {1, 1}, {1, 1})); // attn_q
         }
     }
+    // ARC-LAB: the smallest and largest Bonsai 27B mat-vecs (attn k / v, output head)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32,   1024, 1, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1}));
 
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
@@ -10960,6 +10963,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int64_t nb : {1, 4, 5, 6, 8, 16, 32, 64, 128, 256}) {  // real cache layout (DPAS kernel targets; 5 = MTP verify; 64+ = long n-gram drafts)
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
         }
+    }
+    for (int64_t nkv : {1, 2}) {  // ARC-LAB: fewer KV heads, same 6 q heads per KV head: per-head cost without the 4-head row interleave
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, nkv, {6, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
     }
     for (int64_t nb : {1, 4, 64, 256}) {  // ARC-LAB: ~115K history (Bonsai at 128K context), real cache layout
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 114688, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));

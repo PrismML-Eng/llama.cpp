@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 #include <map>
 #include <array>
 #include <assert.h>
@@ -4988,7 +4989,8 @@ static bool ggml_sycl_t2_mul_mat_try(ggml_backend_sycl_context & ctx, const ggml
     // tokens: ne[1] x ne[2] rows of K floats (row stride nb[1]; planes back to back)
     const int64_t M = src1->ne[1] * src1->ne[2];
     // ARC-LAB: large prompt batches through oneDNN's int8 GEMM (faster than GemmMT there), GGML_SYCL_T2_W8A8_MIN (0 = off)
-    static const int64_t w8a8_min = getenv("GGML_SYCL_T2_W8A8_MIN") ? atoll(getenv("GGML_SYCL_T2_W8A8_MIN")) : 0;
+    static const int64_t w8a8_env = getenv("GGML_SYCL_T2_W8A8_MIN") ? atoll(getenv("GGML_SYCL_T2_W8A8_MIN")) : 0;
+    const int64_t        w8a8_min = ggml_sycl_knob("GGML_SYCL_T2_W8A8_MIN", (int) w8a8_env);
     if (w8a8_min > 0 && M >= w8a8_min && g_ggml_sycl_enable_dnn && src1->nb[1] == (size_t) K * sizeof(float) &&
         ggml_sycl_w8a8_mul_mat_t2(ctx, src0->data, (const float *) src1->data, K, (float *) dst->data, N, M, K, stream)) {
         return true;
@@ -6131,11 +6133,54 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+// ARC-LAB: GGML_SYCL_HOST_TIMING=1 -> host-side token timing without a tracer (tracers slow the host 2x and invent gaps).
+// Per graph: between = host time since the previous synchronize returned (sampling, graph build, logits copy),
+// enqueue = time to submit every kernel, wait = synchronize after the last submit. Plus host enqueue time per op type.
+// Printed every 64 graphs with more than 500 nodes (decode graphs), then reset.
+struct sycl_host_timing {
+    bool on = getenv("GGML_SYCL_HOST_TIMING") && atoi(getenv("GGML_SYCL_HOST_TIMING"));
+    using clk = std::chrono::steady_clock;
+    clk::time_point last_sync_end{}, t_in{}, t_enq{};
+    bool   in_big = false;
+    int    graphs = 0;
+    double between = 0, enqueue = 0, wait = 0, waits_mid = 0;
+    long   nodes = 0, syncs = 0;
+    std::map<std::string, std::pair<double, long>> per_op;
+    void report() {
+        if (graphs == 0) return;
+        fprintf(stderr, "host-timing: %d graphs, per graph: between %.3f ms, enqueue %.3f ms (%ld nodes), wait %.3f ms, other syncs %.1f\n",
+                graphs, between / graphs, enqueue / graphs, nodes / graphs, wait / graphs, (double) syncs / graphs);
+        std::vector<std::pair<double, std::string>> v;
+        for (auto & kv : per_op) v.push_back({ kv.second.first, kv.first });
+        std::sort(v.rbegin(), v.rend());
+        for (size_t i = 0; i < v.size() && i < 12; ++i) {
+            fprintf(stderr, "host-timing:   %-22s %.3f ms/graph (%ld calls/graph)\n", v[i].second.c_str(), v[i].first / graphs,
+                    per_op[v[i].second].second / graphs);
+        }
+        graphs = 0; between = enqueue = wait = 0; nodes = 0; syncs = 0; per_op.clear();
+    }
+};
+static sycl_host_timing g_ht;
+
 static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
     GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+    const auto      ht_t0  = sycl_host_timing::clk::now();
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->wait()));
+    if (g_ht.on) {
+        const auto t1 = sycl_host_timing::clk::now();
+        if (g_ht.in_big) {  // first synchronize after a decode graph
+            g_ht.wait += std::chrono::duration<double, std::milli>(t1 - ht_t0).count();
+            g_ht.in_big = false;
+            if (++g_ht.graphs == 64) {
+                g_ht.report();
+            }
+        } else {
+            g_ht.syncs++;
+        }
+        g_ht.last_sync_end = t1;
+    }
 
     GGML_UNUSED(backend);
 }
@@ -6538,8 +6583,21 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // ARC-LAB: nodes already computed by ggml_sycl_try_ptq1_multi, and staged outputs still to copy in
     std::vector<uint8_t>      done(cgraph->n_nodes, 0);
     std::vector<const void *> pending(cgraph->n_nodes, nullptr);
+    const bool                       ht_on   = g_ht.on && cgraph->n_nodes > 500;
+    sycl_host_timing::clk::time_point ht_prev = sycl_host_timing::clk::now();
+    const char *                     ht_op   = nullptr;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        if (ht_on) {
+            const auto now = sycl_host_timing::clk::now();
+            if (ht_op) {
+                auto & a = g_ht.per_op[ht_op];
+                a.first += std::chrono::duration<double, std::milli>(now - ht_prev).count();
+                a.second++;
+            }
+            ht_prev = now;
+            ht_op   = ggml_op_desc(node);
+        }
         if (done[i]) {
             if (pending[i]) {
                 SYCL_CHECK(CHECK_TRY_ERROR(sycl_ctx->stream()->memcpy(node->data, pending[i], ggml_nbytes(node))));
@@ -6750,6 +6808,22 @@ void ggml_sycl_knobs_refresh() {
 
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    g_ht.in_big = g_ht.on && cgraph->n_nodes > 500;
+    if (g_ht.in_big) {
+        g_ht.t_in = sycl_host_timing::clk::now();
+        if (g_ht.last_sync_end.time_since_epoch().count()) {
+            g_ht.between += std::chrono::duration<double, std::milli>(g_ht.t_in - g_ht.last_sync_end).count();
+        }
+        g_ht.nodes += cgraph->n_nodes;
+    }
+    struct ht_exit {
+        ~ht_exit() {
+            if (g_ht.in_big) {
+                g_ht.t_enq = sycl_host_timing::clk::now();
+                g_ht.enqueue += std::chrono::duration<double, std::milli>(g_ht.t_enq - g_ht.t_in).count();
+            }
+        }
+    } ht_exit_guard;
     ggml_sycl_knobs_refresh();
     ggml_sycl_t2_new_graph();
 
