@@ -2959,6 +2959,22 @@ static bool ggml_cuda_try_gdn_gather_skip(ggml_backend_cuda_context & ctx, const
             if (gr->ne[0] != D || v->ne[3] != 1 || ggml_nelements(cur) != D) {
                 return false;
             }
+            // ggml-alloc sees the GET_ROWS as the last reader of ids, so a later node can reuse ids memory before the GDN kernel reads it
+            const char * ids_beg = (const char *) ids->data;
+            const char * ids_end = ids_beg + ggml_nbytes(ids);
+            for (int k = node_idx + 1; k <= j; ++k) {
+                const ggml_tensor * t = cgraph->nodes[k];
+                const char *        b = (const char *) t->data;
+                if (b != nullptr && b < ids_end && ids_beg < b + ggml_nbytes(t)) {
+                    return false;
+                }
+            }
+            // on a concurrent stream, other nodes can run at the same time as the GDN op
+            for (const auto & [fork_node, event] : ctx.stream_context().concurrent_events) {
+                if (event.stream_mapping.find(n) != event.stream_mapping.end()) {
+                    return false;
+                }
+            }
             ggml_cuda_gated_delta_net_gather gather;
             gather.base       = (const float *) cache->data;
             gather.ids        = (const int32_t *) ids->data;
