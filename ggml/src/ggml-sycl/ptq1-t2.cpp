@@ -436,7 +436,7 @@ inline void rot_quant_block(float (&v)[8], float * s, const Item & it, const syc
 // that also quantizes its output for the T2 mat-vecs which read it next: one 128-lane work-group per 1024 block where
 // fwht.cpp gives a block one 16-lane sub-group (5 sub-groups in all for a decode token), and no quant_a launch after it.
 bool ggml_sycl_t2_fwht_quant(sycl::queue & q, const float * x, const float * signs, float * dst, int64_t M, int64_t K,
-                             const void * key) {
+                             const void * key, const float * glu_g, const float * glu_u) {
     constexpr int N = 1024;
     if (K % N != 0 || M <= 0 || M > 512 || !ggml_sycl_knob("GGML_SYCL_PTQ1_T2_FWHTQ", 1)) {
         return false;
@@ -454,13 +454,25 @@ bool ggml_sycl_t2_fwht_quant(sycl::queue & q, const float * x, const float * sig
             const int     sgi  = sg.get_group_linear_id();
             const int64_t r    = it.get_group(0);
             const int64_t m = r / nblk, kb = r % nblk;
-            const float * src = x + r * N;
             const float * sgn = signs + kb * N;
             float         v[8];
+            if (glu_g) {  // SWIGLU folded in: x = silu(g) * u, as ggml_sycl_op_swiglu computes it
+                const float * gp = glu_g + r * N;
+                const float * up = glu_u + r * N;
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const int e = lane + 16 * j + 128 * sgi;
-                v[j]        = src[e] * (1.0f / 32.0f) * sgn[e];
+                for (int j = 0; j < 8; ++j) {
+                    const int   e  = lane + 16 * j + 128 * sgi;
+                    const float g  = gp[e];
+                    const float xv = g / (1.0f + sycl::exp(-g)) * up[e];
+                    v[j]           = xv * (1.0f / 32.0f) * sgn[e];
+                }
+            } else {
+                const float * src = x + r * N;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int e = lane + 16 * j + 128 * sgi;
+                    v[j]        = src[e] * (1.0f / 32.0f) * sgn[e];
+                }
             }
             rot_quant_block(v, sl.get_multi_ptr<sycl::access::decorated::no>().get(), it, sg, lane, sgi, dst + r * N,
                             Aq + m * K + kb * N, SA, kb * (N / QK), lda, m);

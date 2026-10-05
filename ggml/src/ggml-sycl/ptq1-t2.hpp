@@ -28,8 +28,9 @@ bool   ggml_sycl_t2_mul_mat_multi(sycl::queue & q, int nm, const void * const * 
 void   ggml_sycl_t2_new_graph();
 // dst [M, K] = 1024-point Hadamard of (x * signs) per block / 32 (signs: K floats), quantized for the T2 mat-vecs at once;
 // key = the tensor they will read it through (see x_key). false: shape not served (K % 1024, M > 512) or knob off.
+// glu_g / glu_u (optional, then x is unused): x = silu(glu_g) * glu_u, both [M, K] contiguous (SWIGLU folded in)
 bool   ggml_sycl_t2_fwht_quant(sycl::queue & q, const float * x, const float * signs, float * dst, int64_t M, int64_t K,
-                               const void * key);
+                               const void * key, const float * glu_g = nullptr, const float * glu_u = nullptr);
 // [add_out =] a (+ b); normed = rms_norm(.) * w; [mm = rotation of normed * signs, quantized as above]. b, add_out,
 // normed, signs (and then mm, key) may be null. One work-group per token: K % 1024 == 0, K <= 8192, M <= 512.
 bool   ggml_sycl_t2_add_norm_rot(sycl::queue & q, const float * a, const float * b, float * add_out, const float * w,

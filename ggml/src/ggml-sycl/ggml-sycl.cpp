@@ -6644,7 +6644,8 @@ static bool ggml_sycl_try_t2_multi(ggml_backend_sycl_context & ctx, ggml_cgraph 
 }
 
 // ARC-LAB: see the call in ggml_backend_sycl_graph_compute_impl. Advances i past the nodes it computed.
-static bool ggml_sycl_try_add_norm_rot(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int & i) {
+static bool ggml_sycl_try_add_norm_rot(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int & i,
+                                       std::vector<uint8_t> & done) {
     const int     n0  = i;
     ggml_tensor * add = cgraph->nodes[n0]->op == GGML_OP_ADD ? cgraph->nodes[n0] : nullptr;
     const int     in  = add ? n0 + 1 : n0;  // RMS_NORM
@@ -6685,27 +6686,65 @@ static bool ggml_sycl_try_add_norm_rot(ggml_backend_sycl_context & ctx, ggml_cgr
             signs = (const float *) sg->data;
         }
     }
+    // DeltaNet layers: the rotation comes a few nodes later (conv-cache ops in between). Fold it in and write its output
+    // here, early, if no node in between touches that memory (GGML_SYCL_NORM_ROT_FAR, default on).
+    int ms_far = -1;
+    if (!mm && add && ggml_sycl_knob("GGML_SYCL_NORM_ROT_FAR", 1)) {
+        for (int j = in + 2; j + 2 < cgraph->n_nodes && j <= in + 32; ++j) {
+            ggml_tensor * ms = cgraph->nodes[j];
+            if (ms->op != GGML_OP_MUL || ms->src[0] != mulw) {
+                continue;
+            }
+            ggml_tensor *       rs = cgraph->nodes[j + 1];
+            ggml_tensor *       mt = cgraph->nodes[j + 2];
+            const ggml_tensor * sg = ms->src[1];
+            if (!done[j] && !done[j + 1] && !done[j + 2] && rs->op == GGML_OP_RESHAPE && rs->src[0] == ms &&
+                mt->op == GGML_OP_MUL_MAT && mt->src[1] == rs && ggml_get_op_params_i32(mt, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+                mt->src[0]->ne[0] == 1024 && f32c(mt) && f32c(ms) && sg && f32c(sg) && sg->ne[0] == K && ggml_nrows(sg) == 1) {
+                bool clear = true;  // nodes computed between the norm and the rotation must not touch the rotation output
+                for (int k = in + 2; k < j && clear; ++k) {
+                    const ggml_tensor * nk = cgraph->nodes[k];
+                    if (ggml_sycl_is_view_or_noop(nk) || (nk->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                        continue;
+                    }
+                    clear = !ggml_sycl_tensors_overlap(mt, nk);
+                    for (int t = 0; t < GGML_MAX_SRC && clear; ++t) {
+                        clear = !ggml_sycl_tensors_overlap(mt, nk->src[t]);
+                    }
+                }
+                if (clear) {
+                    ms_far = j;
+                    mm     = mt;
+                    signs  = (const float *) sg->data;
+                }
+            }
+            break;  // only the first MUL of the norm output is a candidate
+        }
+    }
     if (!add && !mm) {
         return false;  // plain RMS_NORM + MUL: ggml_sycl_op_rms_norm_fused below
     }
-    const int last = mm ? in + 4 : in + 1;
+    const int last = mm ? (ms_far >= 0 ? ms_far + 2 : in + 4) : in + 1;
     // nodes inside the chain must have no other consumers; write the ADD and the weighted norm only if used after it
+    std::vector<int> idx;
+    for (int j = n0; j <= in + 1; ++j) idx.push_back(j);
+    if (mm) {
+        const int t0 = ms_far >= 0 ? ms_far : in + 2;
+        for (int j = t0; j <= t0 + 2; ++j) idx.push_back(j);
+    }
     std::vector<int> outs;
     if (add) outs.push_back(n0);
     outs.push_back(in + 1);
     if (mm) outs.push_back(last);
     std::vector<ggml_op> ops;
-    for (int j = n0; j <= last; ++j) ops.push_back(cgraph->nodes[j]->op);
-    {
-        std::vector<int> idx;
-        for (int j = n0; j <= last; ++j) idx.push_back(j);
-        if (!ggml_can_fuse_subgraph_ext(cgraph, idx.data(), (int) idx.size(), ops.data(), outs.data(), (int) outs.size())) {
-            return false;
-        }
+    for (int j : idx) ops.push_back(cgraph->nodes[j]->op);
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idx.data(), (int) idx.size(), ops.data(), outs.data(), (int) outs.size())) {
+        return false;
     }
     auto used_after = [&](int j) {
         int inside = 0;
-        for (int k = j + 1; k <= last; ++k) {
+        for (int k : idx) {
+            if (k <= j) continue;
             for (int s = 0; s < GGML_MAX_SRC; ++s) inside += cgraph->nodes[k]->src[s] == cgraph->nodes[j];
         }
         return (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, j) > inside;
@@ -6735,7 +6774,17 @@ static bool ggml_sycl_try_add_norm_rot(ggml_backend_sycl_context & ctx, ggml_cgr
                                    normed, signs, mm ? (float *) mm->data : nullptr, M, K, mm)) {
         return false;
     }
-    i = last;
+    if (ms_far >= 0) {
+        done[ms_far] = done[ms_far + 1] = done[ms_far + 2] = 1;  // computed here, skipped when the loop gets there
+        i = in + 1;
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            fprintf(stderr, "%s: norm + rotation %d nodes apart fused\n", __func__, ms_far - (in + 1));
+        }
+    } else {
+        i = last;
+    }
     return true;
 }
 
@@ -7056,6 +7105,13 @@ static bool ggml_sycl_try_dn_gates(ggml_backend_sycl_context & ctx, ggml_cgraph 
     return true;
 }
 
+// ARC-LAB: a kernel whose work-group reads block r of an input and later writes block r of its output may run in place
+// (same base address), never with a partial overlap
+static bool ggml_sycl_same_or_disjoint(const ggml_tensor * out, const ggml_tensor * in) {
+    const char * po = (const char *) out->data, * pi = (const char *) in->data;
+    return po == pi || po + ggml_nbytes(out) <= pi || pi + ggml_nbytes(in) <= po;
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
     ggml_sycl_gdn_gather_reset(*sycl_ctx);
@@ -7126,8 +7182,41 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         // (ggml_sycl_t2_add_norm_rot): the post-attention norm of every layer and the pre-attention norm of the full
         // attention layers end in the rotation that feeds the T2 mat-vecs; the DeltaNet layers' norm is followed by
         // cache ops first, so there only the ADD folds in.
-        if ((node->op == GGML_OP_ADD || node->op == GGML_OP_RMS_NORM) && ggml_sycl_try_add_norm_rot(*sycl_ctx, cgraph, i)) {
+        if ((node->op == GGML_OP_ADD || node->op == GGML_OP_RMS_NORM) && ggml_sycl_try_add_norm_rot(*sycl_ctx, cgraph, i, done)) {
             continue;
+        }
+        // ARC-LAB: FFN SWIGLU -> MUL(signs) -> RESHAPE -> FWHT-hint MUL_MAT: the rotation computes silu(gate) * up on its
+        // load (GGML_SYCL_GLU_ROT, default on)
+        if (node->op == GGML_OP_GLU && i + 3 < cgraph->n_nodes && ggml_sycl_knob("GGML_SYCL_GLU_ROT", 1)) {
+            ggml_tensor * ms = cgraph->nodes[i + 1];
+            ggml_tensor * rs = cgraph->nodes[i + 2];
+            ggml_tensor * mt = cgraph->nodes[i + 3];
+            const ggml_tensor * g  = node->src[0];
+            const ggml_tensor * u  = node->src[1];
+            const ggml_tensor * sg = ms->src[1];
+            const ggml_op       gops[4] = { GGML_OP_GLU, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+            const int           gidx[4] = { i, i + 1, i + 2, i + 3 };
+            const int           gout[1] = { i + 3 };
+            if (ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU && u && ggml_get_op_params_i32(node, 1) == 0 &&
+                ms->op == GGML_OP_MUL && ms->src[0] == node && rs->op == GGML_OP_RESHAPE && rs->src[0] == ms &&
+                mt->op == GGML_OP_MUL_MAT && mt->src[1] == rs &&
+                ggml_get_op_params_i32(mt, 1) == GGML_HINT_SRC0_IS_HADAMARD && mt->src[0]->ne[0] == 1024 &&
+                g->type == GGML_TYPE_F32 && u->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(g) && ggml_is_contiguous(u) && ggml_are_same_shape(g, u) &&
+                ggml_are_same_shape(g, node) && g->ne[3] == 1 && sg && sg->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(sg) && sg->ne[0] == g->ne[0] && ggml_nrows(sg) == 1 && ggml_is_contiguous(mt) &&
+                ggml_can_fuse_subgraph_ext(cgraph, gidx, 4, gops, gout, 1) &&
+                ggml_sycl_same_or_disjoint(mt, g) && ggml_sycl_same_or_disjoint(mt, u) &&
+                ggml_sycl_t2_fwht_quant(*sycl_ctx->stream(), nullptr, (const float *) sg->data, (float *) mt->data,
+                                        ggml_nrows(g), g->ne[0], mt, (const float *) g->data, (const float *) u->data)) {
+                static bool glu_logged = false;
+                if (!glu_logged) {
+                    glu_logged = true;
+                    fprintf(stderr, "ggml_sycl: SWIGLU folded into the rotation (%s)\n", node->name);
+                }
+                i += 3;
+                continue;
+            }
         }
         // Hadamard sign flip + reshape + FWHT-hint matmul: apply the signs in the transform's load
         if (node->op == GGML_OP_MUL &&
