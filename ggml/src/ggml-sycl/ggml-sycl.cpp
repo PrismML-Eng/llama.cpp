@@ -6822,6 +6822,143 @@ static bool ggml_sycl_try_conv_chain(ggml_backend_sycl_context & ctx, ggml_cgrap
     return true;
 }
 
+// ARC-LAB: DeltaNet gate block in one kernel (GGML_SYCL_DN_GATES, default on):
+//   alpha = MUL_MAT(bf16 W_a, x) -> RESHAPE -> ADD(dt bias) -> SOFTPLUS -> MUL(ssm_a) -> RESHAPE
+//   beta  = MUL_MAT(bf16 W_b, x) -> RESHAPE -> SIGMOID
+// 9 graph nodes / 7 launches per layer for 2 x 48 outputs; here one work-group per row of both matrices, up to 8 tokens.
+static bool ggml_sycl_try_dn_gates(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int & i) {
+    if (!ggml_sycl_knob("GGML_SYCL_DN_GATES", 1) || i + 8 >= cgraph->n_nodes) {
+        return false;
+    }
+    ggml_tensor * const * n = cgraph->nodes + i;
+    static int dbg = getenv("GGML_SYCL_DN_GATES_DEBUG") ? 6 : 0;
+    const bool bf16_mm = n[0]->src[0] && n[0]->src[0]->type == GGML_TYPE_BF16;
+    auto why = [&](const char * r) {
+        if (dbg > 0 && bf16_mm) {
+            --dbg;
+            fprintf(stderr, "dn gates: not fused at node %d (%s, src1 ne %lld %lld %lld): %s; next ops:", i, n[0]->name,
+                    (long long) n[0]->src[1]->ne[0], (long long) n[0]->src[1]->ne[1], (long long) n[0]->src[1]->ne[2], r);
+            for (int k = 1; k < 9 && i + k < cgraph->n_nodes; ++k) fprintf(stderr, " %s", ggml_op_desc(n[k]));
+            fprintf(stderr, "\n");
+        }
+        return false;
+    };
+    const ggml_op ops[9] = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL,
+                             GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY };
+    for (int k = 0; k < 9; ++k) {
+        if (n[k]->op != ops[k]) {
+            return why("op sequence");
+        }
+    }
+    if (ggml_get_unary_op(n[3]) != GGML_UNARY_OP_SOFTPLUS || ggml_get_unary_op(n[8]) != GGML_UNARY_OP_SIGMOID ||
+        n[1]->src[0] != n[0] || n[2]->src[0] != n[1] || n[3]->src[0] != n[2] || n[4]->src[0] != n[3] ||
+        n[5]->src[0] != n[4] || n[7]->src[0] != n[6] || n[8]->src[0] != n[7] || n[6]->src[1] != n[0]->src[1]) {
+        return why("edges");
+    }
+    const ggml_tensor * wa = n[0]->src[0];
+    const ggml_tensor * wb = n[6]->src[0];
+    const ggml_tensor * x  = n[0]->src[1];
+    const ggml_tensor * bias = n[2]->src[1];
+    const ggml_tensor * sa   = n[4]->src[1];
+    const int64_t K = wa->ne[0], R = wa->ne[1], M = x->ne[1] * x->ne[2];
+    auto f32c = [](const ggml_tensor * t) { return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t); };
+    if (wa->type != GGML_TYPE_BF16 || wb->type != GGML_TYPE_BF16 || !ggml_is_contiguous(wa) || !ggml_is_contiguous(wb) ||
+        wb->ne[0] != K || wb->ne[1] != R || !f32c(x) || x->ne[0] != K || x->ne[3] != 1 || M < 1 || M > 8 || K % 8 != 0 ||
+        !f32c(bias) || ggml_nelements(bias) != R || !f32c(sa) || ggml_nelements(sa) != R || !f32c(n[4]) || !f32c(n[8]) ||
+        ggml_nelements(n[4]) != R * M || ggml_nelements(n[8]) != R * M || !f32c(n[0]) || !f32c(n[6])) {
+        return why("shapes/types");
+    }
+    {
+        int idx[9];
+        for (int k = 0; k < 9; ++k) idx[k] = i + k;
+        const int outs[3] = { i + 4, i + 5, i + 8 };
+        if (!ggml_can_fuse_subgraph_ext(cgraph, idx, 9, ops, outs, 3)) {
+            return why("outside readers");
+        }
+    }
+    auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * pa = (const char *) a->data, * pb = (const char *) b->data;
+        return pa < pb + ggml_nbytes(b) && pb < pa + ggml_nbytes(a);
+    };
+    // every work-group reads all of x: an output on top of an input (the planner reuses x's buffer once its last
+    // reader is done) goes through a scratch buffer and one small copy kernel
+    bool staged = false;
+    for (const ggml_tensor * o : { n[4], n[8] }) {
+        for (const ggml_tensor * in : { x, wa, wb, bias, sa }) {
+            staged |= overlap(o, in);
+        }
+    }
+    ggml_sycl_pool_alloc<float> stage(ctx.pool());
+    float * sa_out = nullptr;
+    if (staged) {
+        sa_out = stage.alloc((size_t) 2 * R * M);
+    }
+    const uint16_t * pa = (const uint16_t *) wa->data;
+    const uint16_t * pb = (const uint16_t *) wb->data;
+    const float *    px = (const float *) x->data;
+    const float *    pbias = (const float *) bias->data;
+    const float *    psa   = (const float *) sa->data;
+    float *          oa    = staged ? sa_out : (float *) n[4]->data;
+    float *          ob    = staged ? sa_out + R * M : (float *) n[8]->data;
+    const int        Ki = (int) K, Ri = (int) R, Mi = (int) M;
+    constexpr int    WG = 256;
+    ctx.stream()->parallel_for(sycl::nd_range<1>((size_t) 2 * R * WG, WG), [=](sycl::nd_item<1> it) {
+        const int        g   = it.get_group(0);
+        const bool       isb = g >= Ri;
+        const int        row = isb ? g - Ri : g;
+        const uint16_t * w   = (isb ? pb : pa) + (size_t) row * Ki;
+        const int        tid = it.get_local_id(0);
+        float            acc[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        for (int k = tid * 8; k < Ki; k += WG * 8) {
+            const sycl::vec<uint16_t, 8> wv = *(const sycl::vec<uint16_t, 8> *) (w + k);
+            float wf[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) wf[j] = sycl::bit_cast<float>((uint32_t) wv[j] << 16);
+            for (int m = 0; m < Mi; ++m) {
+                const float * xr = px + (size_t) m * Ki + k;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) acc[m] += wf[j] * xr[j];
+            }
+        }
+        for (int m = 0; m < Mi; ++m) {
+            const float sum = sycl::reduce_over_group(it.get_group(), acc[m], sycl::plus<float>());
+            if (tid == 0) {
+                if (isb) {
+                    ob[m * Ri + row] = 1.0f / (1.0f + sycl::exp(-sum));
+                } else {
+                    const float v  = sum + pbias[row];
+                    const float sp = sycl::fmax(v, 0.0f) + sycl::log1p(sycl::exp(-sycl::fabs(v)));
+                    oa[m * Ri + row] = sp * psa[row];
+                }
+            }
+        }
+    });
+    if (staged) {
+        float * da = (float *) n[4]->data, * db = (float *) n[8]->data;
+        const float * so = sa_out;
+        const size_t  RM = (size_t) R * M;
+        ctx.stream()->parallel_for(sycl::range<1>(2 * RM), [=](sycl::id<1> j) {
+            if (j < RM) {
+                da[j] = so[j];
+            } else {
+                db[j - RM] = so[j];
+            }
+        });
+    }
+    static bool logged = false, logged_staged = false;
+    if (staged && !logged_staged) {
+        logged_staged = true;
+        fprintf(stderr, "%s: fused DeltaNet gates active via scratch (%lld tokens)\n", __func__, (long long) M);
+    }
+    if (!logged) {
+        logged = true;
+        fprintf(stderr, "%s: fused DeltaNet gates active (K=%lld, 2 x %lld rows, %lld tokens)\n", __func__, (long long) K,
+                (long long) R, (long long) M);
+    }
+    i += 8;
+    return true;
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
     ggml_sycl_gdn_gather_reset(*sycl_ctx);
@@ -6881,6 +7018,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 i += gdn_nodes_to_skip;
                 continue;
             }
+        }
+        if (node->op == GGML_OP_MUL_MAT && ggml_sycl_try_dn_gates(*sycl_ctx, cgraph, i)) {
+            continue;
         }
         if (node->op == GGML_OP_CONCAT && ggml_sycl_try_conv_chain(*sycl_ctx, cgraph, i, done)) {
             continue;
