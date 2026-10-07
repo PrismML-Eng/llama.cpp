@@ -224,7 +224,7 @@ inline dpct::err0 ggml_sycl_set_device(const int device) try {
 //////////////////////
 struct optimize_feature {
     bool reorder=false;
-    bool xmx_pq2=false; // PQ2_0 rewritten into the XMX layout (pq2_xmx.hpp); only that path can read it
+    bool xmx_pq2=false; // PQ2_0/PTQ1_0 rewritten into the XMX layout (pq2_xmx.hpp); only that path can read it
 };
 
 struct sycl_device_info {

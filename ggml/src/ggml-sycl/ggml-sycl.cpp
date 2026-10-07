@@ -983,16 +983,12 @@ static bool ggml_sycl_xmx_disabled() {
     return disabled;
 }
 
-// PTQ1_0 weights are expanded into the 34-byte PQ2_0 XMX blocks on first use (pq2_xmx.hpp), so on devices
-// that run that path their allocation reserves room for the expanded form
-static bool ggml_sycl_ptq1_xmx_expands(int device, const ggml_tensor * tensor) {
-    return tensor->type == GGML_TYPE_PTQ1_0 && g_ggml_sycl_enable_optimize && !ggml_sycl_xmx_disabled() &&
-           tensor->ne[2] == 1 && tensor->ne[3] == 1 && ggml_sycl_pq2_xmx_supports_ne0(tensor->ne[0]) &&
-           ggml_sycl_device_has_dpas16(device);
-}
-
-static size_t ggml_sycl_ptq1_xmx_bytes(const ggml_tensor * tensor) {
-    return (size_t) (ggml_nelements(tensor) / QK_PTQ1_0) * sizeof(block_pq2_0);
+// The XMX layout of PQ2_0/PTQ1_0 weights pads the rows to 16 (pq2_xmx.hpp), so on devices that run that path
+// their allocation reserves the room
+static bool ggml_sycl_xmx_pads(int device, const ggml_tensor * tensor) {
+    return (tensor->type == GGML_TYPE_PQ2_0 || tensor->type == GGML_TYPE_PTQ1_0) && g_ggml_sycl_enable_optimize &&
+           !ggml_sycl_xmx_disabled() && tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+           ggml_sycl_pq2_xmx_supports_ne0(tensor->ne[0]) && ggml_sycl_device_has_dpas16(device);
 }
 
 static size_t ggml_backend_sycl_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
@@ -1006,8 +1002,8 @@ static size_t ggml_backend_sycl_buffer_type_get_alloc_size(ggml_backend_buffer_t
     }
 
     const auto * buft_ctx = (const ggml_backend_sycl_buffer_type_context *) buft->context;
-    if (ggml_sycl_ptq1_xmx_expands(buft_ctx->device, tensor)) {
-        size = std::max(size, ggml_sycl_ptq1_xmx_bytes(tensor));
+    if (ggml_sycl_xmx_pads(buft_ctx->device, tensor)) {
+        size = std::max(size, ggml_sycl_pq2_xmx_bytes(tensor));
     }
 
     return size;
@@ -3808,7 +3804,7 @@ inline bool ggml_sycl_supports_mmq(enum ggml_type type) {
     return false;
 }
 
-// The PQ2_0/PTQ1_0 XMX path feeds 2-bit weights to ESIMD DPAS at execution size 16 through 2D block loads, which
+// The PQ2_0/PTQ1_0 XMX path feeds 2-bit weights to DPAS at execution size 16 through 2D block loads, which
 // every XMX device with 16-wide DPAS has (Xe-HPC, Xe2 and later). 8-wide XMX (Xe-HPG, Arrow Lake-H) keeps the
 // existing paths.
 static bool ggml_sycl_device_has_dpas16(int device) {
@@ -4612,9 +4608,8 @@ static bool ggml_sycl_pq2_xmx_use(ggml_backend_sycl_context & ctx, const ggml_te
         !ggml_is_contiguous(dst)) {
         return false;
     }
-    // PTQ1_0 expands to 34 bytes a block, which only fits where the buffer reserved room for it
-    if (src0->type == GGML_TYPE_PTQ1_0 &&
-        ggml_backend_buft_get_alloc_size(src0->buffer->buft, src0) < ggml_sycl_ptq1_xmx_bytes(src0)) {
+    // the padded rows only fit where the buffer reserved room for them
+    if (ggml_backend_buft_get_alloc_size(src0->buffer->buft, src0) < ggml_sycl_pq2_xmx_bytes(src0)) {
         return false;
     }
     if (!ggml_sycl_pq2_xmx_reorder(const_cast<ggml_tensor *>(src0), ctx.stream())) {
