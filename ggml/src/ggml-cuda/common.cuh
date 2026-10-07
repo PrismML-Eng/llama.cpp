@@ -1283,7 +1283,8 @@ int ggml_cuda_get_device();
 // Under GGML_CUDA_BATCH_INVARIANT the one-column case must run the same arithmetic as 2-8
 // columns, so it takes the planar layout (the SoA vec-dot sums in a different order).
 // Ampere (sm_80/86, including the 3060/3090/170HX): the #218 PT kernel wins at one column
-// too (+5.9% tg128 vs SoA on a 3060). Ada and newer keep SOA_ISUM at one column (4070 win).
+// too (+5.9% tg128 vs SoA on a 3060). Turing (sm_75) as well (+13.7% decode on a 2060 SUPER).
+// Ada and newer keep SOA_ISUM at one column (4070 win).
 // Lives here, after ggml_cuda_info(), because the body reads the current device's cc.
 static inline ggml_cuda_q8_1_layout ggml_cuda_q8_1_layout_host(ggml_type type_src0, int ncols_dst, bool has_ids) {
     const ggml_cuda_q8_1_layout l = ggml_cuda_q8_1_layout_for(type_src0, ncols_dst, has_ids);
@@ -1292,7 +1293,7 @@ static inline ggml_cuda_q8_1_layout ggml_cuda_q8_1_layout_host(ggml_type type_sr
     }
     if (l == GGML_CUDA_Q8_1_SOA_ISUM) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-        if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_ADA_LOVELACE) {
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING && cc < GGML_CUDA_CC_ADA_LOVELACE) {
             return GGML_CUDA_Q8_1_PT;
         }
     }
