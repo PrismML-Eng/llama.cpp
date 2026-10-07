@@ -861,6 +861,19 @@ template <int FMT, int MT_M, int MT_N, int WG_M, int WG_N> struct gemm {
                     }
                 });
             }
+        } else if constexpr (WG_M == 1) {
+            // nothing to share: decode in registers
+            for (int s = kb; s < ke; ++s) {
+                step(s, [&](int s, uint8 * w, float * sb) {
+                    pl2d_y(pb, s * rows);
+                    static_for<NB>([&](auto j) { w[j] = rd2d<b32_16x8, 16 * decltype(j)::value, 0, uint8>(pb); });
+#pragma unroll
+                    for (int j = 0; j < NB; ++j) {
+                        sb[j] = half_bits_to_float((unsigned short) (w[j][6] >> 16));
+                        w[j]  = ptq1_decode(w[j], lut);
+                    }
+                });
+            }
         } else {
             // The WG_M sub-groups of a work-group column share their B columns: each decodes one of
             // every WG_M steps into local memory, then all of them use the WG_M decoded steps.
@@ -1132,6 +1145,34 @@ static int fmt_of(ggml_type type) {
 }
 
 template <int FMT> static void launch(const args & a, int ls, dpct::queue_ptr stream) {
+    if constexpr (FMT == FMT_PTQ1) {
+        // decode-bound: tiles that use each decoded block for more rows; with WG_M == 1 the GEMM
+        // decodes in registers, without the SLM round trip
+        if (a.M == 1) {
+            launch_gemv_ls<FMT, 1>(a, ls, stream);
+        } else if (a.M <= 4) {
+            launch_gemv_ls<FMT, 4>(a, ls, stream);  // the 2-row variant is slower
+        } else if (a.M <= 8 && (int64_t) a.K * a.N < (1 << 24)) {
+            launch_gemv_ls<FMT, 8>(a, ls, stream);
+        } else if (a.M <= 16) {
+            launch_gemm<FMT, 16, 16, 1, 8>(a, stream);
+        } else if (a.M <= 32) {
+            launch_gemm<FMT, 32, 16, 1, 8>(a, stream);
+        } else if (a.M <= 64) {
+            if (a.K >= 6144) {
+                launch_gemm<FMT, 32, 32, 1, 4>(a, stream);
+            } else {
+                launch_gemm<FMT, 16, 32, 4, 2>(a, stream);
+            }
+        } else if (a.M <= 128) {
+            launch_gemm<FMT, 32, 32, 4, 2>(a, stream);
+        } else {
+            // a tall work-group shares each decoded B column block among 8 sub-groups
+            launch_gemm<FMT, 32, 32, 8, 1>(a, stream);
+        }
+        return;
+    }
+
     if (a.M <= GEMV_MAX_M) {
         if (a.M == 1) {
             launch_gemv_ls<FMT, 1>(a, ls, stream);
@@ -1148,16 +1189,9 @@ template <int FMT> static void launch(const args & a, int ls, dpct::queue_ptr st
     } else if (a.M <= 32) {
         launch_gemm<FMT, 8, 32, 4, 4>(a, stream);
     } else if (a.M <= 64) {
-        if constexpr (FMT == FMT_PTQ1) {
-            launch_gemm<FMT, 16, 32, 4, 2>(a, stream);
-        } else {
-            launch_gemm<FMT, 16, 64, 4, 2>(a, stream);
-        }
+        launch_gemm<FMT, 16, 64, 4, 2>(a, stream);
     } else if (a.M <= 128) {
         launch_gemm<FMT, 32, 32, 4, 2>(a, stream);
-    } else if constexpr (FMT == FMT_PTQ1) {
-        // a tall work-group shares each decoded B column block among 8 sub-groups
-        launch_gemm<FMT, 32, 32, 8, 1>(a, stream);
     } else {
         launch_gemm<FMT, 16, 64, 4, 2>(a, stream);
     }
