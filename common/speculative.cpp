@@ -1726,8 +1726,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
         is_dflash2     = selector_top_k > 0;
-        const char * lookup_env = std::getenv("LLAMA_DFLASH2_LOOKUP");
-        prompt_lookup           = is_dflash2 && lookup_env && std::strcmp(lookup_env, "1") == 0;
+        // a lookup hit skips the noise-block forward and leaves the draft context untouched, so it is
+        // valid for DFlash1 and DFlash2 alike; DSpark drafts through its Markov head and stays excluded
+        const char * lookup_env = std::getenv("LLAMA_DFLASH_LOOKUP");
+        if (!lookup_env) {
+            lookup_env = std::getenv("LLAMA_DFLASH2_LOOKUP");
+            if (lookup_env) {
+                LOG_WRN("%s: LLAMA_DFLASH2_LOOKUP is deprecated, use LLAMA_DFLASH_LOOKUP\n", __func__);
+            }
+        }
+        prompt_lookup = !is_dspark && lookup_env && std::strcmp(lookup_env, "1") == 0;
         if (prompt_lookup) {
             lookup_prompts.resize(n_seq);
         }
@@ -1989,7 +1997,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 auto      found = common_prompt_lookup_draft(lookup_prompts[seq_id], *dp.prompt, dp.id_last, limit);
                 if (!found.empty() && found.size() >= (size_t) params.n_min) {
                     *dp.result = std::move(found);
-                    LOG_DBG("DFlash2 prompt lookup: seq=%d tokens=%zu, neural draft skipped\n", seq_id,
+                    LOG_DBG("DFlash prompt lookup: seq=%d tokens=%zu, neural draft skipped\n", seq_id,
                             dp.result->size());
                     continue;
                 }
