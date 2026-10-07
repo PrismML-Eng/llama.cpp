@@ -24,6 +24,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <vector>
+#include <map>
+#include <unordered_map>
 #include <cmath>
 #include <iostream>
 #include <fstream>
@@ -1927,6 +1929,10 @@ std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_device(q
     return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_leg(qptr, device));
 }
 
+
+std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_unordered_pool_for_device(queue_ptr qptr, int device) {
+    return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_leg(qptr, device));
+}
 
 std::unique_ptr<ggml_sycl_fattn_kv_buffers> ggml_backend_sycl_context::new_fattn_kv_buffers(queue_ptr qptr, int device) {
     return std::unique_ptr<ggml_sycl_fattn_kv_buffers>(new ggml_sycl_fattn_kv_buffers(qptr, device));
@@ -4578,8 +4584,9 @@ static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * 
 
 // PQ2_0/PTQ1_0 weights on 16-wide DPAS devices are rewritten into the XMX layout on first use. From then on every
 // mul_mat on them has to take that path, so the layout flag alone decides once it is set.
-static bool ggml_sycl_pq2_xmx_use(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
-                                  const ggml_tensor * dst) {
+// ggml_sycl_pq2_xmx_use() without the rewrite: whether this mul_mat would take the XMX path
+static bool ggml_sycl_pq2_xmx_eligible(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                                       const ggml_tensor * dst) {
     if (src0->type != GGML_TYPE_PQ2_0 && src0->type != GGML_TYPE_PTQ1_0) {
         return false;
     }
@@ -4609,8 +4616,17 @@ static bool ggml_sycl_pq2_xmx_use(ggml_backend_sycl_context & ctx, const ggml_te
         return false;
     }
     // the padded rows only fit where the buffer reserved room for them
-    if (ggml_backend_buft_get_alloc_size(src0->buffer->buft, src0) < ggml_sycl_pq2_xmx_bytes(src0)) {
+    return ggml_backend_buft_get_alloc_size(src0->buffer->buft, src0) >= ggml_sycl_pq2_xmx_bytes(src0);
+}
+
+static bool ggml_sycl_pq2_xmx_use(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                                  const ggml_tensor * dst) {
+    if (!ggml_sycl_pq2_xmx_eligible(ctx, src0, src1, dst)) {
         return false;
+    }
+    ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+    if (extra->optimized_feature.xmx_pq2) {
+        return true;
     }
     if (!ggml_sycl_pq2_xmx_reorder(const_cast<ggml_tensor *>(src0), ctx.stream())) {
         return false;
@@ -4618,6 +4634,316 @@ static bool ggml_sycl_pq2_xmx_use(ggml_backend_sycl_context & ctx, const ggml_te
     extra->optimized_feature.xmx_pq2 = true;
     return true;
 }
+
+static bool ggml_sycl_is_view_or_noop(const ggml_tensor * t);
+
+// Quantized XMX activations shared within one graph compute. An entry is keyed by the activation
+// tensor (a reshape or view of all of it resolves to the same key) and lives until its last XMX
+// consumer ran. Holding it also lets a mat-mul run later than its graph position.
+struct ggml_sycl_xmx_graph_state {
+    struct act_entry {
+        ggml_sycl_pq2_xmx_act * act;
+        int                 remaining;
+    };
+
+    // keyed by (activation, weight type): PQ2_0 and PTQ1_0 read the activation in different K orders
+    std::map<std::pair<const ggml_tensor *, ggml_type>, act_entry> acts;
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *>   deferred;  // GLU node -> its gate mat-mul
+
+    ~ggml_sycl_xmx_graph_state() {
+        for (auto & e : acts) {
+            ggml_sycl_pq2_xmx_act_free(e.second.act);
+        }
+    }
+};
+
+// consumers sharing a plain activation sit close together (q/k/v, gate/up); later ones quantize again
+static constexpr int GGML_SYCL_XMX_SHARE_WINDOW = 64;
+
+static const ggml_tensor * ggml_sycl_xmx_act_key(const ggml_tensor * b) {
+    const ggml_tensor * r = b->view_src;
+    return r && b->data == r->data && ggml_nelements(b) == ggml_nelements(r) ? r : b;
+}
+
+static bool ggml_sycl_is_alias_op(const ggml_tensor * n) {
+    return n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW || n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE;
+}
+
+// a mat-mul that the graph loop runs on the XMX kernels from a shared quantized activation
+static bool ggml_sycl_is_xmx_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * n) {
+    if (n->op != GGML_OP_MUL_MAT || !ggml_sycl_pq2_xmx_eligible(ctx, n->src[0], n->src[1], n)) {
+        return false;
+    }
+    const ggml_tensor * b = n->src[1];
+    return b->type == GGML_TYPE_F32 && ggml_is_contiguous(b) && b->ne[0] == n->src[0]->ne[0] &&
+           n->type == GGML_TYPE_F32 && ggml_is_contiguous(n) && ggml_nelements(n) == n->ne[0] * ggml_nrows(b);
+}
+
+static int ggml_sycl_use_count(const ggml_cgraph * cgraph, const ggml_tensor * t) {
+    const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+    if (pos == GGML_HASHSET_FULL || !ggml_bitset_get(cgraph->visited_hash_set.used, pos)) {
+        return -1;
+    }
+    return cgraph->use_counts[pos];
+}
+
+// Count the users of t (seen through alias ops) from node `from` on, stopping once the graph's
+// use counts are all accounted for. Returns -1 if some are missing (e.g. in another split).
+// n_xmx gets the users that are XMX mat-muls reading t as src1, and wtype their weight type
+// (GGML_TYPE_COUNT if they differ).
+static int ggml_sycl_xmx_users(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph, int from,
+                               const ggml_tensor * t, int & n_xmx, ggml_type & wtype) {
+    wtype = GGML_TYPE_COUNT;
+    int pending = ggml_sycl_use_count(cgraph, t);
+    if (pending < 0) {
+        return -1;
+    }
+    std::vector<const ggml_tensor *> aliases = { t };
+    int                              total   = 0;
+    n_xmx                                    = 0;
+    for (int j = from; j < cgraph->n_nodes && pending > 0; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        for (int s = 0; s < GGML_MAX_SRC && n->src[s]; ++s) {
+            if (std::find(aliases.begin(), aliases.end(), n->src[s]) == aliases.end()) {
+                continue;
+            }
+            pending--;
+            if (ggml_sycl_is_alias_op(n)) {
+                const int uc = ggml_sycl_use_count(cgraph, n);
+                if (uc < 0) {
+                    return -1;
+                }
+                aliases.push_back(n);
+                pending += uc;
+                continue;
+            }
+            total++;
+            if (s == 1 && ggml_sycl_is_xmx_mul_mat(ctx, n) && ggml_sycl_xmx_act_key(n->src[1]) == t) {
+                const ggml_type ty = n->src[0]->type;
+                wtype = n_xmx == 0 || wtype == ty ? ty : GGML_TYPE_COUNT;
+                n_xmx++;
+            }
+        }
+    }
+    return pending == 0 ? total : -1;
+}
+
+static ggml_sycl_pq2_xmx_act * ggml_sycl_xmx_acquire(ggml_backend_sycl_context & ctx, ggml_sycl_xmx_graph_state & st,
+                                                 const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * mm    = cgraph->nodes[node_idx];
+    const ggml_type     wtype = mm->src[0]->type;
+    const auto          key   = std::make_pair(ggml_sycl_xmx_act_key(mm->src[1]), wtype);
+    const auto          it    = st.acts.find(key);
+    if (it != st.acts.end()) {
+        return it->second.act;
+    }
+    int       users = 0;
+    const int end   = std::min(cgraph->n_nodes, node_idx + GGML_SYCL_XMX_SHARE_WINDOW);
+    for (int j = node_idx; j < end; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_sycl_is_xmx_mul_mat(ctx, n) && n->src[0]->type == wtype &&
+            ggml_sycl_xmx_act_key(n->src[1]) == key.first) {
+            users++;
+        }
+    }
+    ggml_sycl_pq2_xmx_act * act = ggml_sycl_pq2_xmx_act_quantize(ctx, mm->src[1], nullptr, wtype);
+    st.acts[key]            = { act, users };
+    return act;
+}
+
+static void ggml_sycl_xmx_release(ggml_sycl_xmx_graph_state & st, const ggml_tensor * mm) {
+    const auto it = st.acts.find(std::make_pair(ggml_sycl_xmx_act_key(mm->src[1]), mm->src[0]->type));
+    GGML_ASSERT(it != st.acts.end());
+    if (--it->second.remaining <= 0) {
+        ggml_sycl_pq2_xmx_act_free(it->second.act);
+        st.acts.erase(it);
+    }
+}
+
+// Skip RESHAPE/VIEW nodes after idx that alias t contiguously. Returns the last alias (or t)
+// and sets idx to the first other node.
+static const ggml_tensor * ggml_sycl_skip_aliases(const ggml_cgraph * cgraph, const ggml_tensor * t, int & idx) {
+    const ggml_tensor * cur = t;
+    for (; idx < cgraph->n_nodes; ++idx) {
+        const ggml_tensor * n = cgraph->nodes[idx];
+        if ((n->op != GGML_OP_RESHAPE && n->op != GGML_OP_VIEW) || n->src[0] != cur || n->data != t->data ||
+            !ggml_is_contiguous(n) || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            break;
+        }
+        cur = n;
+    }
+    return cur;
+}
+
+// Run the XMX mat-mul at node_idx and fuse what follows it where possible:
+// {mul_mat(gate), mul_mat(up), SWIGLU}, a later SWIGLU whose gate it is (run deferred, at the GLU),
+// and {mul_mat, reshape/view..., ADD} residuals. Returns the number of nodes consumed after
+// node_idx, or -1 if the node is not handled here.
+static int ggml_sycl_xmx_mul_mat_node(ggml_backend_sycl_context & ctx, ggml_sycl_xmx_graph_state & st,
+                                      ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * mm = cgraph->nodes[node_idx];
+    if (!ggml_sycl_is_xmx_mul_mat(ctx, mm) || !ggml_sycl_pq2_xmx_use(ctx, mm->src[0], mm->src[1], mm)) {
+        return -1;
+    }
+    const int N = mm->ne[0];
+
+    if (g_ggml_sycl_enable_fusion &&
+        ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, { node_idx + 2 })) {
+        ggml_tensor *       glu  = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * gate = glu->src[0];
+        const ggml_tensor * up   = glu->src[1];
+        const bool pair = (gate == mm && up == cgraph->nodes[node_idx + 1]) ||
+                          (up == mm && gate == cgraph->nodes[node_idx + 1]);
+        if (pair && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && !ggml_get_op_params_i32(glu, 1) /* swapped */ &&
+            ggml_sycl_is_xmx_mul_mat(ctx, gate) && ggml_sycl_is_xmx_mul_mat(ctx, up) &&
+            ggml_sycl_xmx_act_key(gate->src[1]) == ggml_sycl_xmx_act_key(up->src[1]) &&
+            gate->src[0]->type == up->src[0]->type &&
+            ggml_are_same_shape(gate, up) && ggml_are_same_shape(glu, gate) && glu->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(glu)) {
+            scope_op_debug_print scope_dbg_print(__func__, glu, /*num_src=*/2, " : xmx gate + up + swiglu");
+            GGML_ASSERT(ggml_sycl_pq2_xmx_use(ctx, gate->src[0], gate->src[1], gate) &&
+                        ggml_sycl_pq2_xmx_use(ctx, up->src[0], up->src[1], up));
+            const ggml_sycl_pq2_xmx_act *   act = ggml_sycl_xmx_acquire(ctx, st, cgraph, node_idx);
+            ggml_sycl_pool_alloc<float> up_out(ctx.pool(), ggml_nelements(up));
+            ggml_sycl_pq2_xmx_mul_mat_act(ctx, up->src[0], act, up_out.get(), N, GGML_SYCL_XMX_EPI_NONE, nullptr);
+            ggml_sycl_pq2_xmx_mul_mat_act(ctx, gate->src[0], act, (float *) glu->data, N,
+                                            GGML_SYCL_XMX_EPI_SWIGLU, up_out.get());
+            ggml_sycl_xmx_release(st, gate);
+            ggml_sycl_xmx_release(st, up);
+            return 2;
+        }
+    }
+
+    // single user, reached through aliases: a SWIGLU that takes this as its gate, or a residual ADD
+    const ggml_tensor * user     = nullptr;
+    const ggml_tensor * cur      = mm;
+    int                 user_idx = -1;
+    if (g_ggml_sycl_enable_fusion && ggml_node_get_use_count(cgraph, node_idx) == 1 &&
+        !(mm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        const int end = std::min(cgraph->n_nodes, node_idx + 2 * GGML_SYCL_XMX_SHARE_WINDOW);
+        for (int j = node_idx + 1; j < end && !user; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            const bool uses_cur = n->src[0] == cur || n->src[1] == cur;
+            if (!uses_cur) {
+                continue;
+            }
+            if ((n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW) && n->src[0] == cur && n->data == mm->data &&
+                ggml_is_contiguous(n) && ggml_node_get_use_count(cgraph, j) == 1 &&
+                !(n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                cur = n;
+                continue;
+            }
+            user     = n;
+            user_idx = j;
+        }
+    }
+
+    if (user && user->op == GGML_OP_GLU && ggml_get_glu_op(user) == GGML_GLU_OP_SWIGLU && user->src[0] == cur &&
+        !ggml_get_op_params_i32(user, 1) /* swapped */ && user->src[1] && user->src[1] != cur &&
+        user->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(user->src[1]) &&
+        ggml_nelements(user->src[1]) == ggml_nelements(mm) && user->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(user) && ggml_nelements(user) == ggml_nelements(mm)) {
+        // the multiplier is computed later; keep the quantized activation and run at the GLU
+        ggml_sycl_xmx_acquire(ctx, st, cgraph, node_idx);
+        st.deferred[user] = mm;
+        return 0;
+    }
+
+    if (user && user->op == GGML_OP_ADD && (user->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        const ggml_tensor * other = user->src[0] == cur ? user->src[1] : (user->src[1] == cur ? user->src[0] : nullptr);
+        if (other && other->type == GGML_TYPE_F32 && user->type == GGML_TYPE_F32 && ggml_is_contiguous(other) &&
+            ggml_is_contiguous(user) && ggml_are_same_shape(user->src[0], user->src[1]) &&
+            ggml_nelements(user) == ggml_nelements(mm)) {
+            bool only_aliases = true;  // nothing but the alias chain may run between the two
+            for (int j = node_idx + 1; j < user_idx; ++j) {
+                only_aliases = only_aliases && ggml_sycl_is_view_or_noop(cgraph->nodes[j]);
+            }
+            if (only_aliases) {
+                scope_op_debug_print scope_dbg_print(__func__, user, /*num_src=*/2, " : xmx mul_mat + add");
+                const ggml_sycl_pq2_xmx_act * act = ggml_sycl_xmx_acquire(ctx, st, cgraph, node_idx);
+                ggml_sycl_pq2_xmx_mul_mat_act(ctx, mm->src[0], act, (float *) user->data, N, GGML_SYCL_XMX_EPI_ADD,
+                                                (const float *) other->data);
+                ggml_sycl_xmx_release(st, mm);
+                return user_idx - node_idx;
+            }
+        }
+    }
+
+    scope_op_debug_print scope_dbg_print(__func__, mm, /*num_src=*/2, " : xmx");
+    const ggml_sycl_pq2_xmx_act * act = ggml_sycl_xmx_acquire(ctx, st, cgraph, node_idx);
+    ggml_sycl_pq2_xmx_mul_mat_act(ctx, mm->src[0], act, (float *) mm->data, N, GGML_SYCL_XMX_EPI_NONE, nullptr);
+    ggml_sycl_xmx_release(st, mm);
+    return 0;
+}
+
+// the GLU of a deferred gate mat-mul: run the mat-mul with the SWIGLU epilogue into the GLU output
+static bool ggml_sycl_xmx_deferred_glu(ggml_backend_sycl_context & ctx, ggml_sycl_xmx_graph_state & st,
+                                       ggml_tensor * glu) {
+    const auto it = st.deferred.find(glu);
+    if (it == st.deferred.end()) {
+        return false;
+    }
+    const ggml_tensor * mm = it->second;
+    st.deferred.erase(it);
+    scope_op_debug_print       scope_dbg_print(__func__, glu, /*num_src=*/2, " : xmx mul_mat + swiglu (deferred)");
+    const auto a = st.acts.find(std::make_pair(ggml_sycl_xmx_act_key(mm->src[1]), mm->src[0]->type));
+    GGML_ASSERT(a != st.acts.end());
+    ggml_sycl_pq2_xmx_mul_mat_act(ctx, mm->src[0], a->second.act, (float *) glu->data, mm->ne[0],
+                                    GGML_SYCL_XMX_EPI_SWIGLU, (const float *) glu->src[1]->data);
+    ggml_sycl_xmx_release(st, mm);
+    return true;
+}
+
+// Hadamard-folded PQ2_0 input: {x * signs, FWHT_1024 (hinted mul_mat)}. If every user of the FWHT
+// output is an XMX mat-mul, the sign flip and the FWHT go into its activation quantizer and the
+// output is never written; otherwise one kernel writes it. Returns the nodes consumed after node_idx.
+static int ggml_sycl_hadamard_xmx_fused(ggml_backend_sycl_context & ctx, ggml_sycl_xmx_graph_state & st,
+                                        ggml_cgraph * cgraph, int node_idx) {
+    if (!g_ggml_sycl_enable_fusion) {
+        return 0;
+    }
+    const ggml_tensor * mul = cgraph->nodes[node_idx];
+    if (mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul) ||
+        ggml_node_get_use_count(cgraph, node_idx) != 1 || (mul->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    const ggml_tensor * x     = mul->src[0];
+    const ggml_tensor * signs = mul->src[1];
+    if (x->type != GGML_TYPE_F32 || signs->type != GGML_TYPE_F32 || !ggml_are_same_shape(x, mul) ||
+        !ggml_is_contiguous(x) || !ggml_is_contiguous(signs) || ggml_nelements(signs) != x->ne[0] ||
+        x->ne[0] % 1024 != 0) {
+        return 0;
+    }
+
+    int                 j   = node_idx + 1;
+    const ggml_tensor * cur = ggml_sycl_skip_aliases(cgraph, mul, j);
+    if (j >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * had = cgraph->nodes[j];
+    if (had->op != GGML_OP_MUL_MAT || ggml_get_op_params_i32(had, 1) != GGML_HINT_SRC0_IS_HADAMARD ||
+        had->src[1] != cur || had->src[0]->ne[0] != 1024 || had->src[0]->ne[1] != 1024 ||
+        had->type != GGML_TYPE_F32 || !ggml_is_contiguous(had) || ggml_nelements(had) != ggml_nelements(mul) ||
+        (had->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+
+    const float * sd    = (const float *) signs->data;
+    int           n_xmx = 0;
+    ggml_type     wtype = GGML_TYPE_COUNT;
+    const int     total = ggml_sycl_xmx_users(ctx, cgraph, j + 1, had, n_xmx, wtype);
+    if (total > 0 && n_xmx == total && wtype != GGML_TYPE_COUNT && !st.acts.count({ had, wtype })) {
+        scope_op_debug_print scope_dbg_print(__func__, had, /*num_src=*/2, " : hadamard into xmx quantizer");
+        st.acts[{ had, wtype }] = { ggml_sycl_pq2_xmx_act_quantize(ctx, x, sd, wtype), n_xmx };
+        return j - node_idx;
+    }
+
+    scope_op_debug_print scope_dbg_print(__func__, had, /*num_src=*/2, " : hadamard signs + fwht");
+    ggml_sycl_pq2_xmx_hadamard_fwht(ctx, x, sd, (float *) had->data);
+    return j - node_idx;
+}
+
+
 
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
@@ -5778,6 +6104,8 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
 
+    ggml_sycl_xmx_graph_state xmx_state;
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (ggml_sycl_is_view_or_noop(node)) {
@@ -5821,6 +6149,24 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             ggml_sycl_op_unary_mul_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
             i++;
             continue;
+        }
+
+        if (node->op == GGML_OP_GLU && ggml_sycl_xmx_deferred_glu(*sycl_ctx, xmx_state, node)) {
+            continue;
+        }
+        if (node->op == GGML_OP_MUL) {
+            const int had_skip = ggml_sycl_hadamard_xmx_fused(*sycl_ctx, xmx_state, cgraph, i);
+            if (had_skip > 0) {
+                i += had_skip;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_MUL_MAT) {
+            const int xmx_skip = ggml_sycl_xmx_mul_mat_node(*sycl_ctx, xmx_state, cgraph, i);
+            if (xmx_skip >= 0) {
+                i += xmx_skip;
+                continue;
+            }
         }
 
         if (node->op == GGML_OP_MUL_MAT && ggml_sycl_mul_mat_glu_mmvq_fused(*sycl_ctx, cgraph, i)) {

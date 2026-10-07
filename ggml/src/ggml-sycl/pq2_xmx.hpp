@@ -24,3 +24,29 @@ bool ggml_sycl_pq2_xmx_reorder(ggml_tensor * src0, dpct::queue_ptr stream);
 // dst = src0 * src1 for a src0 already in the XMX layout; src1 is f32 with contiguous rows, dst is contiguous
 void ggml_sycl_pq2_xmx_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                                ggml_tensor * dst);
+
+// Activation quantized for the XMX kernels, reusable by any number of weights of type wtype (PQ2_0 and
+// PTQ1_0 read it in different K orders). With had_signs, x is first transformed per row as
+// FWHT_1024(x * had_signs), normalized as in ggml_sycl_op_fwht; x->ne[0] must then be a multiple of 1024.
+// Freeing returns the memory to the context's xmx_act_pool(), which is safe once the last kernel that reads
+// it is submitted.
+struct ggml_sycl_pq2_xmx_act;
+ggml_sycl_pq2_xmx_act * ggml_sycl_pq2_xmx_act_quantize(ggml_backend_sycl_context & ctx, const ggml_tensor * x,
+                                                       const float * had_signs, ggml_type wtype);
+void                    ggml_sycl_pq2_xmx_act_free(ggml_sycl_pq2_xmx_act * act);
+
+// epilogues on the f32 result (TernSYCL postop numbering); other has the layout of dst
+enum ggml_sycl_xmx_epi {
+    GGML_SYCL_XMX_EPI_NONE   = 0,
+    GGML_SYCL_XMX_EPI_SWIGLU = 1,  // silu(acc) * other
+    GGML_SYCL_XMX_EPI_ADD    = 2,  // acc + other
+};
+
+// dst = epi(w x act): [w->ne[1], tokens] f32 with row stride ldc, w in the XMX layout. dst and other may alias.
+void ggml_sycl_pq2_xmx_mul_mat_act(ggml_backend_sycl_context & ctx, const ggml_tensor * w,
+                                   const ggml_sycl_pq2_xmx_act * act, float * dst, int ldc, int epi,
+                                   const float * other);
+
+// dst = FWHT_1024(x * signs) per row, contiguous [x->ne[0], rows]
+void ggml_sycl_pq2_xmx_hadamard_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * x, const float * signs,
+                                     float * dst);

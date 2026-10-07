@@ -440,11 +440,16 @@ struct ggml_backend_sycl_context {
 
     std::unique_ptr<ggml_sycl_pool> host_pools[GGML_SYCL_MAX_DEVICES];
 
+    // XMX activations shared across mat-muls are freed out of order, which the VMM pool does not allow
+    std::unique_ptr<ggml_sycl_pool> xmx_act_pools[GGML_SYCL_MAX_DEVICES];
+
     std::vector<mmid_row_mapping> mmid_row_mapping_host;
 
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_device(queue_ptr qptr, int device);
 
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_host(queue_ptr qptr, int device);
+
+    static std::unique_ptr<ggml_sycl_pool> new_unordered_pool_for_device(queue_ptr qptr, int device);
 
     static std::unique_ptr<ggml_sycl_fattn_kv_buffers> new_fattn_kv_buffers(queue_ptr qptr, int device);
 
@@ -457,6 +462,13 @@ struct ggml_backend_sycl_context {
 
     ggml_sycl_pool & pool() {
         return pool(device);
+    }
+
+    ggml_sycl_pool & xmx_act_pool() {
+        if (xmx_act_pools[device] == nullptr) {
+            xmx_act_pools[device] = new_unordered_pool_for_device(stream(device, 0), device);
+        }
+        return *xmx_act_pools[device];
     }
 
     ggml_sycl_fattn_kv_buffers & fattn_buffers(int device) {

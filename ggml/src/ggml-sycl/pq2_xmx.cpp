@@ -355,6 +355,19 @@ inline uint16_t * ptq1_lut(sycl::nd_item<2> it) {
     return lut;
 }
 
+// fused epilogues on the fp32 result, numbered as TernSYCL postops. other has the layout of C.
+enum { EPI_NONE = 0, EPI_SWIGLU = 1, EPI_ADD = 2 };
+
+inline float epilogue(float v, const float * other, size_t i, int postop) {
+    if (postop == EPI_SWIGLU) {
+        return v / (1.0f + sycl::exp(-v)) * other[i];
+    }
+    if (postop == EPI_ADD) {
+        return v + other[i];
+    }
+    return v;
+}
+
 // One sub-group per (row, 128-group): SA = 127 / absmax, Aq = rint(A * SA). Rows of src1 are
 // flattened over dims 1..3.
 struct quant_a {
@@ -409,6 +422,133 @@ struct quant_a {
     }
 };
 
+// quant_a with a sign flip and a 1024-wide normalized Walsh-Hadamard transform in front, as the
+// Hadamard-folded weights expect: Aq = quant(FWHT(A * signs)). One work-group per (row, 1024-block).
+// The butterflies follow ggml_sycl_op_fwht (fwht_kernel_wide, NT = 256).
+struct quant_a_had {
+    static constexpr int HN = 1024;
+    static constexpr int NT = 256;
+    static constexpr int EL = HN / NT;
+
+    const float * A;
+    const float * signs;
+    float *       SA;
+    int8_t *      Aq;
+    float *       out;  // if set, write the transformed rows (contiguous [K, M]) instead of quantizing
+    int           M, K, ne11, ne12;
+    int64_t       s11, s12, s13;
+    int           perm;  // quantize each 128-group in PTQ1_0 decode order
+
+    void operator()(sycl::nd_item<2> it) const {
+        float *    smem = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[HN]>(it.get_group());
+        const auto sg   = it.get_sub_group();
+        const int  lane = sg.get_local_linear_id();
+        const int  tid  = it.get_local_id(1);
+        const int  b    = it.get_group(1);
+        const int  m    = it.get_group(0);
+
+        const int     i1 = m % ne11;
+        const int     i2 = (m / ne11) % ne12;
+        const int     i3 = m / (ne11 * ne12);
+        const float * a  = A + i1 * s11 + i2 * s12 + i3 * s13 + b * HN;
+        const float * sg_ = signs + b * HN;
+
+        float reg[EL];
+#pragma unroll
+        for (int i = 0; i < EL; ++i) {
+            reg[i] = a[i * NT + tid] * sg_[i * NT + tid] * (1.0f / 32.0f);  // 1 / sqrt(1024)
+        }
+        // butterflies inside the sub-group
+#pragma unroll
+        for (int h = 1; h < 16; h *= 2) {
+#pragma unroll
+            for (int j = 0; j < EL; ++j) {
+                const float v  = reg[j];
+                const float v2 = sycl::permute_group_by_xor(sg, v, h);
+                reg[j]         = (lane & h) == 0 ? v + v2 : v2 - v;
+            }
+        }
+        // across sub-groups, through local memory
+        for (int h = 16; h < NT; h *= 2) {
+#pragma unroll
+            for (int j = 0; j < EL; ++j) {
+                smem[j * NT + tid] = reg[j];
+            }
+            sycl::group_barrier(it.get_group());
+#pragma unroll
+            for (int j = 0; j < EL; ++j) {
+                const float v  = reg[j];
+                const float v2 = smem[j * NT + (tid ^ h)];
+                reg[j]         = (tid & h) == 0 ? v + v2 : v2 - v;
+            }
+            sycl::group_barrier(it.get_group());
+        }
+        // across registers
+#pragma unroll
+        for (int h = NT; h < HN; h *= 2) {
+            const int step = h / NT;
+#pragma unroll
+            for (int j = 0; j < EL; j += 2 * step) {
+#pragma unroll
+                for (int k = 0; k < step; ++k) {
+                    const float x = reg[j + k];
+                    const float y = reg[j + k + step];
+                    reg[j + k]        = x + y;
+                    reg[j + k + step] = x - y;
+                }
+            }
+        }
+        if (out) {
+            float * o = out + (size_t) m * K + b * HN;
+#pragma unroll
+            for (int j = 0; j < EL; ++j) {
+                o[j * NT + tid] = reg[j];
+            }
+            return;
+        }
+#pragma unroll
+        for (int j = 0; j < EL; ++j) {
+            smem[j * NT + tid] = reg[j];
+        }
+        sycl::group_barrier(it.get_group());
+
+        // quantize as quant_a: sub-group g < 8 takes 128-group g of this block
+        const int g = tid / 16;
+        if (g >= HN / GS) {
+            return;
+        }
+        float v[8];
+        float mx = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            v[i] = smem[g * GS + 8 * lane + i];
+            mx   = sycl::fmax(mx, sycl::fabs(v[i]));
+        }
+        mx            = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
+        const float s = 127.0f / sycl::fmax(mx, EPS);
+        const int   gg = b * (HN / GS) + g;
+        if (perm) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                v[i] = smem[g * GS + ptq1_k_orig(8 * lane + i)];
+            }
+        }
+        if (lane == 0) {
+            SA[(size_t) gg * ldsa(M) + m] = s;
+        }
+        uint64_t q = 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            q |= (uint64_t) (uint8_t) (int8_t) sycl::clamp(sycl::rint(v[i] * s), -128.0f, 127.0f) << (8 * i);
+        }
+        *(uint64_t *) (Aq + (size_t) m * K + gg * GS + 8 * lane) = q;
+    }
+
+    auto get(syclex::properties_tag) const {
+        return syclex::properties{ syclex::sub_group_size<16>, syclex::work_group_size<1, NT> };
+    }
+};
+
 template <int SGM> struct rows;
 template <> struct rows<1> { using a_t = short;  using ia_t = int;  using fa_t = float;  };
 template <> struct rows<2> { using a_t = short2; using ia_t = int2; using fa_t = float2; };
@@ -441,7 +581,8 @@ template <int FMT, int SGM, int NSG_N, int LS, int U> struct gemv {
     const uint32_t *       B;
     const unsigned short * SB;
     float *                C;
-    int                    M, N, NP, K, ldc;
+    const float *          other;
+    int                    M, N, NP, K, ldc, postop;
 
     using a_t  = typename rows<SGM>::a_t;
     using ia_t = typename rows<SGM>::ia_t;
@@ -575,7 +716,8 @@ template <int FMT, int SGM, int NSG_N, int LS, int U> struct gemv {
 #pragma unroll
         for (int r = 0; r < SGM; ++r) {
             if (m0 + r < M) {
-                C[(size_t) (m0 + r) * ldc + n0 + lane] = el<SGM>(acc, r);
+                const size_t i = (size_t) (m0 + r) * ldc + n0 + lane;
+                C[i]           = epilogue(el<SGM>(acc, r), other, i, postop);
             }
         }
     }
@@ -594,7 +736,8 @@ template <int FMT, int MT_M, int MT_N, int WG_M, int WG_N> struct gemm {
     const uint32_t *       B;
     const unsigned short * SB;
     float *                C;
-    int                    M, N, NP, K, ldc;
+    const float *          other;
+    int                    M, N, NP, K, ldc, postop;
     bool                   st2d;  // C is a valid 2D surface
     float *                part;  // with ks > 1: per K-slice results [ks][M][NP], summed by launch_gemm
     int                    ks;
@@ -766,7 +909,9 @@ template <int FMT, int MT_M, int MT_N, int WG_M, int WG_N> struct gemm {
         // a K slice writes its partial result; launch_gemm adds the slices up
         float * out = ks > 1 ? part + (size_t) kz * M * NP : C;
         const int  ldo = ks > 1 ? NP : ldc;
-        const bool s2d = ks > 1 || st2d;
+        // an epilogue is applied per element on the way out, so acc stays whole for the 2D store
+        const int  epi = ks > 1 ? EPI_NONE : postop;
+        const bool s2d = ks > 1 || (st2d && epi == EPI_NONE);
         if (s2d) {
             const surf sc(out, N * 4, M, ldo * 4);
 #pragma unroll
@@ -786,7 +931,7 @@ template <int FMT, int MT_M, int MT_N, int WG_M, int WG_N> struct gemm {
                     for (int r = 0; r < 8; ++r) {
                         const int m = m0 + 8 * i + r;
                         if (m < M && n < N) {
-                            out[(size_t) m * ldo + n] = acc[i][j][r];
+                            out[(size_t) m * ldo + n] = epilogue(acc[i][j][r], other, (size_t) m * ldo + n, epi);
                         }
                     }
                 }
@@ -806,7 +951,8 @@ struct args {
     const uint32_t *       B;
     const unsigned short * SB;
     float *                C;
-    int                    M, N, NP, K, ldc;
+    const float *          other;
+    int                    M, N, NP, K, ldc, postop;
     bool                   st2d;
     ggml_sycl_pool *       pool;     // for the K-slice partials
     int                    threads;  // hardware threads of the device
@@ -817,7 +963,7 @@ template <int FMT, int SGM, int NSG, int LS, int U> static void launch_gemv(cons
     const size_t wgn = 16 * NSG;
     const sycl::range<2> local(1, kern::WG);
     const sycl::range<2> global((a.M + SGM - 1) / SGM, (a.N + wgn - 1) / wgn * kern::WG);
-    stream->parallel_for(sycl::nd_range<2>(global, local), kern{ a.Aq, a.SA, a.B, a.SB, a.C, a.M, a.N, a.NP, a.K, a.ldc });
+    stream->parallel_for(sycl::nd_range<2>(global, local), kern{ a.Aq, a.SA, a.B, a.SB, a.C, a.other, a.M, a.N, a.NP, a.K, a.ldc, a.postop });
 }
 
 template <int FMT, int MT_M, int MT_N, int WG_M, int WG_N> static void launch_gemm(const args & a, dpct::queue_ptr stream) {
@@ -832,11 +978,13 @@ template <int FMT, int MT_M, int MT_N, int WG_M, int WG_N> static void launch_ge
     }
     const sycl::range<2> local(1, kern::WG);
     const sycl::range<2> global((size_t) mtiles * ks, (size_t) ntiles * kern::WG);
-    stream->parallel_for(sycl::nd_range<2>(global, local), kern{ a.Aq, a.SA, a.B, a.SB, a.C, a.M, a.N, a.NP, a.K, a.ldc, a.st2d, part.ptr, ks });
+    stream->parallel_for(sycl::nd_range<2>(global, local), kern{ a.Aq, a.SA, a.B, a.SB, a.C, a.other, a.M, a.N, a.NP, a.K, a.ldc, a.postop, a.st2d, part.ptr, ks });
     if (ks > 1) {
         const float * p   = part.ptr;
         float *       C   = a.C;
         const int     M   = a.M, N = a.N, NP = a.NP, ldc = a.ldc;
+        const float * other  = a.other;
+        const int     postop = a.postop;
         stream->parallel_for(sycl::range<1>((size_t) M * N), [=](sycl::item<1> it) {
             const int m = it[0] / N;
             const int n = it[0] % N;
@@ -844,7 +992,8 @@ template <int FMT, int MT_M, int MT_N, int WG_M, int WG_N> static void launch_ge
             for (int k = 0; k < ks; ++k) {
                 v += p[((size_t) k * M + m) * NP + n];
             }
-            C[(size_t) m * ldc + n] = v;
+            const size_t i = (size_t) m * ldc + n;
+            C[i]           = epilogue(v, other, i, postop);
         });
     }
 }
@@ -920,20 +1069,46 @@ static sycl::event reorder_ptq1_0(const uint8_t * src, uint8_t * dst, int ncols,
 // M at or below this uses the GEMV kernel
 static constexpr int GEMV_MAX_M = 8;
 
-// src1 quantized to int8 with one scale per 128 values
+// src1 quantized to int8 with one scale per 128 values; shared by every weight that reads src1
 struct act_q {
     ggml_sycl_pool_alloc<int8_t> aq;
     ggml_sycl_pool_alloc<float>  sa;
     int                          M, K;
     int                          fmt;  // weight format whose K order the activation is in
 
-    act_q(ggml_backend_sycl_context & ctx, const ggml_tensor * src1, int fmt) : aq(ctx.pool()), sa(ctx.pool()), fmt(fmt) {
+    act_q(ggml_backend_sycl_context & ctx, ggml_sycl_pool & pool, const ggml_tensor * src1, const float * had_signs,
+          int fmt) :
+        aq(pool),
+        sa(pool),
+        fmt(fmt) {
         GGML_ASSERT(src1->type == GGML_TYPE_F32 && src1->nb[0] == sizeof(float));
         GGML_ASSERT(src1->ne[0] % GS == 0);
         M = src1->ne[1] * src1->ne[2] * src1->ne[3];
         K = src1->ne[0];
         aq.alloc((size_t) M * K);
         sa.alloc((size_t) (K / GS) * ldsa(M));
+
+        if (had_signs) {
+            GGML_ASSERT(K % quant_a_had::HN == 0);
+            const quant_a_had q{ (const float *) src1->data,
+                                 had_signs,
+                                 sa.get(),
+                                 aq.get(),
+                                 nullptr,
+                                 M,
+                                 K,
+                                 (int) src1->ne[1],
+                                 (int) src1->ne[2],
+                                 (int64_t) (src1->nb[1] / sizeof(float)),
+                                 (int64_t) (src1->nb[2] / sizeof(float)),
+                                 (int64_t) (src1->nb[3] / sizeof(float)),
+                                 fmt == FMT_PTQ1 };
+            ctx.stream()->parallel_for(
+                sycl::nd_range<2>(sycl::range<2>(M, (K / quant_a_had::HN) * quant_a_had::NT),
+                                  sycl::range<2>(1, quant_a_had::NT)),
+                q);
+            return;
+        }
 
         const quant_a q{ (const float *) src1->data,
                          sa.get(),
@@ -950,7 +1125,7 @@ struct act_q {
     }
 };
 
-// out is M x N floats with row stride ldc
+// out (and other) are M x N floats with row stride ldc
 static int fmt_of(ggml_type type) {
     GGML_ASSERT(type == GGML_TYPE_PQ2_0 || type == GGML_TYPE_PTQ1_0);
     return type == GGML_TYPE_PTQ1_0 ? FMT_PTQ1 : FMT_PQ2;
@@ -988,7 +1163,8 @@ template <int FMT> static void launch(const args & a, int ls, dpct::queue_ptr st
     }
 }
 
-static void run(ggml_backend_sycl_context & ctx, const ggml_tensor * w, const act_q & q, float * out, int ldc) {
+static void run(ggml_backend_sycl_context & ctx, const ggml_tensor * w, const act_q & q, float * out, int ldc,
+                int postop, const float * other) {
     GGML_ASSERT(w->ne[0] == q.K);
     const int fmt = fmt_of(w->type);
     GGML_ASSERT(fmt == q.fmt);
@@ -1007,11 +1183,13 @@ static void run(ggml_backend_sycl_context & ctx, const ggml_tensor * w, const ac
                   (const uint32_t *) w->data,
                   (const unsigned short *) ((const char *) w->data + (size_t) (K / 16) * NP * sizeof(uint32_t)),
                   out,
+                  other,
                   M,
                   N,
                   NP,
                   K,
                   ldc,
+                  postop,
                   st2d,
                   &ctx.pool(),
                   0 };
@@ -1037,6 +1215,33 @@ static void run(ggml_backend_sycl_context & ctx, const ggml_tensor * w, const ac
 }
 
 }  // namespace ggml_sycl_xmx
+
+static_assert((int) GGML_SYCL_XMX_EPI_NONE == ggml_sycl_xmx::EPI_NONE &&
+              (int) GGML_SYCL_XMX_EPI_SWIGLU == ggml_sycl_xmx::EPI_SWIGLU &&
+              (int) GGML_SYCL_XMX_EPI_ADD == ggml_sycl_xmx::EPI_ADD, "epilogue numbering");
+
+struct ggml_sycl_pq2_xmx_act {
+    ggml_sycl_xmx::act_q q;
+
+    ggml_sycl_pq2_xmx_act(ggml_backend_sycl_context & ctx, const ggml_tensor * x, const float * had_signs,
+                      ggml_type wtype) :
+        q(ctx, ctx.xmx_act_pool(), x, had_signs, ggml_sycl_xmx::fmt_of(wtype)) {}
+};
+
+ggml_sycl_pq2_xmx_act * ggml_sycl_pq2_xmx_act_quantize(ggml_backend_sycl_context & ctx, const ggml_tensor * x,
+                                                       const float * had_signs, ggml_type wtype) {
+    return new ggml_sycl_pq2_xmx_act(ctx, x, had_signs, wtype);
+}
+
+void ggml_sycl_pq2_xmx_act_free(ggml_sycl_pq2_xmx_act * act) {
+    delete act;
+}
+
+void ggml_sycl_pq2_xmx_mul_mat_act(ggml_backend_sycl_context & ctx, const ggml_tensor * w,
+                                   const ggml_sycl_pq2_xmx_act * act, float * dst, int ldc, int epi,
+                                   const float * other) {
+    ggml_sycl_xmx::run(ctx, w, act->q, dst, ldc, epi, other);
+}
 
 bool ggml_sycl_pq2_xmx_supports_ne0(int64_t ne0) {
     return ne0 % QK_PQ2_0 == 0;
@@ -1066,8 +1271,31 @@ bool ggml_sycl_pq2_xmx_reorder(ggml_tensor * src0, dpct::queue_ptr stream) {
 void ggml_sycl_pq2_xmx_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                                ggml_tensor * dst) {
     GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst));
-    const ggml_sycl_xmx::act_q q(ctx, src1, ggml_sycl_xmx::fmt_of(src0->type));
-    ggml_sycl_xmx::run(ctx, src0, q, (float *) dst->data, (int) dst->ne[0]);
+    const ggml_sycl_xmx::act_q q(ctx, ctx.pool(), src1, nullptr, ggml_sycl_xmx::fmt_of(src0->type));
+    ggml_sycl_xmx::run(ctx, src0, q, (float *) dst->data, (int) dst->ne[0], ggml_sycl_xmx::EPI_NONE, nullptr);
+}
+
+void ggml_sycl_pq2_xmx_hadamard_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * x, const float * signs,
+                                     float * dst) {
+    using ggml_sycl_xmx::quant_a_had;
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && x->ne[0] % quant_a_had::HN == 0);
+    const int         M = x->ne[1] * x->ne[2] * x->ne[3];
+    const int         K = x->ne[0];
+    const quant_a_had q{ (const float *) x->data,
+                         signs,
+                         nullptr,
+                         nullptr,
+                         dst,
+                         M,
+                         K,
+                         (int) x->ne[1],
+                         (int) x->ne[2],
+                         (int64_t) (x->nb[1] / sizeof(float)),
+                         (int64_t) (x->nb[2] / sizeof(float)),
+                         (int64_t) (x->nb[3] / sizeof(float)) };
+    ctx.stream()->parallel_for(sycl::nd_range<2>(sycl::range<2>(M, (K / quant_a_had::HN) * quant_a_had::NT),
+                                                 sycl::range<2>(1, quant_a_had::NT)),
+                               q);
 }
 
 #else
@@ -1085,6 +1313,22 @@ bool ggml_sycl_pq2_xmx_reorder(ggml_tensor *, dpct::queue_ptr) {
 }
 
 void ggml_sycl_pq2_xmx_mul_mat(ggml_backend_sycl_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) {
+    GGML_ABORT("PQ2_0 XMX path is not built in");
+}
+
+ggml_sycl_pq2_xmx_act * ggml_sycl_pq2_xmx_act_quantize(ggml_backend_sycl_context &, const ggml_tensor *, const float *,
+                                                       ggml_type) {
+    GGML_ABORT("PQ2_0 XMX path is not built in");
+}
+
+void ggml_sycl_pq2_xmx_act_free(ggml_sycl_pq2_xmx_act *) {}
+
+void ggml_sycl_pq2_xmx_mul_mat_act(ggml_backend_sycl_context &, const ggml_tensor *, const ggml_sycl_pq2_xmx_act *,
+                                   float *, int, int, const float *) {
+    GGML_ABORT("PQ2_0 XMX path is not built in");
+}
+
+void ggml_sycl_pq2_xmx_hadamard_fwht(ggml_backend_sycl_context &, const ggml_tensor *, const float *, float *) {
     GGML_ABORT("PQ2_0 XMX path is not built in");
 }
 #endif // __INTEL_LLVM_COMPILER && !GGML_SYCL_NO_PQ2_XMX
