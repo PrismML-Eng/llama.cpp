@@ -1702,6 +1702,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"-cent", "--checkpoint-every-nt"}, "N",
+        string_format("also create a context checkpoint inside a long message every N prompt tokens, so a later prompt\n"
+                      "that diverges inside that message restores the nearest checkpoint instead of processing the whole\n"
+                      "prompt again (hybrid / recurrent models; default: %d, 0 = only at user messages and the prompt end)",
+                      params.checkpoint_every_nt),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("checkpoint-every-nt must be non-negative");
+            }
+            params.checkpoint_every_nt = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CHECKPOINT_EVERY_NT"));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
