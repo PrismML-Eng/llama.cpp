@@ -22,6 +22,7 @@
 #include <cinttypes>
 #include <exception>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <filesystem>
 #include <utility>
@@ -207,9 +208,6 @@ struct server_slot {
     // speculative decoding
     common_speculative * spec;
     int32_t spec_depth_max = 0; // no drafting once the sequence is longer than this (0 = always draft)
-    int32_t spec_n_max       = 0; // draft size (--spec-draft-n-max) below spec_tail_depth
-    int32_t spec_n_max_tail  = 0; // draft size from spec_tail_depth on (--spec-draft-n-max-tail, 0 = spec_n_max)
-    int32_t spec_tail_depth  = 0; // start of the tiered-KV host tail (--kv-vram-cells, 0 = none)
 
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
@@ -460,14 +458,6 @@ struct server_slot {
 
         if (n_remaining() > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
-        }
-
-        // past the tiered-KV line a step is bound by reading the host tail over PCIe, and a wider verify
-        // batch reads it once for all columns: draft --spec-draft-n-max-tail there, --spec-draft-n-max below
-        const bool tail = spec_tail_depth > 0 && spec_n_max_tail > 0 && prompt.n_tokens() >= spec_tail_depth;
-        const int32_t cap = tail ? spec_n_max_tail : spec_n_max;
-        if (cap > 0) {
-            n_draft_max = std::min(n_draft_max, (int) cap);
         }
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
@@ -861,7 +851,6 @@ private:
     llama_context * ctx_dft   = nullptr;
 
     common_speculative_init_result_ptr spec_init;
-    int32_t spec_n_max = 0; // --spec-draft-n-max as given (the drafter is built for max(n_max, n_max_tail))
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -984,11 +973,6 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
-
-        // the drafter and the output limits are built for the larger of the two draft sizes; each slot caps a
-        // draft to --spec-draft-n-max below the tiered-KV line (see server_slot::get_n_draft_max)
-        spec_n_max = params_base.speculative.draft.n_max;
-        params_base.speculative.draft.n_max = std::max(params_base.speculative.draft.n_max, params_base.speculative.draft.n_max_tail);
 
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
@@ -1263,10 +1247,7 @@ private:
             slot.ctx_dft = ctx_dft;
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
-            slot.spec_depth_max  = params_base.speculative.draft.n_depth_max;
-            slot.spec_n_max      = spec_n_max;
-            slot.spec_n_max_tail = params_base.speculative.draft.n_max_tail;
-            slot.spec_tail_depth = params_base.n_kv_vram_cells;
+            slot.spec_depth_max = params_base.speculative.draft.n_depth_max;
             slot.n_ctx   = n_ctx_slot;
 
             slot.stats.speculative = slot.can_speculate();
@@ -3696,18 +3677,27 @@ private:
             }
         }
 
-        // --spec-draft-window: before feeding this view to the draft context, drop its rows older than the window.
-        // The draft context is sized for the window (common_speculative_init), so freed cells are reused and its
-        // attention span stays short; the MTP head predicts the next few tokens from recent context.
+        // --spec-draft-window: before feeding this view to the draft context, drop the rows of each sequence in the
+        // view that are older than the window, measured from that sequence's first position in the view. Sequences
+        // that are not in the view keep their rows. The draft context is sized for the window
+        // (common_speculative_init), so freed cells are reused and its attention span stays short.
         if (spec_process && ctx_dft && params_base.speculative.draft.n_window > 0) {
-            llama_pos pos_min = std::numeric_limits<llama_pos>::max();
+            std::map<llama_seq_id, llama_pos> seq_pos_min;
             for (int i = 0; i < batch_view.n_tokens; ++i) {
-                pos_min = std::min(pos_min, batch_view.pos[i]);
+                for (int j = 0; j < batch_view.n_seq_id[i]; ++j) {
+                    const llama_seq_id sid = batch_view.seq_id[i][j];
+                    auto it = seq_pos_min.find(sid);
+                    if (it == seq_pos_min.end()) {
+                        seq_pos_min.emplace(sid, batch_view.pos[i]);
+                    } else {
+                        it->second = std::min(it->second, batch_view.pos[i]);
+                    }
+                }
             }
-            const llama_pos hi = pos_min - params_base.speculative.draft.n_window;
-            if (hi > 0) {
-                for (auto & slot : slots) {
-                    llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, 0, hi);
+            for (const auto & [sid, pos_min] : seq_pos_min) {
+                const llama_pos hi = pos_min - params_base.speculative.draft.n_window;
+                if (hi > 0) {
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), sid, 0, hi);
                 }
             }
         }

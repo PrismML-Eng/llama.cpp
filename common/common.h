@@ -341,10 +341,6 @@ struct common_params_speculative_draft {
     // drafts as the full history at 131k.
     int32_t n_window = 0;
 
-    // draft size once the sequence reaches the tiered-KV line (--kv-vram-cells; 0 = n_max). Past it a step
-    // is bound by reading the host tail over PCIe and a wider verify batch reads it once for all columns.
-    int32_t n_max_tail = 0;
-
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     common_params_model mparams;
