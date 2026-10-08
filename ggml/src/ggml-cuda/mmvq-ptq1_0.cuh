@@ -25,8 +25,11 @@
 #pragma once
 
 #include "common.cuh"
+#include "l2-hint.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+
+#include <algorithm>
 
 #define PTQ1_0_PT_PLANES 9
 
@@ -35,6 +38,13 @@
 #define PTQ1_0_PT_MAX_ROWS     16
 #define PTQ1_0_PT_MAX_COLS     8    // equals MMVQ_MAX_BATCH_SIZE, checked in mmvq.cu
 #define PTQ1_0_PT_SMEM_FLOATS  4096 // 16 KiB target when choosing rows per CTA; the launch may request more for one item
+
+// L2 prefetch of the next mat-vec's weights by the last CTAs of the running kernel (see mul_mat_vec_ptq1_0_pt and
+// ggml_cuda_l2_hint_for_node): percent of the next tensor and upper bound in bytes. One CTA per SM prefetches.
+// 8 MiB costs nothing on an RTX 4070 (36 MiB L2, measured). Other GPUs get 2 MiB, not measured there.
+#define PTQ1_0_L2_PREFETCH_PCT       50
+#define PTQ1_0_L2_PREFETCH_BYTES_ADA (8u << 20)
+#define PTQ1_0_L2_PREFETCH_BYTES     (2u << 20)
 
 // the PT path is CUDA only; HIP keeps the block_q8_1 layout and the old vec_dot
 static constexpr __host__ __device__ bool ptq1_0_pt_enabled() {
@@ -298,7 +308,8 @@ static __global__ void mul_mat_vec_ptq1_0_pt(
         const void * vx_, const void * vy_, const ggml_cuda_mm_fusion_args_device fusion,
         float * dst_,
         const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
-        const int rows_per_cta, const uint3 bpr_fd, const uint3 rpc_fd, const bool invariant) {
+        const int rows_per_cta, const uint3 bpr_fd, const uint3 rpc_fd, const bool invariant,
+        const char * pf_ptr, const int pf_lines_per_cta, const int pf_ctas) {
     // GGML_CUDA_RESTRICT stays off the formal parameters: cudafe's host stub drops __restrict
     // from the explicit specialization and MSVC/GCC then reject it (C2912 / "does not match
     // any template declaration") when compiling sm_90/sm_120. Same pattern as mul_mat_vec_q.
@@ -363,6 +374,15 @@ static __global__ void mul_mat_vec_ptq1_0_pt(
                     partials_gate[(j*rows_per_cta + rg*ROWS + i)*bprp + kbx] = dots[j][i];
                 }
             }
+        }
+    }
+
+    // the last CTAs have finished their loads and the DRAM is about to go idle: pull the head of the next
+    // mat-vec's weights into L2 (prefetch.global.L2 keeps the loads off the critical path of this kernel)
+    if (pf_ptr != nullptr && (int) blockIdx.x + pf_ctas >= (int) gridDim.x) {
+        const char * pf = pf_ptr + (size_t) ((int) blockIdx.x - ((int) gridDim.x - pf_ctas)) * pf_lines_per_cta * 128;
+        for (int i = tid; i < pf_lines_per_cta; i += PTQ1_0_PT_THREADS) {
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(pf + (size_t) i * 128));
         }
     }
 
@@ -504,10 +524,24 @@ static void mul_mat_vec_ptq1_0_pt_launch(
     const size_t smem = ptq1_0_pt_smem_bytes(bpr, ncols, nrows_x, has_gate);
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, smem, stream);
 
+    // L2 prefetch of the next mat-vec's weights (hint from the node loop)
+    const char * pf_ptr = nullptr;
+    int pf_lines_per_cta = 0;
+    const auto & pf_dev = ggml_cuda_info().devices[ggml_cuda_get_device()];
+    const int pf_ctas = std::min(pf_dev.nsm, (int) block_nums.x);
+    if (g_ggml_cuda_l2_hint.ptr != nullptr) {
+        const size_t pf_cap = pf_dev.cc == GGML_CUDA_CC_ADA_LOVELACE ? PTQ1_0_L2_PREFETCH_BYTES_ADA : PTQ1_0_L2_PREFETCH_BYTES;
+        const size_t pf_bytes = std::min(g_ggml_cuda_l2_hint.bytes / 100 * PTQ1_0_L2_PREFETCH_PCT, pf_cap);
+        pf_lines_per_cta = (int) (pf_bytes / 128 / pf_ctas);
+        if (pf_lines_per_cta > 0) {
+            pf_ptr = g_ggml_cuda_l2_hint.ptr;
+        }
+    }
+
 #define PTQ1_0_PT_LAUNCH(FUS, GATE)                                                                                      \
     ggml_cuda_kernel_launch(mul_mat_vec_ptq1_0_pt<ncols, ROWS, FUS, GATE>, lp,                                           \
         vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, rows_per_cta, bpr_fd, rpc_fd, \
-        ggml_cuda_batch_invariant())
+        ggml_cuda_batch_invariant(), pf_ptr, pf_lines_per_cta, pf_ctas)
 
     if (has_fusion) {
         GGML_ASSERT(ncols == 1 && "fusion only supported for ncols_dst=1");
