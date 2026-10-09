@@ -774,6 +774,8 @@ jobs:
           name: llama-${{ steps.tag.outputs.name }}-xcframework.zip
 
   windows-sycl:
+    permissions:
+      contents: read
     runs-on: windows-2022
 
     defaults:
