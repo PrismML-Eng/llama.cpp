@@ -13,6 +13,7 @@
 #include <cstring>
 #include <atomic>
 #include <mutex>
+#include <vector>
 
 namespace {
 
@@ -317,10 +318,162 @@ void gemv_multi(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, int nm,
 }  // namespace
 
 namespace {
+// ARC-LAB: GGML_SYCL_PTQ1_T2_TUNED=1 (default 0): per-shape GEMV tiles for 1..8 rows from the B580 sweep
+// (/lab/exp/gemv-sweep, README "Mapping a winner into the fork"). A row of t2_tuned_table matches a launch by
+// (N, K, rows, multi), N = the sum of the members' N for a same-input merged launch; no match = the default tiles above.
+// =2 is a plumbing self-test (default tiles through the tuned launcher, outputs must not change).
+// The tile is Gemv<SGM, NSG, LS, U> under a GRF mode (0 = no property, as Gemv; 128 / 256; 1 = grf_size_automatic) and
+// a work-group order (0 = row-group outer, as the default path; 1 = the row-groups of a column block adjacent, so with
+// SGM < rows the repeated weight reads hit L2). Same struct as gsw::Sweep in the sweep (sweep_kern.hpp): keep them equal.
+template <int GRF, int WG> constexpr auto t2_tuned_props() {
+    namespace syclex  = sycl::ext::oneapi::experimental;
+    namespace intelex = sycl::ext::intel::experimental;
+    if constexpr (GRF == 128 || GRF == 256) {
+        return syclex::properties{ syclex::sub_group_size<16>, syclex::work_group_size<1, WG>, intelex::grf_size<GRF> };
+    } else if constexpr (GRF == 1) {
+        return syclex::properties{ syclex::sub_group_size<16>, syclex::work_group_size<1, WG>,
+                                   intelex::grf_size_automatic };
+    } else {
+        return syclex::properties{ syclex::sub_group_size<16>, syclex::work_group_size<1, WG> };
+    }
+}
+
+template <int SGM, int NSG, int LS, int U, int GRF>
+struct GemvTuned {
+    using Kern = int8dpas::Gemv<false, 0, SGM, NSG, LS, U>;
+    Kern k0, k1, k2;
+    int  gs1, gs2;  // first column-group of members 1 and 2 (past the end when absent)
+    int  R, C;      // row-groups, column-groups (all members)
+    int  ord;
+    void operator()(sycl::nd_item<2> it) const {
+        const int  g  = (int) it.get_group(1);
+        const int  g0 = ord ? g % R : g / C;
+        const int  g1 = ord ? g / R : g % C;
+        const bool a = g1 < gs1, b = !a && g1 < gs2;
+        const Kern k = a ? k0 : (b ? k1 : k2);  // one call site of run (see GemvMulti)
+        k.run(it, g0, g1 - (a ? 0 : (b ? gs1 : gs2)));
+    }
+    auto get(int8dpas::syclex::properties_tag) const { return t2_tuned_props<GRF, Kern::WG>(); }
+};
+
+template <int SGM, int NSG, int LS, int U, int GRF>
+void gemv_tuned(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, int nm, const uint32_t * const * B,
+                const uint16_t * const * SB, float * const * C, const int * N, int M, int K, int ord) {
+    using T        = GemvTuned<SGM, NSG, LS, U, GRF>;
+    using Kern     = typename T::Kern;
+    const int  wgn = 16 * NSG;
+    const Epi  epi{ nullptr, nullptr, 0, 1 };
+    int        gs[4] = { 0, 0, 0, 0 };
+    Kern       k[3];
+    for (int m = 0; m < 3; ++m) {
+        const int mm = m < nm ? m : 0;
+        k[m]         = Kern{ nullptr, (const signed char *) Aq, SA, B[mm], SB[mm], C[mm], epi, M, N[mm], K };
+        gs[m + 1]    = gs[m] + (m < nm ? (N[m] + wgn - 1) / wgn : 0);
+    }
+    const int R = (M + SGM - 1) / SGM, Ct = gs[nm];
+    const T   f{ k[0], k[1], k[2], nm > 1 ? gs[1] : Ct + 1, nm > 2 ? gs[2] : Ct + 1, R, Ct, ord };
+    q.parallel_for(sycl::nd_range<2>({ 1, (size_t) R * Ct * Kern::WG }, { 1, (size_t) Kern::WG }), f);
+}
+
+// the compiled tiles: X(SGM, NSG, LS, U, GRF), one line per tile a table row uses (a row whose tile is not listed here is
+// skipped with a warning)
+#define T2_TUNED_KERNELS(X)
+
+struct t2_tuned_kernel {
+    int sgm, nsg, ls, u, grf;
+    void (*fn)(sycl::queue &, const int8_t *, const uint16_t *, int, const uint32_t * const *, const uint16_t * const *,
+               float * const *, const int *, int, int, int);
+};
+#define T2_TUNED_X(a, b, c, d, e) t2_tuned_kernel{ a, b, c, d, e, gemv_tuned<a, b, c, d, e> },
+const std::vector<t2_tuned_kernel> & t2_tuned_kernels() {
+    static const std::vector<t2_tuned_kernel> k = { T2_TUNED_KERNELS(T2_TUNED_X) };
+    return k;
+}
+#undef T2_TUNED_X
+
+struct t2_tuned_row {
+    int N, K, M, multi;          // launch: N (sum over members if merged), K, rows (1..8), merged launch (0/1)
+    int sgm, nsg, ls, u, grf, ord;  // tile
+};
+// rows from the sweep's summary ("fork table rows"); empty = GGML_SYCL_PTQ1_T2_TUNED=1 changes nothing
+const std::vector<t2_tuned_row> & t2_tuned_table() {
+    static const std::vector<t2_tuned_row> t = {
+        // { N, K, M, multi, SGM, NSG, LS, U, GRF, ord },
+    };
+    return t;
+}
+
+bool t2_tuned_on() {
+    return ggml_sycl_knob("GGML_SYCL_PTQ1_T2_TUNED", 0) != 0;
+}
+
+// GGML_SYCL_PTQ1_T2_TUNED=2: plumbing self-test, every 1..8-row GEMV through gemv_tuned with the default tile (same LS,
+// so outputs must be token-identical to =0)
+template <int SGM, int NSG>
+void t2_tuned_selftest_ls(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, int nm, const uint32_t * const * B,
+                          const uint16_t * const * SB, float * const * C, const int * N, int M, int K, bool ls4) {
+    ls4 ? gemv_tuned<SGM, NSG, 4, 2, 0>(q, Aq, SA, nm, B, SB, C, N, M, K, 0) :
+          gemv_tuned<SGM, NSG, 2, 2, 0>(q, Aq, SA, nm, B, SB, C, N, M, K, 0);
+}
+
+template <int NSG>
+void t2_tuned_selftest(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, int nm, const uint32_t * const * B,
+                       const uint16_t * const * SB, float * const * C, const int * N, int M, int K, bool ls4) {
+    if (M == 1) {
+        t2_tuned_selftest_ls<1, NSG>(q, Aq, SA, nm, B, SB, C, N, M, K, ls4);
+    } else if (M == 2) {
+        t2_tuned_selftest_ls<2, NSG>(q, Aq, SA, nm, B, SB, C, N, M, K, ls4);
+    } else if (M <= 4) {
+        t2_tuned_selftest_ls<4, NSG>(q, Aq, SA, nm, B, SB, C, N, M, K, ls4);
+    } else {
+        t2_tuned_selftest_ls<8, NSG>(q, Aq, SA, nm, B, SB, C, N, M, K, ls4);
+    }
+}
+
+// launches the tuned tile for this GEMV if the table has one; false = take the default path
+bool t2_tuned(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, int nm, const uint32_t * const * B,
+              const uint16_t * const * SB, float * const * C, const int * N, int M, int K) {
+    const int mode = ggml_sycl_knob("GGML_SYCL_PTQ1_T2_TUNED", 0);
+    if (mode == 0) {
+        return false;
+    }
+    int ntot = 0, nmax = 0;
+    for (int m = 0; m < nm; ++m) {
+        ntot += N[m];
+        nmax = std::max(nmax, N[m]);
+    }
+    if (mode == 2) {
+        // NSG as the default path: 2, or GGML_SYCL_PTQ1_T2_NSG=4 for 2..8 rows
+        (M > 1 && t2_nsg() == 4 ? t2_tuned_selftest<4> : t2_tuned_selftest<2>)(q, Aq, SA, nm, B, SB, C, N, M, K,
+                                                                               nmax <= 8192);
+        return true;
+    }
+    for (const t2_tuned_row & r : t2_tuned_table()) {
+        if (r.N != ntot || r.K != K || r.M != M || r.multi != (nm > 1)) {
+            continue;
+        }
+        for (const t2_tuned_kernel & k : t2_tuned_kernels()) {
+            if (k.sgm == r.sgm && k.nsg == r.nsg && k.ls == r.ls && k.u == r.u && k.grf == r.grf) {
+                k.fn(q, Aq, SA, nm, B, SB, C, N, M, K, r.ord);
+                return true;
+            }
+        }
+        static std::atomic<bool> warned{ false };
+        if (!warned.exchange(true)) {
+            GGML_LOG_WARN("%s: tuned tile %d.%d.%d.%d.%d for N=%d K=%d M=%d is not in T2_TUNED_KERNELS, default tile\n",
+                          __func__, r.sgm, r.nsg, r.ls, r.u, r.grf, r.N, r.K, r.M);
+        }
+        return false;
+    }
+    return false;
+}
+
 void t2_dispatch(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const uint32_t * B, const uint16_t * SB,
                  float * dst, int m, int n, int k, bool use_gemm) {
     if (use_gemm) {
         gemm(q, Aq, SA, B, SB, dst, m, n, k);
+    } else if (t2_tuned(q, Aq, SA, 1, &B, &SB, &dst, &n, m, k)) {
+        // tuned tile
     } else if (m == 1) {
         n <= 8192 ? gemv<1, 4>(q, Aq, SA, B, SB, dst, m, n, k) : gemv<1, 2>(q, Aq, SA, B, SB, dst, m, n, k);
     } else if (t2_nsg() == 4) {
@@ -601,6 +754,9 @@ bool ggml_sycl_t2_mul_mat_multi(sycl::queue & q, int nm, const void * const * w,
     }
     const int  m_ = (int) M, k_ = (int) K;
     const bool ls4 = nmax <= 8192;
+    if (t2_tuned(q, Aq, SA, nm, B, SB, C, Ni, m_, k_)) {
+        return true;
+    }
     if (M == 1) {
         ls4 ? gemv_multi<1, 4>(q, Aq, SA, nm, B, SB, C, Ni, m_, k_) : gemv_multi<1, 2>(q, Aq, SA, nm, B, SB, C, Ni, m_, k_);
     } else if (t2_nsg() == 4) {
@@ -647,6 +803,12 @@ void t2_precompile(sycl::queue & q) {
         gemv<2, 2, 4>(q, aq, sa, B, SB, d, 2, N, K);
         gemv<4, 2, 4>(q, aq, sa, B, SB, d, 4, N, K);
         gemv<8, 2, 4>(q, aq, sa, B, SB, d, 8, N, K);
+    }
+    if (t2_tuned_on()) {  // GGML_SYCL_PTQ1_T2_TUNED: JIT the table's tiles now, not at the first verify
+        for (const t2_tuned_kernel & t : t2_tuned_kernels()) {
+            const int nn = N;
+            t.fn(q, aq, sa, 1, &B, &SB, &d, &nn, 8, K, 0);
+        }
     }
     q.wait();
     sycl::free(w, q);
