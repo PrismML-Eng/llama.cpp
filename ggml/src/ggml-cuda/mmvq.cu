@@ -1,5 +1,6 @@
 #include "mmvq.cuh"
 #include "mmvq-ptq1_0.cuh"
+#include "mmvq-pq2_0.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1215,6 +1216,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const bool y_soa = y_layout == GGML_CUDA_Q8_1_SOA_ISUM;
 
 #if !defined(GGML_USE_HIP)
+    if constexpr (type == GGML_TYPE_PQ2_0) {
+        if (y_layout == GGML_CUDA_Q8_1_PQ2) {
+            // layout_host only picks PQ2 for plain 2D calls without fusion
+            GGML_ASSERT(!ids && nchannels_dst == 1 && nsamples_dst == 1 && !fusion.gate && !fusion.x_bias && !fusion.gate_bias);
+            mul_mat_vec_pq2_0_mc_switch(vx, vy, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst, stream);
+            return;
+        }
+    }
     if constexpr (type == GGML_TYPE_PTQ1_0) {
         // plain 2D PTQ1_0 mat-vec with 2-8 columns: dedicated kernel with full lane utilization,
         // see mmvq-ptq1_0.cuh. One column takes the SoA path in the generic kernel below.
@@ -1657,7 +1666,7 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     // Same (type, ncols_dst, ids) triple the kernel switch evaluates, so quantizer and kernel agree.
-    const ggml_cuda_q8_1_layout y_layout = ggml_cuda_q8_1_layout_host(src0->type, (int) (ids ? ne2 : ne11), ids != nullptr);
+    const ggml_cuda_q8_1_layout y_layout = ggml_cuda_q8_1_layout_host(src0->type, (int) (ids ? ne2 : ne11), ids != nullptr, ne12 == 1 && ne13 == 1);
 
     int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     if (y_layout == GGML_CUDA_Q8_1_SOA_ISUM) {

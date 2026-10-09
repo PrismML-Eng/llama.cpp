@@ -1055,6 +1055,7 @@ enum ggml_cuda_q8_1_layout : int {
     GGML_CUDA_Q8_1_AOS      = 0, // plain block_q8_1 array (every type except the PTQ1_0 cases below)
     GGML_CUDA_Q8_1_SOA_ISUM = 1, // PTQ1_0, one column: warp-transposed, exact int sums (ggml_cuda_ptq1_q8_word)
     GGML_CUDA_Q8_1_PT       = 2, // PTQ1_0, 2-8 columns or MoE ids: planar-transposed (mmvq-ptq1_0.cuh)
+    GGML_CUDA_Q8_1_PQ2      = 3, // PQ2_0, 3-8 columns, plain 2D, Ada: permuted qs plus half2 (d, int sum) per block (mmvq-pq2_0.cuh)
 };
 
 // Column-count helper, not the layout decision. 2-8 columns and MoE (ids) take the planar
@@ -1285,7 +1286,23 @@ int ggml_cuda_get_device();
 // Ampere (sm_80/86, including the 3060/3090/170HX): the #218 PT kernel wins at one column
 // too (+5.9% tg128 vs SoA on a 3060). Ada and newer keep SOA_ISUM at one column (4070 win).
 // Lives here, after ggml_cuda_info(), because the body reads the current device's cc.
-static inline ggml_cuda_q8_1_layout ggml_cuda_q8_1_layout_host(ggml_type type_src0, int ncols_dst, bool has_ids) {
+// PQ2_0 multi-column mat-vec (mmvq-pq2_0.cuh): Ada only, plain 2D (no ids, no batch dims), 3-8 columns.
+// Batch invariance keeps the generic kernel.
+static inline bool ggml_cuda_pq2_multicol(int ncols_dst) {
+#if defined(GGML_USE_HIP)
+    GGML_UNUSED(ncols_dst);
+    return false;
+#else
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    return !ggml_cuda_batch_invariant() && GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ADA_LOVELACE &&
+        ncols_dst >= 3 && ncols_dst <= 8;
+#endif
+}
+
+static inline ggml_cuda_q8_1_layout ggml_cuda_q8_1_layout_host(ggml_type type_src0, int ncols_dst, bool has_ids, bool plain_2d = true) {
+    if (type_src0 == GGML_TYPE_PQ2_0 && plain_2d && !has_ids && ggml_cuda_pq2_multicol(ncols_dst)) {
+        return GGML_CUDA_Q8_1_PQ2;
+    }
     const ggml_cuda_q8_1_layout l = ggml_cuda_q8_1_layout_for(type_src0, ncols_dst, has_ids);
     if (l == GGML_CUDA_Q8_1_SOA_ISUM && ggml_cuda_batch_invariant()) {
         return GGML_CUDA_Q8_1_PT;

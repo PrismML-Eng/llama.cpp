@@ -59,6 +59,9 @@ static __device__ __forceinline__ float nvfp4_native_scale_error(
 //            quantized values bit-cast into ds.y; the 1-column PTQ1_0 vec-dot folds the digit bias
 //            {0,1,2} -> {-1,0,+1} into one subtraction per 32-block instead of a SIMD byte
 //            subtract per 4 weights (bit-identical to the biased path)
+//   PQ2      PQ2_0, 3-8 columns: qs bytes of a column first (permuted inside each 16-element group so that
+//            (code_word >> 2k) & 0x03030303 lines up with the activation bytes), then one half2 (d, raw int sum
+//            of q) per 32-block (see mmvq-pq2_0.cuh)
 //   PT       planar-transposed layout consumed by the 2-8 column PTQ1_0 mat-vec path
 //            (see mmvq-ptq1_0.cuh); same quantization, same bytes per row as block_q8_1, and the
 //            same exact integer sum in ds.y as SOA_ISUM so that kernel can also use unbiased trits
@@ -121,6 +124,26 @@ static __global__ void quantize_q8_1(
 
         // |isum| <= 32*127 fits int16; keep the raw bits in the half slot (read back with __half_as_short).
         half2 * ds = (half2 *) (ycol + 8*nblk*16) + kb*4 + e / QK8_1;
+        *ds = make_half2(__float2half(d), __short_as_half((short) isum));
+        return;
+    }
+    if constexpr (layout == GGML_CUDA_Q8_1_PQ2) {
+        const int64_t row_cont = (i3*ne2.z + i2) * ne1 + i1;
+        char * ycol = (char *) vy + row_cont * (ne0 * 9 / 8); // same row stride as block_q8_1
+        const int64_t kb = i0 / QK8_1;
+        const int     e  = i0 % QK8_1;
+        // inside each 16-element group position (e % 4)*4 + (e % 16)/4 holds element e
+        ((int8_t *) ycol)[kb*QK8_1 + (e / 16)*16 + (e % 4)*4 + (e % 16)/4] = q;
+
+        int isum = q;
+        isum = warp_reduce_sum<QK8_1>(isum);
+
+        if (iqs > 0) {
+            return;
+        }
+
+        // |isum| <= 32*127 fits int16; keep the raw bits in the half slot.
+        half2 * ds = (half2 *) (ycol + ne0) + kb;
         *ds = make_half2(__float2half(d), __short_as_half((short) isum));
         return;
     }
@@ -876,6 +899,9 @@ void quantize_row_q8_1_cuda(
         case GGML_CUDA_Q8_1_SOA_ISUM:
             GGML_ASSERT(ne0 % GGML_CUDA_PTQ1_K_PAD == 0);
             ggml_cuda_kernel_launch(quantize_q8_1<GGML_CUDA_Q8_1_SOA_ISUM>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+            break;
+        case GGML_CUDA_Q8_1_PQ2:
+            ggml_cuda_kernel_launch(quantize_q8_1<GGML_CUDA_Q8_1_PQ2>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
             break;
         default:
             ggml_cuda_kernel_launch(quantize_q8_1<GGML_CUDA_Q8_1_AOS>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
