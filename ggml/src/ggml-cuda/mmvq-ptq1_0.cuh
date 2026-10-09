@@ -282,17 +282,27 @@ static __host__ int ptq1_0_pt_rows_per_cta(const int blocks_per_row, const int n
 #define PTQ1_0_PT_ROWS_34 4
 #endif
 
-// Same row-per-item rule the launcher instantiates. Batch 1 uses its tuned row tile;
-// multi-column paths retain their verified 4/2-row schedule.
+// Same row-per-item rule the launcher instantiates. Multi-column paths retain
+// their existing 4/2-row schedule.
 static constexpr __host__ __device__ int ptq1_0_pt_rows_per_item(const int ncols_dst) {
-    return ncols_dst == 1 ? PTQ1_0_PT_ROWS_1 : (ncols_dst <= 2 ? 4 : (ncols_dst <= 4 ? PTQ1_0_PT_ROWS_34 : 2));
+    return ncols_dst <= 2 ? 4 : (ncols_dst <= 4 ? PTQ1_0_PT_ROWS_34 : 2);
+}
+
+// The one-row tile is tuned on sm_86. Other devices keep the four-row baseline,
+// including Hopper when GGML_CUDA_BATCH_INVARIANT selects this planar path.
+static __host__ int ptq1_0_pt_rows_per_item_for_cc(const int ncols_dst, const int cc) {
+    if (ncols_dst == 1 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc == 860) {
+        return PTQ1_0_PT_ROWS_1;
+    }
+    return ptq1_0_pt_rows_per_item(ncols_dst);
 }
 
 // Bytes the launch requests: one fp32 partial per (column, row, K block + 1 pad) for the CTA,
 // twice that with gate fusion. The +1 is the odd stride the epilogue uses to avoid bank conflicts.
 // Guard and launcher both call this so a shape that would exceed smpb falls back to the generic kernel.
-static __host__ size_t ptq1_0_pt_smem_bytes(const int blocks_per_row, const int ncols_dst, const int nrows_x, const bool has_gate) {
-    const int rows_per_cta = ptq1_0_pt_rows_per_cta(blocks_per_row, ncols_dst, nrows_x, ptq1_0_pt_rows_per_item(ncols_dst));
+static __host__ size_t ptq1_0_pt_smem_bytes(const int blocks_per_row, const int ncols_dst, const int nrows_x,
+        const int rows_per_item, const bool has_gate) {
+    const int rows_per_cta = ptq1_0_pt_rows_per_cta(blocks_per_row, ncols_dst, nrows_x, rows_per_item);
     return (size_t) ncols_dst * rows_per_cta * (blocks_per_row + 1) * sizeof(float) * (has_gate ? 2 : 1);
 }
 
@@ -489,12 +499,11 @@ static __global__ void mul_mat_vec_ptq1_0_pt(
     }
 }
 
-template <int ncols>
+template <int ncols, int ROWS = ptq1_0_pt_rows_per_item(ncols)>
 static void mul_mat_vec_ptq1_0_pt_launch(
         const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
         const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
         cudaStream_t stream) {
-    constexpr int ROWS = ptq1_0_pt_rows_per_item(ncols);
     const int bpr = ncols_x / QK_PTQ1_0;
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
     const bool has_gate   = fusion.gate != nullptr;
@@ -505,7 +514,7 @@ static void mul_mat_vec_ptq1_0_pt_launch(
     const dim3 block_nums((nrows_x + rows_per_cta - 1) / rows_per_cta, 1, 1);
     const dim3 block_dims(PTQ1_0_PT_THREADS, 1, 1);
 
-    const size_t smem = ptq1_0_pt_smem_bytes(bpr, ncols, nrows_x, has_gate);
+    const size_t smem = ptq1_0_pt_smem_bytes(bpr, ncols, nrows_x, ROWS, has_gate);
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, smem, stream);
 
 #define PTQ1_0_PT_LAUNCH(FUS, GATE)                                                                                      \
@@ -536,12 +545,24 @@ static bool mul_mat_vec_ptq1_0_pt_switch(
         ncols_dst < 1 || ncols_dst > PTQ1_0_PT_MAX_COLS) {
         return false;
     }
-    const size_t smem = ptq1_0_pt_smem_bytes(ncols_x / QK_PTQ1_0, ncols_dst, nrows_x, fusion.gate != nullptr);
-    if (smem > ggml_cuda_info().devices[ggml_cuda_get_device()].smpb) {
+    const int device = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[device].cc;
+    const int rows_per_item = ptq1_0_pt_rows_per_item_for_cc(ncols_dst, cc);
+    const size_t smem = ptq1_0_pt_smem_bytes(ncols_x / QK_PTQ1_0, ncols_dst, nrows_x,
+            rows_per_item, fusion.gate != nullptr);
+    if (smem > ggml_cuda_info().devices[device].smpb) {
         return false;
     }
     switch (ncols_dst) {
-        case 1: mul_mat_vec_ptq1_0_pt_launch<1>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+        case 1:
+            if (rows_per_item == PTQ1_0_PT_ROWS_1) {
+                mul_mat_vec_ptq1_0_pt_launch<1, PTQ1_0_PT_ROWS_1>(
+                        vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream);
+            } else {
+                mul_mat_vec_ptq1_0_pt_launch<1, 4>(
+                        vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream);
+            }
+            break;
         case 2: mul_mat_vec_ptq1_0_pt_launch<2>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
         case 3: mul_mat_vec_ptq1_0_pt_launch<3>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
         case 4: mul_mat_vec_ptq1_0_pt_launch<4>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
