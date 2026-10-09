@@ -734,6 +734,17 @@ class SchemaConverter:
             )
             optional_props.append("*")
 
+        # An optional property declared before a required one would be dropped by the required-first rule below;
+        # keep the declared order in that case, optional properties skippable in place (mirrors json-schema-to-grammar.cpp).
+        first_required = [k in required for k in sorted_props]
+        optional_before_required = any(not a and b for i, a in enumerate(first_required) for b in first_required[i + 1:])
+        if optional_before_required and first_required[0] and "*" not in prop_kv_rule_names:
+            rule = '"{" space ' + prop_kv_rule_names[sorted_props[0]]
+            for k in sorted_props[1:]:
+                kv = f' "," space {prop_kv_rule_names[k]}'
+                rule += kv if k in required else f' ({kv} )?'
+            return rule + ' space "}"'
+
         rule = '"{" space '
         rule += ' "," space '.join(prop_kv_rule_names[k] for k in required_props)
 

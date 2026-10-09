@@ -923,6 +923,33 @@ static void test_all(const std::string & lang, std::function<void(const TestCase
 
     test({
         SUCCESS,
+        "optional prop declared before a required one keeps the declared order",
+        R"""({
+            "properties": {
+                "name": {"type": "string"},
+                "nickname": {"type": "string"},
+                "age": {"type": "integer"},
+                "city": {"type": "string"}
+            },
+            "required": ["name", "city"],
+            "additionalProperties": false
+        })""",
+        R"""(
+            age-kv ::= "\"age\"" space ":" space integer
+            char ::= [^"\\\x7F\x00-\x1F] | [\\] (["\\bfnrt] | "u" [0-9a-fA-F]{4})
+            city-kv ::= "\"city\"" space ":" space string
+            integer ::= ("-"? integral-part)
+            integral-part ::= [0] | [1-9] [0-9]{0,15}
+            name-kv ::= "\"name\"" space ":" space string
+            nickname-kv ::= "\"nickname\"" space ":" space string
+            root ::= "{" space name-kv ( "," space nickname-kv )? ( "," space age-kv )? "," space city-kv space "}"
+            space ::= | " " | "\n"{1,2} [ \t]{0,20}
+            string ::= "\"" char* "\""
+        )"""
+    });
+
+    test({
+        SUCCESS,
         "additional props",
         R"""({
             "type": "object",

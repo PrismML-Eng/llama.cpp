@@ -748,6 +748,29 @@ private:
             optional_props.push_back("*");
         }
 
+        // An optional property declared before a required one can never be written where the model puts it
+        // when all required properties are emitted first: models follow the declared order (as vLLM/xgrammar
+        // do), so the field is silently dropped. In that case keep the declared order, with each optional
+        // property skippable in place. Applies when the first property is required and there are no additional
+        // properties; every other schema gets the unchanged rule below.
+        bool optional_before_required = false;
+        for (size_t i = 0, seen_optional = 0; i < prop_names.size(); i++) {
+            if (!required.count(prop_names[i])) {
+                seen_optional = 1;
+            } else if (seen_optional) {
+                optional_before_required = true;
+                break;
+            }
+        }
+        if (optional_before_required && required.count(prop_names[0]) && !prop_kv_rule_names.count("*")) {
+            std::string ordered = "\"{\" space " + prop_kv_rule_names[prop_names[0]];
+            for (size_t i = 1; i < prop_names.size(); i++) {
+                std::string kv = " \",\" space " + prop_kv_rule_names[prop_names[i]];
+                ordered += required.count(prop_names[i]) ? kv : " (" + kv + " )?";
+            }
+            return ordered + " space \"}\"";
+        }
+
         std::string rule = "\"{\" space ";
         for (size_t i = 0; i < required_props.size(); i++) {
             if (i > 0) {
