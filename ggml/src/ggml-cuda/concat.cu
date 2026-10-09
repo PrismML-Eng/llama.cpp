@@ -200,8 +200,7 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
 
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         if constexpr (sizeof(T) == sizeof(uint32_t)) {
-            const bool transpose_dim0 = ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK &&
-                dim == 0 && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+            const bool transpose_dim0 = dim == 0 && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
                 dst->ne[2] == 1 && dst->ne[3] == 1 && src0->ne[0] <= 8 &&
                 src0->nb[0] == sizeof(uint32_t) && src0->nb[1] == (uint64_t) src0->ne[0]*sizeof(uint32_t) &&
                 src1->nb[1] == sizeof(uint32_t) && dst->nb[0] == sizeof(uint32_t) &&
