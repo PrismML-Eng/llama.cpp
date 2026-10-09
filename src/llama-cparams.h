@@ -51,6 +51,8 @@ struct llama_cparams {
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;
+    bool gdn_rows_plain            = false; // GGML_GDN_ROWS_PLAIN=1: in-place recurrent state rows for plain decode
+    int  gdn_rows_plain_max_tokens = 0;     // GGML_GDN_ROWS_PLAIN_MAX_TOKENS: only up to this many tokens per sequence (0: any)
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
     bool fused_gdn_ch;       // use fused gated delta net (chunked)
     bool auto_fgdn;
