@@ -377,7 +377,11 @@ void gemv_tuned(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, int nm,
 
 // the compiled tiles: X(SGM, NSG, LS, U, GRF), one line per tile a table row uses (a row whose tile is not listed here is
 // skipped with a warning)
-#define T2_TUNED_KERNELS(X)
+#define T2_TUNED_KERNELS(X) \
+    X(4, 8, 4, 2, 0)        \
+    X(4, 1, 2, 2, 0)        \
+    X(4, 1, 2, 4, 0)        \
+    X(1, 2, 2, 1, 0)
 
 struct t2_tuned_kernel {
     int sgm, nsg, ls, u, grf;
@@ -399,6 +403,13 @@ struct t2_tuned_row {
 const std::vector<t2_tuned_row> & t2_tuned_table() {
     static const std::vector<t2_tuned_row> t = {
         // { N, K, M, multi, SGM, NSG, LS, U, GRF, ord },
+        // B580 sweep 2026-10-10 (/lab/exp/gemv-sweep jit.log, JIT build, medians of 5 interleaved rounds): bit-exact
+        // winners only (same LS as the default tile), > 2% faster, launches the model issues. Time vs the default tile:
+        { 5120, 17408, 5, 0, 4, 8, 4, 2, 0, 1 },    // ffn_down, 5-row verify             0.775
+        { 34816, 5120, 5, 1, 4, 1, 2, 2, 0, 1 },    // ffn gate+up merged, 5 rows         0.896
+        { 248320, 5120, 5, 0, 4, 1, 2, 4, 0, 1 },   // output head, 5 rows                0.882
+        { 14336, 5120, 5, 1, 4, 1, 2, 2, 0, 1 },    // attention q+k+v merged, 5 rows     0.923
+        { 14336, 5120, 1, 1, 1, 2, 2, 1, 0, 0 },    // attention q+k+v merged, 1 row      0.974
     };
     return t;
 }
