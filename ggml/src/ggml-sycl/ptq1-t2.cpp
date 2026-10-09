@@ -318,7 +318,7 @@ void gemv_multi(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, int nm,
 }  // namespace
 
 namespace {
-// ARC-LAB: GGML_SYCL_PTQ1_T2_TUNED=1 (default 0): per-shape GEMV tiles for 1..8 rows from the B580 sweep
+// ARC-LAB: GGML_SYCL_PTQ1_T2_TUNED=1 (default: 1 on a B580, else 0): per-shape GEMV tiles for 1..8 rows from the B580 sweep
 // (/lab/exp/gemv-sweep, README "Mapping a winner into the fork"). A row of t2_tuned_table matches a launch by
 // (N, K, rows, multi), N = the sum of the members' N for a same-input merged launch; no match = the default tiles above.
 // =2 is a plumbing self-test (default tiles through the tuned launcher, outputs must not change).
@@ -414,8 +414,17 @@ const std::vector<t2_tuned_row> & t2_tuned_table() {
     return t;
 }
 
+// the tiles were swept on a B580 (20 Xe cores): on by default there only; GGML_SYCL_PTQ1_T2_TUNED=1 / 0 forces it
+static int t2_tuned_default() {
+    static const int d = [] {
+        const std::string name = dpct::dev_mgr::instance().get_device(ggml_sycl_get_device()).get_info<sycl::info::device::name>();
+        return name.find("B580") != std::string::npos ? 1 : 0;
+    }();
+    return d;
+}
+
 bool t2_tuned_on() {
-    return ggml_sycl_knob("GGML_SYCL_PTQ1_T2_TUNED", 0) != 0;
+    return ggml_sycl_knob("GGML_SYCL_PTQ1_T2_TUNED", t2_tuned_default()) != 0;
 }
 
 // GGML_SYCL_PTQ1_T2_TUNED=2: plumbing self-test, every 1..8-row GEMV through gemv_tuned with the default tile (same LS,
@@ -444,7 +453,7 @@ void t2_tuned_selftest(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, 
 // launches the tuned tile for this GEMV if the table has one; false = take the default path
 bool t2_tuned(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, int nm, const uint32_t * const * B,
               const uint16_t * const * SB, float * const * C, const int * N, int M, int K) {
-    const int mode = ggml_sycl_knob("GGML_SYCL_PTQ1_T2_TUNED", 0);
+    const int mode = ggml_sycl_knob("GGML_SYCL_PTQ1_T2_TUNED", t2_tuned_default());
     if (mode == 0) {
         return false;
     }
