@@ -26,6 +26,10 @@ void quantize_row_q1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
     quantize_row_q1_0_ref(x, y, k);
 }
 
+void quantize_row_pq1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_pq1_0_ref(x, y, k);
+}
+
 void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q2_0_ref(x, y, k);
 }
@@ -171,6 +175,52 @@ void ggml_vec_dot_q1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
                            +  ((mask & 0x20) ? qy[5] : -qy[5])
                            +  ((mask & 0x40) ? qy[6] : -qy[6])
                            +  ((mask & 0x80) ? qy[7] : -qy[7]);
+            }
+
+            sumi += d1 * sumi_block;
+        }
+
+        sumf += d0 * sumi;
+    }
+
+    *s = sumf;
+}
+
+// PQ1_0 x Q8_0: one 64-weight block spans two Q8_0 blocks.
+void ggml_vec_dot_pq1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK_PQ1_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_pq1_0 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0;
+
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+
+        float sumi = 0.0f;
+
+        for (int k = 0; k < 2; k++) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[i * 2 + k];
+            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+            int sumi_block = 0;
+
+            const uint8_t * GGML_RESTRICT bits = &x[i].qs[k * 4];
+            const int8_t  * GGML_RESTRICT qy   = yb->qs;
+
+            for (int b = 0; b < 4; ++b, qy += 8) {
+                const unsigned mask = bits[b];
+                for (int j = 0; j < 8; ++j) {
+                    sumi_block += ((mask >> j) & 1) ? qy[j] : -qy[j];
+                }
             }
 
             sumi += d1 * sumi_block;

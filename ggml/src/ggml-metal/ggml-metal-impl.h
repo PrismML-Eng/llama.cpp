@@ -24,6 +24,9 @@
 #define N_R0_Q1_0 8
 #define N_SG_Q1_0 2
 
+#define N_R0_PQ1_0 8
+#define N_SG_PQ1_0 2
+
 // Q1_0 word-parallel (popcount) verify path: rows per simdgroup, and the uint32
 // stride of one activation bit-plane record (8 planes x 4 words + scale + sum + pad).
 #define N_R0_Q1_0_PC 4
