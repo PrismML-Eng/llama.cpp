@@ -635,6 +635,7 @@ public:
     int64_t       n_tokens = 0;
     ggml_tensor * pos      = nullptr; // I32 [n_tokens * n_pos_per_embd]
     ggml_tensor * out_idx  = nullptr; // I32 [gathering steps]: nr - 1 (the step's last row produces its draft); null: none
+    bool          out_in_pos = false; // the output rows follow the positions in pos (one upload), out_idx unused
 
     void set_input(const llama_ubatch * ubatch) override {
         GGML_ASSERT(ubatch->n_tokens == n_tokens);
@@ -661,8 +662,11 @@ public:
                 o.push_back((int32_t) st.nr - 1);
             }
         }
+        if (out_in_pos) {
+            v.insert(v.end(), o.begin(), o.end());
+        }
         ggml_backend_tensor_set(pos, v.data(), 0, v.size() * sizeof(int32_t));
-        if (out_idx) {
+        if (out_idx && !out_in_pos) {
             ggml_backend_tensor_set(out_idx, o.data(), 0, o.size() * sizeof(int32_t));
         }
     }
@@ -986,16 +990,16 @@ void llama_model_qwen35::graph_mtp::build_chain(const llama_model & model) {
     //      contiguous, only a multi-row step 0 narrower than the full mask needs the copy (one copy kernel, not n).
     //   4: a step picks its output row with a GET_ROWS only if it has several rows (step 0 with catch-up rows); a
     //      1-row step's row is already the output (no gather, no output-index slice).
+    //   8: fewer uploads: the output rows ride in the position input, and V is stored with the K indices (equal for a
+    //      non-transposed V cache; the V index input is then unused and not uploaded).
     static const int tight = [] {
         const char * e = getenv("LLAMA_MTP_CHAIN_TIGHT");
-        return e ? atoi(e) : 7;
+        return e ? atoi(e) : 15;
     }();
 
     const uint32_t n_pos = hparams.n_pos_per_embd();
     auto chain_inp = std::make_unique<llm_graph_input_mtp_chain>(n_pos);
     chain_inp->n_tokens = n_tokens;
-    chain_inp->pos      = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens * n_pos);
-    ggml_set_input(chain_inp->pos);
     int64_t n_gather = 0;
     for (int64_t s = 0; s < n_steps; ++s) {
         llm_graph_input_mtp_chain::step st;
@@ -1006,13 +1010,17 @@ void llama_model_qwen35::graph_mtp::build_chain(const llama_model & model) {
         n_gather += st.gather;
         chain_inp->steps.push_back(st);
     }
-    if (n_gather > 0) {
+    chain_inp->out_in_pos = (tight & 8) && n_gather > 0;
+    chain_inp->pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens * n_pos + (chain_inp->out_in_pos ? n_gather : 0));
+    ggml_set_input(chain_inp->pos);
+    if (n_gather > 0 && !chain_inp->out_in_pos) {
         chain_inp->out_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_gather);
         ggml_set_input(chain_inp->out_idx);
     }
-    const auto    steps   = chain_inp->steps;
-    ggml_tensor * pos_all = chain_inp->pos;
-    ggml_tensor * out_all = chain_inp->out_idx;
+    const auto    steps      = chain_inp->steps;
+    const bool    out_in_pos = chain_inp->out_in_pos;
+    ggml_tensor * pos_all    = chain_inp->pos;
+    ggml_tensor * out_all    = chain_inp->out_idx;
     res->add_input(std::move(chain_inp));
 
     // token embeddings: the host table for the ubatch's own tokens (catch-up tokens need not be in the draft
@@ -1057,7 +1065,7 @@ void llama_model_qwen35::graph_mtp::build_chain(const llama_model & model) {
     ggml_tensor * tok_rows = ggml_get_rows(ctx0, tok_embd_w, ggml_view_1d(ctx0, tokens_all, n_lead, 0));
     ggml_tensor * h_embd   = ggml_view_2d(ctx0, h_all, h_all->ne[0], n_lead, h_all->nb[1], 0);
     ggml_tensor * k_all    = inp_attn->get_k_idxs();
-    ggml_tensor * v_all    = inp_attn->get_v_idxs();
+    ggml_tensor * v_all    = (tight & 8) && !kvc->is_v_trans() ? k_all : inp_attn->get_v_idxs();
     ggml_tensor * mask_all = inp_attn->get_kq_mask();
 
     // the device holding the head's weights (none: CPU-only, the slices stay views of the host inputs)
@@ -1087,11 +1095,12 @@ void llama_model_qwen35::graph_mtp::build_chain(const llama_model & model) {
             return c;
         };
         pos_all  = on_dev(pos_all,  "mtp_chain_pos_dev");
-        if (n_gather > 1) {
+        if (n_gather > 1 && !out_in_pos) {
             out_all = on_dev(out_all, "mtp_chain_out_dev");
         }
+        const bool v_is_k = v_all == k_all;
         k_all    = on_dev(k_all,    "mtp_chain_k_idxs_dev");
-        v_all    = on_dev(v_all,    "mtp_chain_v_idxs_dev");
+        v_all    = v_is_k ? k_all : on_dev(v_all, "mtp_chain_v_idxs_dev");
         mask_all = on_dev(mask_all, "mtp_chain_kq_mask_dev");
     }
 
@@ -1100,6 +1109,9 @@ void llama_model_qwen35::graph_mtp::build_chain(const llama_model & model) {
     struct step_inputs {
         ggml_tensor * pos, * out, * k_idxs, * v_idxs, * kq_mask;
     };
+    if (out_in_pos) {
+        out_all = ggml_view_1d(ctx0, pos_all, n_gather, n_tokens * n_pos * ggml_element_size(pos_all));
+    }
     std::vector<step_inputs> sin(n_steps);
     for (int64_t s = 0, g = 0; s < n_steps; ++s) {
         const auto &  st = steps[s];
