@@ -6,6 +6,7 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <chrono>
 #include <cmath>
 #include <limits>
 #ifdef LLAMA_DSPARK_MARKOV_CUDA
@@ -41,6 +42,40 @@
 // ARC-LAB: LLAMA_MTP_DRAFT_LOG=<file> appends one JSON line per MTP draft step (position predicted, depth, top 3 candidates
 // with probabilities, whether p_min stopped the draft) plus a "begin" line per request, for offline acceptance / tree
 // simulation (arctune, 2026-10-05).
+// ARC-LAB: LLAMA_MTP_DRAFT_TIMING=1: host-side phase timing of the MTP draft() calls (chain and loop), averaged and
+// printed to stderr every 64 calls. pre = deferred flushes before the draft, batch = building batches, decode = the
+// llama_decode calls (batch split, slot search, input uploads, kernel submission; no wait), wait = waiting for the GPU
+// and reading the draft back (chain: llama_get_mtp_chain_ids; loop: the per-step sampling, which syncs).
+struct common_mtp_draft_timing {
+    using clk = std::chrono::steady_clock;
+    const bool on = [] { const char * e = std::getenv("LLAMA_MTP_DRAFT_TIMING"); return e && std::atoi(e) != 0; }();
+    clk::time_point t0, t;
+    int    calls = 0, chain_calls = 0, decodes = 0;
+    double total = 0, pre = 0, batch = 0, decode = 0, wait = 0, rest = 0;
+    void begin() { if (on) { t0 = t = clk::now(); } }
+    void lap(double & acc) {
+        if (!on) { return; }
+        const auto n = clk::now();
+        acc += std::chrono::duration<double, std::milli>(n - t).count();
+        t = n;
+    }
+    void end(bool chain) {
+        if (!on) { return; }
+        lap(rest);
+        total += std::chrono::duration<double, std::milli>(t - t0).count();
+        calls++;
+        chain_calls += chain;
+        if (calls == 64) {
+            fprintf(stderr, "mtp-draft-timing: %d calls (%d chained), per call: total %.3f ms = pre %.3f + batch %.3f + "
+                    "decode %.3f (%.2f llama_decode) + wait/readback %.3f + rest %.3f\n", calls, chain_calls, total / calls,
+                    pre / calls, batch / calls, decode / calls, (double) decodes / calls, wait / calls, rest / calls);
+            calls = chain_calls = decodes = 0;
+            total = pre = batch = decode = wait = rest = 0;
+        }
+    }
+};
+static common_mtp_draft_timing g_mtp_dt;
+
 static FILE * common_mtp_draft_log() {
     static FILE * f = [] {
         const char * p = std::getenv("LLAMA_MTP_DRAFT_LOG");
@@ -2465,6 +2500,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        g_mtp_dt.lap(g_mtp_dt.pre);
         common_sampler_reset(smpls[0].get());
         common_batch_clear(batch);
 
@@ -2481,9 +2517,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[0].data(), row_bytes);
         }
 
+        g_mtp_dt.lap(g_mtp_dt.batch);
         llama_set_mtp_chain(ctx_dft, n_draft);
         const int32_t rc = llama_decode(ctx_dft, batch);
         llama_set_mtp_chain(ctx_dft, 0);
+        g_mtp_dt.lap(g_mtp_dt.decode);
+        g_mtp_dt.decodes++;
         if (rc != 0) {
             SPC_ERR("llama_decode(ctx_dft) chained draft returned %d\n", (int) rc);
             if (n_catch > 0) {
@@ -2496,6 +2535,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const llama_token * ids = llama_get_mtp_chain_ids(ctx_dft);
+        g_mtp_dt.lap(g_mtp_dt.wait);
         if (ids == nullptr) {
             SPC_ERR("%s", "chained draft produced no tokens\n");
             return true;
@@ -2768,9 +2808,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        g_mtp_dt.begin();
+        draft_impl(dparams);
+        g_mtp_dt.end(last_draft_chained);
+    }
+
+    bool last_draft_chained = false;
+
+    void draft_impl(common_speculative_draft_params_vec & dparams) {
         auto & ctx_dft = params.ctx_dft;
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        last_draft_chained = false;
 
         // deferred catch-up rows that do not lead straight into this draft position are decoded
         // on their own first (uses `batch`, so before it is built)
@@ -2825,6 +2874,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         if (chain_mode && draft_chain(dparams)) {
+            last_draft_chained = true;
             auto & dp = dparams[0];
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
@@ -2832,6 +2882,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
+        g_mtp_dt.lap(g_mtp_dt.pre);
         common_batch_clear(batch);
 
         // keep track of which sequences are still drafting
@@ -2891,7 +2942,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            g_mtp_dt.lap(g_mtp_dt.batch);
             int ret = llama_decode(ctx_dft, batch);
+            g_mtp_dt.lap(g_mtp_dt.decode);
+            g_mtp_dt.decodes++;
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 if (i == 0) {
@@ -2924,6 +2978,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                g_mtp_dt.lap(g_mtp_dt.wait);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);

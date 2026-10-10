@@ -6255,6 +6255,45 @@ struct sycl_host_timing {
 };
 static sycl_host_timing g_ht;
 
+// ARC-LAB: GGML_SYCL_OP_TIMING=1 -> GPU time per op type for draft-sized graphs (fewer than 2000 nodes, every mat-mul at
+// most 8 rows: the MTP draft decodes and chains, not the target's verify graph). The queue is drained after every kernel
+// group, so each entry is its kernel time plus one launch latency (a serialised upper bound); the sum is reported next to
+// the kernel-group count. Printed every 64 such graphs. Timing-only: it slows the draft, never use it for speed runs.
+struct sycl_op_timing {
+    bool on = getenv("GGML_SYCL_OP_TIMING") && atoi(getenv("GGML_SYCL_OP_TIMING"));
+    using clk = std::chrono::steady_clock;
+    int    graphs = 0;
+    long   groups = 0, nodes = 0;
+    double total = 0;
+    std::map<std::string, std::pair<double, long>> per_op;
+    static bool draft_sized(const ggml_cgraph * g) {
+        if (g->n_nodes >= 2000) return false;
+        bool mm = false;
+        for (int i = 0; i < g->n_nodes; ++i) {
+            const ggml_tensor * n = g->nodes[i];
+            if (n->op == GGML_OP_MUL_MAT) {
+                mm = true;
+                if (n->src[1]->ne[1] * n->src[1]->ne[2] > 8) return false;
+            }
+        }
+        return mm;
+    }
+    void report() {
+        fprintf(stderr, "op-timing: %d draft-sized graphs, per graph: %.3f ms serialised over %.1f kernel groups (%.0f nodes)\n",
+                graphs, total / graphs, (double) groups / graphs, (double) nodes / graphs);
+        std::vector<std::pair<double, std::string>> v;
+        for (auto & kv : per_op) v.push_back({ kv.second.first, kv.first });
+        std::sort(v.rbegin(), v.rend());
+        for (size_t i = 0; i < v.size() && i < 16; ++i) {
+            const auto & a = per_op[v[i].second];
+            fprintf(stderr, "op-timing:   %-22s %.3f ms/graph (%.1f groups/graph, %.1f us each)\n", v[i].second.c_str(),
+                    a.first / graphs, (double) a.second / graphs, 1000.0 * a.first / std::max(1L, a.second));
+        }
+        graphs = 0; groups = 0; nodes = 0; total = 0; per_op.clear();
+    }
+};
+static sycl_op_timing g_ot;
+
 static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
     GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
@@ -7249,6 +7288,27 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     const bool                       ht_on   = g_ht.on && cgraph->n_nodes > 500;
     sycl_host_timing::clk::time_point ht_prev = sycl_host_timing::clk::now();
     const char *                     ht_op   = nullptr;
+    const bool                       ot_on   = g_ot.on && sycl_op_timing::draft_sized(cgraph);
+    sycl_op_timing::clk::time_point  ot_prev{};
+    const char *                     ot_op   = nullptr;
+    auto ot_mark = [&](const char * next) {  // drain the queue, charge the time since the last mark to the op that ran
+        SYCL_CHECK(CHECK_TRY_ERROR(sycl_ctx->stream()->wait()));
+        const auto now = sycl_op_timing::clk::now();
+        if (ot_op) {
+            const double ms = std::chrono::duration<double, std::milli>(now - ot_prev).count();
+            auto & a = g_ot.per_op[ot_op];
+            a.first += ms;
+            a.second++;
+            g_ot.total += ms;
+            g_ot.groups++;
+        }
+        ot_prev = now;
+        ot_op   = next;
+    };
+    if (ot_on) {
+        ot_mark(nullptr);  // inputs and earlier work are not charged
+        g_ot.nodes += cgraph->n_nodes;
+    }
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (ht_on) {
@@ -7272,6 +7332,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
+        }
+        if (ot_on) {
+            ot_mark(ggml_op_desc(node));
         }
 
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
@@ -7411,6 +7474,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+    }
+    if (ot_on) {
+        ot_mark(nullptr);
+        if (++g_ot.graphs == 64) {
+            g_ot.report();
+        }
     }
 }
 
