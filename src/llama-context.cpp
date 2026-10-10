@@ -711,6 +711,8 @@ void llama_context::sched_reserve() {
 
     synchronize();
 
+    mtp_chain_cache.clear();  // ARC-LAB: built under the old settings
+
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
@@ -1430,6 +1432,24 @@ void llama_context::set_mtp_chain(uint32_t n_steps) {
 
     LLAMA_LOG_INFO("%s: MTP chain: %lld draft-vocab token_embd rows (%s, %.1f MiB) on %s\n", __func__, (long long) n_rows,
             ggml_type_name(src->type), staging.size() / 1048576.0, ggml_backend_dev_name(dev));
+}
+
+llama_context::mtp_chain_entry * llama_context::mtp_chain_entry_for(uint32_t n_tokens) {
+    const uint32_t key = (cparams.mtp_chain_n << 16) | n_tokens;
+    auto it = mtp_chain_cache.find(key);
+    if (it != mtp_chain_cache.end()) {
+        return &it->second;
+    }
+    if (mtp_chain_cache.size() >= 16) {  // shapes are catch-up rows (1..n_max+1) + steps: a handful in practice
+        synchronize();
+        mtp_chain_cache.clear();
+    }
+    const size_t max_nodes = graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
+    mtp_chain_entry e;
+    e.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false,
+                                         cparams.op_offload));
+    e.res.reset(new llm_graph_result(max_nodes));
+    return &(mtp_chain_cache[key] = std::move(e));
 }
 
 const int32_t * llama_context::get_mtp_chain_ids() {
@@ -2174,7 +2194,30 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
+        // ARC-LAB: a chained MTP draft runs on the cached scheduler + graph of its batch shape (mtp_chain_cache)
+        mtp_chain_entry * chain_e = cparams.mtp_chain_n > 0 ? mtp_chain_entry_for(ubatch.n_tokens) : nullptr;
+        if (chain_e) {
+            std::swap(sched,       chain_e->sched);
+            std::swap(gf_res_prev, chain_e->res);
+        }
+
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+
+        if (chain_e) {
+            // the per-step argmax rows, mapped to tokens in get_mtp_chain_ids()
+            if (res && !res->t_mtp_chain.empty()) {
+                mtp_chain_out.resize(res->t_mtp_chain.size());
+                for (size_t s = 0; s < res->t_mtp_chain.size(); ++s) {
+                    ggml_tensor *  t = res->t_mtp_chain[s];
+                    ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+                    GGML_ASSERT(b != nullptr);
+                    ggml_backend_tensor_get_async(b, t, &mtp_chain_out[s], 0, sizeof(int32_t));
+                }
+                mtp_chain_n_out = (uint32_t) res->t_mtp_chain.size();
+            }
+            std::swap(sched,       chain_e->sched);
+            std::swap(gf_res_prev, chain_e->res);
+        }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2315,18 +2358,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
-
-        // ARC-LAB: chained MTP draft: the per-step argmax rows, mapped to tokens in get_mtp_chain_ids()
-        if (!res->t_mtp_chain.empty()) {
-            mtp_chain_out.resize(res->t_mtp_chain.size());
-            for (size_t s = 0; s < res->t_mtp_chain.size(); ++s) {
-                ggml_tensor *  t = res->t_mtp_chain[s];
-                ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), t);
-                GGML_ASSERT(b != nullptr);
-                ggml_backend_tensor_get_async(b, t, &mtp_chain_out[s], 0, sizeof(int32_t));
-            }
-            mtp_chain_n_out = (uint32_t) res->t_mtp_chain.size();
-        }
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.

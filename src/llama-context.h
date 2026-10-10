@@ -418,6 +418,16 @@ private:
     std::vector<int32_t>    mtp_chain_vocab;   // draft-head index -> token id (empty: no draft head, indices are tokens)
     std::vector<int32_t>    mtp_chain_out;
     std::vector<int32_t>    mtp_chain_tok;     // mtp_chain_out mapped to token ids
+
+    // ARC-LAB: chain graphs are kept per batch shape, each with its own scheduler, so a draft whose shape (rows, steps)
+    // and per-step KV lengths match an earlier one reuses its built and allocated graph: no build, split or allocation
+    // per draft, and the regular decodes keep their own reusable graph in gf_res_prev
+    struct mtp_chain_entry {
+        ggml_backend_sched_ptr sched;
+        llm_graph_result_ptr   res;
+    };
+    std::map<uint32_t, mtp_chain_entry> mtp_chain_cache;
+    mtp_chain_entry * mtp_chain_entry_for(uint32_t n_tokens);
     uint32_t                mtp_chain_n_out = 0;
 
     // host buffer for the model output (logits and embeddings)

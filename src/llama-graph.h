@@ -939,8 +939,8 @@ struct llm_graph_params {
             return false;
         }
 
-        // ARC-LAB: a chained MTP draft graph bakes per-step KV lengths in; never reuse it or reuse into it
-        if (cparams.mtp_chain_n > 0 || other.cparams.mtp_chain_n > 0) {
+        // ARC-LAB: a chained MTP draft graph only for the same step count (its input checks the per-step KV lengths)
+        if (cparams.mtp_chain_n != other.cparams.mtp_chain_n) {
             return false;
         }
 
