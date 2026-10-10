@@ -688,7 +688,7 @@ catch (sycl::exception const &exc) {
 struct ggml_sycl_sync_trace {
     const bool on = getenv("GGML_SYCL_SYNC_TRACE") && atoi(getenv("GGML_SYCL_SYNC_TRACE")) != 0;
     std::mutex mtx;
-    int        big = 0, small = 0;
+    int        n_big = 0, n_small = 0;
     std::map<std::string, long>                         syncs;
     std::map<std::string, std::pair<long, size_t>>     uploads;
     std::unordered_map<void *, std::string>             names;  // return address -> caller label
@@ -746,10 +746,10 @@ struct ggml_sycl_sync_trace {
     void note_graph(const ggml_cgraph * g) {
         std::lock_guard<std::mutex> lock(mtx);
         if (g->n_nodes < 2000) {
-            small++;
+            n_small++;
             return;
         }
-        if (++big < 64) {
+        if (++n_big < 64) {
             return;
         }
         long ns = 0, nu = 0;
@@ -757,17 +757,17 @@ struct ggml_sycl_sync_trace {
         for (auto & kv : syncs) ns += kv.second;
         for (auto & kv : uploads) { nu += kv.second.first; nb += kv.second.second; }
         fprintf(stderr, "sync-trace: %d big graphs (+%d smaller), per big graph: %.1f synchronizes, %.1f blocking uploads (%.0f bytes)\n",
-                big, small, (double) ns / big, (double) nu / big, (double) nb / big);
+                n_big, n_small, (double) ns / n_big, (double) nu / n_big, (double) nb / n_big);
         std::vector<std::pair<long, std::string>> v;
         for (auto & kv : syncs) v.push_back({ kv.second, kv.first });
         std::sort(v.rbegin(), v.rend());
-        for (auto & e : v) fprintf(stderr, "sync-trace:   sync   %6.2f  %s\n", (double) e.first / big, e.second.c_str());
+        for (auto & e : v) fprintf(stderr, "sync-trace:   sync   %6.2f  %s\n", (double) e.first / n_big, e.second.c_str());
         std::vector<std::pair<long, std::string>> w;
         for (auto & kv : uploads) w.push_back({ kv.second.first, kv.first });
         std::sort(w.rbegin(), w.rend());
-        for (auto & e : w) fprintf(stderr, "sync-trace:   upload %6.2f  %8.0f B  %s\n", (double) e.first / big,
-                                   (double) uploads[e.second].second / big, e.second.c_str());
-        big = small = 0;
+        for (auto & e : w) fprintf(stderr, "sync-trace:   upload %6.2f  %8.0f B  %s\n", (double) e.first / n_big,
+                                   (double) uploads[e.second].second / n_big, e.second.c_str());
+        n_big = n_small = 0;
         syncs.clear();
         uploads.clear();
     }
