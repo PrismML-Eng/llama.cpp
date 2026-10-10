@@ -74,6 +74,9 @@ static inline ggml_tensor * llama_mul_mat_hadamard(
     return res;
 }
 
+// ARC-LAB: LLAMA_SYNC_TRIM bit mask, see llama-context.cpp
+int llama_sync_trim();
+
 struct time_meas {
     time_meas(int64_t & t_acc, bool disable = false);
     ~time_meas();

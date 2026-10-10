@@ -447,6 +447,7 @@ private:
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
     bool has_evaluated_once = false;
+    bool sync_pending       = true;  // ARC-LAB: work queued since the last synchronize (LLAMA_SYNC_TRIM)
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
