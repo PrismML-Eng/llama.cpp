@@ -1035,9 +1035,11 @@ void llama_model_qwen35::graph_mtp::build_chain(const llama_model & model) {
     //      host input is its own scheduler split input (one blocking host->device copy per view and step), and a view
     //      built lazily lands between the step's compute nodes; here the device split starts with 4-5 copy kernels and
     //      all the slices, then each step's compute nodes run uninterrupted, as in the single-step draft graph.
+    //   2: a step's mask rows are copied only when the slice is not contiguous: a 1-row step's row is already
+    //      contiguous, only a multi-row step 0 narrower than the full mask needs the copy (one copy kernel, not n).
     static const int tight = [] {
         const char * e = getenv("LLAMA_MTP_CHAIN_TIGHT");
-        return e ? atoi(e) : 1;
+        return e ? atoi(e) : 3;
     }();
 
     ggml_tensor * tok_rows = ggml_get_rows(ctx0, tok_embd_w, ggml_view_1d(ctx0, tokens_all, n_lead, 0));
@@ -1093,7 +1095,10 @@ void llama_model_qwen35::graph_mtp::build_chain(const llama_model & model) {
         si.out     = ggml_view_1d(ctx0, out_all, 1, s * ggml_element_size(out_all));
         si.k_idxs  = ggml_view_1d(ctx0, k_all, nr, st.r0 * ggml_element_size(k_all));
         si.v_idxs  = ggml_view_1d(ctx0, v_all, nr, st.r0 * ggml_element_size(v_all));
-        si.kq_mask = ggml_cont(ctx0, ggml_view_2d(ctx0, mask_all, st.n_kv, nr, mask_all->nb[1], st.r0 * mask_all->nb[1]));
+        si.kq_mask = ggml_view_2d(ctx0, mask_all, st.n_kv, nr, mask_all->nb[1], st.r0 * mask_all->nb[1]);
+        if (!(tight & 2) || !ggml_is_contiguous(si.kq_mask)) {
+            si.kq_mask = ggml_cont(ctx0, si.kq_mask);
+        }
         if (tight & 1) {
             for (ggml_tensor * t : { si.pos, si.out, si.k_idxs, si.v_idxs, si.kq_mask }) {
                 ggml_build_forward_expand(gf, t);
