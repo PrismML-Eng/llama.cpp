@@ -790,6 +790,20 @@ class ModelBase:
                     )
                 weight_names.append(mapped)
 
+        # --fuse-qkv writes one attn_qkv per layer, so Q, K and V must all be folded and get one name
+        for bid in sorted(self._fusable_qkv_weight_layers):
+            qkv = [
+                self.format_tensor_name(t, bid)
+                for t in (gguf.MODEL_TENSOR.ATTN_Q, gguf.MODEL_TENSOR.ATTN_K, gguf.MODEL_TENSOR.ATTN_V)
+            ]
+            n_folded = sum(name in weight_names for name in qkv)
+            if n_folded == 0:
+                continue
+            if n_folded != len(qkv):
+                raise ValueError(f"--fuse-qkv needs all of Q, K and V folded in layer {bid}, or none of them")
+            weight_names = [name for name in weight_names if name not in qkv]
+            weight_names.append(self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_QKV, bid))
+
         tied_output = manifest.get("tied_output", False)
         if not isinstance(tied_output, bool) or (schema_version == 3) != tied_output:
             raise ValueError("Hadamard schema 3 requires tied_output=true; older schemas forbid it")
