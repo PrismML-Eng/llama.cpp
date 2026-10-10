@@ -11,6 +11,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <string>
 #include <unordered_map>
 
 struct ggml_cgraph;
@@ -1024,6 +1025,10 @@ public:
     //   contexts of the input tensors of the graph and we can reuse it for another computation
     // return true if the graph was updated and can be reused
     bool can_reuse(const llm_graph_params & params);
+
+    // ARC-LAB: why can_reuse(params) refuses (diagnostics, LLAMA_MTP_DRAFT_TIMING): "new" (never built), "params"
+    // (allow_reuse), or the type name of the first input that refuses; "" if it would not refuse
+    std::string reuse_miss_reason(const llm_graph_params & params);
 
     llm_graph_input_i * add_input(llm_graph_input_ptr input);
 

@@ -1452,6 +1452,19 @@ llama_context::mtp_chain_entry * llama_context::mtp_chain_entry_for(uint32_t n_t
     return &(mtp_chain_cache[key] = std::move(e));
 }
 
+void llama_context::mtp_chain_reuse_stats::report() {
+    std::string why;
+    for (const auto & [k, v] : miss) {
+        why += (why.empty() ? "" : ", ") + k + " " + std::to_string(v);
+    }
+    fprintf(stderr, "mtp-chain-decode: %d chain decodes, graph reused %d, rebuilt %d (%s); per decode: reuse check or "
+            "build+alloc %.3f ms, set_inputs %.3f ms, compute submit %.3f ms\n", n, reused, n - reused,
+            why.empty() ? "-" : why.c_str(), build_ms / n, set_ms / n, compute_ms / n);
+    n = reused = 0;
+    build_ms = set_ms = compute_ms = 0;
+    miss.clear();
+}
+
 const int32_t * llama_context::get_mtp_chain_ids() {
     synchronize();
 
@@ -1695,6 +1708,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    static const bool chain_stats_on = [] {
+        const char * e = getenv("LLAMA_MTP_DRAFT_TIMING");
+        return e && atoi(e) != 0;
+    }();
+    const bool chain_stats = chain_stats_on && cparams.mtp_chain_n > 0;
+    const int64_t t_cs0 = chain_stats ? ggml_time_us() : 0;
+
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -1706,7 +1726,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        if (chain_stats) {
+            mtp_chain_rs.reused++;
+        }
     } else {
+        if (chain_stats) {
+            const std::string why = graph_reuse_disable ? std::string("disabled") : res->reuse_miss_reason(gparams);
+            mtp_chain_rs.miss[why.empty() ? std::string("?") : why]++;
+        }
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -1731,6 +1758,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    const int64_t t_cs1 = chain_stats ? ggml_time_us() : 0;
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1741,7 +1770,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t t_cs2 = chain_stats ? ggml_time_us() : 0;
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    if (chain_stats) {
+        const int64_t t_cs3 = ggml_time_us();
+        mtp_chain_rs.build_ms   += (t_cs1 - t_cs0) / 1000.0;
+        mtp_chain_rs.set_ms     += (t_cs2 - t_cs1) / 1000.0;
+        mtp_chain_rs.compute_ms += (t_cs3 - t_cs2) / 1000.0;
+        if (++mtp_chain_rs.n == 64) {
+            mtp_chain_rs.report();
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;

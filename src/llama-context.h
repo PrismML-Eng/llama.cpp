@@ -430,6 +430,16 @@ private:
     mtp_chain_entry * mtp_chain_entry_for(uint32_t n_tokens);
     uint32_t                mtp_chain_n_out = 0;
 
+    // ARC-LAB: LLAMA_MTP_DRAFT_TIMING=1: per chain decode, whether its cached graph was reused (else why not) and the
+    // host time of process_ubatch's parts; printed to stderr every 64 chain decodes
+    struct mtp_chain_reuse_stats {
+        int                        n = 0, reused = 0;
+        double                     build_ms = 0, set_ms = 0, compute_ms = 0;
+        std::map<std::string, int> miss;
+        void report();
+    };
+    mtp_chain_reuse_stats mtp_chain_rs;
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 

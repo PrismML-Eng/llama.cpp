@@ -22,6 +22,7 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <typeinfo>
 #include <unordered_set>
 
 // dedup helpers
@@ -1487,6 +1488,22 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     }
 
     return res;
+}
+
+std::string llm_graph_result::reuse_miss_reason(const llm_graph_params & params) {
+    if (inputs.empty()) {
+        return "new";
+    }
+    if (!this->params.allow_reuse(params)) {
+        return "params";
+    }
+    for (auto & input : inputs) {
+        if (!input->can_reuse(params)) {
+            const llm_graph_input_i & in = *input;
+            return typeid(in).name();
+        }
+    }
+    return "";
 }
 
 llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
