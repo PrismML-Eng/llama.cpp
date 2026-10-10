@@ -1591,6 +1591,26 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// ARC-LAB: see ggml-backend-impl.h
+static thread_local char g_sync_trace_cause[128];
+static thread_local bool g_sync_trace_has_cause = false;
+
+void ggml_sync_trace_set_cause(const char * cause) {
+    g_sync_trace_has_cause = cause != nullptr;
+    if (cause) {
+        snprintf(g_sync_trace_cause, sizeof(g_sync_trace_cause), "%s", cause);
+    }
+}
+
+const char * ggml_sync_trace_get_cause(void) {
+    return g_sync_trace_has_cause ? g_sync_trace_cause : nullptr;
+}
+
+static bool ggml_sync_trace_on() {
+    static const bool on = getenv("GGML_SYCL_SYNC_TRACE") && atoi(getenv("GGML_SYCL_SYNC_TRACE")) != 0;
+    return on;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1609,6 +1629,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+            if (ggml_sync_trace_on()) {
+                ggml_sync_trace_set_cause("sched: backend switch");
+            }
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
@@ -1621,6 +1644,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+            if (ggml_sync_trace_on()) {
+                char cause[128];
+                snprintf(cause, sizeof(cause), "sched: split input %s%s", input->flags & GGML_TENSOR_FLAG_INPUT ? "" : "(computed) ",
+                         input->name);
+                ggml_sync_trace_set_cause(cause);
+            }
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -1737,6 +1766,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
             }
+        }
+
+        if (ggml_sync_trace_on()) {
+            ggml_sync_trace_set_cause(nullptr);
         }
 
         if (!sched->callback_eval) {

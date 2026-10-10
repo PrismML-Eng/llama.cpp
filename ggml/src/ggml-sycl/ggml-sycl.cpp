@@ -36,6 +36,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <regex>
+#include <cxxabi.h>
+#include <dlfcn.h>
+#include <execinfo.h>
 
 #include <sycl/sycl.hpp>
 #include <sycl/backend.hpp>
@@ -677,6 +680,94 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+// ARC-LAB: GGML_SYCL_SYNC_TRACE=1: every ggml_backend_sycl_synchronize and blocking buffer_set_tensor is counted under its
+// cause: the scheduler's tag (ggml_sync_trace_set_cause: split input <name>, backend switch), else the first named caller
+// outside libggml (e.g. llama_get_logits_ith). Printed per 64 graphs of >= 2000 nodes (target graphs: ~ per MTP cycle).
+struct ggml_sycl_sync_trace {
+    const bool on = getenv("GGML_SYCL_SYNC_TRACE") && atoi(getenv("GGML_SYCL_SYNC_TRACE")) != 0;
+    std::mutex mtx;
+    int        big = 0, small = 0;
+    std::map<std::string, long>                         syncs;
+    std::map<std::string, std::pair<long, size_t>>     uploads;
+    std::unordered_map<void *, std::string>             names;  // return address -> caller label
+
+    std::string caller() {
+        const char * c = ggml_sync_trace_get_cause();
+        if (c) {
+            return c;
+        }
+        void * fr[24];
+        const int n = backtrace(fr, 24);
+        std::string label, last;
+        int named = 0;
+        for (int i = 1; i < n && named < 2; ++i) {
+            auto it = names.find(fr[i]);
+            std::string nm;
+            if (it != names.end()) {
+                nm = it->second;
+            } else {
+                Dl_info di{};
+                if (dladdr(fr[i], &di) && di.dli_sname && di.dli_fname && !strstr(di.dli_fname, "libggml")) {
+                    int st = 0;
+                    char * dm = abi::__cxa_demangle(di.dli_sname, nullptr, nullptr, &st);
+                    nm = dm && st == 0 ? std::string(dm) : std::string(di.dli_sname);
+                    free(dm);
+                    const size_t paren = nm.find('(');
+                    if (paren != std::string::npos) {
+                        nm.resize(paren);
+                    }
+                }
+                names[fr[i]] = nm;
+            }
+            if (!nm.empty() && nm != last) {
+                label += (label.empty() ? "" : " <- ") + nm;
+                last = nm;
+                named++;
+            }
+        }
+        return label.empty() ? std::string("?") : label;
+    }
+    void note_sync() {
+        std::lock_guard<std::mutex> lock(mtx);
+        syncs[caller()]++;
+    }
+    void note_upload(size_t bytes) {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto & u = uploads[caller()];
+        u.first++;
+        u.second += bytes;
+    }
+    void note_graph(const ggml_cgraph * g) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (g->n_nodes < 2000) {
+            small++;
+            return;
+        }
+        if (++big < 64) {
+            return;
+        }
+        long ns = 0, nu = 0;
+        size_t nb = 0;
+        for (auto & kv : syncs) ns += kv.second;
+        for (auto & kv : uploads) { nu += kv.second.first; nb += kv.second.second; }
+        fprintf(stderr, "sync-trace: %d big graphs (+%d smaller), per big graph: %.1f synchronizes, %.1f blocking uploads (%.0f bytes)\n",
+                big, small, (double) ns / big, (double) nu / big, (double) nb / big);
+        std::vector<std::pair<long, std::string>> v;
+        for (auto & kv : syncs) v.push_back({ kv.second, kv.first });
+        std::sort(v.rbegin(), v.rend());
+        for (auto & e : v) fprintf(stderr, "sync-trace:   sync   %6.2f  %s\n", (double) e.first / big, e.second.c_str());
+        std::vector<std::pair<long, std::string>> w;
+        for (auto & kv : uploads) w.push_back({ kv.second.first, kv.first });
+        std::sort(w.rbegin(), w.rend());
+        for (auto & e : w) fprintf(stderr, "sync-trace:   upload %6.2f  %8.0f B  %s\n", (double) e.first / big,
+                                   (double) uploads[e.second].second / big, e.second.c_str());
+        big = small = 0;
+        syncs.clear();
+        uploads.clear();
+    }
+};
+static ggml_sycl_sync_trace g_sync_trace;
+
 // ARC-LAB: per-token accounting of synchronous buffer_set_tensor calls, printed with the GGML_SYCL_HOST_TIMING report
 static double g_st_ms = 0; static long g_st_calls = 0; static size_t g_st_bytes = 0;
 static void ggml_sycl_note_set_tensor(size_t bytes, double ms) { g_st_ms += ms; g_st_calls++; g_st_bytes += bytes; }
@@ -696,6 +787,9 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
         size_t bytes; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
         ~st_timer() { ggml_sycl_note_set_tensor(bytes, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()); }
     } st_guard{ size };
+    if (g_sync_trace.on) {
+        g_sync_trace.note_upload(size);
+    }
     // ARC-LAB: GGML_SYCL_FAST_SET_TENSOR=1: small writes (<= 4 MB, i.e. per-token inputs, not weights) skip the device-wide
     // wait and the malloc'd bounce buffer (the mmap workaround is for weights loaded from disk): one pinned staging copy and
     // one wait on this queue. Still synchronous for the caller.
@@ -6317,6 +6411,9 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
     const auto      ht_t0  = sycl_host_timing::clk::now();
+    if (g_sync_trace.on) {
+        g_sync_trace.note_sync();
+    }
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->wait()));
     g_upload_off = 0;
     if (g_ht.on) {
@@ -7323,6 +7420,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         ot_prev = now;
         ot_op   = next;
     };
+    if (g_sync_trace.on) {
+        g_sync_trace.note_graph(cgraph);
+    }
     if (ot_on) {
         ot_mark(std::string());  // inputs and earlier work are not charged
         g_ot.nodes += cgraph->n_nodes;

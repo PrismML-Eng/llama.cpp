@@ -270,6 +270,11 @@ extern "C" {
 #    define GGML_BACKEND_DL_SCORE_IMPL(score_fn)
 #endif
 
+    // ARC-LAB: sync/upload attribution (GGML_SYCL_SYNC_TRACE): the scheduler tags the blocking copies it makes with a
+    // cause (e.g. "split input <name>"); a backend that counts synchronizes / uploads reads it. Thread-local; null = none.
+    GGML_API void         ggml_sync_trace_set_cause(const char * cause);
+    GGML_API const char * ggml_sync_trace_get_cause(void);
+
 #ifdef  __cplusplus
 }
 #endif
