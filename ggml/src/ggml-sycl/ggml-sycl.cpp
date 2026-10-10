@@ -331,6 +331,23 @@ static const char* dev2dev_int2str(int dev2dev) {
     }
 }
 
+// ARC-LAB: use the legacy Level Zero adapter unless the user chose one. On the B580 (oneAPI 2025.3, where V2 is the
+// default) plain decode measured +1-1.5% in llama-bench and MTP +0.5%, outputs identical. Set at library load, before
+// any SYCL platform query; SYCL_UR_USE_LEVEL_ZERO_V2=1 in the environment keeps V2.
+namespace {
+struct ggml_sycl_l0_adapter_default {
+    ggml_sycl_l0_adapter_default() {
+        if (getenv("SYCL_UR_USE_LEVEL_ZERO_V2") == nullptr) {
+#ifdef _WIN32
+            _putenv_s("SYCL_UR_USE_LEVEL_ZERO_V2", "0");
+#else
+            setenv("SYCL_UR_USE_LEVEL_ZERO_V2", "0", 0);
+#endif
+        }
+    }
+} ggml_sycl_l0_adapter_default_init;
+}
+
 static void ggml_check_sycl() try {
     static bool initialized = false;
 
