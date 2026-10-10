@@ -71,6 +71,7 @@ public:
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
 
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
+    // (ARC-LAB: with rpl on, S has 2 groups only - base and record banks; r keeps 1 + n_rs_seq)
     uint32_t n_rs_seq = 0;
 
     // per-seq rollback index
@@ -80,7 +81,8 @@ public:
 
     // ARC-LAB: rollback by replay for the gated delta net state (LLAMA_GDN_REPLAY, default on where it applies;
     // independent implementation of the technique described by llamADALL). The S rows of plane 0 hold the base
-    // state; plane 1 of each cell holds two banks of per-token update records (ggml_gated_delta_net_replay).
+    // state; plane 1 of each cell holds two banks of per-token update records (ggml_gated_delta_net_replay). S is
+    // allocated with these 2 planes only (the snapshot path allocates 1 + n_rs_seq).
     // Rolling back r tokens drops the last r pending records instead of selecting a snapshot plane. The conv
     // state (r_l) keeps its snapshot planes and rs_idx.
     bool     rpl   = false;

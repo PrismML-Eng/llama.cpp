@@ -578,6 +578,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         // base state in plane 0 plus the update records of the last K-1 tokens in plane 1 (two banks: this pass
         // reads one, its records go to the other) instead of K snapshot planes; see ggml_gated_delta_net_replay.
         GGML_ASSERT(state_rows == nullptr && n_seqs == 1 && g->ne[0] == 1);
+        // the memory allocates S with planes 0 and 1 only in replay mode (llama_memory_recurrent::rpl)
+        GGML_ASSERT(ssm_states_all->ne[1] == 2 * (int64_t) mem_size);
         const int64_t R        = H_v * (2 * S_v + 1);
         const size_t  row_size = ssm_states_all->nb[1];
         const size_t  rec_size = ggml_row_size(ssm_states_all->type, R * (K - 1));

@@ -72,6 +72,41 @@ llama_memory_recurrent::llama_memory_recurrent(
         return it->second.get();
     };
 
+    // ARC-LAB: GDN rollback by replay (LLAMA_GDN_REPLAY=0 keeps the snapshot planes). Applies to a single sequence
+    // of a qwen35 model whose recurrent layers all run on SYCL; anything else silently keeps the snapshot path.
+    // Decided before the tensors are created: in replay mode S gets only planes 0 (base) and 1 (record banks), so
+    // planes 2..n_rs_seq are not allocated. The snapshot path keeps the full (1 + n_rs_seq)-plane layout.
+    {
+        const char * env = getenv("LLAMA_GDN_REPLAY");
+        bool on = !(env && atoi(env) == 0) && n_rs_seq > 0 && n_seq_max == 1 && mem_size == 1 && offload &&
+                  model.arch == LLM_ARCH_QWEN35 && type_s == GGML_TYPE_F32 &&
+                  getenv("GGML_SYCL_GDN_CHUNKED") == nullptr; // the opt-in chunked prefill has no replay variant
+        const uint32_t S = hparams.ssm_d_state;
+        const uint32_t H = hparams.ssm_dt_rank;
+        on = on && S == 128 && H > 0 && hparams.ssm_d_inner == S * H && hparams.n_embd_s() == S * S * H;
+        const uint32_t R = H * (2 * S + 1);
+        // both banks of n_rs_seq records must fit in one S row
+        on = on && (uint64_t) 2 * n_rs_seq * R <= (uint64_t) hparams.n_embd_s();
+        bool any = false;
+        for (int i = 0; on && i < n_layer; i++) {
+            if (filter && !filter(i)) { // same layer selection as the allocation below
+                continue;
+            }
+            any = true;
+            ggml_backend_dev_t dev = model.dev_layer(i);
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            on = reg && strcmp(ggml_backend_reg_name(reg), "SYCL") == 0;
+        }
+        rpl   = on && any;
+        rpl_R = rpl ? R : 0;
+        if (rpl) {
+            LLAMA_LOG_INFO("%s: GDN rollback by replay: on (%u records of %u floats per bank, S planes 2 of %u)\n", __func__,
+                    n_rs_seq, R, 1 + n_rs_seq);
+        } else if (n_rs_seq > 0) {
+            LLAMA_LOG_INFO("%s: GDN rollback by replay: off (snapshot planes)\n", __func__);
+        }
+    }
+
     r_l.resize(n_layer);
     s_l.resize(n_layer);
 
@@ -99,46 +134,15 @@ llama_memory_recurrent::llama_memory_recurrent(
             throw std::runtime_error("failed to create ggml context for rs cache");
         }
 
-        const uint32_t n_rows = mem_size * (1 + n_rs_seq);
+        const uint32_t n_rows   = mem_size * (1 + n_rs_seq);
+        // ARC-LAB replay: S needs plane 0 (base) and plane 1 (record banks) only; the conv state keeps all its planes
+        const uint32_t n_rows_s = rpl ? mem_size * 2 : n_rows;
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows_s);
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
         s_l[i] = s;
-    }
-
-    // ARC-LAB: GDN rollback by replay (LLAMA_GDN_REPLAY=0 keeps the snapshot planes). Applies to a single sequence
-    // of a qwen35 model whose recurrent layers all run on SYCL; anything else silently keeps the snapshot path.
-    // The tensor layout is the same either way (planes 0 and 1 of S are reused), only their meaning changes.
-    {
-        const char * env = getenv("LLAMA_GDN_REPLAY");
-        bool on = !(env && atoi(env) == 0) && n_rs_seq > 0 && n_seq_max == 1 && mem_size == 1 && offload &&
-                  model.arch == LLM_ARCH_QWEN35 && type_s == GGML_TYPE_F32 &&
-                  getenv("GGML_SYCL_GDN_CHUNKED") == nullptr; // the opt-in chunked prefill has no replay variant
-        const uint32_t S = hparams.ssm_d_state;
-        const uint32_t H = hparams.ssm_dt_rank;
-        on = on && S == 128 && H > 0 && hparams.ssm_d_inner == S * H && hparams.n_embd_s() == S * S * H;
-        const uint32_t R = H * (2 * S + 1);
-        // both banks of n_rs_seq records must fit in one S row
-        on = on && (uint64_t) 2 * n_rs_seq * R <= (uint64_t) hparams.n_embd_s();
-        bool any = false;
-        for (int i = 0; on && i < n_layer; i++) {
-            if (s_l[i] == nullptr) {
-                continue;
-            }
-            any = true;
-            ggml_backend_dev_t dev = model.dev_layer(i);
-            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-            on = reg && strcmp(ggml_backend_reg_name(reg), "SYCL") == 0;
-        }
-        rpl   = on && any;
-        rpl_R = rpl ? R : 0;
-        if (rpl) {
-            LLAMA_LOG_INFO("%s: GDN rollback by replay: on (%u records of %u floats per bank)\n", __func__, n_rs_seq, R);
-        } else if (n_rs_seq > 0) {
-            LLAMA_LOG_INFO("%s: GDN rollback by replay: off (snapshot planes)\n", __func__);
-        }
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
