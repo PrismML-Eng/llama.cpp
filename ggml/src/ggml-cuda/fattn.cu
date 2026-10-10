@@ -579,8 +579,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_MMA_F16:
-            if (ggml_cuda_fattn_mma_kv_native_supported(dst)) {
-                // In-place quantized K/V kernel: nothing to reserve beyond dst.
+            if (ggml_cuda_fattn_mma_kv_native_supported(dst) || ggml_cuda_fattn_prefill_f16(dst)) {
+                // In-place quantized K/V kernel, or f16 copies taken from the pool: nothing to reserve beyond dst.
                 break;
             }
             need_f16_K = true;
