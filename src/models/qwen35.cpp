@@ -1030,24 +1030,90 @@ void llama_model_qwen35::graph_mtp::build_chain(const llama_model & model) {
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    ggml_tensor * tok_embd = unrotate(ggml_get_rows(ctx0, tok_embd_w, ggml_view_1d(ctx0, tokens_all, n_lead, 0)));
+    // ARC-LAB: LLAMA_MTP_CHAIN_TIGHT (bit mask, default all on; 0 = the first chain layout):
+    //   1: every per-step input slice is made once, up front, from ONE device copy of each packed input. A view of a
+    //      host input is its own scheduler split input (one blocking host->device copy per view and step), and a view
+    //      built lazily lands between the step's compute nodes; here the device split starts with 4-5 copy kernels and
+    //      all the slices, then each step's compute nodes run uninterrupted, as in the single-step draft graph.
+    static const int tight = [] {
+        const char * e = getenv("LLAMA_MTP_CHAIN_TIGHT");
+        return e ? atoi(e) : 1;
+    }();
+
+    ggml_tensor * tok_rows = ggml_get_rows(ctx0, tok_embd_w, ggml_view_1d(ctx0, tokens_all, n_lead, 0));
     ggml_tensor * h_embd   = ggml_view_2d(ctx0, h_all, h_all->ne[0], n_lead, h_all->nb[1], 0);
+    ggml_tensor * k_all    = inp_attn->get_k_idxs();
+    ggml_tensor * v_all    = inp_attn->get_v_idxs();
+    ggml_tensor * mask_all = inp_attn->get_kq_mask();
+
+    // the device holding the head's weights (none: CPU-only, the slices stay views of the host inputs)
+    ggml_backend_t dev = nullptr;
+    if ((tight & 1) && sched && layer.wq->buffer) {
+        ggml_backend_buffer_type_t wbuft = ggml_backend_buffer_get_type(layer.wq->buffer);
+        for (int b = 0; b < ggml_backend_sched_get_n_backends(sched) && !dev; ++b) {
+            ggml_backend_t be = ggml_backend_sched_get_backend(sched, b);
+            if (be != backend_cpu && ggml_backend_supports_buft(be, wbuft)) {
+                dev = be;
+            }
+        }
+    }
+    if (tight & 1) {
+        ggml_build_forward_expand(gf, tok_rows);  // the host-table lookup first: one host split, then one device split
+    }
+    if (dev) {
+        // whole-tensor copies (a device memcpy each), pinned to the device so their views need no upload
+        auto on_dev = [&](ggml_tensor * t, const char * name) {
+            ggml_tensor * c = ggml_cont(ctx0, t);
+            ggml_set_name(c, name);
+            if (!ggml_backend_supports_op(dev, c)) {
+                return t;
+            }
+            ggml_backend_sched_set_tensor_backend(sched, c, dev);
+            ggml_build_forward_expand(gf, c);
+            return c;
+        };
+        pos_all  = on_dev(pos_all,  "mtp_chain_pos_dev");
+        out_all  = on_dev(out_all,  "mtp_chain_out_dev");
+        k_all    = on_dev(k_all,    "mtp_chain_k_idxs_dev");
+        v_all    = on_dev(v_all,    "mtp_chain_v_idxs_dev");
+        mask_all = on_dev(mask_all, "mtp_chain_kq_mask_dev");
+    }
+
+    // each step's slices: positions, output row, KV indices and mask rows, sized as a decode of rows [0, r0 + nr)
+    // would be (created here; added to the graph here with bit 1, else where the step first reads them)
+    struct step_inputs {
+        ggml_tensor * pos, * out, * k_idxs, * v_idxs, * kq_mask;
+    };
+    std::vector<step_inputs> sin(n_steps);
+    for (int64_t s = 0; s < n_steps; ++s) {
+        const auto &  st = steps[s];
+        const int64_t nr = st.nr;
+        auto &        si = sin[s];
+        si.pos     = ggml_view_1d(ctx0, pos_all, nr * n_pos, st.r0 * n_pos * ggml_element_size(pos_all));
+        si.out     = ggml_view_1d(ctx0, out_all, 1, s * ggml_element_size(out_all));
+        si.k_idxs  = ggml_view_1d(ctx0, k_all, nr, st.r0 * ggml_element_size(k_all));
+        si.v_idxs  = ggml_view_1d(ctx0, v_all, nr, st.r0 * ggml_element_size(v_all));
+        si.kq_mask = ggml_cont(ctx0, ggml_view_2d(ctx0, mask_all, st.n_kv, nr, mask_all->nb[1], st.r0 * mask_all->nb[1]));
+        if (tight & 1) {
+            for (ggml_tensor * t : { si.pos, si.out, si.k_idxs, si.v_idxs, si.kq_mask }) {
+                ggml_build_forward_expand(gf, t);
+            }
+        }
+    }
+
+    ggml_tensor * tok_embd = unrotate(tok_rows);
 
     for (int64_t s = 0; s < n_steps; ++s) {
         const auto &  st = steps[s];
         const int64_t nr = st.nr;
         cb(tok_embd, "mtp_tok_embd", il);
 
-        // this step's slice of the ubatch's KV indices and mask, sized as a decode of rows [0, r0 + nr) would be
-        const uint32_t n_kv_s = st.n_kv;
-        ggml_tensor * st_pos = ggml_view_1d(ctx0, pos_all, nr * n_pos, st.r0 * n_pos * ggml_element_size(pos_all));
-        ggml_tensor * st_out = ggml_view_1d(ctx0, out_all, 1, s * ggml_element_size(out_all));
-        ggml_tensor * k_idxs = inp_attn->get_k_idxs();
-        ggml_tensor * v_idxs = inp_attn->get_v_idxs();
-        k_idxs = ggml_view_1d(ctx0, k_idxs, nr, st.r0 * ggml_element_size(k_idxs));
-        v_idxs = ggml_view_1d(ctx0, v_idxs, nr, st.r0 * ggml_element_size(v_idxs));
-        ggml_tensor * kq_mask = inp_attn->get_kq_mask();
-        kq_mask = ggml_cont(ctx0, ggml_view_2d(ctx0, kq_mask, n_kv_s, nr, kq_mask->nb[1], st.r0 * kq_mask->nb[1]));
+        const uint32_t n_kv_s  = st.n_kv;
+        ggml_tensor *  st_pos  = sin[s].pos;
+        ggml_tensor *  st_out  = sin[s].out;
+        ggml_tensor *  k_idxs  = sin[s].k_idxs;
+        ggml_tensor *  v_idxs  = sin[s].v_idxs;
+        ggml_tensor *  kq_mask = sin[s].kq_mask;
 
         ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
         cb(h_norm, "mtp_hnorm", il);
