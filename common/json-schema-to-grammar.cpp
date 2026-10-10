@@ -748,6 +748,26 @@ private:
             optional_props.push_back("*");
         }
 
+        // Also allow declared order for interleaved optional fields, preserving the required-first alternative.
+        bool optional_before_required = false;
+        for (size_t i = 0, seen_optional = 0; i < prop_names.size(); i++) {
+            if (!required.count(prop_names[i])) {
+                seen_optional = 1;
+            } else if (seen_optional) {
+                optional_before_required = true;
+                break;
+            }
+        }
+        std::string declared_order_rule;
+        if (optional_before_required && required.count(prop_names[0]) && !prop_kv_rule_names.count("*")) {
+            declared_order_rule = "\"{\" space " + prop_kv_rule_names[prop_names[0]];
+            for (size_t i = 1; i < prop_names.size(); i++) {
+                std::string kv = " \",\" space " + prop_kv_rule_names[prop_names[i]];
+                declared_order_rule += required.count(prop_names[i]) ? kv : " (" + kv + " )?";
+            }
+            declared_order_rule += " space \"}\"";
+        }
+
         std::string rule = "\"{\" space ";
         for (size_t i = 0; i < required_props.size(); i++) {
             if (i > 0) {
@@ -798,6 +818,9 @@ private:
 
         rule += " space \"}\"";
 
+        if (!declared_order_rule.empty()) {
+            return declared_order_rule + " | " + rule;
+        }
         return rule;
     }
 
