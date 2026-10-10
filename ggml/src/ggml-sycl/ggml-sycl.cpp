@@ -6271,12 +6271,30 @@ struct sycl_op_timing {
         bool mm = false;
         for (int i = 0; i < g->n_nodes; ++i) {
             const ggml_tensor * n = g->nodes[i];
-            if (n->op == GGML_OP_MUL_MAT) {
+            // weight mat-muls only: a Hadamard transform reshapes each row into 1024-wide blocks (5..17 per row)
+            if (n->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(n, 1) != GGML_HINT_SRC0_IS_HADAMARD) {
                 mm = true;
                 if (n->src[1]->ne[1] * n->src[1]->ne[2] > 8) return false;
             }
         }
+        if (mm) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                fprintf(stderr, "op-timing: active (first draft-sized graph: %d nodes)\n", g->n_nodes);
+            }
+        }
         return mm;
+    }
+    // op label: mat-muls by weight type (and the Hadamard transforms apart)
+    static std::string label(const ggml_tensor * n) {
+        if (n->op == GGML_OP_MUL_MAT) {
+            if (ggml_get_op_params_i32(n, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+                return "MUL_MAT hadamard";
+            }
+            return std::string("MUL_MAT ") + ggml_type_name(n->src[0]->type);
+        }
+        return ggml_op_desc(n);
     }
     void report() {
         fprintf(stderr, "op-timing: %d draft-sized graphs, per graph: %.3f ms serialised over %.1f kernel groups (%.0f nodes)\n",
@@ -7290,11 +7308,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     const char *                     ht_op   = nullptr;
     const bool                       ot_on   = g_ot.on && sycl_op_timing::draft_sized(cgraph);
     sycl_op_timing::clk::time_point  ot_prev{};
-    const char *                     ot_op   = nullptr;
-    auto ot_mark = [&](const char * next) {  // drain the queue, charge the time since the last mark to the op that ran
+    std::string                      ot_op;
+    auto ot_mark = [&](const std::string & next) {  // drain the queue, charge the time since the last mark to the op that ran
         SYCL_CHECK(CHECK_TRY_ERROR(sycl_ctx->stream()->wait()));
         const auto now = sycl_op_timing::clk::now();
-        if (ot_op) {
+        if (!ot_op.empty()) {
             const double ms = std::chrono::duration<double, std::milli>(now - ot_prev).count();
             auto & a = g_ot.per_op[ot_op];
             a.first += ms;
@@ -7306,7 +7324,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         ot_op   = next;
     };
     if (ot_on) {
-        ot_mark(nullptr);  // inputs and earlier work are not charged
+        ot_mark(std::string());  // inputs and earlier work are not charged
         g_ot.nodes += cgraph->n_nodes;
     }
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -7334,7 +7352,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
         if (ot_on) {
-            ot_mark(ggml_op_desc(node));
+            ot_mark(sycl_op_timing::label(node));
         }
 
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
@@ -7476,7 +7494,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         GGML_ASSERT(ok);
     }
     if (ot_on) {
-        ot_mark(nullptr);
+        ot_mark(std::string());
         if (++g_ot.graphs == 64) {
             g_ot.report();
         }
