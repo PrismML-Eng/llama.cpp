@@ -992,9 +992,11 @@ void llama_model_qwen35::graph_mtp::build_chain(const llama_model & model) {
     //      1-row step's row is already the output (no gather, no output-index slice).
     //   8: fewer uploads: the output rows ride in the position input, and V is stored with the K indices (equal for a
     //      non-transposed V cache; the V index input is then unused and not uploaded).
+    //  16: the n draft ids are concatenated into one I32 tensor at the end of the graph (n-1 tiny kernels), so the host
+    //      reads them with one copy: each small device->host read costs ~0.2 ms on this stack.
     static const int tight = [] {
         const char * e = getenv("LLAMA_MTP_CHAIN_TIGHT");
-        return e ? atoi(e) : 15;
+        return e ? atoi(e) : 31;
     }();
 
     const uint32_t n_pos = hparams.n_pos_per_embd();
@@ -1262,7 +1264,9 @@ void llama_model_qwen35::graph_mtp::build_chain(const llama_model & model) {
         cb(logits, "result_output", -1);
         ggml_tensor * best = ggml_argmax(ctx0, logits);
         ggml_set_name(best, "mtp_chain_argmax");
-        ggml_set_output(best);
+        if (!(tight & 16)) {
+            ggml_set_output(best);
+        }
         ggml_build_forward_expand(gf, best);
         res->t_mtp_chain.push_back(best);
 
@@ -1283,5 +1287,17 @@ void llama_model_qwen35::graph_mtp::build_chain(const llama_model & model) {
         }
         tok_embd = unrotate(e);
         h_embd   = h_out;
+    }
+
+    if (tight & 16) {
+        // after the last step, so no node lands between a step's compute nodes
+        ggml_tensor * ids = res->t_mtp_chain[0];
+        for (size_t s = 1; s < res->t_mtp_chain.size(); ++s) {
+            ids = ggml_concat(ctx0, ids, res->t_mtp_chain[s], 0);
+        }
+        ggml_set_name(ids, "mtp_chain_ids");
+        ggml_set_output(ids);
+        ggml_build_forward_expand(gf, ids);
+        res->t_mtp_chain_ids = ids;
     }
 }

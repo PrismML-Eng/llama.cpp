@@ -1386,6 +1386,7 @@ void llm_graph_result::reset() {
     t_sampled.clear();
     t_dspark_greedy.clear();
     t_mtp_chain.clear();
+    t_mtp_chain_ids = nullptr;
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();

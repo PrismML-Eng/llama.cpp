@@ -1057,6 +1057,7 @@ public:
     // ARC-LAB: chained MTP draft (cparams.mtp_chain_n): per step, the argmax row of the draft logits (I32 [1]); an
     // index into the draft head's vocabulary when it has one, else a token id
     std::vector<ggml_tensor *> t_mtp_chain;
+    ggml_tensor *              t_mtp_chain_ids = nullptr; // I32 [n_steps]: the same ids in one tensor (one readback), or null
     std::vector<ggml_tensor *> t_sampled_probs;
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;

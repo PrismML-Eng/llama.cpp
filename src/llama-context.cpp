@@ -2266,7 +2266,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         if (chain_e) {
             // the per-step argmax rows, mapped to tokens in get_mtp_chain_ids()
-            if (res && !res->t_mtp_chain.empty()) {
+            if (res && res->t_mtp_chain_ids) {
+                // one copy of all the ids (LLAMA_MTP_CHAIN_TIGHT bit 16)
+                ggml_tensor *  t = res->t_mtp_chain_ids;
+                ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+                GGML_ASSERT(b != nullptr && t->ne[0] == (int64_t) res->t_mtp_chain.size());
+                mtp_chain_out.resize(res->t_mtp_chain.size());
+                ggml_backend_tensor_get_async(b, t, mtp_chain_out.data(), 0, mtp_chain_out.size() * sizeof(int32_t));
+                mtp_chain_n_out = (uint32_t) res->t_mtp_chain.size();
+            } else if (res && !res->t_mtp_chain.empty()) {
                 mtp_chain_out.resize(res->t_mtp_chain.size());
                 for (size_t s = 0; s < res->t_mtp_chain.size(); ++s) {
                     ggml_tensor *  t = res->t_mtp_chain[s];
