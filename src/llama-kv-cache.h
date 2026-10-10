@@ -280,6 +280,12 @@ private:
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
 
+    // ARC-LAB: device copies of attn_rot_hadamard (LLAMA_SYNC_TRIM bit 2): graphs read these instead of an input that
+    // is uploaded (one sync + one blocking copy each) on every decode
+    ggml_context_ptr                          attn_rot_dev_ctx;
+    ggml_backend_buffer_ptr                   attn_rot_dev_buf;
+    std::unordered_map<int64_t, ggml_tensor *> attn_rot_dev;
+
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
 
