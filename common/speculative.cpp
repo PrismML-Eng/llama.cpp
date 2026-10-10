@@ -2418,15 +2418,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         deferred.assign(n_seq, {});
 
-        // chained drafts: default on when the head has a trimmed draft vocabulary (its token_embd rows fit on the
-        // device; measured slower without one), LLAMA_MTP_CHAIN=1 forces, =0 off. Greedy single-sequence drafting only.
+        // chained drafts: default OFF for now (B580, 2026-10-10: identical drafts but -0.2..-0.8%, the chain graph is rebuilt
+        // on every draft; revisit with graph reuse). LLAMA_MTP_CHAIN=1 turns it on. Greedy single-sequence drafting only.
         {
             const char *  env  = getenv("LLAMA_MTP_CHAIN");
             const int32_t sup  = llama_mtp_chain_support(ctx_dft);
-            const bool    want = env ? atoi(env) != 0 : (sup & 2) != 0;
+            const bool    want = env ? atoi(env) != 0 : false;
             const char *  why  = nullptr;
             if (!want) {
-                why = env ? "LLAMA_MTP_CHAIN=0" : "no trimmed draft head (LLAMA_MTP_CHAIN=1 forces it)";
+                why = env ? "LLAMA_MTP_CHAIN=0" : "off by default (LLAMA_MTP_CHAIN=1 turns it on)";
             } else if (sup == 0) {
                 why = "not supported by this context (qwen35 single head, flash attention, plain KV cache)";
             } else if (is_mem_shared || chain_heads) {
