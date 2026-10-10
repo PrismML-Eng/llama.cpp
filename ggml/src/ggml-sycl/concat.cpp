@@ -116,7 +116,7 @@ static void concat_T_sycl(const T *x, const T *y, T *dst,
   }
 }
 
-// non-contiguous kernel (slow)
+// strided kernel, also used for short rows
 template<typename T>
 static void concat_T_sycl_non_cont(
     queue_ptr stream, const char *src0, const char *src1, char *dst,
@@ -126,37 +126,32 @@ static void concat_T_sycl_non_cont(
     uint64_t nb11, uint64_t nb12, uint64_t nb13, int64_t ne0, int64_t ne1,
     int64_t ne2, int64_t ne3, uint64_t nb0, uint64_t nb1, uint64_t nb2,
     uint64_t nb3, int32_t dim) {
-  sycl::range<3> gridDim(ne3, ne2, ne1);
+  // one work-item per dst element, so short rows do not leave most of each work-group idle
+  const int64_t n = ne0 * ne1 * ne2 * ne3;
 
-  // Avoid oversubscribing device when there is not enough elements along the innermost dim to
-  // fill a full SYCL_CONCAT_BLOCK_SIZE. For larger # of elements, the full SYCL_CONCAT_BLOCK_SIZE
-  // is used.
-  const int64_t ne0_pad   = GGML_PAD(ne0, WARP_SIZE);
-  const int64_t block_ne0 = ne0_pad < SYCL_CONCAT_BLOCK_SIZE ? ne0_pad : (int64_t) SYCL_CONCAT_BLOCK_SIZE;
-  sycl::range<3> blockDim(1, 1, block_ne0);
+  int64_t o[4] = { 0, 0, 0, 0 };
+  o[dim]       = dim == 0 ? ne00 : (dim == 1 ? ne01 : (dim == 2 ? ne02 : ne03));
+  const int64_t o0 = o[0], o1 = o[1], o2 = o[2], o3 = o[3];
 
-  stream->parallel_for(sycl::nd_range<3>(gridDim * blockDim, blockDim), [=](sycl::nd_item<3> item_ct1) {
-      int64_t i3 = item_ct1.get_group(0);
-      int64_t i2 = item_ct1.get_group(1);
-      int64_t i1 = item_ct1.get_group(2);
-
-      int64_t o[4] = { 0, 0, 0, 0 };
-      o[dim]       = dim == 0 ? ne00 : (dim == 1 ? ne01 : (dim == 2 ? ne02 : ne03));
+  stream->parallel_for(sycl::nd_range<1>(GGML_PAD(n, SYCL_CONCAT_BLOCK_SIZE), SYCL_CONCAT_BLOCK_SIZE),
+                       [=](sycl::nd_item<1> item_ct1) {
+      const int64_t idx = item_ct1.get_global_id(0);
+      if (idx >= n) {
+          return;
+      }
+      const int64_t i0 = idx % ne0;
+      const int64_t i1 = (idx / ne0) % ne1;
+      const int64_t i2 = (idx / (ne0 * ne1)) % ne2;
+      const int64_t i3 = idx / (ne0 * ne1 * ne2);
 
       const T * x;
-
-      for (int i0 = item_ct1.get_local_id(2); i0 < ne0; i0 += item_ct1.get_local_range(2)) {
-          if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
-              x = (const T *) (src0 + (i3) *nb03 + (i2) *nb02 + (i1) *nb01 + (i0) *nb00);
-          } else {
-              x = (const T *) (src1 + (i3 - o[3]) * nb13 + (i2 - o[2]) * nb12 + (i1 - o[1]) * nb11 +
-                                   (i0 - o[0]) * nb10);
-          }
-
-          T *y = (T *)(dst + i3 * nb3 + i2 * nb2 + i1 * nb1 + i0 * nb0);
-
-          *y = *x;
+      if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+          x = (const T *) (src0 + i3 * nb03 + i2 * nb02 + i1 * nb01 + i0 * nb00);
+      } else {
+          x = (const T *) (src1 + (i3 - o3) * nb13 + (i2 - o2) * nb12 + (i1 - o1) * nb11 + (i0 - o0) * nb10);
       }
+
+      *(T *) (dst + i3 * nb3 + i2 * nb2 + i1 * nb1 + i0 * nb0) = *x;
   });
 }
 
@@ -169,7 +164,8 @@ void concat_impl_sycl(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {
 
     const int32_t dim = ((int32_t *) dst->op_params)[0];
 
-    if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+    // the contiguous kernels use one work-group per row, which wastes most lanes on short rows
+    if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && (dim == 3 || dst->ne[0] >= SYCL_CONCAT_BLOCK_SIZE)) {
         const T * src0_d = (const T *) src0->data;
         const T * src1_d = (const T *) src1->data;
         T * dst_d = (T *) dst->data;

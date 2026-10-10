@@ -216,11 +216,37 @@ static void dequantize_mul_mat_vec_reorder(const void * __restrict__ vx, const d
     }
 }
 
+// Few rows: one work-group per row with K split over the group. One sub-group per row leaves
+// the GPU mostly idle and bound by load latency (e.g. 48 rows of 5120 took ~25 us).
+static constexpr int DMMV_FEW_ROWS    = 512;
+static constexpr int DMMV_FEW_ROWS_WG = 256;
+
+template <typename src_t>
+static void mul_mat_vec_few_rows_sycl(const void * vx, const dfloat * y, float * dst, const int ncols,
+                                      const int nrows, dpct::queue_ptr stream) {
+    stream->parallel_for(sycl::nd_range<1>((size_t) nrows * DMMV_FEW_ROWS_WG, DMMV_FEW_ROWS_WG),
+                         [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             const src_t * x   = (const src_t *) vx + (size_t) it.get_group(0) * ncols;
+                             float         sum = 0.0f;
+                             for (int i = it.get_local_id(0); i < ncols; i += DMMV_FEW_ROWS_WG) {
+                                 sum += (float) x[i] * (float) y[i];
+                             }
+                             sum = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
+                             if (it.get_local_id(0) == 0) {
+                                 dst[it.get_group(0)] = sum;
+                             }
+                         });
+}
+
 static void convert_mul_mat_vec_f16_sycl(const void *vx, const dfloat *y,
                                          float *dst, const int ncols,
                                          const int nrows,
                                          dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % GGML_SYCL_DMMV_X == 0);
+    if (nrows <= DMMV_FEW_ROWS) {
+        mul_mat_vec_few_rows_sycl<sycl::half>(vx, y, dst, ncols, nrows, stream);
+        return;
+    }
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
@@ -245,6 +271,10 @@ static void convert_mul_mat_vec_bf16_sycl(const void *vx, const dfloat *y,
     // The qk=1 kernel iterates with stride 2*GGML_SYCL_DMMV_X, so ncols must be a
     // multiple of that — not just GGML_SYCL_DMMV_X — to avoid out-of-bounds reads.
     GGML_ASSERT(ncols % (2*GGML_SYCL_DMMV_X) == 0);
+    if (nrows <= DMMV_FEW_ROWS) {
+        mul_mat_vec_few_rows_sycl<sycl::ext::oneapi::bfloat16>(vx, y, dst, ncols, nrows, stream);
+        return;
+    }
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
