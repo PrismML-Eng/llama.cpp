@@ -566,6 +566,11 @@ class SchemaConverter:
         return self._format_literal(json.dumps(value))
 
     def visit(self, schema, name):
+        # An empty union ("anyOf": [], "oneOf": [] or "type": []) has no alternatives to build a rule from; drop the
+        # keyword and convert the rest of the schema (same as the C++ converter).
+        for key in ('oneOf', 'anyOf', 'type'):
+            if isinstance(schema, dict) and isinstance(schema.get(key), list) and not schema[key]:
+                return self.visit({k: v for k, v in schema.items() if k != key}, name)
         schema_type = schema.get('type')
         schema_format = schema.get('format')
         rule_name = name + '-' if name in RESERVED_NAMES else name or 'root'

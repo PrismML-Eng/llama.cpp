@@ -931,6 +931,16 @@ public:
     }
 
     std::string visit(const json & schema, const std::string & name) {
+        // An empty union ("anyOf": [], "oneOf": [] or "type": []) has no alternatives to build a rule from; it used to
+        // produce an empty rule that the grammar parser rejects, failing the whole request. Schema generators do emit
+        // it, so drop the keyword and convert the rest of the schema.
+        for (const char * key : {"oneOf", "anyOf", "type"}) {
+            if (schema.is_object() && schema.contains(key) && schema.at(key).is_array() && schema.at(key).empty()) {
+                json rest = schema;
+                rest.erase(key);
+                return visit(rest, name);
+            }
+        }
         json schema_type = schema.contains("type") ? schema["type"] : json();
         std::string schema_format = schema.contains("format") ? schema["format"].get<std::string>() : "";
         std::string rule_name = is_reserved_name(name) ? name + "-" : name.empty() ? "root" : name;
