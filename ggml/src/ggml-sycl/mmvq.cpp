@@ -2827,8 +2827,198 @@ static void reorder_mul_mat_vec_q5_k_q8_1_sycl_switch_ncols(
     }
 }
 
+// ARC-LAB: Q6_K reordered single-column mat-vec with more loads in flight (GGML_SYCL_Q6K_GEMV=1; the MTP draft head's
+// eh_proj / q / wo / ffn weights are Q6_K and ran at ~70% of the B580's bandwidth). Same arithmetic as
+// mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<Q6_K>>: one sub-group per row, lane l handles quant ints l and l + 16 of
+// every block, blocks in order, `partial_sum += vec_dot_q6_K_q8_1_impl_mmvq_scalar(...)` per (block, int) in the same
+// order, then the same sub-group reduction. What changes:
+// - U blocks' operands are loaded before any of them is used, so U x 2 groups of loads are in flight per lane instead
+//   of the ones of one block (the loop body was latency bound);
+// - ql / qh words are read as aligned 32-bit loads (the generic helper assembles them from two 16-bit loads; the
+//   reordered planes are 4-byte aligned, so the int is the same);
+// - the work-group holds GGML_SYCL_Q6K_SG sub-groups (rows) instead of 16.
+// GGML_SYCL_Q6K_U (1, 2, 4; default 2) and GGML_SYCL_Q6K_SG (4, 8, 16; default 8) are runtime knobs for a sweep.
+// GGML_SYCL_Q6K_CHECK=1 also runs the original kernel and counts rows whose result differs in any bit (stderr, every
+// 256 launches): the identity check for the GPU run.
+namespace {
+struct q6k_ops {
+    int   vl, vh, u0, u1;
+    int   sc0, sc1;
+    float d80, d81;
+};
+
+static __dpct_inline__ void q6k_load(const uint8_t * __restrict__ base, const int8_t * __restrict__ q8,
+                                     const sycl::half2 * __restrict__ ds, const int ql_byte, const int qh_byte,
+                                     const int sc_byte, const int iqs, q6k_ops & o) {
+    const int bq8_offset   = 2 * QR6_K * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 4);
+    const int scale_offset = (QI6_K / 4) * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 8);
+    const int vh_shift     = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
+    const int qh_int       = (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4);
+
+    o.vl  = *(const int *) (base + ql_byte + 4 * iqs);
+    o.vh  = *(const int *) (base + qh_byte + 4 * qh_int) >> vh_shift;
+    const int8_t * scs = (const int8_t *) (base + sc_byte) + scale_offset;
+    o.sc0 = scs[0];
+    o.sc1 = scs[4];
+    o.u0  = *(const int *) (q8 + bq8_offset * QK8_1 + 4 * (iqs % QI8_1));
+    o.u1  = *(const int *) (q8 + (bq8_offset + 2) * QK8_1 + 4 * (iqs % QI8_1));
+    o.d80 = ds[bq8_offset + 0][0];
+    o.d81 = ds[bq8_offset + 2][0];
+}
+}  // namespace
+
+template <int U>
+static void mul_mat_vec_q6_k_reorder_pf(const void * __restrict__ vx, const void * __restrict__ vy,
+                                        float * __restrict__ dst, const int ncols, const int nrows,
+                                        const sycl::nd_item<3> & nd_item) {
+    using block_type = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q6_K>;
+    static_assert(QI6_K == 2 * WARP_SIZE, "two quant ints per lane per block");
+
+    const auto sg  = nd_item.get_sub_group();
+    const int  row = nd_item.get_group_linear_id() * sg.get_group_linear_range() + sg.get_group_linear_id();
+    if (row >= nrows) {
+        return;
+    }
+    const int lane = sg.get_local_linear_id();
+
+    const int       blocks_per_row = ncols / QK_K;
+    const int       nblocks        = nrows * blocks_per_row;
+    const uint8_t * base           = (const uint8_t *) vx;
+
+    float partial_sum = 0.0f;
+    int   i           = 0;
+    for (; i + U <= blocks_per_row; i += U) {
+        q6k_ops o[U][2];
+        float   d[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int  ibx  = row * blocks_per_row + i + u;
+            const auto bx   = block_type::get_block_offset(ibx, nblocks);
+            const auto doff = block_type::get_d_offset(nrows, ncols, ibx);
+            const int  iby  = (i + u) * block_type::block_to_q8_1_ratio();
+            const int8_t *      q8 = (const int8_t *) vy + iby * QK8_1;
+            const sycl::half2 * ds = (const sycl::half2 *) ((const char *) vy + ncols + iby * sizeof(sycl::half2));
+            d[u] = *(const ggml_half *) (base + doff.second);
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                q6k_load(base, q8, ds, bx.first, bx.second, doff.first, e * WARP_SIZE + lane, o[u][e]);
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                partial_sum += vec_dot_q6_K_q8_1_impl_mmvq_scalar(o[u][e].vl, o[u][e].vh, o[u][e].u0, o[u][e].u1,
+                                                                  o[u][e].sc0, o[u][e].sc1, d[u], o[u][e].d80,
+                                                                  o[u][e].d81);
+            }
+        }
+    }
+    for (; i < blocks_per_row; ++i) {
+        const int  ibx  = row * blocks_per_row + i;
+        const auto bx   = block_type::get_block_offset(ibx, nblocks);
+        const auto doff = block_type::get_d_offset(nrows, ncols, ibx);
+        const int  iby  = i * block_type::block_to_q8_1_ratio();
+        const int8_t *      q8 = (const int8_t *) vy + iby * QK8_1;
+        const sycl::half2 * ds = (const sycl::half2 *) ((const char *) vy + ncols + iby * sizeof(sycl::half2));
+        const float d = *(const ggml_half *) (base + doff.second);
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+            q6k_ops o;
+            q6k_load(base, q8, ds, bx.first, bx.second, doff.first, e * WARP_SIZE + lane, o);
+            partial_sum += vec_dot_q6_K_q8_1_impl_mmvq_scalar(o.vl, o.vh, o.u0, o.u1, o.sc0, o.sc1, d, o.d80, o.d81);
+        }
+    }
+
+    const float sum = sycl::reduce_over_group(sg, partial_sum, std::plus<>());
+    if (sg.leader()) {
+        dst[row] = sum;
+    }
+}
+
+template <int U>
+static void launch_q6_k_reorder_pf(const void * vx, const void * vy, float * dst, const int ncols, const int nrows,
+                                   const int n_sg, dpct::queue_ptr stream) {
+    const sycl::range<3> block_nums(1, 1, ceil_div(nrows, n_sg));
+    const sycl::range<3> block_dims(1, 1, (size_t) n_sg * WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_q6_k_reorder_pf<U>(vx, vy, dst, ncols, nrows, nd_item);
+                         });
+    });
+}
+
+static void reorder_mul_mat_vec_q6_k_q8_1_sycl_orig(const void * vx, const void * vy, float * dst, const int ncols,
+                                                    const int nrows, dpct::queue_ptr stream);
+
+// returns false when the tuned kernel is off (GGML_SYCL_Q6K_GEMV=0)
+static bool reorder_mul_mat_vec_q6_k_q8_1_sycl_tuned(const void * vx, const void * vy, float * dst, const int ncols,
+                                                     const int nrows, dpct::queue_ptr stream) {
+    if (!ggml_sycl_knob("GGML_SYCL_Q6K_GEMV", 0)) {
+        return false;
+    }
+    const int u    = ggml_sycl_knob("GGML_SYCL_Q6K_U", 2);
+    int       n_sg = ggml_sycl_knob("GGML_SYCL_Q6K_SG", 8);
+    if (n_sg != 4 && n_sg != 8 && n_sg != 16) {
+        n_sg = 8;
+    }
+    switch (u) {
+        case 1:  launch_q6_k_reorder_pf<1>(vx, vy, dst, ncols, nrows, n_sg, stream); break;
+        case 4:  launch_q6_k_reorder_pf<4>(vx, vy, dst, ncols, nrows, n_sg, stream); break;
+        default: launch_q6_k_reorder_pf<2>(vx, vy, dst, ncols, nrows, n_sg, stream); break;
+    }
+
+    if (ggml_sycl_knob("GGML_SYCL_Q6K_CHECK", 0)) {
+        // the original kernel into a scratch row vector, then a bitwise compare (debug only: allocates and waits)
+        static float * ref    = nullptr;
+        static int     ref_n  = 0;
+        static int *   n_diff = nullptr;
+        static long    launches = 0, rows = 0, diffs = 0;
+        if (ref_n < nrows) {
+            if (ref) {
+                sycl::free(ref, *stream);
+            }
+            ref   = sycl::malloc_device<float>(nrows, *stream);
+            ref_n = nrows;
+        }
+        if (!n_diff) {
+            n_diff = sycl::malloc_shared<int>(1, *stream);
+        }
+        reorder_mul_mat_vec_q6_k_q8_1_sycl_orig(vx, vy, ref, ncols, nrows, stream);
+        *n_diff = 0;
+        stream->wait();
+        int * nd = n_diff;
+        float * r = ref;
+        stream->parallel_for(sycl::range<1>(nrows), [=](sycl::id<1> k) {
+            const uint32_t a = sycl::bit_cast<uint32_t>(dst[k]);
+            const uint32_t b = sycl::bit_cast<uint32_t>(r[k]);
+            if (a != b) {
+                sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device> c(*nd);
+                c.fetch_add(1);
+            }
+        }).wait();
+        launches++;
+        rows += nrows;
+        diffs += *n_diff;
+        if (launches % 256 == 0) {
+            fprintf(stderr, "q6k-check: %ld launches, %ld rows, %ld rows differ (U=%d, SG=%d)\n", launches, rows, diffs, u,
+                    n_sg);
+        }
+    }
+    return true;
+}
+
 static void reorder_mul_mat_vec_q6_k_q8_1_sycl(const void * vx, const void * vy, float * dst, const int ncols,
                                                const int nrows, dpct::queue_ptr stream) {
+    if (reorder_mul_mat_vec_q6_k_q8_1_sycl_tuned(vx, vy, dst, ncols, nrows, stream)) {
+        return;
+    }
+    reorder_mul_mat_vec_q6_k_q8_1_sycl_orig(vx, vy, dst, ncols, nrows, stream);
+}
+
+static void reorder_mul_mat_vec_q6_k_q8_1_sycl_orig(const void * vx, const void * vy, float * dst, const int ncols,
+                                                    const int nrows, dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
     // Round up to a whole number of subgroup-sized workgroups; out-of-range rows are skipped inside the kernel.
     constexpr size_t num_subgroups = WARP_SIZE;
@@ -3992,6 +4182,9 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu
         case GGML_TYPE_PQ2_0:
             return mul_mat_vec_q_glu_reorder_type<GGML_TYPE_PQ2_0>(glu_op, vx, vgate, vy, dst, ncols, nrows, ncols_dst,
                                                                    stride_col_y_bytes, stride_col_dst, stream);
+        case GGML_TYPE_Q6_K:  // ARC-LAB: GGML_SYCL_Q6K_GLU (fusion.cpp)
+            return mul_mat_vec_q_glu_reorder_type<GGML_TYPE_Q6_K>(glu_op, vx, vgate, vy, dst, ncols, nrows, ncols_dst,
+                                                                  stride_col_y_bytes, stride_col_dst, stream);
         case GGML_TYPE_PTQ1_0:
             if (ncols_dst == 1 && ggml_sycl_ptq1_0_glu_n1_enabled()) {
                 static const int glu_nr = getenv("GGML_SYCL_PTQ1_GLU1_NR") ? atoi(getenv("GGML_SYCL_PTQ1_GLU1_NR")) : 2;
