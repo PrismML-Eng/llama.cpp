@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-kv-cache.h"
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -672,8 +673,19 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     res->add_input(std::move(inp));
 
+    // ARC-LAB: KV-only pass (LLAMA_MTP_KV_ONLY, default on; independent implementation of the technique described by
+    // GRIMOIRE). A decode with no output rows (the head's prompt catch-up) is only there to fill this layer's K/V, so
+    // build up to the cache store and stop: no query, attention, output projection, FFN or head. The K/V ops are the
+    // full graph's, in the same order, so the cache rows are bit-identical. Unmasked nextn readers copy h for every
+    // token, so they keep the full graph.
+    static const bool kv_only_on = [] {
+        const char * e = getenv("LLAMA_MTP_KV_ONLY");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const bool kv_only = kv_only_on && n_outputs == 0 && cparams.embeddings_nextn_masked;
+
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();  // an unread input would have no buffer
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -693,6 +705,46 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_norm", il);
+
+    if (kv_only) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LLAMA_LOG_INFO("%s: MTP KV-only pass for decodes without outputs (LLAMA_MTP_KV_ONLY=0 turns it off)\n", __func__);
+        }
+        // the SYCL backend runs same-input mat-vecs of <= 8 rows as one launch whose tile choice depends on the
+        // largest member; keep the Q projection (result unused) so q + k + v group exactly as in the full graph
+        if (n_tokens <= 8) {
+            ggml_build_forward_expand(gf, build_lora_mm(layer.wq, cur, layer.wq_s));
+        }
+
+        ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Kcur, "mtp_Kcur_normed", il);
+
+        ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+        cb(Vcur, "mtp_Vcur", il);
+
+        Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+
+        // the store half of build_attn(): same optional cache rotations, same expand order (v, k, then the copies)
+        if (inp_attn->self_k_rot) {
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot);
+        }
+        if (inp_attn->self_v_rot) {
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
+        }
+        ggml_build_forward_expand(gf, Vcur);
+        ggml_build_forward_expand(gf, Kcur);
+        cb(Kcur, "k_cache_in", il);
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+        return;
+    }
 
     ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
     cb(Qcur_full, "mtp_Qcur_full", il);
