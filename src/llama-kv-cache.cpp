@@ -1236,6 +1236,32 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
+uint32_t llama_kv_cache::get_n_kv_prefix(const slot_info & sinfo, uint32_t n_rows) const {
+    GGML_ASSERT(sinfo.n_stream() == 1);
+
+    const auto & cells = v_cells[sinfo.strm[0]];
+    const auto & idxs  = sinfo.idxs[0];
+
+    // highest used cell, not counting the cells of rows >= n_rows (they were empty before this ubatch)
+    uint32_t p1 = cells.used_max_p1();
+    while (p1 > 0) {
+        const uint32_t c = p1 - 1;
+        bool later = false;
+        for (size_t k = n_rows; k < idxs.size() && !later; ++k) {
+            later = idxs[k] == c;
+        }
+        if (!later && !cells.is_empty(c)) {
+            break;
+        }
+        --p1;
+    }
+
+    // same padding as get_n_kv
+    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+
+    return std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(p1, n_pad_cur)));
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
@@ -2781,6 +2807,22 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+uint32_t llama_kv_cache_context::get_n_kv_prefix(uint32_t n_rows) const {
+    return kv->get_n_kv_prefix(sinfos[i_cur], n_rows);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_n(ggml_context * ctx, int32_t il, uint32_t n_kv_view) const {
+    return kv->get_k(ctx, il, n_kv_view, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_n(ggml_context * ctx, int32_t il, uint32_t n_kv_view) const {
+    return kv->get_v(ctx, il, n_kv_view, sinfos[i_cur]);
+}
+
+bool llama_kv_cache_context::is_v_trans() const {
+    return kv->get_v_trans();
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

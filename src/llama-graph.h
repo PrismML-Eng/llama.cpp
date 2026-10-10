@@ -863,6 +863,7 @@ struct llm_graph_params {
     int64_t                          dspark_ctx_width;
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
+    ggml_tensor *                    mtp_chain_embd; // ARC-LAB: device copy of the draft-vocab token_embd rows, or null
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -928,6 +929,11 @@ struct llm_graph_params {
         }
 
         if (n_outputs != other.n_outputs) {
+            return false;
+        }
+
+        // ARC-LAB: a chained MTP draft graph bakes per-step KV lengths in; never reuse it or reuse into it
+        if (cparams.mtp_chain_n > 0 || other.cparams.mtp_chain_n > 0) {
             return false;
         }
 
@@ -1035,6 +1041,10 @@ public:
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_dspark_greedy;
+
+    // ARC-LAB: chained MTP draft (cparams.mtp_chain_n): per step, the argmax row of the draft logits (I32 [1]); an
+    // index into the draft head's vocabulary when it has one, else a token id
+    std::vector<ggml_tensor *> t_mtp_chain;
     std::vector<ggml_tensor *> t_sampled_probs;
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
@@ -1127,6 +1137,7 @@ struct llm_graph_context {
     int64_t                          dspark_ctx_width;
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
+    ggml_tensor *                    mtp_chain_embd;
 
     // Transforms shared by folded weights on the same activation. Key is (input, rotation);
     // both must match. Valid for one graph build only.

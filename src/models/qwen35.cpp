@@ -609,6 +609,52 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
     return cur;
 }
 
+// ARC-LAB: per-step inputs of a chained MTP draft graph (graph_mtp::build_chain): the positions of each step's rows in
+// the layout build_inp_pos() gives a decode of just those rows, and the step's output row
+class llm_graph_input_mtp_chain : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_mtp_chain(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
+
+    struct step {
+        int64_t       r0;      // first ubatch row of the step
+        int64_t       nr;      // rows
+        ggml_tensor * pos;     // I32 [nr * n_pos_per_embd]
+        ggml_tensor * out_idx; // I32 [1] = nr - 1 (the step's last row produces its draft)
+    };
+    std::vector<step> steps;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        const int64_t n_tokens = ubatch->n_tokens;
+        std::vector<int32_t> v;
+        for (const auto & st : steps) {
+            v.assign((size_t) st.nr * n_pos_per_embd, 0);
+            for (int64_t r = 0; r < st.nr; ++r) {
+                if (ubatch->token && n_pos_per_embd == 4) {
+                    // text tokens under M-RoPE, as llm_graph_input_pos: three equal dims, the fourth 0
+                    for (int d = 0; d < 3; ++d) {
+                        v[d * st.nr + r] = ubatch->pos[st.r0 + r];
+                    }
+                } else {
+                    for (uint32_t d = 0; d < n_pos_per_embd; ++d) {
+                        v[d * st.nr + r] = ubatch->pos[d * n_tokens + st.r0 + r];
+                    }
+                }
+            }
+            ggml_backend_tensor_set(st.pos, v.data(), 0, v.size() * sizeof(int32_t));
+            const int32_t out_row = (int32_t) st.nr - 1;
+            ggml_backend_tensor_set(st.out_idx, &out_row, 0, sizeof(out_row));
+        }
+    }
+
+    // never reused (llm_graph_params::allow_reuse refuses chain graphs)
+    bool can_reuse(const llm_graph_params & params) override {
+        GGML_UNUSED(params);
+        return false;
+    }
+
+    const uint32_t n_pos_per_embd;
+};
+
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for Qwen3.5/3.6 dense series
 llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
     : llm_graph_context(params) {
@@ -617,6 +663,11 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+
+    if (cparams.mtp_chain_n > 0) {
+        build_chain(model);
+        return;
+    }
 
     // hparams.n_layer includes both main model layers and MTP layers. The MTP
     // layer is stored immediately after the main layers in model.layers[].
@@ -855,4 +906,248 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);
+}
+
+// ARC-LAB: chained MTP drafts, n = cparams.mtp_chain_n steps in one graph (independent implementation of the technique
+// described by llamADALL). The ubatch holds the deferred catch-up rows and the anchor (step 0, as the first decode of the
+// draft loop in common/speculative.cpp) followed by one placeholder row per later step, so the KV cache has given every
+// draft position its cell and the mask rows exist. Step j > 0 reads step j-1's argmax token and output state (h_nextn
+// row) on the device and writes its K/V into its row's cell, as decode j of the loop does.
+//
+// Each step is built with the loop's shapes, so the kernels and their rounding are the loop's: its own rows only (step 0
+// the catch-up rows + anchor, later steps one row), its own positions, KV index slices and mask rows, and K/V views and
+// mask columns of the KV length a decode of the rows up to and including its own would see (get_n_kv_prefix; flash
+// attention splits the KV range by that length). The ops mirror the single-step graph above; keep the two in sync.
+void llama_model_qwen35::graph_mtp::build_chain(const llama_model & model) {
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+    const int     il          = hparams.n_layer();
+    const auto &  layer       = model.layers[il];
+
+    const int64_t n_steps = cparams.mtp_chain_n;
+    GGML_ASSERT(n_steps >= 1 && n_tokens >= n_steps);
+    GGML_ASSERT(ubatch.token && ubatch.embd && "MTP chain needs tokens and hidden rows");
+    const int64_t n_lead = n_tokens - n_steps + 1;  // step 0: catch-up rows + the anchor
+
+    int sections[4];
+    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+
+    // inputs as the single-step graph creates them
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->tokens);
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
+    ggml_set_input(inp->embd);
+    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    ggml_set_input(inp->h);
+    ggml_set_name(inp->h, "mtp_h_input");
+    ggml_tensor * tokens_all = inp->tokens;
+    ggml_tensor * h_all      = inp->h;
+    res->add_input(std::move(inp));
+
+    auto * inp_attn = build_attn_inp_kv();
+    const llama_kv_cache_context * kvc = inp_attn->mctx;
+
+    auto chain_inp = std::make_unique<llm_graph_input_mtp_chain>(hparams.n_pos_per_embd());
+    for (int64_t s = 0; s < n_steps; ++s) {
+        llm_graph_input_mtp_chain::step st;
+        st.r0      = s == 0 ? 0 : n_lead - 1 + s;
+        st.nr      = s == 0 ? n_lead : 1;
+        st.pos     = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, st.nr * hparams.n_pos_per_embd());
+        st.out_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+        ggml_set_input(st.pos);
+        ggml_set_input(st.out_idx);
+        chain_inp->steps.push_back(st);
+    }
+    const auto steps = chain_inp->steps;
+    res->add_input(std::move(chain_inp));
+
+    // token embeddings: the host table for the ubatch's own tokens (catch-up tokens need not be in the draft
+    // vocabulary), the draft-vocab device copy (row k = token draft_head_ids[k]) for the argmax tokens
+    ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+    const llama_hadamard_transform * inv = nullptr;
+    if (hadamard_inverses) {
+        const auto it = hadamard_inverses->find(tok_embd_w);
+        if (it != hadamard_inverses->end()) {
+            inv = &it->second;
+        }
+    }
+    auto unrotate = [&](ggml_tensor * e) {
+        // the single-step graph's inverse transform after the lookup (also applies to the copy: same rows)
+        if (inv) {
+            e = llama_mul_mat_hadamard(ctx0, e, inv->rot);
+            if (inv->signs) {
+                e = ggml_mul(ctx0, e, inv->signs);
+            }
+        }
+        return e;
+    };
+
+    static const bool draft_head_off = getenv("LLAMA_MTP_DRAFT_HEAD_OFF") != nullptr;
+    const bool use_draft_head = layer.nextn.draft_head && layer.nextn.draft_head_ids && !layer.nextn.shared_head_head &&
+                                !draft_head_off;
+    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+    ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+    ggml_tensor * head_norm_w = layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm;
+    GGML_ASSERT(head_w && head_norm_w);
+
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        LLAMA_LOG_INFO("%s: MTP chain graph (%lld steps, %s, %s token lookups)\n", __func__, (long long) n_steps,
+                use_draft_head ? "draft head" : "full head", use_draft_head && mtp_chain_embd ? "device" : "host");
+    }
+
+    const float kq_scale = hparams.f_attention_scale == 0.0f
+            ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+
+    ggml_tensor * tok_embd = unrotate(ggml_get_rows(ctx0, tok_embd_w, ggml_view_1d(ctx0, tokens_all, n_lead, 0)));
+    ggml_tensor * h_embd   = ggml_view_2d(ctx0, h_all, h_all->ne[0], n_lead, h_all->nb[1], 0);
+
+    for (int64_t s = 0; s < n_steps; ++s) {
+        const auto &  st = steps[s];
+        const int64_t nr = st.nr;
+        cb(tok_embd, "mtp_tok_embd", il);
+
+        // this step's slice of the ubatch's KV indices and mask, sized as a decode of rows [0, r0 + nr) would be
+        const uint32_t n_kv_s = kvc->get_n_kv_prefix((uint32_t) (st.r0 + nr));
+        ggml_tensor * k_idxs = inp_attn->get_k_idxs();
+        ggml_tensor * v_idxs = inp_attn->get_v_idxs();
+        k_idxs = ggml_view_1d(ctx0, k_idxs, nr, st.r0 * ggml_element_size(k_idxs));
+        v_idxs = ggml_view_1d(ctx0, v_idxs, nr, st.r0 * ggml_element_size(v_idxs));
+        ggml_tensor * kq_mask = inp_attn->get_kq_mask();
+        kq_mask = ggml_cont(ctx0, ggml_view_2d(ctx0, kq_mask, n_kv_s, nr, kq_mask->nb[1], st.r0 * kq_mask->nb[1]));
+
+        ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+        cb(h_norm, "mtp_hnorm", il);
+
+        ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+        cb(e_norm, "mtp_enorm", il);
+
+        ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);
+        cb(concat, "mtp_concat", il);
+
+        ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
+        cb(cur, "mtp_eh_proj", il);
+
+        ggml_tensor * inpSA = cur;
+
+        cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+        cb(cur, "mtp_attn_norm", il);
+
+        ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
+        cb(Qcur_full, "mtp_Qcur_full", il);
+
+        ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full,
+                n_embd_head, n_head, nr,
+                ggml_element_size(Qcur_full) * n_embd_head * 2,
+                ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+                0);
+        Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Qcur, "mtp_Qcur_normed", il);
+
+        ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full,
+                n_embd_head, n_head, nr,
+                ggml_element_size(Qcur_full) * n_embd_head * 2,
+                ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+                ggml_element_size(Qcur_full) * n_embd_head);
+        gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, nr);
+        cb(gate, "mtp_gate", il);
+
+        ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, nr);
+        Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Kcur, "mtp_Kcur_normed", il);
+
+        ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, nr);
+        cb(Vcur, "mtp_Vcur", il);
+
+        Qcur = ggml_rope_multi(ctx0, Qcur, st.pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        Kcur = ggml_rope_multi(ctx0, Kcur, st.pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+
+        // build_attn() for this step's rows: same rotations, same expand order, store, then attend
+        if (inp_attn->self_k_rot) {
+            Qcur = llama_mul_mat_hadamard(ctx0, Qcur, inp_attn->self_k_rot);
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot);
+        }
+        if (inp_attn->self_v_rot) {
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
+        }
+        ggml_build_forward_expand(gf, Qcur);
+        ggml_build_forward_expand(gf, Vcur);
+        ggml_build_forward_expand(gf, Kcur);
+        cb(Kcur, "k_cache_in", il);
+        ggml_build_forward_expand(gf, kvc->cpy_k(ctx0, Kcur, k_idxs, il));
+        ggml_build_forward_expand(gf, kvc->cpy_v(ctx0, Vcur, v_idxs, il));
+
+        cur = build_attn_mha(Qcur, kvc->get_k_n(ctx0, il, n_kv_s), kvc->get_v_n(ctx0, il, n_kv_s), nullptr, kq_mask,
+                nullptr, nullptr, kq_scale, il);
+        cb(cur, "kqv_out", il);
+        if (inp_attn->self_v_rot) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp_attn->self_v_rot);
+        }
+        cb(cur, "mtp_attn_pregate", il);
+
+        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
+        cur = build_lora_mm(layer.wo, cur, layer.wo_s);
+        cb(cur, "mtp_attn_out", il);
+
+        cur = ggml_add(ctx0, cur, inpSA);
+        cb(cur, "mtp_attn_residual", il);
+
+        ggml_tensor * ffn_residual = cur;
+        cur = build_norm(cur, layer.attn_post_norm, nullptr, LLM_NORM_RMS, il);
+        cb(cur, "mtp_attn_post_norm", il);
+
+        cur = build_ffn(cur,
+                layer.ffn_up,   nullptr, layer.ffn_up_s,
+                layer.ffn_gate, nullptr, layer.ffn_gate_s,
+                layer.ffn_down, nullptr, layer.ffn_down_s,
+                nullptr,
+                LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(cur, "mtp_ffn_out", il);
+
+        cur = ggml_add(ctx0, cur, ffn_residual);
+        cb(cur, "mtp_post_ffn", il);
+
+        cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
+        cb(cur, "h_nextn", -1);
+
+        // the step's output row (masked h_nextn: the next step's hidden input)
+        ggml_tensor * h_out = ggml_get_rows(ctx0, cur, st.out_idx);
+        cb(h_out, "mtp_shared_head_norm", -1);
+
+        // greedy draft: argmax of the head's logits. With a draft head that is an index into its vocabulary (the
+        // -inf scatter of the single-step graph only maps it to a token id, which the context does on the host)
+        ggml_tensor * logits = use_draft_head ? build_lora_mm(layer.nextn.draft_head, h_out, nullptr)
+                                              : build_lora_mm(head_w, h_out, head_s);
+        cb(logits, "result_output", -1);
+        ggml_tensor * best = ggml_argmax(ctx0, logits);
+        ggml_set_name(best, "mtp_chain_argmax");
+        ggml_set_output(best);
+        ggml_build_forward_expand(gf, best);
+        res->t_mtp_chain.push_back(best);
+
+        if (s + 1 == n_steps) {
+            break;
+        }
+
+        // next step's inputs: this step's draft token and output row
+        ggml_tensor * e;
+        if (use_draft_head && mtp_chain_embd) {
+            e = ggml_get_rows(ctx0, mtp_chain_embd, best);
+        } else if (use_draft_head) {
+            ggml_tensor * ids = layer.nextn.draft_head_ids;
+            ggml_tensor * tok = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, ids, 1, ids->ne[0]), best);  // I32 [1, 1]
+            e = ggml_get_rows(ctx0, tok_embd_w, ggml_reshape_1d(ctx0, tok, 1));
+        } else {
+            e = ggml_get_rows(ctx0, tok_embd_w, best);
+        }
+        tok_embd = unrotate(e);
+        h_embd   = h_out;
+    }
 }

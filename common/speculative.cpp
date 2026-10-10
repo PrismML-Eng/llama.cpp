@@ -2301,6 +2301,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     };
     std::vector<deferred_rows> deferred;
 
+    // ARC-LAB: chained drafts (LLAMA_MTP_CHAIN; independent implementation of the technique described by llamADALL).
+    // All draft steps run in one llama_decode (llama_set_mtp_chain): each step's argmax token and output row feed the
+    // next step on the device, and the n draft tokens are read back once, instead of n decodes with a host sample in
+    // between. Same greedy drafts and the same draft K/V as the loop below. Set in the ctor.
+    bool chain_mode = false;
+
     bool can_defer() const {
         return !is_mem_shared && !chain_heads && !getenv("LLAMA_MTP_EAGER_CATCHUP");
     }
@@ -2411,6 +2417,108 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h_rows.assign(n_seq, 0);
 
         deferred.assign(n_seq, {});
+
+        // chained drafts: default on when the head has a trimmed draft vocabulary (its token_embd rows fit on the
+        // device; measured slower without one), LLAMA_MTP_CHAIN=1 forces, =0 off. Greedy single-sequence drafting only.
+        {
+            const char *  env  = getenv("LLAMA_MTP_CHAIN");
+            const int32_t sup  = llama_mtp_chain_support(ctx_dft);
+            const bool    want = env ? atoi(env) != 0 : (sup & 2) != 0;
+            const char *  why  = nullptr;
+            if (!want) {
+                why = env ? "LLAMA_MTP_CHAIN=0" : "no trimmed draft head (LLAMA_MTP_CHAIN=1 forces it)";
+            } else if (sup == 0) {
+                why = "not supported by this context (qwen35 single head, flash attention, plain KV cache)";
+            } else if (is_mem_shared || chain_heads) {
+                why = "shared-memory or multi-head MTP";
+            } else if (n_seq != 1) {
+                why = "more than one sequence";
+            } else if (this->params.p_min > 0.0f) {
+                why = "p_min > 0";
+            }
+            chain_mode = why == nullptr;
+            if (chain_mode) {
+                SPC_INF("MTP chained drafts on (%s)\n", (sup & 2) ? "draft head" : "full head, host token lookups");
+            } else {
+                SPC_INF("MTP chained drafts off: %s\n", why);
+            }
+        }
+    }
+
+    // ARC-LAB: one chained decode for the whole draft of sequence 0. Returns false when it does not apply (the loop
+    // runs), true when it ran (dparams[0].result holds the drafts, empty on failure).
+    bool draft_chain(common_speculative_draft_params_vec & dparams) {
+        auto * ctx_dft = params.ctx_dft;
+        auto & dp      = dparams[0];
+        auto & d       = deferred[0];
+        if (!dp.drafting || d.catchup_failed) {
+            return false;
+        }
+
+        // the loop's step count: it stops once min(n_max, LAB_SPEC_DRAFT_N_MAX) tokens are drafted (at least one)
+        const int32_t n_draft = std::max(1, std::min((int) params.n_max, common_lab_knob("LAB_SPEC_DRAFT_N_MAX", params.n_max)));
+        const int32_t n_catch = d.pending ? d.n_valid : 0;
+        const int32_t n_rows  = n_catch + n_draft;
+        if (n_draft < 2 || n_rows > (int32_t) std::min(llama_n_batch(ctx_dft), llama_n_ubatch(ctx_dft))) {
+            return false;
+        }
+
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        common_sampler_reset(smpls[0].get());
+        common_batch_clear(batch);
+
+        // catch-up rows and the anchor exactly as the loop's first decode, then one placeholder row per later step
+        // (its cell receives that step's K/V; token and embd are not read)
+        for (int32_t k = 0; k < n_catch; ++k) {
+            common_batch_add(batch, d.tokens[k], d.pos[k], { 0 }, false);
+            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, d.h.data() + (size_t) k * n_embd, row_bytes);
+        }
+        common_batch_add(batch, dp.id_last, dp.n_past, { 0 }, true);
+        std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[0].data(), row_bytes);
+        for (int32_t j = 1; j < n_draft; ++j) {
+            common_batch_add(batch, dp.id_last, dp.n_past + j, { 0 }, false);
+            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[0].data(), row_bytes);
+        }
+
+        llama_set_mtp_chain(ctx_dft, n_draft);
+        const int32_t rc = llama_decode(ctx_dft, batch);
+        llama_set_mtp_chain(ctx_dft, 0);
+        if (rc != 0) {
+            SPC_ERR("llama_decode(ctx_dft) chained draft returned %d\n", (int) rc);
+            if (n_catch > 0) {
+                d.catchup_failed = true;
+            }
+            return true;
+        }
+        if (n_catch > 0) {
+            d.pending = false;
+        }
+
+        const llama_token * ids = llama_get_mtp_chain_ids(ctx_dft);
+        if (ids == nullptr) {
+            SPC_ERR("%s", "chained draft produced no tokens\n");
+            return true;
+        }
+
+        auto *        smpl    = smpls[0].get();
+        auto &        result  = *dp.result;
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+        for (int32_t j = 0; j < n_draft; ++j) {
+            const llama_token id = ids[j];
+            if (FILE * lf = common_mtp_draft_log()) {
+                // the chain reads back token ids only: no candidate list or probabilities (p logged as -1)
+                fprintf(lf, "{\"pos\": %d, \"d\": %d, \"c\": [[%d, -1.0]], \"stop\": 0, \"chain\": 1}\n",
+                        (int) (dp.n_past + j + 1), j, (int) id);
+            }
+            if (id < 0 || id >= n_vocab) {
+                SPC_ERR("chained draft id %d out of vocab (step %d) - dropping the rest\n", (int) id, j);
+                break;
+            }
+            common_sampler_accept(smpl, id, true);
+            result.push_back(id);
+        }
+        return true;
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -2714,6 +2822,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     }
                 }
             }
+        }
+
+        if (chain_mode && draft_chain(dparams)) {
+            auto & dp = dparams[0];
+            if (dp.result->size() < (size_t) params.n_min) {
+                dp.result->clear();
+            }
+            return;
         }
 
         common_batch_clear(batch);

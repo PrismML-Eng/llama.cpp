@@ -101,6 +101,16 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// ARC-LAB: chained MTP drafts (single NextN head, qwen35). llama_mtp_chain_support: 0 = not available on this context,
+// bit 0 = available, bit 1 = the head has a trimmed draft vocabulary (in-graph token lookups can stay on the device).
+// llama_set_mtp_chain(ctx, n): the next llama_decode on this MTP context drafts n tokens in one graph. Its batch must be
+// one ubatch: catch-up rows (no output), the anchor row (id_last at n_past, output), then n-1 rows at n_past+1.. whose
+// token and embd are placeholders (the graph writes their K/V). Reset with n = 0 after the decode.
+// llama_get_mtp_chain_ids: after that decode, the n greedy draft tokens (synchronizes), or nullptr.
+LLAMA_API int32_t             llama_mtp_chain_support(const struct llama_context * ctx);
+LLAMA_API void                llama_set_mtp_chain    (struct llama_context * ctx, int32_t n_steps);
+LLAMA_API const llama_token * llama_get_mtp_chain_ids(struct llama_context * ctx);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);

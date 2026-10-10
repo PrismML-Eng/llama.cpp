@@ -67,6 +67,19 @@ static __dpct_inline__ int ptq1_0_trit(const uint8_t * qs, const uint8_t * qh, c
     return (int) ((v * 3) >> 8);
 }
 
+// ARC-LAB: f32 output whatever GGML_SYCL_F16 says, for GET_ROWS (MTP chain draft-token embeddings). (trit - 1) * d
+// with d widened from fp16 is exact in f32 (the product of 0 / +-1 and d), so the rows match the CPU's
+// dequantize_row_ptq1_0 bit for bit.
+static __dpct_inline__ void dequantize_ptq1_0_f32(const void *vx, const int64_t ib,
+                                                  const int iqs, float &v0, float &v1) {
+    const block_ptq1_0 * x = (const block_ptq1_0 *) vx;
+
+    const float d = (float) x[ib].d;
+
+    v0 = (float) (ptq1_0_trit(x[ib].qs, x[ib].qh, iqs + 0) - 1) * d;
+    v1 = (float) (ptq1_0_trit(x[ib].qs, x[ib].qh, iqs + 1) - 1) * d;
+}
+
 static __dpct_inline__ void dequantize_q4_0(const void *vx, const int64_t ib,
                                             const int iqs, dfloat2 &v) {
     const block_q4_0 * x = (const block_q4_0 *) vx;

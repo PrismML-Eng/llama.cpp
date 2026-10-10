@@ -2302,6 +2302,9 @@ struct llama_model_qwen35 : public llama_model_base {
 
     struct graph_mtp : public llm_graph_context {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
+
+        // ARC-LAB: cparams.mtp_chain_n > 0: all draft steps in one graph (see llama_set_mtp_chain)
+        void build_chain(const llama_model & model);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

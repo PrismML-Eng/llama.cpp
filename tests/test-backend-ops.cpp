@@ -2252,13 +2252,30 @@ struct test_get_rows : public test_case {
     const int be1; // batch size
     const int be2; // batch size
     const bool v; // view (non-contiguous src1)
+    const bool exact; // ARC-LAB: require bit-identical rows (max NMSE 0), e.g. PTQ1_0 MTP draft embeddings
 
     std::string vars() override {
-        return VARS_TO_STR7(type, n, m, r, be1, be2, v);
+        return exact ? VARS_TO_STR8(type, n, m, r, be1, be2, v, exact) : VARS_TO_STR7(type, n, m, r, be1, be2, v);
     }
 
-    test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false)
-        : type(type), n(n), m(m), r(r), be1(be1), be2(be2), v(v) {}
+    double max_nmse_err() override {
+        return exact ? 0.0 : 1e-7;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (!exact) {
+            return test_case::err(a, b, n);
+        }
+        size_t n_diff = 0;  // bit patterns, so -0.0 vs 0.0 counts too
+        for (size_t i = 0; i < n; ++i) {
+            n_diff += memcmp(a + i, b + i, sizeof(float)) != 0;
+        }
+        return (double) n_diff;
+    }
+
+    test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false,
+                  bool exact = false)
+        : type(type), n(n), m(m), r(r), be1(be1), be2(be2), v(v), exact(exact) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * in = ggml_new_tensor_4d(ctx, type, n, m, be1, be2);
@@ -8868,6 +8885,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 256, 5, 4, b, 1, v));
         }
     }
+    // ARC-LAB: MTP chain draft-token lookups (PTQ1_0 token_embd rows, Bonsai width 5120, 1..8 rows): bit-exact
+    for (int r : {1, 4, 8}) {
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_PTQ1_0, 5120, 300, r, 1, 1, false, true));
+    }
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_PTQ1_0, 5120, 300, 8, 3, 1, true, true));
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)

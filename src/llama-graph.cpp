@@ -1354,6 +1354,7 @@ void llm_graph_result::reset() {
 
     t_sampled.clear();
     t_dspark_greedy.clear();
+    t_mtp_chain.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
@@ -1521,6 +1522,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     dspark_ctx_width(params.dspark_ctx_width),
     hadamard_rotations(params.hadamard_rotations),
     hadamard_inverses(params.hadamard_inverses),
+    mtp_chain_embd(params.mtp_chain_embd),
     samplers(params.samplers),
     cb_func(params.cb),
     res(params.res),

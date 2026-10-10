@@ -334,6 +334,10 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
             get_rows_sycl<QK_K, 1, dequantize_iq4_xs>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
             src1_i32, (float *)dst->data, ctx.stream());
             break;
+        case GGML_TYPE_PTQ1_0:
+            get_rows_sycl_f32<QK_PTQ1_0, 1, dequantize_ptq1_0_f32>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
+            src1_i32, (float *)dst->data, ctx.stream());
+            break;
         case GGML_TYPE_Q2_K:
             get_rows_sycl_f32<QK_K, 1, dequantize_q2_K_f32>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
             src1_i32, (float *)dst->data, ctx.stream());

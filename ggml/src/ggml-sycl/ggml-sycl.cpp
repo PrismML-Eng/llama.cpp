@@ -7743,6 +7743,7 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
             {
                 switch (op->src[0]->type) {
                     case GGML_TYPE_I32:
+                    case GGML_TYPE_PTQ1_0:  // ARC-LAB: dequantize_ptq1_0_f32, bit-exact with the CPU
                     case GGML_TYPE_F16:
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_F32:

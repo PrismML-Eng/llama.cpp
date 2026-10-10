@@ -134,6 +134,11 @@ struct llama_context {
 
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+
+    // ARC-LAB: chained MTP drafts (llama-ext.h llama_mtp_chain_support / llama_set_mtp_chain / llama_get_mtp_chain_ids)
+    int32_t         mtp_chain_support() const;
+    void            set_mtp_chain(uint32_t n_steps);
+    const int32_t * get_mtp_chain_ids();
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -402,6 +407,18 @@ private:
 
     // one-time Hadamard transform-coverage check on the first built graph
     bool hadamard_verified = false;
+
+    // ARC-LAB: chained MTP drafts. mtp_chain_embd: device copy of the token_embd rows the draft head can produce (row k
+    // = token mtp_chain_vocab[k]), built on first use unless LLAMA_MTP_CHAIN_GPU_EMBD=0. mtp_chain_out: the last chain
+    // decode's per-step argmax rows, read back asynchronously.
+    ggml_tensor *           mtp_chain_embd = nullptr;
+    ggml_context_ptr        mtp_chain_ctx;
+    ggml_backend_buffer_ptr mtp_chain_buf;
+    bool                    mtp_chain_embd_tried = false;
+    std::vector<int32_t>    mtp_chain_vocab;   // draft-head index -> token id (empty: no draft head, indices are tokens)
+    std::vector<int32_t>    mtp_chain_out;
+    std::vector<int32_t>    mtp_chain_tok;     // mtp_chain_out mapped to token ids
+    uint32_t                mtp_chain_n_out = 0;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

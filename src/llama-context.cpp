@@ -1338,6 +1338,119 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+// ARC-LAB: chained MTP drafts (independent implementation of the technique described by llamADALL). The draft loop in
+// common/speculative.cpp decodes the NextN head once per drafted token, with a host round trip in between. A chain
+// decode runs all steps in one graph (qwen35 graph_mtp::build_chain): step j+1 takes step j's argmax token and output
+// state on the device. Bit 0: the chain graph applies to this context; bit 1: the head has a trimmed draft vocabulary,
+// so in-graph tokens can be looked up in a small device copy of their token_embd rows.
+int32_t llama_context::mtp_chain_support() const {
+    if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || model.arch != LLM_ARCH_QWEN35 || model.hparams.n_layer_nextn != 1 ||
+        cparams.nextn_layer_offset != 0 || !cparams.flash_attn || !cparams.embeddings_nextn_masked) {
+        return 0;
+    }
+    // per-step K/V views and index slices assume one plain KV cache with a non-transposed V
+    const auto * kv = dynamic_cast<const llama_kv_cache *>(memory.get());
+    if (kv == nullptr || kv->get_v_trans()) {
+        return 0;
+    }
+    const auto & layer = model.layers[model.hparams.n_layer()];
+    // same condition as graph_mtp's draft-head branch
+    const bool draft_head = layer.nextn.draft_head && layer.nextn.draft_head_ids && !layer.nextn.shared_head_head &&
+                            getenv("LLAMA_MTP_DRAFT_HEAD_OFF") == nullptr;
+    return 1 | (draft_head ? 2 : 0);
+}
+
+void llama_context::set_mtp_chain(uint32_t n_steps) {
+    cparams.mtp_chain_n = n_steps;
+    if (n_steps == 0) {
+        return;  // keeps the last chain's ids readable
+    }
+    mtp_chain_n_out = 0;
+
+    if (mtp_chain_embd_tried) {
+        return;
+    }
+    mtp_chain_embd_tried = true;
+
+    if ((mtp_chain_support() & 2) == 0) {
+        LLAMA_LOG_INFO("%s: MTP chain: no draft head, in-graph tokens use the host token_embd lookup\n", __func__);
+        return;
+    }
+
+    const auto &  layer = model.layers[model.hparams.n_layer()];
+    ggml_tensor * ids   = layer.nextn.draft_head_ids;
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_n_dims(ids) == 1);
+    mtp_chain_vocab.resize(ids->ne[0]);
+    ggml_backend_tensor_get(ids, mtp_chain_vocab.data(), 0, ggml_nbytes(ids));
+
+    const char * env_gpu = getenv("LLAMA_MTP_CHAIN_GPU_EMBD");
+    if (env_gpu && atoi(env_gpu) == 0) {
+        LLAMA_LOG_INFO("%s: MTP chain: LLAMA_MTP_CHAIN_GPU_EMBD=0, in-graph tokens use the host token_embd lookup\n", __func__);
+        return;
+    }
+
+    ggml_tensor *            src = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+    const ggml_backend_dev_t dev = model.dev_layer(model.hparams.n_layer());
+    if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU ||
+        (src->type != GGML_TYPE_PTQ1_0 && src->type != GGML_TYPE_F16 && src->type != GGML_TYPE_F32)) {
+        LLAMA_LOG_INFO("%s: MTP chain: no device copy of token_embd (%s), host lookups\n", __func__, ggml_type_name(src->type));
+        return;
+    }
+
+    const int64_t n_rows = ids->ne[0];
+    const size_t  row    = ggml_row_size(src->type, src->ne[0]);
+    GGML_ASSERT(src->nb[1] == row);
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    mtp_chain_ctx.reset(ggml_init(ip));
+    ggml_tensor * t = ggml_new_tensor_2d(mtp_chain_ctx.get(), src->type, src->ne[0], n_rows);
+    ggml_set_name(t, "mtp_chain_embd");
+    mtp_chain_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mtp_chain_ctx.get(), ggml_backend_dev_buffer_type(dev)));
+    if (!mtp_chain_buf) {
+        LLAMA_LOG_WARN("%s: MTP chain: could not allocate the device token_embd copy, host lookups\n", __func__);
+        mtp_chain_ctx.reset();
+        return;
+    }
+    // a weight to the scheduler: ops reading it run on its device (no copy of the table per graph)
+    ggml_backend_buffer_set_usage(mtp_chain_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // row k of the copy = token_embd row of draft-head index k, bytes unchanged (same quantization, same latent basis)
+    std::vector<uint8_t> staging((size_t) n_rows * row);
+    for (int64_t k = 0; k < n_rows; ++k) {
+        const int32_t id = mtp_chain_vocab[k];
+        GGML_ASSERT(id >= 0 && id < src->ne[1]);
+        ggml_backend_tensor_get(src, staging.data() + (size_t) k * row, (size_t) id * src->nb[1], row);
+    }
+    ggml_backend_tensor_set(t, staging.data(), 0, staging.size());
+    mtp_chain_embd = t;
+
+    LLAMA_LOG_INFO("%s: MTP chain: %lld draft-vocab token_embd rows (%s, %.1f MiB) on %s\n", __func__, (long long) n_rows,
+            ggml_type_name(src->type), staging.size() / 1048576.0, ggml_backend_dev_name(dev));
+}
+
+const int32_t * llama_context::get_mtp_chain_ids() {
+    synchronize();
+
+    if (mtp_chain_n_out == 0) {
+        return nullptr;
+    }
+    auto & tok = mtp_chain_tok;
+    tok.resize(mtp_chain_n_out);
+    for (uint32_t s = 0; s < mtp_chain_n_out; ++s) {
+        const int32_t v = mtp_chain_out[s];
+        if (mtp_chain_vocab.empty()) {
+            tok[s] = v;
+        } else {
+            tok[s] = v >= 0 && v < (int32_t) mtp_chain_vocab.size() ? mtp_chain_vocab[v] : -1;
+        }
+    }
+    return tok.data();
+}
+
 void llama_context::set_capture_layers(const std::vector<int32_t> & layer_ids) {
     const int32_t n_layer = (int32_t) model.hparams.n_layer();
     if (layer_ids.size() > LLAMA_MAX_LAYERS) {
@@ -1940,6 +2053,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
+    // ARC-LAB: a chained MTP draft is one graph over the whole batch (catch-up rows, anchor, one row per later step)
+    if (cparams.mtp_chain_n > 0 && (n_tokens_all > cparams.n_ubatch || n_tokens_all < cparams.mtp_chain_n)) {
+        LLAMA_LOG_ERROR("%s: MTP chain of %u steps needs %u..%u tokens in one ubatch, got %u\n", __func__,
+                cparams.mtp_chain_n, cparams.mtp_chain_n, cparams.n_ubatch, n_tokens_all);
+        return -1;
+    }
+
     if (output_all) {
         // require that all tokens are output
         if (n_outputs_all != n_tokens_all) {
@@ -2195,6 +2315,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+
+        // ARC-LAB: chained MTP draft: the per-step argmax rows, mapped to tokens in get_mtp_chain_ids()
+        if (!res->t_mtp_chain.empty()) {
+            mtp_chain_out.resize(res->t_mtp_chain.size());
+            for (size_t s = 0; s < res->t_mtp_chain.size(); ++s) {
+                ggml_tensor *  t = res->t_mtp_chain[s];
+                ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+                GGML_ASSERT(b != nullptr);
+                ggml_backend_tensor_get_async(b, t, &mtp_chain_out[s], 0, sizeof(int32_t));
+            }
+            mtp_chain_n_out = (uint32_t) res->t_mtp_chain.size();
+        }
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -2695,6 +2827,10 @@ ggml_cgraph * llama_context::graph_reserve(
 
     this->n_outputs = n_outputs;
 
+    // ARC-LAB: reserve with the regular graph, never a chained MTP draft (it needs real tokens and hidden rows)
+    const uint32_t save_mtp_chain_n = cparams.mtp_chain_n;
+    cparams.mtp_chain_n = 0;
+
     llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
     llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
 
@@ -2716,6 +2852,7 @@ ggml_cgraph * llama_context::graph_reserve(
     }
 
     this->n_outputs = save_n_outputs;
+    cparams.mtp_chain_n = save_mtp_chain_n;
 
     // initialize scheduler with the specified graph
     if (split_only) {
@@ -2756,6 +2893,7 @@ llm_graph_params llama_context::graph_params(
         /*.dspark_ctx_width =*/dspark_ctx.n_embd_cap,
         /*.hadamard_rotations =*/&hadamard_rotations,
         /*.hadamard_inverses  =*/&hadamard_inverses,
+        /*.mtp_chain_embd     =*/mtp_chain_embd,
         /*.samplers    =*/sampling.samplers,
         /*.n_outputs   =*/n_outputs,
         /*.cb          =*/graph_get_cb(),
@@ -4079,6 +4217,18 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+int32_t llama_mtp_chain_support(const llama_context * ctx) {
+    return ctx->mtp_chain_support();
+}
+
+void llama_set_mtp_chain(llama_context * ctx, int32_t n_steps) {
+    ctx->set_mtp_chain(n_steps > 0 ? (uint32_t) n_steps : 0u);
+}
+
+const llama_token * llama_get_mtp_chain_ids(llama_context * ctx) {
+    return ctx->get_mtp_chain_ids();
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {
