@@ -47,4 +47,36 @@ inline f32x8 dpas_hf_r8(s8x8 a, i32x8 b, f32x8 acc) {
 #endif
     return acc;
 }
+// ARC-LAB: transposed 2D block load (lsc_load_block2d, d32, 8 dwords x 16 rows): lane l receives row y + l, component c =
+// dword x + c of that row. Surface: base (64-byte aligned), width / height / pitch minus one (bytes, rows, bytes; pitch a
+// multiple of 16); rows or dwords outside the surface read as zero. One message replaces 8 per-lane dword gathers.
+// The arguments must be uniform over the subgroup; lane 0's values are used (copied into scalars here, so IGC need not
+// prove uniformity: "rw.u" operands failed its inline-asm validation after a spill recompile).
+typedef unsigned u32x8 __attribute__((ext_vector_type(8)));
+inline u32x8 ld2d_t32_8x16(long long base, int wm1, int hm1, int pm1, int x, int y) {
+    u32x8 v;
+#ifdef __SYCL_DEVICE_ONLY__
+    __asm__("{\n"
+            ".decl SB v_type=G type=q num_elts=1 align=qword\n"
+            ".decl SW v_type=G type=d num_elts=1 align=dword\n"
+            ".decl SH v_type=G type=d num_elts=1 align=dword\n"
+            ".decl SP v_type=G type=d num_elts=1 align=dword\n"
+            ".decl SX v_type=G type=d num_elts=1 align=dword\n"
+            ".decl SY v_type=G type=d num_elts=1 align=dword\n"
+            "mov (M1_NM, 1) SB(0,0)<1> %1(0,0)<0;1,0>\n"
+            "mov (M1_NM, 1) SW(0,0)<1> %2(0,0)<0;1,0>\n"
+            "mov (M1_NM, 1) SH(0,0)<1> %3(0,0)<0;1,0>\n"
+            "mov (M1_NM, 1) SP(0,0)<1> %4(0,0)<0;1,0>\n"
+            "mov (M1_NM, 1) SX(0,0)<1> %5(0,0)<0;1,0>\n"
+            "mov (M1_NM, 1) SY(0,0)<1> %6(0,0)<0;1,0>\n"
+            "lsc_load_block2d.ugm (M1, 1) %0:d32.8x16tn flat[SB,SW,SH,SP,SX,SY]\n"
+            "}\n"
+            : "=rw"(v)
+            : "rw"(base), "rw"(wm1), "rw"(hm1), "rw"(pm1), "rw"(x), "rw"(y));
+#else
+    v = 0;
+    (void) base; (void) wm1; (void) hm1; (void) pm1; (void) x; (void) y;
+#endif
+    return v;
+}
 }  // namespace xe2dp

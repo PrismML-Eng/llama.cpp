@@ -703,7 +703,10 @@ typedef unsigned dp_uint4  __attribute__((ext_vector_type(4)));
 // (consecutive work-items read consecutive dwords of a key row) and the lane = key reads come from there (row stride 37
 // dwords: conflict-free). Without it every lane reads its own key straight from memory: 16 cache lines per load
 // instruction, ~90-110 GB/s per phase at 48K. The V copy is issued before the softmax and shares its barrier.
-template <int D, int G, int NQ, int KG, int TC, int ST = 0>
+// BL bit 0 (GGML_SYCL_FA_DEC_B2D, ST = 0 only): the lane = key reads use transposed 2D block loads (xe2dp::ld2d_t32_8x16:
+// 16 keys x 8 dwords per message) instead of per-lane dword gathers. Same bytes, same math. Needs 64-byte aligned surfaces.
+// B580, 128K, us: on its own SLOWER (spills; 5 tok 1069 -> 1220, 16 tok 2945 -> 3610). Off by default.
+template <int D, int G, int NQ, int KG, int TC, int ST = 0, int BL = 0>
 static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, const char * mask, float * dst,
                                 float * parts, sycl::float2 * meta, float scale, int ne01, int ne02, int ne11,
                                 int nkvh, int ne03, int64_t nb01, int64_t nb02, int64_t nb03, int64_t nb11,
@@ -725,6 +728,7 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
     constexpr int RW   = NB * 18 / 4;        // dwords per q4_0 key row (36 at D 256)
     constexpr int SW   = RW + 1;             // SLM row stride (odd: no bank conflicts on lane = key reads)
     static_assert(ST == 0 || (D == 256 && RW % 4 == 0), "staging is sized for D 256");
+    static_assert((BL & 1) == 0 || (ST == 0 && D == 256), "block loads replace the per-lane reads of the D 256 unstaged path");
     const int nqc = (ne01 + NQ - 1) / NQ;    // token chunks
     const int probe_env = ggml_sycl_knob("GGML_SYCL_FA_DEC_DPAS_PROBE", 0);
     const int        probe     = probe_env;  // phase probe: bit0 skip Q.K, bit1 skip P.V, bit2 skip softmax, bit3 Q.K loads only (no DPAS / scale math)
@@ -741,9 +745,8 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
         sycl::local_accessor<float, 1>     sL(sycl::range<1>(R16), cgh);
         sycl::local_accessor<float, 1>     sA(sycl::range<1>(R16), cgh);
         sycl::local_accessor<uint32_t, 1>  sKV(sycl::range<1>(ST ? TK * SW : 1), cgh);  // staged K or V tile
-        cgh.parallel_for(
-            sycl::nd_range<3>(sycl::range<3>((size_t) ne03 * nqc, nkvh, (size_t) nsplit * DEC_WG), sycl::range<3>(1, 1, DEC_WG)),
-            [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] {
+        const sycl::nd_range<3> ndr(sycl::range<3>((size_t) ne03 * nqc, nkvh, (size_t) nsplit * DEC_WG), sycl::range<3>(1, 1, DEC_WG));
+        auto kern = [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] {
                 const int tid   = it.get_local_id(2);
                 const int split = it.get_group(2);
                 const int kvh   = it.get_group(1);
@@ -792,6 +795,12 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
                 const char * Kh = K + seq * nb13 + kvh * nb12;
                 const char * Vh = V + seq * nb23 + kvh * nb22;
                 const sycl::half * mrow = mask ? (const sycl::half *) (mask + (seq % ne33) * nb33) : nullptr;
+                // 2D surfaces (BL): rows = keys (pitch nb11 / nb21). Heads interleaved within a token row (the real cache
+                // layout, nb12 < nb11): surface = the sequence's rows, this head at dword x0; else the head's own rows.
+                const bool      kil = nb12 < nb11, vil = nb22 < nb21;
+                const long long kbs = (long long) (K + seq * nb13 + (kil ? 0 : kvh * nb12));
+                const long long vbs = (long long) (V + seq * nb23 + (vil ? 0 : kvh * nb22));
+                const int       kx0 = kil ? (int) (kvh * nb12 / 4) : 0, vx0 = vil ? (int) (kvh * nb22 / 4) : 0;
 
                 // O^T accumulators: subgroup w owns head dims DPS w .. +DPS-1 (XT 8-dim tiles), lane = query row
                 dp_float8 o[RT16][XT];
@@ -861,6 +870,16 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
                         const int  j  = t0 + kg * 16 + lane;
                         const bool jv = j < k_end;
                         const uint32_t * kr = (const uint32_t *) (Kh + (int64_t) (jv ? j : k_begin) * nb11);
+                        // BL: the 16 keys' 36-dword rows (+4 unused) in 5 loads of 8 dwords, lane = key; issued two blocks
+                        // ahead of their first use (all 5 up front = 40 more registers: spills)
+                        xe2dp::u32x8 kb[(BL & 1) ? 5 : 1];
+                        auto kload = [&](int i) {
+                            kb[i] = xe2dp::ld2d_t32_8x16(kbs, (int) nb11 - 1, ne11 - 1, (int) nb11 - 1, kx0 + 8 * i, t0 + kg * 16);
+                        };
+                        if constexpr (BL & 1) {
+                            kload(0);
+                            kload(1);
+                        }
                         dp_float8 s[TC];
 #pragma unroll
                         for (int tt = 0; tt < TC; ++tt) {
@@ -872,9 +891,17 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
                             const int o0 = 18 * b;  // even b: dword aligned; odd b: 2 bytes in
                             const int      wd = o0 / 4;  // the block's 18 bytes lie in these 5 dwords
                             uint32_t k0, k1, k2, k3, k4;
+                            if constexpr (BL & 1) {
+                                if (b == 1 || b == 3 || b == 5) {  // block b + 2 starts in dword chunk (b + 1) / 2 + 1
+                                    kload((b + 1) / 2 + 1);
+                                }
+                            }
                             if constexpr (ST) {
                                 const int sb = (kg * 16 + lane) * SW + wd;
                                 k0 = sKV[sb]; k1 = sKV[sb + 1]; k2 = sKV[sb + 2]; k3 = sKV[sb + 3]; k4 = sKV[sb + 4];
+                            } else if constexpr (BL & 1) {
+                                k0 = kb[wd / 8][wd % 8]; k1 = kb[(wd + 1) / 8][(wd + 1) % 8]; k2 = kb[(wd + 2) / 8][(wd + 2) % 8];
+                                k3 = kb[(wd + 3) / 8][(wd + 3) % 8]; k4 = kb[(wd + 4) / 8][(wd + 4) % 8];
                             } else {
                                 k0 = kr[wd]; k1 = kr[wd + 1]; k2 = kr[wd + 2]; k3 = kr[wd + 3]; k4 = kr[wd + 4];
                             }
@@ -968,6 +995,13 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
                             o[t][x] *= a;
                         }
                     }
+                    // BL: this subgroup's V block of the next 16 keys is loaded one key group ahead
+                    xe2dp::u32x8 vnext;
+                    if constexpr (BL & 1) {
+                        if (!(probe & 2)) {
+                            vnext = xe2dp::ld2d_t32_8x16(vbs, (int) nb21 - 1, ne11 - 1, (int) nb21 - 1, vx0 + 18 * vb / 4, t0);
+                        }
+                    }
 #pragma unroll 1
                     for (int kg = 0; kg < ((probe & 2) ? 0 : KG); ++kg) {
                         const int  j  = t0 + kg * 16 + lane;
@@ -975,7 +1009,13 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
                         const uint32_t * vr = (const uint32_t *) (Vh + (int64_t) (jv ? j : k_begin) * nb21);
                         const int o0 = 18 * vb, wd = o0 / 4;  // block start; even block: dword aligned, odd: 2 bytes in
                         uint32_t w0, w1, w2, w3, w4;
-                        if constexpr (ST) {
+                        if constexpr (BL & 1) {
+                            const xe2dp::u32x8 vc = vnext;
+                            if (kg + 1 < KG) {
+                                vnext = xe2dp::ld2d_t32_8x16(vbs, (int) nb21 - 1, ne11 - 1, (int) nb21 - 1, vx0 + wd, t0 + (kg + 1) * 16);
+                            }
+                            w0 = vc[0]; w1 = vc[1]; w2 = vc[2]; w3 = vc[3]; w4 = vc[4];
+                        } else if constexpr (ST) {
                             const int sb = (kg * 16 + lane) * SW + wd;
                             w0 = sKV[sb]; w1 = sKV[sb + 1]; w2 = sKV[sb + 2]; w3 = sKV[sb + 3]; w4 = sKV[sb + 4];
                         } else {
@@ -1039,7 +1079,8 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
                     const int64_t jdu = ((int64_t) seq * ne01 + c0 + tid / G) * ne02 + kvh * G + tid % G;
                     meta[jdu * nsplit + split] = sycl::float2(sM[tid], sL[tid]);
                 }
-            });
+            };
+        cgh.parallel_for(ndr, kern);
     });
 }
 
@@ -1113,8 +1154,31 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
     // 8-token kernel with 3 empty tokens (48 rows of Q.K / softmax for 30). B580 per layer: 16K 215 -> 175 us, 48K 637 ->
     // 502 us. =0 off, =2 SLM-staged (slower: 48K 579), =3 256-key tiles (48K 513).
     const int nq5_env = ggml_sycl_knob("GGML_SYCL_FA_DEC_NQ5", 1);
+    // ARC-LAB: GGML_SYCL_FA_DEC_B2D: 1 = transposed 2D block loads for the unstaged DPAS paths (2+ query tokens), 2 = also
+    // for 1 token instead of the SLM staging; 0 = per-lane reads. Needs 64-byte aligned K / V surfaces, else per-lane reads.
+    const int  b2d_env = ggml_sycl_knob("GGML_SYCL_FA_DEC_B2D", 0);
+    auto b2d_fits = [](const ggml_tensor * t) {
+        const bool il = t->nb[2] < t->nb[1];  // heads interleaved in a token row
+        return ((uintptr_t) t->data) % 64 == 0 && (t->ne[3] == 1 || t->nb[3] % 64 == 0) && t->nb[1] % 16 == 0 &&
+               t->nb[1] >= 64 && t->nb[1] < (1 << 24) && t->ne[1] < (1 << 24) &&
+               (il ? (t->nb[2] % 4 == 0 && t->nb[2] * (t->ne[2] - 1) + (int64_t) (t->ne[0] / QK4_0) * 18 <= (int64_t) t->nb[1])
+                   : t->nb[2] % 64 == 0);
+    };
+    const bool b2d_shape = dpas && b2d_env && K->ne[0] == DEC_D && Q->ne[2] == 6 * K->ne[2];
+    const bool b2d = b2d_shape && b2d_fits(K) && b2d_fits(V);
+    if (b2d_shape) {
+        static bool logged_on = false, logged_off = false;
+        bool & logged = b2d ? logged_on : logged_off;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_INFO("%s: GGML_SYCL_FA_DEC_B2D=%d %s (K data %% 64 = %d, nb1 %zu nb2 %zu)\n", __func__, b2d_env,
+                          b2d ? "engaged" : "NOT engaged: surface not 64-byte aligned, per-lane reads",
+                          (int) (((uintptr_t) K->data) % 64), K->nb[1], K->nb[2]);
+        }
+    }
+    const int  bl   = b2d ? 1 : 0;
     const int nq5 = (dpas && !d512 && !g2 && ne01 == 5) ? nq5_env : 0;
-    const bool stage = dpas && stage_env && !d512 && !g2 && (nq == 1 || nq5 == 2);
+    const bool stage = dpas && stage_env && !d512 && !g2 && (nq == 1 || nq5 == 2) && !(b2d && b2d_env >= 2 && nq == 1);
     const int tk   = (d512 || g2) ? (nq == 1 ? 256 : 128)
                    : nq5 == 3 ? 256
                    : (stage || nq5) ? 128
@@ -1149,10 +1213,11 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
     const int64_t   nb33   = mask ? mask->nb[3] : 0;
     const int       ne33   = mask ? (int) mask->ne[3] : 1;
 
-#define FATTN_DEC_DPAS(NQ_, KG_, TC_) fattn_dec_q4_0_dpas<DEC_D, 6, NQ_, KG_, TC_>((const char *) Q->data, (const char *) K->data, \
-        (const char *) V->data, mdata, (float *) dst->data, parts.get(), meta.get(), scale, ne01, (int) Q->ne[2], ne11,      \
-        (int) K->ne[2], (int) Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2],     \
-        V->nb[3], nb31, nb33, ne33, nsplit, chunk, stream)
+#define FATTN_DEC_DPAS_BL(NQ_, KG_, TC_, BL_) fattn_dec_q4_0_dpas<DEC_D, 6, NQ_, KG_, TC_, 0, BL_>((const char *) Q->data,      \
+        (const char *) K->data, (const char *) V->data, mdata, (float *) dst->data, parts.get(), meta.get(), scale, ne01,       \
+        (int) Q->ne[2], ne11, (int) K->ne[2], (int) Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3],     \
+        V->nb[1], V->nb[2], V->nb[3], nb31, nb33, ne33, nsplit, chunk, stream)
+#define FATTN_DEC_DPAS(NQ_, KG_, TC_) do { if (bl) { FATTN_DEC_DPAS_BL(NQ_, KG_, TC_, 1); } else { FATTN_DEC_DPAS_BL(NQ_, KG_, TC_, 0); } } while (0)
     if (d512) {
 #define FATTN_DEC_DPAS512(NQ_, KG_, TC_) fattn_dec_q4_0_dpas<512, 16, NQ_, KG_, TC_>((const char *) Q->data, (const char *) K->data, \
         (const char *) V->data, mdata, (float *) dst->data, parts.get(), meta.get(), scale, ne01, (int) Q->ne[2], ne11,             \
@@ -1201,6 +1266,7 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
         }
     }
 #undef FATTN_DEC_DPAS
+#undef FATTN_DEC_DPAS_BL
 #define FATTN_DEC_CALL(NQ_) fattn_dec_q4_0<6, NQ_, (NQ_ == 4 ? 64 : 128), (NQ_ != 4)>(  /* PIPE: see v4 notes */(const char *) Q->data, (const char *) K->data, (const char *) V->data, \
         mdata, (float *) dst->data, parts.get(), meta.get(), scale, ne01, (int) Q->ne[2], ne11, (int) K->ne[2],           \
         (int) Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3], nb31,    \
