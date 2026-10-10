@@ -12,6 +12,7 @@
 
 #include "xe2-dpas.hpp"
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include "dpct/helper.hpp"
 #include "common.hpp"
 #include "fattn-common.hpp"
@@ -703,9 +704,24 @@ typedef unsigned dp_uint4  __attribute__((ext_vector_type(4)));
 // (consecutive work-items read consecutive dwords of a key row) and the lane = key reads come from there (row stride 37
 // dwords: conflict-free). Without it every lane reads its own key straight from memory: 16 cache lines per load
 // instruction, ~90-110 GB/s per phase at 48K. The V copy is issued before the softmax and shares its barrier.
+// ARC-LAB: launches a kernel lambda with the 256-register file (half the threads per EU; the 3+ token one-wave launch
+// already runs only 2 work-groups x 16 subgroups = 32 threads per Xe core, which is what 256-register mode allows)
+template <class F> struct fattn_dec_grf256 {
+    F f;
+    void operator()(sycl::nd_item<3> it) const { f(it); }
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        return sycl::ext::oneapi::experimental::properties{ sycl::ext::oneapi::experimental::sub_group_size<16>,
+                                                            sycl::ext::intel::experimental::grf_size<256> };
+    }
+};
+
 // BL bit 0 (GGML_SYCL_FA_DEC_B2D, ST = 0 only): the lane = key reads use transposed 2D block loads (xe2dp::ld2d_t32_8x16:
 // 16 keys x 8 dwords per message) instead of per-lane dword gathers. Same bytes, same math. Needs 64-byte aligned surfaces.
 // B580, 128K, us: on its own SLOWER (spills; 5 tok 1069 -> 1220, 16 tok 2945 -> 3610). Off by default.
+// BL bit 1: launch with the 256-register file (GGML_SYCL_FA_DEC_GRF, default 256 = on for 3+ query tokens; 0 = off). Not
+// for 1-2 tokens: their one-wave launch puts 4 work-groups on a core, twice what 256-register mode can hold.
+// B580, us per layer, 128K 5 / 8 / 16 tokens: 1070 / 1419 / 2840 -> 988-1006 / 1250 / 2450-2507; whole model (arctune x3,
+// MTP + n-gram, sd3 head) 48K 105.2 -> 107.7 t/s, 115K 86.6 -> 90.5, outputs identical.
 template <int D, int G, int NQ, int KG, int TC, int ST = 0, int BL = 0>
 static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, const char * mask, float * dst,
                                 float * parts, sycl::float2 * meta, float scale, int ne01, int ne02, int ne11,
@@ -1080,7 +1096,11 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
                     meta[jdu * nsplit + split] = sycl::float2(sM[tid], sL[tid]);
                 }
             };
-        cgh.parallel_for(ndr, kern);
+        if constexpr ((BL & 2) != 0) {
+            cgh.parallel_for(ndr, fattn_dec_grf256<decltype(kern)>{ kern });
+        } else {
+            cgh.parallel_for(ndr, kern);
+        }
     });
 }
 
@@ -1176,7 +1196,7 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
                           (int) (((uintptr_t) K->data) % 64), K->nb[1], K->nb[2]);
         }
     }
-    const int  bl   = b2d ? 1 : 0;
+    const int  bl   = (b2d ? 1 : 0) | ((ggml_sycl_knob("GGML_SYCL_FA_DEC_GRF", 256) == 256 && nq >= 4) ? 2 : 0);
     const int nq5 = (dpas && !d512 && !g2 && ne01 == 5) ? nq5_env : 0;
     const bool stage = dpas && stage_env && !d512 && !g2 && (nq == 1 || nq5 == 2) && !(b2d && b2d_env >= 2 && nq == 1);
     const int tk   = (d512 || g2) ? (nq == 1 ? 256 : 128)
@@ -1217,7 +1237,9 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
         (const char *) K->data, (const char *) V->data, mdata, (float *) dst->data, parts.get(), meta.get(), scale, ne01,       \
         (int) Q->ne[2], ne11, (int) K->ne[2], (int) Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3],     \
         V->nb[1], V->nb[2], V->nb[3], nb31, nb33, ne33, nsplit, chunk, stream)
-#define FATTN_DEC_DPAS(NQ_, KG_, TC_) do { if (bl) { FATTN_DEC_DPAS_BL(NQ_, KG_, TC_, 1); } else { FATTN_DEC_DPAS_BL(NQ_, KG_, TC_, 0); } } while (0)
+#define FATTN_DEC_DPAS(NQ_, KG_, TC_) do { switch (bl) {                                                                   \
+        case 3: FATTN_DEC_DPAS_BL(NQ_, KG_, TC_, 3); break; case 2: FATTN_DEC_DPAS_BL(NQ_, KG_, TC_, 2); break;            \
+        case 1: FATTN_DEC_DPAS_BL(NQ_, KG_, TC_, 1); break; default: FATTN_DEC_DPAS_BL(NQ_, KG_, TC_, 0); break; } } while (0)
     if (d512) {
 #define FATTN_DEC_DPAS512(NQ_, KG_, TC_) fattn_dec_q4_0_dpas<512, 16, NQ_, KG_, TC_>((const char *) Q->data, (const char *) K->data, \
         (const char *) V->data, mdata, (float *) dst->data, parts.get(), meta.get(), scale, ne01, (int) Q->ne[2], ne11,             \
