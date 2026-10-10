@@ -495,7 +495,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
             } else {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-                    if (Q->ne[1] <= 2) {
+                    // Above GQA 4 the MMA kernel is faster on Ada (same rule as for F16 K/V above), but only when it reads K/V in place.
+                    // Otherwise it converts the whole cache to f16 on every call, so keep the vector kernel.
+                    if (Q->ne[1] <= 2 && (gqa_ratio <= 4 || !ggml_cuda_fattn_mma_kv_native_supported(dst))) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {
