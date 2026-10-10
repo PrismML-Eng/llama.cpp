@@ -588,6 +588,9 @@ struct common_params {
     // only takes effect when cache_type_k == GGML_TYPE_Q4_0; see docs/kv-mean-center.md
     std::string kv_mean_center_path = "";
 
+    // tiered KV cache: cells past this many live in pinned host memory (0 = all in device memory)
+    int32_t n_kv_vram_cells = 0;
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)
