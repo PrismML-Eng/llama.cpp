@@ -346,6 +346,13 @@ public:
     ggml_tensor * s_write_rows = nullptr;
     int64_t       s_write_K    = 0;
 
+    // ARC-LAB GDN rollback by replay (llama_memory_recurrent::rpl), null when off:
+    ggml_tensor * s_rpl_rows  = nullptr; // I32 [n_rs]: plane-0 S row each state is read from (no rollback plane)
+    ggml_tensor * s_rpl_main  = nullptr; // view [n_seqs]
+    ggml_tensor * s_rpl_extra = nullptr; // view [n_rs - n_seqs]
+    ggml_tensor * s_rpl_ctrl  = nullptr; // I32 [2, n_seqs]: {records to re-apply, their bank}
+    ggml_tensor * s_rpl_wrow  = nullptr; // I64 [n_seqs]: bank the new records go to
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse

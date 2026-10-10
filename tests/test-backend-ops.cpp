@@ -1218,6 +1218,8 @@ struct test_case {
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
+    // tensor capacity of the test contexts (ARC-LAB: multi-launch chain tests need more than the default)
+    virtual size_t ctx_tensors() { return 128; }
 
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
@@ -1320,7 +1322,7 @@ struct test_case {
         mode = MODE_TEST;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead(),
+            /* .mem_size = */ ggml_tensor_overhead()*ctx_tensors() + ggml_graph_overhead(),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -1511,7 +1513,7 @@ struct test_case {
         static const size_t graph_nodes = 8192;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_size = */ ggml_tensor_overhead()*ctx_tensors() + ggml_graph_overhead_custom(graph_nodes, false),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -1658,7 +1660,7 @@ struct test_case {
         static const size_t graph_nodes = 8192;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_size = */ ggml_tensor_overhead()*ctx_tensors() + ggml_graph_overhead_custom(graph_nodes, false),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -1692,7 +1694,7 @@ struct test_case {
         const std::vector<float> expect = grad_expect();
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + 2*ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true),
+            /* .mem_size = */ ggml_tensor_overhead()*ctx_tensors() + 2*ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -4347,6 +4349,197 @@ struct test_rwkv_wkv6 : public test_case {
         ggml_tensor * s   = ggml_new_tensor(ctx, type, 2, std::vector<int64_t>{ head_size * head_size * head_count, n_seqs }.data());
         ggml_tensor * out = ggml_rwkv_wkv6(ctx, k, v, r, tf, td, s);
         return out;
+    }
+};
+
+// ARC-LAB: GGML_OP_GATED_DELTA_NET_REPLAY (rollback by replay; independent implementation of the technique described
+// by llamADALL). One graph runs a chain of launches twice, the way the recurrent memory does across MTP steps:
+//   snapshot path: GATED_DELTA_NET(K) -> CPY of the snapshots into a K-plane cache; the next launch reads plane r
+//   replay path:   GATED_DELTA_NET_REPLAY -> CPY of the base into row 0 + SET_ROWS of the records into one bank of
+//                  row 1; the next launch re-applies m - r records ({n_rec, bank} in its ctrl input)
+// where r is the rollback (rejected drafts) chosen per step. Each launch reads the cache through the previous CPY /
+// SET_ROWS result, which orders the launches and keeps the cache-write fusion of the real graph.
+//   exact = true : output = snapshot results - replay results (attention outputs of every step + final state);
+//                  must be exactly 0 on each backend (max |x|, threshold 0)
+//   exact = false: output = replay results, compared with the CPU backend (nmse)
+// The last step must have 1 token, so both paths hold the final state in their first row.
+struct test_gdn_replay_chain : public test_case {
+    const int64_t head_count; // q/k heads
+    const int64_t v_repeat;   // v heads = head_count * v_repeat
+    const int64_t K;          // snapshot slots = 1 + records per bank
+    const std::vector<std::pair<int64_t, int64_t>> steps; // (n_tokens, rollback after the step)
+    const bool    exact;
+
+    static constexpr int64_t S = 128;
+
+    test_gdn_replay_chain(int64_t head_count, int64_t v_repeat, int64_t K,
+                          std::vector<std::pair<int64_t, int64_t>> steps, bool exact)
+        : head_count(head_count), v_repeat(v_repeat), K(K), steps(std::move(steps)), exact(exact) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_REPLAY";
+    }
+
+    std::string vars() override {
+        std::string st;
+        for (const auto & p : steps) {
+            st += (st.empty() ? "" : " ") + std::to_string(p.first) + "-" + std::to_string(p.second);
+        }
+        return VARS_TO_STR4(head_count, v_repeat, K, exact) + ",steps=[" + st + "]";
+    }
+
+    bool   run_whole_graph() override { return true; }
+    size_t ctx_tensors() override { return 64 * steps.size() + 128; }
+
+    double max_nmse_err() override { return exact ? 0.0 : 1e-7; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (!exact) {
+            return nmse(a, b, n);
+        }
+        double mx = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            mx = std::max(mx, (double) std::fabs(a[i]));
+            mx = std::max(mx, (double) std::fabs(b[i]));
+        }
+        if (mx > 0.0) {
+            printf("[replay != snapshot: max |diff| %g] ", mx);
+        }
+        return mx;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t H = head_count * v_repeat;
+        const int64_t D = S * S * H;
+        const int64_t R = H * (2 * S + 1);
+        const int64_t RK = R * (K - 1);
+        GGML_ASSERT(!steps.empty() && steps.back().first == 1 && steps.back().second == 0);
+        GGML_ASSERT(2 * RK <= D);
+
+        ggml_tensor * snap_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, K);
+        ggml_tensor * rpl_cache  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, 2);
+        ggml_set_name(snap_cache, "snap_cache");
+        ggml_set_name(rpl_cache,  "rpl_cache");
+
+        ggml_tensor * snap_src = snap_cache; // [D, rows]: the rows the next snapshot launch can read
+        ggml_tensor * base_src = rpl_cache;  // [D, rows]: row 0 = base state
+        ggml_tensor * rec_src  = ggml_view_3d(ctx, rpl_cache, RK, 2, 1, RK * sizeof(float), rpl_cache->nb[1], rpl_cache->nb[1]);
+
+        ggml_tensor * zero_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(zero_idx, "idx_0");
+
+        ggml_tensor * out_snap = nullptr;
+        ggml_tensor * out_rpl  = nullptr;
+        auto append = [&](ggml_tensor * acc, ggml_tensor * t) {
+            t = ggml_view_1d(ctx, t, ggml_nelements(t), 0);
+            return acc ? ggml_concat(ctx, acc, t, 0) : t;
+        };
+
+        int64_t snap_plane = 0; // rollback plane the next snapshot launch reads
+        int64_t n_rec = 0, bank = 0;
+        for (size_t i = 0; i < steps.size(); ++i) {
+            const int64_t n = steps[i].first;
+            const int64_t r = steps[i].second;
+            const int64_t m = std::min(n - 1, K - 1);
+            GGML_ASSERT(r <= m);
+
+            ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, head_count, n, 1);
+            ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, head_count, n, 1);
+            ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, n, 1);
+            ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n, 1);
+            ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n, 1);
+            ggml_set_name(v, "v");
+            ggml_set_name(g, "g");
+            ggml_set_name(b, "beta");
+            q = ggml_l2_norm(ctx, q, 1e-6f);
+            k = ggml_l2_norm(ctx, k, 1e-6f);
+
+            // snapshot path
+            ggml_tensor * sidx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+            ggml_set_name(sidx, ("idx_" + std::to_string(snap_plane)).c_str());
+            ggml_tensor * st = ggml_reshape_4d(ctx, ggml_get_rows(ctx, snap_src, sidx), S, S, H, 1);
+            ggml_tensor * o  = ggml_gated_delta_net(ctx, q, k, v, g, b, st, K);
+            const int64_t n_written = std::min(n, K);
+            ggml_tensor * cs = ggml_cpy(ctx,
+                ggml_view_3d(ctx, o, D, 1, n_written, D * sizeof(float), D * sizeof(float), S * H * n * sizeof(float)),
+                ggml_view_3d(ctx, snap_cache, D, 1, n_written, snap_cache->nb[1], snap_cache->nb[1], 0));
+            if (gf) {
+                ggml_build_forward_expand(gf, cs);
+            }
+            snap_src   = ggml_reshape_2d(ctx, cs, D, n_written);
+            snap_plane = r;
+            out_snap   = append(out_snap, ggml_view_1d(ctx, o, S * H * n, 0));
+
+            // replay path
+            ggml_tensor * ctrl = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2);
+            ggml_set_name(ctrl, ("ctrl_" + std::to_string(n_rec) + "_" + std::to_string(bank)).c_str());
+            ggml_tensor * wrow = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1);
+            ggml_set_name(wrow, ("wrow_" + std::to_string(bank ^ 1)).c_str());
+            ggml_tensor * bs = ggml_reshape_4d(ctx, ggml_get_rows(ctx, base_src, zero_idx), S, S, H, 1);
+            ggml_tensor * o2 = ggml_gated_delta_net_replay(ctx, q, k, v, g, b, bs, rec_src, ctrl, (int) K);
+            const size_t base_off = S * H * n * sizeof(float);
+            ggml_tensor * cb = ggml_cpy(ctx, ggml_view_2d(ctx, o2, D, 1, D * sizeof(float), base_off),
+                                             ggml_view_2d(ctx, rpl_cache, D, 1, rpl_cache->nb[1], 0));
+            ggml_tensor * sr = ggml_set_rows(ctx,
+                ggml_view_2d(ctx, rpl_cache, RK, 2, RK * sizeof(float), rpl_cache->nb[1]),
+                ggml_view_2d(ctx, o2, RK, 1, RK * sizeof(float), base_off + D * sizeof(float)), wrow);
+            if (gf) {
+                ggml_build_forward_expand(gf, cb);
+                ggml_build_forward_expand(gf, sr);
+            }
+            base_src = ggml_reshape_2d(ctx, cb, D, 1);
+            rec_src  = ggml_reshape_3d(ctx, sr, RK, 2, 1);
+            n_rec    = m - r;
+            bank    ^= 1;
+            out_rpl  = append(out_rpl, ggml_view_1d(ctx, o2, S * H * n, 0));
+
+            if (i + 1 == steps.size()) {
+                out_snap = append(out_snap, ggml_view_1d(ctx, cs, D, 0));
+                out_rpl  = append(out_rpl,  ggml_view_1d(ctx, cb, D, 0));
+            }
+        }
+
+        ggml_tensor * out = exact ? ggml_sub(ctx, out_snap, out_rpl) : out_rpl;
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+        std::vector<float> s0(S * S * head_count * v_repeat);
+        for (auto & x : s0) {
+            x = u(rng);
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op) || t->op != GGML_OP_NONE) { continue; }
+            const std::string name = t->name;
+            if (name == "snap_cache" || name == "rpl_cache") {
+                // the same initial state in row 0 of both caches, zeros elsewhere (no records to replay yet)
+                std::vector<float> z(ggml_nelements(t), 0.0f);
+                std::copy(s0.begin(), s0.end(), z.begin());
+                ggml_backend_tensor_set(t, z.data(), 0, ggml_nbytes(t));
+            } else if (name.rfind("idx_", 0) == 0) {
+                const int32_t x = std::stoi(name.substr(4));
+                ggml_backend_tensor_set(t, &x, 0, sizeof(x));
+            } else if (name.rfind("ctrl_", 0) == 0) {
+                const size_t  us = name.find('_', 5);
+                const int32_t x[2] = { std::stoi(name.substr(5, us - 5)), std::stoi(name.substr(us + 1)) };
+                ggml_backend_tensor_set(t, x, 0, sizeof(x));
+            } else if (name.rfind("wrow_", 0) == 0) {
+                const int64_t x = std::stoll(name.substr(5));
+                ggml_backend_tensor_set(t, &x, 0, sizeof(x));
+            } else if (name == "g") {
+                init_tensor_uniform(t, -3.0f, -1e-4f); // keep some of the state alive across the chain
+            } else if (name == "beta") {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (name == "v") {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else if (t->type == GGML_TYPE_F32) {
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 
@@ -10795,6 +10988,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1,  2, 2, false, false, 1, false, -1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1, 1, false, false, 1, false, -1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1,  2, 1, false, false, 2, true,  -1, true));
+
+    // ARC-LAB: GDN rollback by replay - replay chain == snapshot chain (exact), and replay chain vs CPU.
+    // steps (n_tokens, rollback): prompt-sized launches (>= 16 tokens: blocked kernel on SYCL), MTP verify launches
+    // with partial acceptance, full rejection (rollback = n - 1) and a prompt after pending records.
+    for (bool exact : { true, false }) {
+        const std::vector<std::pair<int64_t, int64_t>> chain_a = { {20, 0}, {5, 2}, {5, 0}, {3, 1}, {5, 4}, {2, 0}, {1, 0} };
+        const std::vector<std::pair<int64_t, int64_t>> chain_b = { {5, 1}, {17, 0}, {4, 3}, {18, 2}, {5, 1}, {1, 0} };
+        test_cases.emplace_back(new test_gdn_replay_chain(4, 1, 5, chain_a, exact));
+        test_cases.emplace_back(new test_gdn_replay_chain(2, 3, 5, chain_b, exact));
+        test_cases.emplace_back(new test_gdn_replay_chain(16, 3, 5, chain_a, exact)); // Bonsai: 16 q/k, 48 v heads
+        test_cases.emplace_back(new test_gdn_replay_chain(2, 2, 3, { {7, 1}, {3, 2}, {3, 0}, {1, 0} }, exact));
+    }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));

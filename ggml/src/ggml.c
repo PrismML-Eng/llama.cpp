@@ -1114,9 +1114,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "GATED_DELTA_NET_REPLAY",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1229,9 +1231,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "gated_delta_net_replay(q, k, v, g, beta, s, rec, ctrl)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6439,6 +6443,65 @@ void ggml_gated_delta_net_set_raw_gates(
 
     gdn->src[7] = dt_bias;
     gdn->src[8] = a;
+}
+
+// ARC-LAB: ggml_gated_delta_net_replay (see ggml.h)
+struct ggml_tensor * ggml_gated_delta_net_replay(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * rec,
+        struct ggml_tensor  * ctrl,
+        int                   K) {
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+    GGML_ASSERT(ggml_is_contiguous(ctrl));
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32 && state->type == GGML_TYPE_F32);
+    GGML_ASSERT(rec->type == GGML_TYPE_F32);
+    GGML_ASSERT(ctrl->type == GGML_TYPE_I32);
+
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+
+    GGML_ASSERT(K >= 2 && n_tokens >= 1);
+    GGML_ASSERT(q->ne[0] == S_v && k->ne[0] == S_v && q->ne[1] == k->ne[1] && H % q->ne[1] == 0);
+    GGML_ASSERT(g->ne[0] == 1 && g->ne[1] == H && g->ne[2] == n_tokens && g->ne[3] == n_seqs); // scalar gate only
+    GGML_ASSERT(beta->ne[0] == 1 && beta->ne[1] == H && beta->ne[2] == n_tokens && beta->ne[3] == n_seqs);
+    GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v && state->ne[2] == H && state->ne[3] == n_seqs);
+
+    const int64_t R = H * (2 * S_v + 1);
+    GGML_ASSERT(rec->ne[0] == R * (K - 1) && rec->ne[1] == 2 && rec->ne[2] == n_seqs);
+    GGML_ASSERT(rec->nb[0] == sizeof(float) && rec->nb[1] == (size_t) rec->ne[0] * sizeof(float));
+    GGML_ASSERT(ggml_nelements(ctrl) == 2 * n_seqs);
+
+    const int64_t ne[4] = { S_v * H * n_tokens * n_seqs + S_v * S_v * H * n_seqs + (K - 1) * R * n_seqs, 1, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) K);
+
+    result->op     = GGML_OP_GATED_DELTA_NET_REPLAY;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[6] = rec;
+    result->src[7] = ctrl;
+
+    return result;
 }
 
 // ggml_lightning_indexer

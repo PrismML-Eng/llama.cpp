@@ -573,6 +573,46 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
+    if (inp->s_rpl_ctrl) {
+        // ARC-LAB: rollback by replay (independent implementation of the technique described by llamADALL). One
+        // base state in plane 0 plus the update records of the last K-1 tokens in plane 1 (two banks: this pass
+        // reads one, its records go to the other) instead of K snapshot planes; see ggml_gated_delta_net_replay.
+        GGML_ASSERT(state_rows == nullptr && n_seqs == 1 && g->ne[0] == 1);
+        const int64_t R        = H_v * (2 * S_v + 1);
+        const size_t  row_size = ssm_states_all->nb[1];
+        const size_t  rec_size = ggml_row_size(ssm_states_all->type, R * (K - 1));
+
+        // both banks of this cell's records: [R*(K-1), 2, n_seqs]
+        ggml_tensor * rec = ggml_view_3d(ctx0, ssm_states_all, R * (K - 1), 2, n_seqs, rec_size, row_size,
+                (size_t) (mem_size + kv_head) * row_size);
+
+        ggml_tensor * gdn_out = ggml_gated_delta_net_replay(ctx0, q, k, v, g, b, s, rec, inp->s_rpl_ctrl, (int) K);
+        res->add_fused_node({n_seq_tokens > 1 ? LLM_FUSED_OP_GDN_CH : LLM_FUSED_OP_GDN_AR, gdn_out, il});
+
+        ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
+            S_v, H_v, n_seq_tokens, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, S_v * H_v),
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+            0);
+        cb(output, "attn_output", il);
+
+        const size_t base_off = ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens * n_seqs);
+        const size_t rec_off  = base_off + ggml_row_size(gdn_out->type, D * n_seqs);
+
+        // base state -> plane 0; records -> the bank s_rpl_wrow picks (the SYCL backend fuses both into the op)
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0,
+            ggml_view_2d(ctx0, gdn_out, D, n_seqs, ggml_row_size(gdn_out->type, D), base_off),
+            ggml_view_2d(ctx0, ssm_states_all, D, n_seqs, row_size, (size_t) kv_head * row_size)));
+
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0,
+            ggml_view_2d(ctx0, ssm_states_all, R * (K - 1), 2, rec_size, (size_t) (mem_size + kv_head) * row_size),
+            ggml_view_2d(ctx0, gdn_out, R * (K - 1), n_seqs, rec_size, rec_off),
+            inp->s_rpl_wrow));
+
+        return output;
+    }
+
     const bool raw = gdn_raw_beta && gdn_raw_alpha && gdn_raw_dt_bias && gdn_raw_a;
     ggml_tensor * gg = raw ? gdn_raw_alpha : g;
     ggml_tensor * bb = raw ? gdn_raw_beta  : b;

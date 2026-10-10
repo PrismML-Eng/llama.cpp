@@ -78,6 +78,18 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // ARC-LAB: rollback by replay for the gated delta net state (LLAMA_GDN_REPLAY, default on where it applies;
+    // independent implementation of the technique described by llamADALL). The S rows of plane 0 hold the base
+    // state; plane 1 of each cell holds two banks of per-token update records (ggml_gated_delta_net_replay).
+    // Rolling back r tokens drops the last r pending records instead of selecting a snapshot plane. The conv
+    // state (r_l) keeps its snapshot planes and rs_idx.
+    bool     rpl   = false;
+    uint32_t rpl_R = 0;              // floats per record: n_v_heads * (2 * head_dim + 1)
+    std::vector<uint32_t> rpl_n;     // per seq: records still to be re-applied onto the base state
+    std::vector<uint8_t>  rpl_bank;  // per seq: bank holding them
+
+    void rpl_reset(llama_seq_id seq_id); // seq_id < 0: all
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -127,7 +139,8 @@ private:
     size_t size_s_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+            const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges_s, uint32_t rpl_pending, uint32_t rpl_bank_cur) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
@@ -172,6 +185,13 @@ public:
     ggml_tensor * get_s_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // ARC-LAB GDN replay (see llama_memory_recurrent::rpl)
+    bool    get_rpl() const;
+    int32_t rpl_row(int i) const; // plane-0 S row the state of rs i is read from
+    // records to re-apply for seq set i of the ubatch and their bank; also books this ubatch's records (call once
+    // per ubatch, when setting the inputs - like s_copy() consumes rs_idx)
+    void    rpl_take(int i, uint32_t n_seq_tokens, int32_t & n_rec, int32_t & bank) const;
 
 private:
     const llama_memory_status status;

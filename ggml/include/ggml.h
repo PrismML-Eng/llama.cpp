@@ -596,6 +596,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_GATED_DELTA_NET_REPLAY, // ARC-LAB: appended last so the existing op numbers do not move
+
         GGML_OP_COUNT,
     };
 
@@ -2627,6 +2629,34 @@ extern "C" {
             struct ggml_tensor  * gdn,
             struct ggml_tensor  * dt_bias,
             struct ggml_tensor  * a);
+
+    // ARC-LAB: gated delta net with rollback by replay (independent implementation of the technique described by
+    // llamADALL). Same recurrence as ggml_gated_delta_net (scalar gate only), but instead of K state snapshots the op
+    // keeps ONE base state plus, for each later token, its update record: the per-token update is
+    // S <- g * S + k (x) delta, so a record is (delta [S_v], k [S_v], g [1]) per head, R = H*(2*S_v + 1) floats:
+    //   record = [ delta: S_v*H | k: S_v*H (head h holds k of head h % H_k) | g: H ]   (g = the decay factor exp(gate))
+    //
+    //   q, k, v, g, beta : as ggml_gated_delta_net (g: [1, H, n_tokens, n_seqs])
+    //   state : [S_v, S_v, H, n_seqs] stored base state
+    //   rec   : F32 [R*(K-1), 2, n_seqs] stored records, two banks per seq (a pass reads one bank, the caller
+    //           stores the new records in the other one)
+    //   ctrl  : I32 [2, n_seqs] = {n_rec, bank}: records 0..n_rec-1 of `bank` are first re-applied to state
+    //
+    // output, packed: [ attn scores S_v*H*n_tokens*n_seqs | base D*n_seqs | records (K-1)*R*n_seqs ], D = S_v*S_v*H
+    //   with m = min(n_tokens - 1, K - 1): base = state after token n_tokens-1-m (the oldest state a rollback of up
+    //   to m tokens can need), record j = token n_tokens-m+j for j < m; records m..K-2 are left unwritten.
+    //   Rolling back r <= m tokens = re-applying m - r records to base on the next call.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_replay(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * rec,
+            struct ggml_tensor  * ctrl,
+            int                   K);
 
     // DSA lightning indexer
     //

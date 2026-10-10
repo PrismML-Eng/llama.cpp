@@ -491,10 +491,19 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // GPU device in the model is Metal.
     static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
 
-    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0;
+    // ARC-LAB: GDN rollback by replay (the memory decides, see llama_memory_recurrent::rpl): the state is the base
+    // row in plane 0, gathered with its own row indices (s_copy carries the conv rollback plane)
+    const bool gdn_rpl = inp->s_rpl_ctrl != nullptr;
+
+    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0 && !gdn_rpl;
 
     ggml_tensor * state;
-    if (gdn_state_rows) {
+    if (gdn_rpl) {
+        state = build_rs(ssm_states_all, inp->s_rpl_main, inp->s_rpl_extra, hparams.n_embd_s(), n_seqs,
+                mctx_cur->get_n_rs(), mctx_cur->get_head(), mctx_cur->get_size(), mctx_cur->get_rs_z());
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+        cb(state, "state_predelta", il);
+    } else if (gdn_state_rows) {
         state = build_rs_cache_view(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
         cb(state, "state_cache_view", il);
     } else {

@@ -6024,6 +6024,9 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         case GGML_OP_GATED_DELTA_NET:
             ggml_sycl_gated_delta_net(ctx, dst);
             break;
+        case GGML_OP_GATED_DELTA_NET_REPLAY:
+            ggml_sycl_op_gated_delta_net_replay(ctx, dst, nullptr);
+            break;
         case GGML_OP_OPT_STEP_ADAMW:
             ggml_sycl_opt_step_adamw(ctx, dst);
             break;
@@ -6359,6 +6362,83 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
     return skip;
 }
 
+// ARC-LAB: match GATED_DELTA_NET_REPLAY + the two nodes that store its output in the recurrent cache - a CPY of the
+// base state and a SET_ROWS of the update records into the bank picked by its row index - so the kernel writes both
+// straight into the cache and the two copies are skipped. Single sequence only. Returns the nodes to skip (0 = none).
+static int ggml_sycl_try_gdn_replay_fusion(const ggml_cgraph * cgraph, int node_idx, ggml_sycl_gdn_replay_fused & fused) {
+    if (!g_ggml_sycl_enable_fusion) {
+        return 0;
+    }
+    const ggml_tensor * gdn = cgraph->nodes[node_idx];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET_REPLAY || gdn->type != GGML_TYPE_F32 || (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    const ggml_tensor * src_v    = gdn->src[2];
+    const int64_t       S_v      = src_v->ne[0];
+    const int64_t       H        = src_v->ne[1];
+    const int64_t       n_tokens = src_v->ne[2];
+    const int64_t       n_seqs   = src_v->ne[3];
+    const int64_t       K        = ggml_get_op_params_i32(gdn, 0);
+    const int64_t       D        = S_v * S_v * H;
+    const int64_t       R        = H * (2 * S_v + 1);
+    if (n_seqs != 1) {
+        return 0;
+    }
+    const size_t base_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
+    const size_t rec_off  = base_off + ggml_row_size(GGML_TYPE_F32, D * n_seqs);
+
+    // the next two computed nodes must be the CPY and the SET_ROWS (either order), nothing in between
+    const ggml_tensor * cpy  = nullptr;
+    const ggml_tensor * sr   = nullptr;
+    int                 skip = 0;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && (cpy == nullptr || sr == nullptr); ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_sycl_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if ((n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+        if (n->op == GGML_OP_CPY && cpy == nullptr) {
+            cpy = n;
+        } else if (n->op == GGML_OP_SET_ROWS && sr == nullptr) {
+            sr = n;
+        } else {
+            return 0;
+        }
+        skip = j - node_idx;
+    }
+    if (cpy == nullptr || sr == nullptr) {
+        return 0;
+    }
+
+    // CPY: base region of this op's output -> a contiguous F32 cache view of D * n_seqs floats
+    const ggml_tensor * cs = cpy->src[0];
+    const ggml_tensor * cd = cpy->src[1];
+    if (cs->op != GGML_OP_VIEW || cs->view_src != gdn || cs->view_offs != base_off || !ggml_is_contiguous(cs) ||
+        ggml_nelements(cs) != D * n_seqs || cd->type != GGML_TYPE_F32 || cd->data == nullptr ||
+        !ggml_is_contiguous(cd)) {
+        return 0;
+    }
+
+    // SET_ROWS: one row of R * (K - 1) records from the record region -> F32 rows (banks), I64 index on the device
+    const ggml_tensor * rs = sr->src[0];
+    const ggml_tensor * ri = sr->src[1];
+    if (rs->op != GGML_OP_VIEW || rs->view_src != gdn || rs->view_offs != rec_off || !ggml_is_contiguous(rs) ||
+        rs->ne[0] != R * (K - 1) || ggml_nrows(rs) != 1 || sr->type != GGML_TYPE_F32 || sr->data == nullptr ||
+        sr->ne[0] != R * (K - 1) || sr->nb[0] != sizeof(float) || sr->nb[1] % sizeof(float) != 0 ||
+        ri->type != GGML_TYPE_I64 || ggml_nelements(ri) != 1 || ri->data == nullptr ||
+        (ri->buffer && ggml_backend_buffer_is_host(ri->buffer))) {
+        return 0;
+    }
+
+    fused.base           = (float *) cd->data;
+    fused.rec            = (float *) sr->data;
+    fused.rec_rows       = (const int64_t *) ri->data;
+    fused.rec_row_stride = (int64_t) (sr->nb[1] / sizeof(float));
+    return skip;
+}
+
 // GET_ROWS that gathers a recurrent state row feeding only GATED_DELTA_NET src[5] (possibly through a RESHAPE):
 // skip it and let the kernel read the cache row directly. Single sequence only. GGML_SYCL_GDN_GATHER=0 disables.
 static bool ggml_sycl_try_gdn_gather_skip(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
@@ -6385,7 +6465,7 @@ static bool ggml_sycl_try_gdn_gather_skip(ggml_backend_sycl_context & ctx, const
     const ggml_tensor * cur = gr;
     for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
-        if (n->op == GGML_OP_GATED_DELTA_NET && n->src[5] == cur) {
+        if ((n->op == GGML_OP_GATED_DELTA_NET || n->op == GGML_OP_GATED_DELTA_NET_REPLAY) && n->src[5] == cur) {
             const ggml_tensor * v = n->src[2];
             const int64_t       D = v->ne[0] * v->ne[0] * v->ne[1];
             if (gr->ne[0] != D || v->ne[3] != 1 || ggml_nelements(cur) != D) {
@@ -7220,6 +7300,15 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 continue;
             }
         }
+        if (node->op == GGML_OP_GATED_DELTA_NET_REPLAY) {
+            ggml_sycl_gdn_replay_fused fused;
+            const int rpl_nodes_to_skip = ggml_sycl_try_gdn_replay_fusion(cgraph, i, fused);
+            if (rpl_nodes_to_skip > 0) {
+                ggml_sycl_op_gated_delta_net_replay(*sycl_ctx, node, &fused);
+                i += rpl_nodes_to_skip;
+                continue;
+            }
+        }
         if (node->op == GGML_OP_MUL_MAT && ggml_sycl_try_dn_gates(*sycl_ctx, cgraph, i)) {
             continue;
         }
@@ -8033,6 +8122,9 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_GATED_DELTA_NET:
             // rows-indexed state read (src[6]) and raw gates (op_params[1]) not implemented here
             return op->src[6] == NULL && ggml_get_op_params_i32(op, 1) == 0;
+        case GGML_OP_GATED_DELTA_NET_REPLAY:
+            // ARC-LAB: kernels exist for the scalar gate at head size 128 (Bonsai / Qwen3.5) only
+            return op->src[2]->ne[0] == 128 && op->src[3]->ne[0] == 1 && ggml_are_same_stride(op->src[0], op->src[1]);
         case GGML_OP_SSM_CONV:
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 &&
