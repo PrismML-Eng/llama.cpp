@@ -5,13 +5,22 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+// 3-4 queries with a quantized V take the 64-column f16 tiles (#189): launch_fattn converts K and V to f16 in the
+// op's extra buffer, also when an in-place quantized K/V kernel exists for the head size. ggml_cuda_flash_attn_ext_get_alloc_size
+// must reserve that buffer for these ops.
+static bool ggml_cuda_fattn_mma_short_query_f16(const int cc, const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * V = dst->src[2];
+    return turing_mma_available(cc) && ggml_is_quantized(V->type) && Q->ne[1] > 2 && Q->ne[1] <= 4;
+}
+
 template <int DKQ, int DV, int ncols2, ggml_type type_KV = GGML_TYPE_F16>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * V = dst->src[2];
 
-    if (turing_mma_available(cc) && ggml_is_quantized(V->type) && Q->ne[1] > 2 && Q->ne[1] <= 4) {
+    if (ggml_cuda_fattn_mma_short_query_f16(cc, dst)) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
         return;
     }
@@ -579,7 +588,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_MMA_F16:
-            if (ggml_cuda_fattn_mma_kv_native_supported(dst)) {
+            if (ggml_cuda_fattn_mma_kv_native_supported(dst) &&
+                    !ggml_cuda_fattn_mma_short_query_f16(ggml_cuda_info().devices[device].cc, dst)) {
                 // In-place quantized K/V kernel: nothing to reserve beyond dst.
                 break;
             }
@@ -617,6 +627,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
+            if (dst->buffer && ggml_cuda_fattn_mma_short_query_f16(ggml_cuda_info().devices[ggml_cuda_get_device()].cc, dst)) {
+                // the f16 K/V this route writes after dst must fit in what the buffer reserved for dst
+                const ggml_cuda_flash_attn_ext_f16_extra_data need = ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, true, true);
+                GGML_ASSERT(need.end - (uintptr_t) dst->data <= ggml_backend_buffer_get_alloc_size(dst->buffer, dst) &&
+                    "flash attention: f16 K/V scratch not reserved for the short-query route");
+            }
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
     }
