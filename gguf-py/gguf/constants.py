@@ -5476,6 +5476,11 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    TQ3_1S  = 45
+    TQ4_1S  = 46
+    Q8_CR   = 48
+    Q5_CR   = 49
+    Q6_CR   = 50
     PQ2_0   = 142
     PTQ1_0  = 143
 
@@ -5534,6 +5539,11 @@ class LlamaFileType(IntEnum):
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
+    MOSTLY_Q8_CR         = 42  # except 1d tensors, ConvRot-rotated Q8_0
+    MOSTLY_TQ3_1S        = 43  # except 1d tensors
+    MOSTLY_TQ4_1S        = 44  # except 1d tensors
+    MOSTLY_Q5_CR         = 45  # except 1d tensors, ConvRot-rotated Q5_0
+    MOSTLY_Q6_CR         = 46  # except 1d tensors, ConvRot-rotated Q6_K
     MOSTLY_PQ2_0         = 128  # except 1d tensors
     MOSTLY_PTQ1_0        = 129  # except 1d tensors
 
@@ -5674,6 +5684,11 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
     GGMLQuantizationType.PQ2_0:   (128, 2 + 32),
     GGMLQuantizationType.PTQ1_0:  (128, 2 + 24 + 2),
+    GGMLQuantizationType.TQ3_1S:  (32, 2 + 2 + 12),
+    GGMLQuantizationType.TQ4_1S:  (32, 2 + 2 + 16),
+    GGMLQuantizationType.Q8_CR:   (256, 8 * (2 + 32)),
+    GGMLQuantizationType.Q5_CR:   (256, 8 * (2 + 4 + 16)),
+    GGMLQuantizationType.Q6_CR:   (256, 2 + 128 + 64 + 16),
 }
 
 
