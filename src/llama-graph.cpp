@@ -2657,6 +2657,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
                float   kq_scale,
                  int   il) const {
+    if (k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
+        GGML_ASSERT(v_mla == nullptr);
+        if (q->ne[0] != k->ne[0]) {
+            GGML_ASSERT(q->ne[0] < k->ne[0]);
+            q = ggml_pad(ctx0, q, k->ne[0] - q->ne[0], 0, 0, 0);
+        }
+        q = ggml_turbo_wht(ctx0, ggml_cont(ctx0, q), 0, 128, nullptr);
+    }
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2801,6 +2809,23 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (!cparams.offload_kqv) {
             // all nodes between the KV store and the attention output are run on the CPU
             ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+        }
+    }
+
+    // TurboQuant: if V was padded the output carries the padded head_dim; slice it
+    // back to the model's original V head_dim (no-op when head_dim % 128 == 0).
+    if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0) {
+        const int64_t orig_v_head   = hparams.n_embd_head_v(il);
+        const int64_t padded_v_head = v->ne[0];
+        if (padded_v_head != orig_v_head) {
+            GGML_ASSERT(cur->ne[0] % padded_v_head == 0);
+            const int64_t n_head_v     = cur->ne[0] / padded_v_head;
+            const int64_t n_tokens_cur = cur->ne[1];
+            cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
+            cur = ggml_view_3d (ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,
+                                cur->nb[1], cur->nb[2], 0);
+            cur = ggml_cont     (ctx0, cur);
+            cur = ggml_reshape_2d(ctx0, cur, orig_v_head * n_head_v, n_tokens_cur);
         }
     }
 
@@ -2972,38 +2997,8 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    // TurboQuant pre-rotate-queries: rotate Q (padding it first if K is padded)
-    // so that <WHT(q), WHT(k)> = <q, k> yields the correct attention scores.
-    if (k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
-        if (q->ne[0] % 128 != 0) {
-            const int64_t pad = ((q->ne[0] + 127)/128)*128 - q->ne[0];
-            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
-        }
-        if (!ggml_is_contiguous(q)) {
-            q = ggml_cont(ctx0, q);
-        }
-        q = ggml_turbo_wht(ctx0, q, 0, 0, nullptr); // 0 = forward, auto group size
-    }
-
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
-
-    // TurboQuant: if V was padded the output carries the padded head_dim; slice it
-    // back to the model's original V head_dim (no-op when head_dim % 128 == 0).
-    if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0) {
-        const int64_t orig_v_head   = hparams.n_embd_head_v(il);
-        const int64_t padded_v_head = v->ne[0];
-        if (padded_v_head != orig_v_head) {
-            GGML_ASSERT(cur->ne[0] % padded_v_head == 0);
-            const int64_t n_head_v     = cur->ne[0] / padded_v_head;
-            const int64_t n_tokens_cur = cur->ne[1];
-            cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
-            cur = ggml_view_3d (ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,
-                                cur->nb[1], cur->nb[2], 0);
-            cur = ggml_cont     (ctx0, cur);
-            cur = ggml_reshape_2d(ctx0, cur, orig_v_head * n_head_v, n_tokens_cur);
-        }
-    }
 
     if (inp->self_v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);

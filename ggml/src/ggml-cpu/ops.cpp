@@ -5054,6 +5054,14 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TQ3_1S:
+        case GGML_TYPE_TQ4_1S:
+        case GGML_TYPE_Q8_CR:
+        case GGML_TYPE_Q5_CR:
+        case GGML_TYPE_Q6_CR:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -11494,7 +11502,7 @@ static void ggml_compute_forward_turbo_wht_f32(
     int direction;
     int group_size;
     memcpy(&direction, dst->op_params + 0, sizeof(int));
-    memcpy(&group_size, dst->op_params + sizeof(int), sizeof(int));
+    group_size = ggml_get_op_params_i32(dst, 1);
 
     const int64_t head_dim        = src->ne[0];
     const int64_t n_heads         = ggml_nelements(src) / head_dim;

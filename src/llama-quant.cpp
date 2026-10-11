@@ -377,6 +377,24 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
     const int64_t ncols = t->ne[0];
     const int64_t qk_k = ggml_blck_size(target_type);
 
+    // CR types rotate activations in groups of 256 at runtime.
+    static constexpr int64_t q8_cr_group_size = 256;
+    if ((return_type == GGML_TYPE_Q8_CR || return_type == GGML_TYPE_Q5_CR || return_type == GGML_TYPE_Q6_CR) &&
+            (t->ne[2] != 1 || t->ne[3] != 1 || ncols % q8_cr_group_size != 0)) {
+        LLAMA_LOG_WARN("warning: %-36s - cannot use %s (needs 2D tensor with ncols %% %3d == 0) ",
+                       t->name, ggml_type_name(return_type), (int) q8_cr_group_size);
+        ++qs.n_fallback;
+        return_type = (return_type == GGML_TYPE_Q8_CR) ? GGML_TYPE_Q8_0 :
+                      (return_type == GGML_TYPE_Q5_CR) ? GGML_TYPE_Q5_0 :
+                      (return_type == GGML_TYPE_Q6_CR) ? GGML_TYPE_Q6_K : GGML_TYPE_Q8_0;
+        if (ncols % ggml_blck_size(return_type) != 0) {
+            LLAMA_LOG_WARN("(WARNING: must use F16 due to unusual shape) ");
+            return_type = GGML_TYPE_F16;
+        }
+        LLAMA_LOG_WARN("-> falling back to %7s\n", ggml_type_name(return_type));
+        return return_type;
+    }
+
     if (ncols % qk_k != 0) { // this tensor's shape is incompatible with this quant
         LLAMA_LOG_WARN("warning: %-36s - ncols %6" PRId64 " not divisible by %3" PRId64 " (required for type %7s) ",
                         t->name, ncols, qk_k, ggml_type_name(target_type));
@@ -469,7 +487,8 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                      ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
                 new_type = GGML_TYPE_Q5_K;
             }
-            else if (new_type != GGML_TYPE_Q8_0) {
+            else if (new_type != GGML_TYPE_Q8_0 && new_type != GGML_TYPE_Q8_CR &&
+                     new_type != GGML_TYPE_Q5_CR && new_type != GGML_TYPE_Q6_CR) {
                 new_type = GGML_TYPE_Q6_K;
             }
         }
@@ -502,6 +521,16 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0 || ftype == LLAMA_FTYPE_MOSTLY_Q2_0 || ftype == LLAMA_FTYPE_MOSTLY_PQ2_0 || ftype == LLAMA_FTYPE_MOSTLY_PTQ1_0) {
                 new_type = GGML_TYPE_Q4_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q8_CR) {
+                // token embeddings are read with get_rows, not mul_mat, so they cannot be rotated
+                new_type = GGML_TYPE_Q8_0;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q5_CR) {
+                new_type = GGML_TYPE_Q5_0;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q6_CR) {
+                new_type = GGML_TYPE_Q6_K;
             }
         }
     } else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ1_S ||

@@ -355,6 +355,9 @@ unset(LLAMA_TEST_NAME)
 llama_build_and_test(test-mtmd-impl.cpp)
 target_link_libraries(test-mtmd-impl PRIVATE mtmd)
 
+# Synthetic quantization type-selection test: no model downloads or SSL required.
+llama_build_and_test(test-quant-cr.cpp LABEL "quant")
+
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)
 if (TARGET cpp-httplib)

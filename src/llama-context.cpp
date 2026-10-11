@@ -3872,6 +3872,22 @@ llama_context * llama_init_from_model(
         }
     }
 
+    const bool turbo_cache = params.type_k == GGML_TYPE_TURBO2_0 ||
+                             params.type_k == GGML_TYPE_TURBO3_0 ||
+                             params.type_k == GGML_TYPE_TURBO4_0 ||
+                             params.type_v == GGML_TYPE_TURBO2_0 ||
+                             params.type_v == GGML_TYPE_TURBO3_0 ||
+                             params.type_v == GGML_TYPE_TURBO4_0;
+    if (turbo_cache && (model->hparams.is_mla() ||
+                        model->arch == LLM_ARCH_DEEPSEEK32 ||
+                        model->arch == LLM_ARCH_GLM_DSA ||
+                        model->arch == LLM_ARCH_DOTS3NOTE ||
+                        model->arch == LLM_ARCH_DEEPSEEK4 ||
+                        model->arch == LLM_ARCH_MINIMAX_M3)) {
+        LLAMA_LOG_ERROR("%s: Turbo KV cache is not supported for MLA/DSA, DeepSeek4, or MiniMax M3 attention paths\n", __func__);
+        return nullptr;
+    }
+
     if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
         return nullptr;
@@ -3890,8 +3906,16 @@ llama_context * llama_init_from_model(
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
+        const bool k_is_turbo = params.type_k == GGML_TYPE_TURBO2_0 ||
+                                params.type_k == GGML_TYPE_TURBO3_0 ||
+                                params.type_k == GGML_TYPE_TURBO4_0;
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
-            if (model->hparams.n_embd_head_k(il) % blck_size != 0) {
+            uint32_t head_k = model->hparams.n_embd_head_k(il);
+            // Match the Turbo head padding used by the KV cache allocation.
+            if (k_is_turbo) {
+                head_k = GGML_PAD(head_k, 128);
+            }
+            if (head_k % blck_size != 0) {
                 LLAMA_LOG_ERROR("%s: K cache type %s with block size %u does not divide n_embd_head_k=%u\n",
                     __func__, ggml_type_name(params.type_k), blck_size, model->hparams.n_embd_head_k(il));
                 return nullptr;
@@ -3901,8 +3925,17 @@ llama_context * llama_init_from_model(
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_v)) {
         const uint32_t blck_size = ggml_blck_size(params.type_v);
+        const bool v_is_turbo = params.type_v == GGML_TYPE_TURBO2_0 ||
+                                params.type_v == GGML_TYPE_TURBO3_0 ||
+                                params.type_v == GGML_TYPE_TURBO4_0;
+        const bool is_mla = model->hparams.is_mla();
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
-            if (model->hparams.n_embd_head_v(il) % blck_size != 0) {
+            uint32_t head_v = model->hparams.n_embd_head_v(il);
+            // MLA uses a view of K, not a separately padded V cache.
+            if (v_is_turbo && !is_mla) {
+                head_v = GGML_PAD(head_v, 128);
+            }
+            if (head_v % blck_size != 0) {
                 LLAMA_LOG_ERROR("%s: V cache type %s with block size %u does not divide n_embd_head_v=%u\n",
                     __func__, ggml_type_name(params.type_v), blck_size, model->hparams.n_embd_head_v(il));
                 return nullptr;
