@@ -1,19 +1,46 @@
-# llama.cpp
+# llama.cpp — Bonsai + TurboQuant fork
 
 > [!IMPORTANT]
-> **This is the PrismML fork of llama.cpp**, the main line behind the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models (branch `prism`, developed as `prism-v7`). It tracks current mainline llama.cpp and adds the fork's low-bit formats and runtime features on top.
+> **This is `bonsai-turboquant-llama.cpp`, an experimental integration fork** that brings together two llama.cpp forks into one build:
 >
-> **New here? Start with the [Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo) repo.** It downloads the right models and the correct prebuilt binaries for your hardware/backend automatically.
+> - **[PrismML-Eng/llama.cpp](https://github.com/PrismML-Eng/llama.cpp)** (`prism` branch) — the engine behind the **[Bonsai](https://huggingface.co/collections/prism-ml/bonsai)** ternary models.
+> - **[AtomicBot-ai/atomic-llama-cpp-turboquant](https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant)** — the **TurboQuant** low-bit KV-cache / weight quantization fork.
 >
-> **Which ternary model file to use:**
+> The base history is Prism's `prism` (which itself tracks mainline llama.cpp); TurboQuant's features are ported on top.
+> **Goal:** run Bonsai models *and* use TurboQuant from a single build.
 >
-> - `*-PQ2_0.gguf` (fork group-128, ggml id 142): preferred on Metal, CUDA, HIP and CPU. About 6% smaller than group-64.
-> - `*-Q2_0_g64.gguf` / 27B `*-Q2_g64.gguf` (official group-64, ggml id 42): runs on every backend here AND on mainline llama.cpp. If unsure, use this. Newer model releases name this file plain `*-Q2_0.gguf`.
-> - `*-Q2_0.gguf` on OLDER model repos is the **deprecated legacy format** (group 128 stored as id 42). It does not load on these builds; the error tells you which file to get instead. If you must run it, use the frozen [`prism-v5`](https://github.com/PrismML-Eng/llama.cpp/tree/prism-v5) line and its final release [`prism-b9601`](https://github.com/PrismML-Eng/llama.cpp/releases/tag/prism-b9601-68faa14).
+> **Implemented on this branch (CPU + Vulkan):**
 >
-> **Speculative decoding (dspark)** is supported via mainline's draft-dspark plus fork patches. Drafters published for older model releases need a one-time conversion with `gguf-dspark-to-dflash` (see [SPECULATIVE.md](https://github.com/PrismML-Eng/Bonsai-demo/blob/main/SPECULATIVE.md) in Bonsai-demo); newer releases ship ready-to-use drafters.
+> - Bonsai ternary weights — `PQ2_0` (ggml id 142), `PTQ1_0` (id 143), plus upstream `Q2_0` (42) / `Q1_0` (41), and the `prism.hadamard.*` weight-fold graph.
+> - TurboQuant KV cache — `turbo2` / `turbo3` / `turbo4` (ggml ids 43 / 44 / 47, runtime-only):
+>   `llama-cli -m model.gguf -fa on -ctk turbo3 -ctv turbo3`.
+> - TurboQuant weights — `TQ3_1S` (45), `TQ4_1S` (46); ConvRot weights `Q8_CR` (48), `Q5_CR` (49), `Q6_CR` (50).
+> - `GGML_OP_TURBO_WHT` (Walsh–Hadamard rotation) and the TurboQuant codec (`ggml-turbo-quant.c`).
 >
-> Do NOT build from `prism-v6` (stale mid-migration snapshot) and do NOT mix this fork's `ggml-*` libraries with a stock llama.cpp build.
+> **Backend coverage:** CPU ✅ · Vulkan ✅ · CUDA / Metal / SYCL ❌ (not ported yet — those backends reject the TurboQuant types and fall back to CPU).
+>
+> **Model files (Bonsai):**
+> - `*-PQ2_0.gguf` (group-128, id 142) — preferred here.
+> - `*-Q2_0_g64.gguf` (group-64, id 42) — also loads on mainline llama.cpp.
+> - Legacy group-128 stored as id 42 is rejected with a diagnostic.
+>
+> **Build (Windows example):**
+> ```bat
+> cmake -S . -B build-vk -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+>   -DGGML_VULKAN=ON -DGGML_CUDA=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_SERVER=ON
+> cmake --build build-vk -j
+> ```
+> Vulkan needs the [Vulkan SDK](https://vulkan.lunarg.com/) (for `glslc`); set `VULKAN_SDK`.
+>
+> **Provenance / remotes:** `upstream` = `ggml-org/llama.cpp`, `prism` = `PrismML-Eng/llama.cpp`,
+> `turboquant` = `AtomicBot-ai/atomic-llama-cpp-turboquant`, `bt` = `nicheng251/BonsaiTurbo`.
+>
+> **Status:** experimental, work in progress, **not affiliated** with either upstream. The KV/attention
+> rotation is the key integration point: TurboQuant owns KV rotation for `turbo*` cache types, while the
+> mainline `attn_rot` path (used by Bonsai) is kept for other quantized KV types — the two must not both
+> apply to the same cache.
+>
+> Do not mix this fork's `ggml-*` libraries with a stock llama.cpp build.
 
 ---
 
