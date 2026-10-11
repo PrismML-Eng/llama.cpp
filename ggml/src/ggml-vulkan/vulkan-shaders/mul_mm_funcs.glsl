@@ -607,6 +607,69 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             store_a(col, eff_row + 4, FLOAT_TYPEV2(kvalues_mxfp4[vui  >>  4] * d,
                                                     kvalues_mxfp4[vui2 >>  4] * d));
 #endif
+#elif defined(DATA_A_TQ3_1S)
+            // TurboQuant, ROTATED formulation: produce centroid*scale WITHOUT the
+            // inverse WHT, so this is only correct when the B operand has been
+            // pre-rotated by tq_rotate_act.comp. LOAD_VEC_A is 8: one invocation
+            // covers one 3-byte packing group (8 contiguous elements).
+            {
+            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+
+            const uint ib  = idx / 4u;   // 4 groups of 8 per 32-element block
+            const uint iqs = idx & 3u;   // which 3-byte group
+
+            // ASYMMETRIC -- must match TQ3_0_CENTROIDS in ggml-turbo-quant.c
+            // and dequant_tq3_1s.comp.
+            const float centroids[8] = float[8](
+                -1.996684, -1.291398, -0.740341, -0.247508,
+                 0.230106,  0.725222,  1.277503,  1.988943
+            );
+
+            // elements iqs*8 .. iqs*8+7, so d0 covers groups 0-1, d1 groups 2-3
+            const float d = (iqs < 2u) ? float(data_a[ib].d0) : float(data_a[ib].d1);
+
+            const uint g = iqs * 3u;
+            const uint pk = uint(data_a[ib].qs[g])
+                          | (uint(data_a[ib].qs[g + 1u]) << 8)
+                          | (uint(data_a[ib].qs[g + 2u]) << 16);
+
+            const uint k_pair = row * LOAD_VEC_A / 2;
+            [[unroll]] for (uint i = 0; i < 4u; i++) {
+                const uint i0 = i * 2u;
+                const uint i1 = i0 + 1u;
+                store_a(col, k_pair + i, FLOAT_TYPEV2(
+                    centroids[(pk >> (i0 * 3u)) & 7u] * d,
+                    centroids[(pk >> (i1 * 3u)) & 7u] * d));
+            }
+            }
+#elif defined(DATA_A_TQ4_1S)
+            // Same rotated formulation as TQ3_1S above. 16 levels, 2 nibbles per
+            // byte, so one invocation covers 8 contiguous elements = 4 qs bytes.
+            {
+            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+
+            const uint ib  = idx / 4u;
+            const uint iqs = idx & 3u;
+
+            // SYMMETRIC 16-level Lloyd-Max; must match TQ4_0_CENTROIDS.
+            const float centroids[16] = float[16](
+                -2.732590, -2.069017, -1.618046, -1.256231,
+                -0.942340, -0.656759, -0.388048, -0.128395,
+                 0.128395,  0.388048,  0.656759,  0.942340,
+                 1.256231,  1.618046,  2.069017,  2.732590
+            );
+
+            const float d = (iqs < 2u) ? float(data_a[ib].d0) : float(data_a[ib].d1);
+
+            const uint b0 = iqs * 4u;
+            const uint k_pair = row * LOAD_VEC_A / 2;
+            [[unroll]] for (uint i = 0; i < 4u; i++) {
+                const uint byt = uint(data_a[ib].qs[b0 + i]);
+                store_a(col, k_pair + i, FLOAT_TYPEV2(
+                    centroids[byt & 0xFu] * d,
+                    centroids[(byt >> 4u) & 0xFu] * d));
+            }
+            }
 #endif
 }
 

@@ -2476,6 +2476,121 @@ struct test_set_rows : public test_case {
     }
 };
 
+// GGML_OP_TURBO_WHT (128-element groups, without InnerQ scaling)
+struct test_turbo_wht : public test_case {
+    const int64_t head_dim;
+    const int64_t n_heads;
+    const int direction;
+
+    std::string vars() override {
+        return VARS_TO_STR3(head_dim, n_heads, direction);
+    }
+
+    double max_nmse_err() override { return 1e-5; }
+
+    test_turbo_wht(int64_t head_dim, int64_t n_heads, int direction)
+        : head_dim(head_dim), n_heads(n_heads), direction(direction) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim, n_heads);
+        ggml_set_name(a, "a");
+        ggml_tensor * out = ggml_turbo_wht(ctx, a, direction, 0, nullptr);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// Check the identity itself, not just agreement between two implementations.
+struct test_turbo_wht_roundtrip : public test_case {
+    const int64_t head_dim;
+    const int64_t n_heads;
+
+    std::string vars() override {
+        return VARS_TO_STR2(head_dim, n_heads);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "TURBO_WHT_ROUNDTRIP";
+    }
+
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-10; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (n == 1) {
+            // Each backend returns the sum of squared round-trip residuals.
+            return std::max(std::abs(a[0]), std::abs(b[0])) / double(head_dim * n_heads);
+        }
+        return nmse(a, b, n); // unchanged sentinels
+    }
+
+    test_turbo_wht_roundtrip(int64_t head_dim, int64_t n_heads)
+        : head_dim(head_dim), n_heads(n_heads) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim, n_heads);
+        ggml_set_name(a, "a");
+        ggml_tensor * fwd = ggml_turbo_wht(ctx, a, 0, 0, nullptr);
+        ggml_tensor * inv = ggml_turbo_wht(ctx, fwd, 1, 0, nullptr);
+        ggml_tensor * out = ggml_sum(ctx, ggml_sqr(ctx, ggml_sub(ctx, inv, a)));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// SET_ROWS -> CPY compares dequantized values, including untouched cache rows.
+// Turbo KV values stay in the rotated domain, so this is backend parity, not
+// a comparison against the unrotated, unquantized source.
+struct test_set_rows_turbo : public test_case {
+    const ggml_type type;
+    const ggml_type type_idx;
+    const int64_t ne0;
+    const int64_t ne1;
+    const int r;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, type_idx, ne0, ne1, r);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SET_ROWS_TURBO";
+    }
+
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 0.05; }
+
+    test_set_rows_turbo(ggml_type type, ggml_type type_idx, int64_t ne0, int64_t ne1, int r)
+        : type(type), type_idx(type_idx), ne0(ne0), ne1(ne1), r(r) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * dst = ggml_new_tensor_2d(ctx, type, ne0, ne1);
+        ggml_set_name(dst, "dst");
+        ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, r);
+        ggml_set_name(src, "src");
+        ggml_tensor * row_idxs = ggml_new_tensor_1d(ctx, type_idx, r);
+        ggml_set_name(row_idxs, "row_idxs");
+        ggml_tensor * written = ggml_set_rows(ctx, dst, src, row_idxs);
+        ggml_tensor * out = ggml_cpy(ctx, written, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I64 || t->type == GGML_TYPE_I32) {
+                init_set_rows_row_ids(t, ne1);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_ROPE + GGML_OP_VIEW + GGML_OP_SET_ROWS
 struct test_rope_set_rows : public test_case {
     const ggml_type type;
@@ -8721,6 +8836,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, true));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, true));
 
+    // Keep TurboQuant coverage explicit: adding these types to all_types would
+    // multiply the unrelated operation sweeps and include unaligned KV shapes.
+    for (int64_t head_dim : {128, 256, 512}) {
+        for (int direction : {0, 1}) {
+            test_cases.emplace_back(new test_turbo_wht(head_dim, 3, direction));
+        }
+        test_cases.emplace_back(new test_turbo_wht_roundtrip(head_dim, 3));
+    }
+
+    for (ggml_type type : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
+        for (ggml_type type_idx : {GGML_TYPE_I32, GGML_TYPE_I64}) {
+            test_cases.emplace_back(new test_set_rows_turbo(type, type_idx, 128, 16, 1));
+            test_cases.emplace_back(new test_set_rows_turbo(type, type_idx, 256, 16, 7));
+        }
+        // Cross the 512-workgroup boundary without a large test matrix.
+        test_cases.emplace_back(new test_set_rows_turbo(type, GGML_TYPE_I32, 128, 1024, 513));
+        test_cases.emplace_back(new test_cpy(type, GGML_TYPE_F32, {256, 5, 2, 1}));
+        test_cases.emplace_back(new test_cpy(type, GGML_TYPE_F32, {256, 5, 2, 1}, {-1, -1, -1, -1}, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_get_rows(type, 256, 11, 7, 2, 1, true));
+    }
+
     for (int mode : { GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_VISION }) {
         for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
             for (int ne2 : {1, 8, 512}) {
@@ -9474,6 +9610,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             //test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 18,  i, 32*256, { 1,  1}, {8, 1}));
             //test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 19,  i, 33*256, { 1,  1}, {1, 1}));
         }
+    }
+
+    // TurboQuant weight matmul: decode, multi-token decode, and prefill.
+    // Use odd row counts and multi-block K to cover packing and row tails.
+    for (ggml_type type : {GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S}) {
+        for (int64_t n : {1, 4, 9, 32}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 67, n, 1536, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F16, 67, 4, 1536, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 67, 32, 1536, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1600));
     }
 
     // PTQ1_0 / PQ2_0 integer-dot mat-vec: Bonsai-2 shapes, odd row counts (row tail), batches and multi-column B
@@ -10308,6 +10454,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // TQ expert decode and prefill exercise the rotated-activation staging path.
+    for (ggml_type type : {GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S}) {
+        for (int n : {1, 32}) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 4, 2, false, 67, n, 1536));
+        }
+    }
+
+    // Turbo KV flash attention: aligned heads, decode and prefill, and GQA.
+    for (ggml_type type : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
+        for (int head_dim : {128, 256}) {
+            for (int nb : {1, 32}) {
+                test_cases.emplace_back(new test_flash_attn_ext(head_dim, head_dim, 2, {2, 1}, 256, nb,
+                    true, false, 0, 0, GGML_PREC_F32, type, type));
+            }
+        }
+        // Unequal K/V head sizes and types exercise separate dequant strides.
+        test_cases.emplace_back(new test_flash_attn_ext(256, 128, 2, {2, 1}, 256, 3,
+            false, false, 0, 0, GGML_PREC_F32, type, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 256, 2, {2, 1}, 256, 3,
+            true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, type));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 128, 2, {2, 1}, 256, 32,
+        true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}));
 
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
