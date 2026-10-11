@@ -551,9 +551,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t n_seqs       = v->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
-    const bool keep = cparams.n_rs_seq > 0;
-
-    GGML_ASSERT(state_rows == nullptr || keep); // rows mode is a ring-path optimization
+    // rows mode also serves plain decode (GGML_GDN_ROWS_PLAIN): one snapshot slot, K = 1
+    const bool keep = cparams.n_rs_seq > 0 || state_rows != nullptr;
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
