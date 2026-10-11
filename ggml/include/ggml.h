@@ -447,6 +447,12 @@ extern "C" {
     enum ggml_op_hint {
         GGML_HINT_NONE             = 0,
         GGML_HINT_SRC0_IS_HADAMARD = 1,
+        // marks the reshape that tiles the activation feature axis into [hd, nk, rep]
+        // for the Hadamard fold; its input must be replicated under tensor parallelism
+        GGML_HINT_HADAMARD_TILING  = 2,
+        // marks a node that must materialise a full (replicated) copy of a split input,
+        // i.e. an all-gather across the tensor-parallel devices
+        GGML_HINT_META_GATHER      = 3,
     };
 
     // model file types

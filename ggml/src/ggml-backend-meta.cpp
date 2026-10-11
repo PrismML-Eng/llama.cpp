@@ -495,6 +495,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
 
+    // prism-debug: trace every consumer of a tensor whose name mentions "final_output"
+    if (tensor->src[0] != nullptr && tensor->src[0]->name != nullptr &&
+            strstr(tensor->src[0]->name, "final_output") != nullptr) {
+        fprintf(stderr, "[DBG consumer] %s op=%s ne=[%lld,%lld,%lld,%lld]  <- src0=%s ne=[%lld,%lld,%lld,%lld]\n",
+            tensor->name, ggml_op_name(tensor->op),
+            (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3],
+            tensor->src[0]->name,
+            (long long) tensor->src[0]->ne[0], (long long) tensor->src[0]->ne[1],
+            (long long) tensor->src[0]->ne[2], (long long) tensor->src[0]->ne[3]);
+        fflush(stderr);
+    }
+
     auto split_states_equal = [&](const ggml_backend_meta_split_state & a, const ggml_backend_meta_split_state & b) -> bool {
         if (a.axis != b.axis) {
             return false;
@@ -517,8 +529,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
     auto handle_generic = [&](const std::vector<ggml_backend_meta_split_state> & src_ss, bool scalar_only) -> ggml_backend_meta_split_state {
         ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1};
+        bool saw_mirrored = false;
         for (size_t i = 0; i < GGML_MAX_SRC; i++) {
             if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
+                continue;
+            }
+            // prism: a replicated operand is compatible with a split operand: each backend
+            // already holds the full (broadcast) copy it needs.
+            if (src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                saw_mirrored = true;
                 continue;
             }
             if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
@@ -529,10 +548,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
         }
         if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
-            ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+            ret = {saw_mirrored ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
         if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+        }
+        if (ret.axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+            fprintf(stderr, "[META-GEN-FAIL] %s op=%s axes=%d,%d,%d,%d\n",
+                tensor->name, ggml_op_name(tensor->op),
+                (int) src_ss[0].axis, (int) src_ss[1].axis, (int) src_ss[2].axis, (int) src_ss[3].axis);
+            fflush(stderr);
         }
         GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         return ret;
@@ -560,6 +585,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
     auto handle_concat = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         const ggml_backend_meta_split_axis concat_axis = ggml_backend_meta_split_axis(ggml_get_op_params_i32(tensor, 0));
+        fprintf(stderr, "[META-CAT] %s concat_axis=%d out_ne=[%lld,%lld] s0{ax=%d nseg=%zu nr0=%u ne=[%lld,%lld]} s1{ax=%d nseg=%zu nr0=%u ne=[%lld,%lld]}\n",
+            tensor->name, (int) concat_axis,
+            (long long) tensor->ne[0], (long long) tensor->ne[1],
+            (int) src_ss[0].axis, src_ss[0].n_segments, src_ss[0].nr[0], (long long) src_ss[0].ne[0], (long long) src_ss[0].ne[1],
+            (int) src_ss[1].axis, src_ss[1].n_segments, src_ss[1].nr[0], (long long) src_ss[1].ne[0], (long long) src_ss[1].ne[1]);
+        fflush(stderr);
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis >= 0 && src_ss[1].axis < GGML_MAX_DIMS) {
             GGML_ASSERT(concat_axis != src_ss[1].axis);
             return src_ss[1];
@@ -569,6 +600,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             return src_ss[0];
         }
         if (src_ss[0].axis == src_ss[1].axis && src_ss[0].axis != concat_axis) {
+            return src_ss[0];
+        }
+        // prism: conv-state concat along the conv width -- the operands must be split on the
+        // channel axis (axis 1) so each backend concatenates its own full-width slice.
+        if (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1) {
+            return src_ss[1];
+        }
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1) {
             return src_ss[0];
         }
         return handle_generic(src_ss, /*scalar_only =*/ true);
@@ -581,14 +620,20 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             ggml_backend_meta_split_state ret = src_ss[0];
             ret.axis = GGML_BACKEND_SPLIT_AXIS_0;
-            ret.nr[0] = 1;
-            ret.n_segments = 1;
+            // prism: keep the weight's segment structure (head-group partition) so the output
+            // activation is partitioned exactly like the weight's output dimension
             return ret;
         }
         if (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[1];
         }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            if (!split_states_equal(src_ss[0], src_ss[1])) {
+                fprintf(stderr, "[META-MM0-FAIL] %s src0=%s{nr=%u ne0=%lld} src1=%s{nr=%u ne0=%lld ne1=%lld}\n",
+                    tensor->name, tensor->src[0]->name, src_ss[0].nr[0], (long long) src_ss[0].ne[0],
+                    tensor->src[1]->name, src_ss[1].nr[0], (long long) src_ss[1].ne[0], (long long) src_ss[1].ne[1]);
+                fflush(stderr);
+            }
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
         }
@@ -602,12 +647,60 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
         }
+        // prism: contraction-axis weight split (e.g. the Hadamard-folded ssm_out) with a
+        // replicated activation. Each device computes a partial sum over its slice of the
+        // contraction axis; the boundary allreduce then produces the full result.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+        }
+        // prism: identity-matmul gather: replicated weight x split activation -> each device
+        // contributes its slice placed in the full output; the boundary allreduce assembles it
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+        }
+        // prism: if either operand already carries a partial sum, the product stays partial
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL || src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+        }
+        // prism: replicated left operand x sub-axis-split activation (e.g. the Hadamard
+        // rotation against a feature-sub-axis-split activation) -- the split carries through
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                src_ss[1].axis >= GGML_BACKEND_SPLIT_AXIS_2 && src_ss[1].axis < GGML_MAX_DIMS) {
+            return src_ss[1];
+        }
+        fprintf(stderr, "[MM-FAIL-DETAIL] node=%s op=%s\n  src0=%s op=%s ne=[%lld,%lld,%lld,%lld] axis=%d nr=%u ne0=%lld ne1=%lld\n",
+            tensor->name, ggml_op_name(tensor->op),
+            tensor->src[0]->name, ggml_op_name(tensor->src[0]->op),
+            (long long) tensor->src[0]->ne[0], (long long) tensor->src[0]->ne[1], (long long) tensor->src[0]->ne[2], (long long) tensor->src[0]->ne[3],
+            (int) src_ss[0].axis, src_ss[0].nr[0], (long long) src_ss[0].ne[0], (long long) src_ss[0].ne[1]);
+        fprintf(stderr, "  src1=%s op=%s ne=[%lld,%lld,%lld,%lld] axis=%d nr=%u ne0=%lld ne1=%lld\n",
+            tensor->src[1]->name, ggml_op_name(tensor->src[1]->op),
+            (long long) tensor->src[1]->ne[0], (long long) tensor->src[1]->ne[1], (long long) tensor->src[1]->ne[2], (long long) tensor->src[1]->ne[3],
+            (int) src_ss[1].axis, src_ss[1].nr[0], (long long) src_ss[1].ne[0], (long long) src_ss[1].ne[1]);
+        if (tensor->src[1]->src[0]) {
+            const ggml_backend_meta_split_state ss1s = ggml_backend_meta_get_split_state(tensor->src[1]->src[0], true);
+            fprintf(stderr, "  src1->src0=%s op=%s ne=[%lld,%lld,%lld,%lld] axis=%d nr=%u ne0=%lld ne1=%lld\n",
+                tensor->src[1]->src[0]->name, ggml_op_name(tensor->src[1]->src[0]->op),
+                (long long) tensor->src[1]->src[0]->ne[0], (long long) tensor->src[1]->src[0]->ne[1],
+                (long long) tensor->src[1]->src[0]->ne[2], (long long) tensor->src[1]->src[0]->ne[3],
+                (int) ss1s.axis, ss1s.nr[0], (long long) ss1s.ne[0], (long long) ss1s.ne[1]);
+        }
+        fflush(stderr);
         GGML_ABORT("unsupported mul_mat split states: node=%s src0=%s axis=%d src1=%s axis=%d",
             tensor->name, tensor->src[0]->name, (int) src_ss[0].axis, tensor->src[1]->name, (int) src_ss[1].axis);
         //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
     };
 
     auto handle_reshape = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // prism: the Hadamard tiling reshape decomposes the activation feature axis into
+        // [hd, nk, rep]; no single-axis split can survive it, so the input must be
+        // replicated. Return MIRRORED (the gather is inserted at execution time).
+        if (tensor->op == GGML_OP_RESHAPE && ggml_get_op_params_i32(tensor, 1) == GGML_HINT_HADAMARD_TILING) {
+            fprintf(stderr, "[META-HINT] hadamard tiling reshape '%s' -> MIRRORED (src axis=%d)\n",
+                    tensor->name, src_ss[0].axis);
+            fflush(stderr);
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
         switch (src_ss[0].axis) {
             case GGML_BACKEND_SPLIT_AXIS_0:
             case GGML_BACKEND_SPLIT_AXIS_1:
@@ -648,7 +741,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         return {ggml_backend_meta_split_axis(dim), {0}, {1}, 1};
                     }
                 }
-                GGML_ABORT("shape mismatch for %s", ggml_op_name(tensor->op));
+                // prism: fall back to a replicated result rather than aborting on a shape the
+                // generic single-axis mapping can't express
+                return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
             }
             case GGML_BACKEND_SPLIT_AXIS_MIRRORED:
             case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
@@ -669,6 +764,17 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_view = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (tensor->name && (std::string(tensor->name).find("conv_output_silu") != std::string::npos)) {
+            fprintf(stderr, "[META-VIEW] %s ne=[%lld,%lld,%lld,%lld] src_ax=%d nr=%u ne0=%lld ne1=%lld src_ne=[%lld,%lld,%lld,%lld]\n",
+                tensor->name, (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3],
+                (int) src_ss[0].axis, src_ss[0].nr[0], (long long) src_ss[0].ne[0], (long long) src_ss[0].ne[1],
+                (long long) tensor->src[0]->ne[0], (long long) tensor->src[0]->ne[1], (long long) tensor->src[0]->ne[2], (long long) tensor->src[0]->ne[3]);
+            fflush(stderr);
+        }
+        // prism: segmented splits go through the reshape mapping
+        if (src_ss[0].nr[0] > 1) {
+            return handle_reshape(src_ss);
+        }
         if (ggml_is_contiguous(tensor) && ggml_is_contiguous(tensor->src[0])) {
             return handle_reshape(src_ss);
         }
@@ -704,6 +810,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_permute = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // prism: segmented split -- just remap the axis through the permutation
+        if (src_ss[0].nr[0] > 1) {
+            ggml_backend_meta_split_state ret = src_ss[0];
+            const int a = (int) src_ss[0].axis;
+            if (a >= 0 && a < GGML_MAX_DIMS) {
+                ret.axis = ggml_backend_meta_split_axis(tensor->op_params[a]);
+            }
+            return ret;
+        }
         switch (src_ss[0].axis) {
             case GGML_BACKEND_SPLIT_AXIS_0:
             case GGML_BACKEND_SPLIT_AXIS_1:
@@ -799,6 +914,22 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_ssm_conv = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // prism: replicated activation with a channel-split kernel: the weight's channel axis
+        // (axis 1) is the output's channel axis (axis 0), so the output splits on axis 0
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1) {
+            return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+        }
+        // prism: replicated convolution kernel -- the split follows the input, axis flipped
+        if (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+                return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+            }
+            if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1) {
+                return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+            }
+            return src_ss[0];
+        }
         if (src_ss[0].axis == src_ss[1].axis) {
             if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
                 return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
@@ -811,19 +942,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_gated_delta_net = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
-                src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
-                src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
-            return src_ss[0];
+        // prism: in the replicated-activation design the recurrent op runs replicated whenever
+        // any operand is replicated; otherwise it follows the head-axis (axis 0) split.
+        for (int i = 0; i < 6; i++) {
+            if (src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+            }
         }
-        GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1);
-        GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1);
-        GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_1);
-        GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_1);
-        GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_1);
-        // state shape is [S_v, S_v, H_v, n_seqs] (s0 only); the heads dim is its own axis 2,
-        // so a head-aligned split on the input cache lands on axis 2 here.
-        GGML_ASSERT(src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_2 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_1 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_0);
         return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
     };
 
@@ -868,6 +993,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
             } break;
             case GGML_OP_DUP: {
+                if (ggml_get_op_params_i32(tensor, 1) == GGML_HINT_META_GATHER) {
+                    // gather node: output is the replicated (all-gathered) activation
+                    split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+                    break;
+                }
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_ADD:
@@ -935,6 +1065,37 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_CONT:
             case GGML_OP_RESHAPE: {
+                // prism: segmented (nr>1) split through the Hadamard tiling chain.
+                // [F] {axis0, nr=R, ne=S}  ->  [hd,nk,R,...] {axis1(nk), nr=R, ne=S/hd}
+                // and the reverse on the flatten back to [F].
+                if (src_ss[0].nr[0] > 1) {
+                    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+                    ggml_backend_meta_split_state ret = src_ss[0];
+                    // flatten/sub-axis mapping: a segmented flat feature axis becomes a
+                    // sub-axis split when the leading output dim divides the segment size.
+                    // (Hadamard tiling [hd,nk,rep] and the conv-state view [d_conv-1,channels].)
+                    if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 &&
+                            tensor->ne[0] > 1 && tensor->ne[1] > 1 && ret.ne[0] % tensor->ne[0] == 0) {
+                        ret.axis = GGML_BACKEND_SPLIT_AXIS_1;
+                        for (size_t j = 0; j < n_bufs; j++) ret.ne[j] /= tensor->ne[0];
+                        ret.nr[0] = 1;
+                        ret.n_segments = 1;
+                        return ret;
+                    }
+                    if (src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_1 && src_ss[0].axis < GGML_MAX_DIMS) {
+                        // flatten a multi-dim tensor whose split was on a sub-axis back to axis 0
+                        int64_t factor = 1;
+                        for (int d = 0; d < (int) src_ss[0].axis; d++) factor *= tensor->src[0]->ne[d];
+                        if (factor > 0 && tensor->ne[0] > 0) {
+                            ret.axis = GGML_BACKEND_SPLIT_AXIS_0;
+                            for (size_t j = 0; j < n_bufs; j++) ret.ne[j] *= factor;
+                            ret.nr[0] = 1;
+                            ret.n_segments = 1;
+                            return ret;
+                        }
+                    }
+                    return ret;
+                }
                 split_state = handle_reshape(src_ss);
             } break;
             case GGML_OP_VIEW: {
@@ -992,9 +1153,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_PAD_REFLECT_1D:
             case GGML_OP_ROLL:
-            case GGML_OP_ARANGE:
             case GGML_OP_TIMESTEP_EMBEDDING: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
+            case GGML_OP_ARANGE: {
+                // source-less constant: replicated on every backend
+                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
             } break;
             case GGML_OP_ARGSORT:
             case GGML_OP_TOP_K: {
@@ -1064,6 +1228,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
         }
         if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
+            if (strstr(tensor->name, "final_output") != nullptr) {
+                fprintf(stderr, "[DBG final_output] out.axis=%d n_seg=%zu nr0=%u ne=[%lld,%lld,%lld,%lld]\n",
+                    split_state.axis, split_state.n_segments, split_state.nr[0],
+                    (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3]);
+                for (int _i = 0; _i < GGML_MAX_SRC; _i++) {
+                    if (tensor->src[_i] == nullptr) continue;
+                    fprintf(stderr, "   src[%d]=%s op=%s axis=%d n_seg=%zu nr0=%u ne=[%lld,%lld,%lld,%lld]\n",
+                        _i, tensor->src[_i]->name, ggml_op_name(tensor->src[_i]->op), src_ss[_i].axis, src_ss[_i].n_segments, src_ss[_i].nr[0],
+                        (long long) tensor->src[_i]->ne[0], (long long) tensor->src[_i]->ne[1],
+                        (long long) tensor->src[_i]->ne[2], (long long) tensor->src[_i]->ne[3]);
+                }
+                fflush(stderr);
+            }
             bool first_src_split_by_axis = true;
             const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
 
@@ -1071,21 +1248,31 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 if (tensor->src[i] == nullptr || src_ss[i].axis < 0 || src_ss[i].axis >= GGML_MAX_DIMS) {
                     continue;
                 }
+                // prism: a broadcast source (split axis of size 1, e.g. the GDN gate) does not
+                // constrain the output split
+                if (tensor->src[i]->ne[src_ss[i].axis] == 1 && tensor->ne[split_state.axis] != 1) {
+                    continue;
+                }
                 if (first_src_split_by_axis) {
-                    for (size_t j = 0; j < n_bufs; j++) {
-                        // Take over ratio from src:
-                        for (size_t s = 0; s < src_ss[i].n_segments; s++) {
-                            split_state.ne[s*n_bufs + j] = 0;
+                    {
+                        // prism: distribute the output axis by each device's source fraction so
+                        // the resulting split state always sums to the output axis.
+                        int64_t src_total = 0;
+                        for (size_t j = 0; j < n_bufs; j++) {
+                            for (size_t s = 0; s < src_ss[i].n_segments; s++) {
+                                src_total += src_ss[i].ne[s*n_bufs + j] * src_ss[i].nr[s];
+                            }
                         }
-                        for (size_t s = 0; s < src_ss[i].n_segments; s++) {
-                            split_state.ne[j] += src_ss[i].ne[s*n_bufs + j] * src_ss[i].nr[s];
+                        const int64_t out_ne = tensor->ne[split_state.axis];
+                        for (size_t j = 0; j < n_bufs; j++) {
+                            int64_t sj = 0;
+                            for (size_t s = 0; s < src_ss[i].n_segments; s++) {
+                                sj += src_ss[i].ne[s*n_bufs + j] * src_ss[i].nr[s];
+                            }
+                            split_state.ne[j] = src_total > 0 ? (sj * out_ne) / src_total : 0;
                         }
-                        split_state.ne[j] *= tensor->ne[split_state.axis];
-                        if (split_state.ne[j] != 0 || tensor->src[i]->ne[src_ss[i].axis] != 0) {
-                            const int64_t div = tensor->src[i]->ne[src_ss[i].axis] * split_state.nr[0];
-                            GGML_ASSERT(split_state.ne[j] % div == 0);
-                            split_state.ne[j] /= div;
-                        }
+                        split_state.nr[0] = 1;
+                        split_state.n_segments = 1;
                     }
                 } else {
                     GGML_ASSERT(split_state.n_segments == 1);
@@ -1095,8 +1282,24 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         for (size_t s = 0; s < src_ss[i].n_segments; s++) {
                             sum += src_ss[i].ne[s*n_bufs + j] * src_ss[i].nr[s];
                         }
-                        GGML_ASSERT(split_state.ne[j]*split_state.nr[0] * tensor->src[i]->ne[src_ss[i].axis]
-                                                                 == sum * tensor->ne[split_state.axis]);
+                        if (split_state.ne[j]*split_state.nr[0] * tensor->src[i]->ne[src_ss[i].axis]
+                                                                 != sum * tensor->ne[split_state.axis]) {
+                            fprintf(stderr, "[META-RATIO-FAIL] %s op=%s out_ax=%d out_ne=%lld nr=%u src%d_ax=%d src_ne=%lld sum=%lld ne0=%lld\n",
+                                tensor->name, ggml_op_name(tensor->op), (int) split_state.axis,
+                                (long long) tensor->ne[split_state.axis], split_state.nr[0],
+                                (int) i, (int) src_ss[i].axis, (long long) tensor->src[i]->ne[src_ss[i].axis], (long long) sum,
+                                (long long) split_state.ne[j]);
+                            fflush(stderr);
+                        }
+                        if (split_state.ne[j]*split_state.nr[0] * tensor->src[i]->ne[src_ss[i].axis]
+                                                                 != sum * tensor->ne[split_state.axis]) {
+                            fprintf(stderr, "[META-RATIO-SKIP] %s op=%s out_ax=%d out_ne=%lld src%d_ax=%d src_ne=%lld sum=%lld\n",
+                                tensor->name, ggml_op_name(tensor->op), (int) split_state.axis,
+                                (long long) tensor->ne[split_state.axis],
+                                (int) i, (int) src_ss[i].axis, (long long) tensor->src[i]->ne[src_ss[i].axis], (long long) sum);
+                            fflush(stderr);
+                            continue; // structure differs (e.g. recurrent state) -- not a flat ratio
+                        }
                     }
                 }
                 first_src_split_by_axis = false;
@@ -1114,8 +1317,43 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     }
 
     if (it == buf_ctx->split_state_cache.end()) {
-        buf_ctx->split_state_cache[key].first = calculate_split_state();
+        ggml_backend_meta_split_state ss = calculate_split_state();
+        // prism: enforce closure -- a split's per-device slices must sum to the tensor axis.
+        // Any state that does not is rescaled to a simple, summing split, so every downstream
+        // op (gather, view, matmul) sees a consistent representation.
+        if (ss.axis >= 0 && ss.axis < GGML_MAX_DIMS && tensor->ne[ss.axis] > 0) {
+            const size_t nb2 = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+            int64_t per_dev[16] = {0};
+            int64_t total = 0;
+            for (size_t j = 0; j < nb2; j++) {
+                for (size_t s = 0; s < ss.n_segments && s < 16; s++) {
+                    per_dev[j] += ss.ne[s*nb2 + j] * ss.nr[s];
+                }
+                total += per_dev[j];
+            }
+            if (total != tensor->ne[ss.axis]) {
+                int64_t acc = 0;
+                for (size_t j = 0; j + 1 < nb2; j++) {
+                    per_dev[j] = total > 0 ? (per_dev[j] * tensor->ne[ss.axis]) / total : 0;
+                    acc += per_dev[j];
+                }
+                per_dev[nb2 - 1] = tensor->ne[ss.axis] - acc;
+                for (size_t j = 0; j < nb2; j++) ss.ne[j] = per_dev[j];
+                ss.nr[0] = 1;
+                ss.n_segments = 1;
+            }
+        }
+        buf_ctx->split_state_cache[key].first = ss;
         memcpy(buf_ctx->split_state_cache[key].second, tensor, sizeof(buf_ctx->split_state_cache[key].second));
+        if (const char * dbg_name = getenv("META_DBG_NAME")) {
+            if (tensor->name != nullptr && strstr(tensor->name, dbg_name) != nullptr) {
+                fprintf(stderr, "[META-SS] %s axis=%d nseg=%zu nr0=%u ne=[%lld,%lld] src0=%s\n",
+                    tensor->name, (int) ss.axis, ss.n_segments, ss.nr[0],
+                    (long long) ss.ne[0], (long long) ss.ne[1],
+                    tensor->src[0] ? tensor->src[0]->name : "(null)");
+                fflush(stderr);
+            }
+        }
         if (buf_ctx->debug > 0) {
             std::string srcs_info;
             for (size_t i = 0; i < GGML_MAX_SRC; i++) {
@@ -1945,8 +2183,12 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     }
 }
 
-static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
-    GGML_ASSERT(cgraph->grads == nullptr);
+// prism: a gather node materialises a replicated (all-gathered) copy of a split tensor
+static inline bool ggml_backend_meta_is_gather_node(const ggml_tensor * t) {
+    return t->op == GGML_OP_DUP && ((const int32_t *) t->op_params)[1] == GGML_HINT_META_GATHER;
+}
+
+static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {    GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
@@ -2163,6 +2405,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 return i_delayed;
             };
 
+            auto is_gather_node = [](const ggml_tensor * t) -> bool {
+                return t->op == GGML_OP_DUP && ((const int32_t *) t->op_params)[1] == GGML_HINT_META_GATHER;
+            };
+
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -2173,7 +2419,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                     max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
                 }
-                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                // prism: force a subgraph boundary right before a gather node so its (split)
+                // source has been computed when the all-gather runs
+                const bool next_is_gather = i + 1 < cgraph->n_nodes && is_gather_node(cgraph->nodes[i + 1]);
+                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL || next_is_gather;
                 if (!new_subgraph) {
                     continue;
                 }
@@ -2255,11 +2504,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 ggml_cgraph * cgraph_ij = bcj.cgraphs[i_graph].cgraph_main;
                 const size_t i_node_start = bcj.cgraphs[i_graph].offset;
                 const size_t i_node_stop = i_graph + 1 < n_subgraphs ? bcj.cgraphs[i_graph + 1].offset : cgraph->n_nodes;
-                cgraph_ij->n_nodes = i_node_stop - i_node_start;
+                cgraph_ij->n_nodes = 0;
                 ggml_hash_set_reset(&cgraph_ij->visited_hash_set);
                 for (size_t i_node = i_node_start; i_node < i_node_stop; i_node++) {
+                    if (ggml_backend_meta_is_gather_node(cgraph->nodes[i_node])) {
+                        continue; // serviced by the gather boundary, never executed per device
+                    }
                     ggml_tensor * node_ij = bcj.nodes[i_node];
-                    cgraph_ij->nodes[i_node - i_node_start] = node_ij;
+                    cgraph_ij->nodes[cgraph_ij->n_nodes++] = node_ij;
                     const size_t hash_pos_orig = ggml_hash_find(&cgraph->visited_hash_set, cgraph->nodes[i_node]);
                     const size_t hash_pos_ij = ggml_hash_insert(&cgraph_ij->visited_hash_set, node_ij);
                     cgraph_ij->use_counts[hash_pos_ij] = cgraph->use_counts[hash_pos_orig];
@@ -2415,16 +2667,130 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    // prism: all-gather a split tensor into a replicated copy at a subgraph boundary.
+    // Device s holds slice s; every device needs every slice, placed at offset s.
+    auto do_gather = [&](ggml_tensor * F) {
+        ggml_tensor * X = F->src[0];
+        const ggml_backend_meta_split_state xs = ggml_backend_meta_get_split_state(X, /*assume_sync =*/ true);
+        {
+            ggml_tensor * Xd = ggml_backend_meta_buffer_simple_tensor(X, 0);
+            ggml_tensor * Fd = ggml_backend_meta_buffer_simple_tensor(F, 0);
+            fprintf(stderr, "[META-GATHER] F=%s ax=%d F_nb=%zu F_nb0=%zu X_nb0=%zu X_ne0=%lld\n",
+                F->name, (int) xs.axis, ggml_nbytes(F), ggml_nbytes(Fd), ggml_nbytes(Xd), (long long) Xd->ne[0]);
+            fflush(stderr);
+        }
+        // Fast path: direct device-to-device peer copies. Each device's slice is copied into
+        // every device's full buffer, placed at its flat element offset. The CUDA copy is an
+        // async peer copy enqueued on the source stream after the producing subgraph and awaited
+        // on the destination stream via an event -- no host round-trip, and the two GPUs stay
+        // pipelined. Only taken for single-token decode, where a slice is one contiguous block
+        // (so the destination sub-view has the source layout).
+        if (xs.axis == GGML_BACKEND_SPLIT_AXIS_0 && xs.n_segments == 1 && xs.nr[0] == 1 &&
+                n_backends >= 2 && ggml_is_contiguous(X)) {
+            bool fast = true;
+            int64_t row_off[16] = {0};
+            int64_t acc = 0;
+            for (size_t s = 0; s < n_backends; s++) {
+                ggml_tensor * Xs = ggml_backend_meta_buffer_simple_tensor(X, s);
+                if (Xs == nullptr || Xs->ne[1] != 1 || Xs->ne[2] != 1 || Xs->ne[3] != 1) { fast = false; break; }
+                row_off[s] = acc;
+                acc += Xs->ne[0];
+            }
+            if (fast && acc == X->ne[0]) {
+                for (size_t d = 0; d < n_backends; d++) {
+                    ggml_tensor * F_d = ggml_backend_meta_buffer_simple_tensor(F, d);
+                    for (size_t s = 0; s < n_backends; s++) {
+                        ggml_tensor * X_s = ggml_backend_meta_buffer_simple_tensor(X, s);
+                        ggml_tensor dst = *F_d;
+                        dst.data = (char *) F_d->data + (size_t) row_off[s] * F_d->nb[0];
+                        for (int q = 0; q < GGML_MAX_DIMS; q++) { dst.ne[q] = X_s->ne[q]; dst.nb[q] = X_s->nb[q]; }
+                        ggml_backend_tensor_copy_async(
+                            ggml_backend_meta_simple_backend(backend, s),
+                            ggml_backend_meta_simple_backend(backend, d), X_s, &dst);
+                    }
+                }
+                return;
+            }
+        }
+
+        // Fallback: assemble via the backend's own splice logic. This places each device's slice
+        // at the correct row-strided offset for the split layout; a flat cumulative-byte
+        // concatenation is wrong whenever the simple tensor's row stride differs from the full one.
+        std::vector<char> full(ggml_nbytes(F));
+        if (xs.axis >= 0 && xs.axis < GGML_MAX_DIMS && ggml_is_contiguous(X)) {
+            ggml_backend_meta_get_tensor_async(backend, X, full.data(), 0, full.size());
+        } else {
+            ggml_tensor * X0 = ggml_backend_meta_buffer_simple_tensor(X, 0);
+            ggml_backend_tensor_get(X0, full.data(), 0, full.size());
+        }
+        for (size_t d = 0; d < n_backends; d++) {
+            ggml_tensor * F_d = ggml_backend_meta_buffer_simple_tensor(F, d);
+            ggml_backend_tensor_set(F_d, full.data(), 0, full.size());
+        }
+    };
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+        // prism: service any all-gather at the head of this subgraph (its source was
+        // produced by the previous subgraph)
+        {
+            const size_t g_start = backend_ctx->backend_configs[0].cgraphs[i].offset;
+            const size_t g_stop  = (i + 1 < backend_ctx->n_subgraphs) ? backend_ctx->backend_configs[0].cgraphs[i + 1].offset : cgraph->n_nodes;
+            for (size_t k = g_start; k < g_stop; k++) {
+                if (ggml_backend_meta_is_gather_node(cgraph->nodes[k])) {
+                    do_gather(cgraph->nodes[k]);
+                }
+            }
+        }
+
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
+            if (j == 0) {
+                ggml_cgraph * cg = bcj.cgraphs[i].cgraph_main;
+                fprintf(stderr, "[META-SUBG] i=%zu nodes=%d", i, cg->n_nodes);
+                for (int q = 0; q < cg->n_nodes; q++) {
+                    fprintf(stderr, " %s(%s)", cg->nodes[q]->name, ggml_op_name(cg->nodes[q]->op));
+                }
+                fprintf(stderr, "\n");
+                fflush(stderr);
+            }
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
         }
 
+        if (const char * dump_node = getenv("META_DUMP_NODE")) {
+            for (size_t j = 0; j < n_backends; j++) {
+                ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+            }
+            const size_t d_start = backend_ctx->backend_configs[0].cgraphs[i].offset;
+            const size_t d_stop  = (i + 1 < backend_ctx->n_subgraphs) ? backend_ctx->backend_configs[0].cgraphs[i + 1].offset : cgraph->n_nodes;
+            for (size_t k = d_start; k < d_stop; k++) {
+                ggml_tensor * node = cgraph->nodes[k];
+                if (node->name == nullptr || strcmp(node->name, dump_node) != 0) {
+                    continue;
+                }
+                for (size_t j = 0; j < n_backends; j++) {
+                    ggml_tensor * st = ggml_backend_meta_buffer_simple_tensor(node, j);
+                    if (st == nullptr) { continue; }
+                    std::vector<char> buf(ggml_nbytes(st));
+                    ggml_backend_tensor_get(st, buf.data(), 0, buf.size());
+                    char path[512];
+                    const char * ddir = getenv("META_DUMP_DIR");
+                    snprintf(path, sizeof(path), "%s/dev%zu.bin", ddir ? ddir : "/tmp", j);
+                    if (FILE * f = fopen(path, "wb")) { fwrite(buf.data(), 1, buf.size(), f); fclose(f); }
+                    fprintf(stderr, "[META-DEVDUMP] %s sg=%zu dev=%zu nbytes=%zu\n", dump_node, i, j, buf.size());
+                    fflush(stderr);
+                }
+            }
+        }
+
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+            // prism: a gather boundary replaces the allreduce
+            const size_t n_start = backend_ctx->backend_configs[0].cgraphs[i + 1].offset;
+            if (n_start < cgraph->n_nodes && ggml_backend_meta_is_gather_node(cgraph->nodes[n_start])) {
+                continue;
+            }
             bool backend_allreduce_success = false;
             if (backend_ctx->comm_ctx) {
                 std::vector<ggml_tensor *> nodes;

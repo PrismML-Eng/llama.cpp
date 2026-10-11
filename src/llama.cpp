@@ -155,6 +155,8 @@ int64_t llama_time_us(void) {
 
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
+    // prism: record tensor mode so the graph builder can insert the Hadamard activation gather
+    g_llama_tensor_split = (params.split_mode == LLAMA_SPLIT_MODE_TENSOR);
     // create list of devices to use with this model
     if (params.devices) {
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {

@@ -2,6 +2,7 @@
 
 #include "ggml.h" // for ggml_log_level
 
+#include <cstring>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -54,21 +55,56 @@ static inline dst_t llama_cast(src_t v) {
     }
 }
 
-static inline ggml_tensor * llama_mul_mat_hadamard(
-        ggml_context * ctx,
+// prism: true when the model runs with LLAMA_SPLIT_MODE_TENSOR; used to insert the
+// activation gather in front of the feature-mixing Hadamard transform.
+extern bool g_llama_tensor_split;
+
+// prism-debug: pointers to the first Hadamard transform's input/output, for pointer-based dumping
+extern ggml_tensor * g_prism_dbg_hm_in;
+extern ggml_tensor * g_prism_dbg_hm_out;
+extern ggml_tensor * g_prism_dbg_hm_rope;
+
+static inline ggml_tensor * llama_mul_mat_hadamard(        ggml_context * ctx,
         ggml_tensor * cur,
-        ggml_tensor * rot) {
+        ggml_tensor * rot,
+        bool mark_gather = false,
+        const char * dbg_tag = nullptr) {
     const auto n = rot->ne[0];
 
     ggml_tensor * res;
+
+    char dbg_name_in[64]  = {0};
+    char dbg_name_out[64] = {0};
+    const bool dbg_hm = dbg_tag != nullptr && getenv("PRISM_DBG_HM") != nullptr;
+    if (dbg_hm) {
+        snprintf(dbg_name_in,  sizeof(dbg_name_in),  "dbg_hm_in_%s",  dbg_tag);
+        snprintf(dbg_name_out, sizeof(dbg_name_out), "dbg_hm_mm_%s",  dbg_tag);
+    }
 
     if (!ggml_is_contiguous(cur)) {
         res = ggml_cont_2d(ctx, cur, n, ggml_nelements(cur)/n);
     } else {
         res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur)/n);
     }
+    if (dbg_hm) {
+        ggml_set_name(res, dbg_name_in);
+        ggml_set_output(res);
+        g_prism_dbg_hm_in = res;
+        g_prism_dbg_hm_rope = rot;
+    }
+    // prism: the rotation reshapes the feature axis into [block, nblocks]. When this is a
+    // weight-fold rotation (not an attention rotation) mark it so the meta backend
+    // replicates the activation instead of requiring a single-axis split here.
+    if (mark_gather) {
+        ((int32_t *) res->op_params)[1] = GGML_HINT_HADAMARD_TILING;
+    }
     res = ggml_mul_mat(ctx, rot, res);
     ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
+    if (dbg_hm) {
+        ggml_set_name(res, dbg_name_out);
+        ggml_set_output(res);
+        g_prism_dbg_hm_out = res;
+    }
     res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
 
     return res;

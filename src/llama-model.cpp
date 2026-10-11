@@ -580,6 +580,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
+        // prism: column-parallel design -- weights use a simple split on their output axis,
+        // so no head-group / tiling segmentation is required (avoids the coupled segment algebra).
+        if (tensor_name.size() >= 7 && tensor_name.compare(tensor_name.size() - 7, 7, ".weight") == 0 && axis >= 0 && axis < GGML_MAX_DIMS) {
+            return { { tensor->ne[axis], 1 } };
+        }
         if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE) {
             const int64_t head_k_dim = hparams.ssm_d_state;
             const int64_t head_v_dim = hparams.ssm_d_state;
@@ -769,6 +774,29 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     ggml_backend_meta_split_state split_state;
     memset(&split_state, 0, sizeof(split_state));
     tensor_config tc = get_tensor_config();
+    // prism: column-parallel design -- 2D matmul weights split on their output axis (axis 1);
+    // the activations stay replicated and each matmul output is gathered back to replicated.
+    // Only true 2D weights are re-pointed: 1D norms/scales and 3D (MoE) weights keep the
+    // framework's native config, which is already correct for them.
+    const bool is_weight = tensor_name.size() >= 7 &&
+            tensor_name.compare(tensor_name.size() - 7, 7, ".weight") == 0;
+    if (is_weight && ggml_n_dims(tensor) == 2 && tensor->ne[1] > 1 ) {
+        tc.axis = GGML_BACKEND_SPLIT_AXIS_1;
+    }
+    // prism: the depthwise ssm conv must run replicated -- the CUDA kernel does not support a
+    // split output, and the conv is cheap
+    if (tensor_name.find("ssm_conv1d") != std::string::npos) {
+        tc.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    }
+    // prism: the token embedding feeds get_rows, so it splits on its row (embedding) axis and
+    // is gathered right after the lookup -- it cannot use the output axis like a matmul weight.
+    if (is_weight && tensor_name.find("token_embd") != std::string::npos) {
+        tc.axis = GGML_BACKEND_SPLIT_AXIS_0;
+    }
+    // prism: caches/states are replicated in the column-parallel design (their activations are)
+    if (tensor_name.find("cache_") != std::string::npos) {
+        tc.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    }
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
@@ -817,10 +845,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
         }
     }
+    if (tensor_name.find("cache_r") != std::string::npos || tensor_name.find("cache_s") != std::string::npos ||
+        tensor_name.find("ssm_out") != std::string::npos ||
+        tensor_name.find("token_embd") != std::string::npos || tensor_name.find("output.weight") != std::string::npos) {
+        fprintf(stderr, "[SPLITCFG] %s shape=[%lld,%lld,%lld,%lld] axis=%d n_seg=%zu nr=[%u] ne=[%lld,%lld]\n",
+            tensor_name.c_str(), (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3],
+            (int) split_state.axis, split_state.n_segments, split_state.nr[0], (long long) split_state.ne[0], (long long) split_state.ne[1]);
+    }
     return split_state;
     GGML_UNUSED(userdata);
 }
-
 const char * llm_type_name(llm_type type) {
     switch (type) {
         case LLM_TYPE_14M:           return "14M";
@@ -2032,6 +2066,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     }
                 }
                 ggml_backend_tensor_set(rotation, data.data(), 0, data.size() * sizeof(float));
+                if (const char * rot_dir = getenv("PRISM_DBG_ROT")) {
+                    std::vector<float> chk(data.size());
+                    ggml_backend_tensor_get(rotation, chk.data(), 0, chk.size() * sizeof(float));
+                    double s = 0;
+                    for (float v : chk) s += v;
+                    double s2 = 0;
+                    for (size_t i = 0; i < chk.size(); i++) s2 += (double) chk[i] * (double) (i + 1);
+                    fprintf(stderr, "[ROT] bs=%u buf=%s sum=%.6f weighted=%.6f first=%.6f e1=%.6f\n",
+                        block_size, ggml_backend_buft_name(buft), s, s2, chk[0], chk.size() > 1 ? chk[1] : 0.f);
+                    if (getenv("PRISM_DBG_ROT_FULL") != nullptr) {
+                        std::string path = std::string(rot_dir) + "/rot_" + std::to_string(block_size) + "_" +
+                            (ggml_backend_buft_name(buft) ? ggml_backend_buft_name(buft) : "x") + ".bin";
+                        if (FILE * f = fopen(path.c_str(), "wb")) { fwrite(chk.data(), 1, chk.size()*sizeof(float), f); fclose(f); }
+                    }
+                }
 
                 std::vector<ggml_backend_buffer_ptr> buffers;
                 buffers.emplace_back(std::move(buffer));
@@ -2077,6 +2126,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         data[i] = (float) sd->second[i];
                     }
                     ggml_backend_tensor_set(signs, data.data(), 0, data.size() * sizeof(float));
+                    if (getenv("PRISM_DBG_ROT") != nullptr) {
+                        std::vector<float> chk(data.size());
+                        ggml_backend_tensor_get(signs, chk.data(), 0, chk.size() * sizeof(float));
+                        double s = 0, s2 = 0;
+                        for (size_t i = 0; i < chk.size(); i++) { s += chk[i]; s2 += (double) chk[i] * (double) (i + 1); }
+                        fprintf(stderr, "[SIGNS] width=%u buf=%s sum=%.6f weighted=%.6f first=%.6f\n",
+                            width, ggml_backend_buft_name(buft), s, s2, chk[0]);
+                    }
 
                     std::vector<ggml_backend_buffer_ptr> buffers;
                     buffers.emplace_back(std::move(buffer));
@@ -2110,8 +2167,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+    const buft_list_t * buft_list_input = pimpl->dev_input.buft_list;
+    // prism: with tensor split the embedding lookup must run on the split (meta) device, otherwise
+    // its host output is fed to the split graph uncopied and the Hadamard inverse reads garbage.
+    if (false && g_llama_tensor_split && tn.tensor == LLM_TENSOR_TOKEN_EMBD && !pimpl->dev_layer.empty()) {
+        buft_list_input = pimpl->dev_layer.at(0).buft_list;
+    }
     return ml.create_tensor(
-        hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+        hparams, &pimpl->cpu_buft_list, buft_list_input, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
 }
 

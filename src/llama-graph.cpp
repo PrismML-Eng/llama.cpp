@@ -6,6 +6,8 @@
 #include "llama-cparams.h"
 #include "llama-sampler.h"
 
+extern "C" bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
+
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
@@ -18,6 +20,9 @@
 
 #include <cassert>
 #include <cmath>
+
+// prism: set by llama.cpp when LLAMA_SPLIT_MODE_TENSOR is active
+bool g_llama_tensor_split = false;
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -1569,7 +1574,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
             if (t.signs) {
                 cur_mm = ggml_mul(ctx0, cur_mm, t.signs);
             }
-            cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot);
+            cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot, false, w->name);
             hadamard_memo[memo_key] = cur_mm;
             }
         }
@@ -1597,6 +1602,22 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
+    }
+
+    // prism: under tensor parallelism the matmul is column-parallel (weights split on the
+    // output axis) producing a split activation; gather it back to a replicated activation,
+    // which is the form every downstream op (residual add, next matmul, Hadamard) expects.
+    if (g_llama_tensor_split && getenv("PRISM_NATIVE_SPLIT") == nullptr) {
+        if (getenv("PRISM_DBG_MM") != nullptr && w->name != nullptr) {
+            ggml_format_name(res, "dbg_mm_pre_%s", w->name);
+            ggml_set_output(res);
+        }
+        res = ggml_dup(ctx0, res);
+        ((int32_t *) res->op_params)[1] = GGML_HINT_META_GATHER;
+        if (getenv("PRISM_DBG_MM") != nullptr && w->name != nullptr) {
+            ggml_format_name(res, "dbg_mm_post_%s", w->name);
+            ggml_set_output(res);
+        }
     }
 
     return res;
@@ -1629,7 +1650,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
             if (t.signs) {
                 cur_mm = ggml_mul(ctx0, cur_mm, t.signs);
             }
-            cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot);
+            cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot, false, w->name);
             hadamard_memo[memo_key] = cur_mm;
             }
         }
@@ -1663,6 +1684,22 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
 
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
+    }
+
+    // prism: under tensor parallelism the matmul is column-parallel (weights split on the
+    // output axis) producing a split activation; gather it back to a replicated activation,
+    // which is the form every downstream op (residual add, next matmul, Hadamard) expects.
+    if (g_llama_tensor_split && getenv("PRISM_NATIVE_SPLIT") == nullptr) {
+        if (getenv("PRISM_DBG_MM") != nullptr && w->name != nullptr) {
+            ggml_format_name(res, "dbg_mm_pre_%s", w->name);
+            ggml_set_output(res);
+        }
+        res = ggml_dup(ctx0, res);
+        ((int32_t *) res->op_params)[1] = GGML_HINT_META_GATHER;
+        if (getenv("PRISM_DBG_MM") != nullptr && w->name != nullptr) {
+            ggml_format_name(res, "dbg_mm_post_%s", w->name);
+            ggml_set_output(res);
+        }
     }
 
     return res;
@@ -2422,13 +2459,21 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         auto & cur = inps[0];
 
         cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        cb(cur, "dbg_embed_raw", -1);
+
+        // prism: when the embedding lives on the split (meta) device it is split on its row
+        // axis; gather it back to replicated before the feature-mixing Hadamard inverse.
+        if (g_llama_tensor_split && ggml_backend_buffer_is_meta(tok_embd->buffer)) {
+            cur = ggml_dup(ctx0, cur);
+            ((int32_t *) cur->op_params)[1] = GGML_HINT_META_GATHER;
+        }
 
         // a Hadamard-latent embedding table stores rotated rows; restore the
         // primal basis right after the lookup: h = s * (H z)
         if (hadamard_inverses) {
             const auto it = hadamard_inverses->find(tok_embd);
             if (it != hadamard_inverses->end()) {
-                cur = llama_mul_mat_hadamard(ctx0, cur, it->second.rot);
+                cur = llama_mul_mat_hadamard(ctx0, cur, it->second.rot, /*mark_gather =*/ false, "embed");
                 if (it->second.signs) {
                     cur = ggml_mul(ctx0, cur, it->second.signs);
                 }

@@ -18,6 +18,9 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <sstream>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -38,7 +41,8 @@ static void llama_verify_hadamard_graph(
         const llama_hadamard_rotations & rotations,
         const llama_hadamard_rotations & inverses) {
     auto unwrap = [](const ggml_tensor * t) {
-        while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW)) {
+        while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW ||
+                (t->op == GGML_OP_DUP && ((const int32_t *) t->op_params)[1] == GGML_HINT_META_GATHER))) {
             t = t->src[0];
         }
         return t;
@@ -100,6 +104,10 @@ static void llama_verify_hadamard_graph(
         }
     }
 }
+
+ggml_tensor * g_prism_dbg_hm_in  = nullptr;
+ggml_tensor * g_prism_dbg_hm_out = nullptr;
+ggml_tensor * g_prism_dbg_hm_rope = nullptr;
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -2768,6 +2776,53 @@ ggml_status llama_context::graph_compute(
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
+    // prism-debug: pointer-based dump of the first Hadamard transform (robust to renames)
+    if (getenv("PRISM_DBG_HM_PTR") != nullptr) {
+        static int s_hmseq = 0;
+        const int seq = s_hmseq++;
+        const char * ddir = getenv("LLAMA_DUMP_DIR");
+        const ggml_tensor * pick[3] = { g_prism_dbg_hm_in, g_prism_dbg_hm_out, g_prism_dbg_hm_rope };
+        const char * pname[3] = { "hm_in", "hm_out", "hm_rope" };
+        for (int k = 0; k < 3; k++) {
+            ggml_tensor * t = (ggml_tensor *) pick[k];
+            if (t == nullptr || t->buffer == nullptr) { continue; }
+            std::vector<char> buf(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+            char path[512];
+            snprintf(path, sizeof(path), "%s/%s.%d.bin", ddir ? ddir : "/tmp", pname[k], seq);
+            if (FILE * f = fopen(path, "wb")) { fwrite(buf.data(), 1, buf.size(), f); fclose(f); }
+            fprintf(stderr, "[PTRDUMP] %s ne=[%lld,%lld] nbytes=%zu\n", pname[k],
+                (long long) t->ne[0], (long long) t->ne[1], buf.size());
+        }
+    }
+
+    // prism-debug: dump named graph tensors so layer and tensor mode can be compared numerically
+    if (const char * dump_names = getenv("LLAMA_DUMP_TENSOR")) {
+        static int s_dump_seq = 0;
+        const int seq = s_dump_seq++;
+        const char * dir_env = getenv("LLAMA_DUMP_DIR");
+        const std::string dir = dir_env ? dir_env : "/tmp/llmdump";
+        std::stringstream ss(dump_names);
+        std::string nm;
+        while (std::getline(ss, nm, ',')) {
+            for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+                ggml_tensor * t = ggml_graph_node(gf, i);
+                if (t->name == nullptr || nm != t->name) {
+                    continue;
+                }
+                std::vector<char> buf(ggml_nbytes(t));
+                ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+                const std::string path = dir + "/" + std::string(t->name) + "." + std::to_string(seq) + ".bin";
+                if (FILE * f = fopen(path.c_str(), "wb")) {
+                    fwrite(buf.data(), 1, buf.size(), f);
+                    fclose(f);
+                }
+                fprintf(stderr, "[DUMP] %s seq=%d ne=[%lld,%lld,%lld,%lld] nbytes=%zu\n", nm.c_str(), seq,
+                    (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], buf.size());
+            }
+        }
+    }
+
     return status;
 }
 
@@ -2777,6 +2832,18 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        // prism-debug: pin requested tensors as graph outputs so their buffers are not reused
+        if (const char * dump = getenv("LLAMA_DUMP_TENSOR")) {
+            std::stringstream ss(dump);
+            std::string nm;
+            while (std::getline(ss, nm, ',')) {
+                if (nm == cur->name) {
+                    ggml_set_output(cur);
+                    break;
+                }
+            }
         }
 
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
