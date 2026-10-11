@@ -283,6 +283,21 @@ typedef struct {
 } block_q8_0;
 static_assert(sizeof(block_q8_0) == sizeof(ggml_half) + QK8_0, "wrong q8_0 block size/padding");
 
+// Q8_CR / Q5_CR: same block layout as Q8_0 / Q5_0, but the blocks encode a
+// tensor rotated along rows in groups of QK8_CR with the normalized
+// Kronecker-Hadamard matrix (see ggml-quants.c). mul_mat must rotate the other
+// operand the same way before the dot products.
+#define QK8_CR 256
+typedef struct {
+    block_q8_0 blocks[QK8_CR/QK8_0];
+} block_q8_cr;
+static_assert(sizeof(block_q8_cr) == QK8_CR/QK8_0*(sizeof(ggml_half) + QK8_0), "wrong q8_cr block size/padding");
+
+typedef struct {
+    block_q5_0 blocks[QK8_CR/QK5_0];
+} block_q5_cr;
+static_assert(sizeof(block_q5_cr) == QK8_CR/QK5_0*(sizeof(ggml_half) + sizeof(uint32_t) + QK5_0/2), "wrong q5_cr block size/padding");
+
 #define QK8_1 32
 typedef struct {
     GGML_EXTENSION union {
@@ -314,6 +329,75 @@ typedef struct {
     ggml_half d;
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
+
+// TurboQuant 3-bit MSE-only: 3-bit PolarQuant indices (no QJL)
+// Storage block size = 32 (matches q4_0 for optimal GPU parallelism)
+// Transform group size = 128 (head_dim, for rotation Gaussianization)
+// The 3-bit index is split: lower 2 bits in qs[], upper 1 bit in signs[]
+#define QK_TURBO3 128   // Block size 128: one block per rotation group, eliminates redundant norms
+#define QK_TURBO3_GROUP 128  // rotation group size = head_dim
+#define NL_TURBO3     (QK_TURBO3 / 16)   // non-vec FA iterations per block
+#define NL_TURBO3_VEC (QK_TURBO3 / 4)    // vec FA iterations per block
+typedef struct {
+    ggml_half  norm;                    //  2 bytes: vector L2 norm (for rescaling)
+    uint8_t    qs[QK_TURBO3 / 4];      //  8 bytes: lower 2-bit indices (4 per byte)
+    uint8_t    signs[QK_TURBO3 / 8];   //  4 bytes: upper 1-bit of 3-bit index (8 per byte)
+} block_turbo3_0;                       // 14 bytes total
+static_assert(sizeof(block_turbo3_0) == sizeof(ggml_half) + QK_TURBO3/4 + QK_TURBO3/8, "wrong turbo3_0 block size/padding");
+
+// TurboQuant 4-bit: 4-bit PolarQuant indices (legacy 3-bit+QJL behind TURBO4_USE_4BIT=0)
+#ifndef TURBO4_USE_4BIT
+#  define TURBO4_USE_4BIT 1
+#endif
+
+#define QK_TURBO4 128
+
+#if TURBO4_USE_4BIT
+typedef struct {
+    ggml_half  norm;                    //  2 bytes
+    uint8_t    qs[QK_TURBO4 / 2];      // 64 bytes: 4-bit PolarQuant indices (nibble packed)
+} block_turbo4_0;                       // 66 bytes total (4.125 bpw, dropped dead rnorm)
+static_assert(sizeof(block_turbo4_0) == 66, "wrong turbo4_0 block size");
+#else
+typedef struct {
+    ggml_half  norm;                    //  2 bytes
+    ggml_half  rnorm;                   //  2 bytes: residual norm for QJL scale
+    uint8_t    qs[QK_TURBO4 * 3 / 8];  // 48 bytes: 3-bit PolarQuant indices
+    uint8_t    signs[QK_TURBO4 / 8];   // 16 bytes: 1-bit QJL signs
+} block_turbo4_0;                       // 68 bytes total
+static_assert(sizeof(block_turbo4_0) == 2*sizeof(ggml_half) + QK_TURBO4*3/8 + QK_TURBO4/8, "wrong turbo4_0 block size");
+#endif
+
+static_assert(QK_TURBO4 == 128, "turbo4 kernels assume QK_TURBO4 == 128");
+
+// TurboQuant 2-bit: 2-bit PolarQuant indices only (no QJL)
+#define QK_TURBO2 128   // Block size 128: one block per rotation group
+#define QK_TURBO2_GROUP 128  // rotation group size = head_dim
+#define NL_TURBO2     (QK_TURBO2 / 16)   // non-vec FA iterations per block
+#define NL_TURBO2_VEC (QK_TURBO2 / 4)    // vec FA iterations per block
+typedef struct {
+    ggml_half  norm;                    //  2 bytes: corrected L2 norm
+    uint8_t    qs[QK_TURBO2 / 4];      //  8 bytes: 2-bit indices (4 per byte)
+} block_turbo2_0;                       // 10 bytes total
+static_assert(sizeof(block_turbo2_0) == sizeof(ggml_half) + QK_TURBO2/4, "wrong turbo2_0 block size/padding");
+
+// TQ3_1S: WHT-rotated 3-bit weight quantization (8-level Lloyd-Max for N(0,1))
+#define QK_TQ3_0 32
+typedef struct {
+    ggml_half d0;                       //  2 bytes: scale for first 16 elements
+    ggml_half d1;                       //  2 bytes: scale for last 16 elements
+    uint8_t   qs[QK_TQ3_0 * 3 / 8];   // 12 bytes: 3-bit indices packed (4 groups of 8 in 3 bytes)
+} block_tq3_1s;                         // 16 bytes total
+static_assert(sizeof(block_tq3_1s) == 16, "wrong tq3_1s block size");
+
+// TQ4_1S: WHT-rotated 4-bit weight quantization (16-level Lloyd-Max for N(0,1))
+#define QK_TQ4_1S 32
+typedef struct {
+    ggml_half d0;                       //  2 bytes: scale for first 16 elements
+    ggml_half d1;                       //  2 bytes: scale for last 16 elements
+    uint8_t   qs[QK_TQ4_1S / 2];      // 16 bytes: 4-bit indices nibble-packed
+} block_tq4_1s;                         // 20 bytes total
+static_assert(sizeof(block_tq4_1s) == 20, "wrong tq4_1s block size");
 
 //
 // Super-block quantization structures
@@ -394,6 +478,11 @@ typedef struct {
     ggml_half d;             // super-block scale
 } block_q6_K;
 static_assert(sizeof(block_q6_K) == sizeof(ggml_half) + QK_K / 16 + 3*QK_K/4, "wrong q6_K block size/padding");
+
+// Q6_CR: same block layout as Q6_K, but the block encodes a ConvRot-rotated group of QK_K weights.
+// QK_K == QK8_CR == 256, so one block_q6_K is exactly one ConvRot group.
+typedef block_q6_K block_q6_cr;
+static_assert(sizeof(block_q6_cr) == sizeof(ggml_half) + QK_K / 16 + 3*QK_K/4, "wrong q6_cr block size/padding");
 
 // This is only used for intermediate quantization and dot products
 typedef struct {
@@ -1147,6 +1236,10 @@ GGML_TABLE_END()
 // TODO: fix name to kvalues_iq4_nl
 GGML_TABLE_BEGIN(int8_t, kvalues_iq4nl, 16)
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(int8_t, kvalues_tq4, 16)
+    -127, -96, -75, -58, -44, -31, -18, -6, 6, 18, 31, 44, 58, 75, 96, 127,
 GGML_TABLE_END()
 
 // e2m1 values (doubled), shared by MXFP4 and NVFP4

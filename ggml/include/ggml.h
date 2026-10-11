@@ -430,8 +430,17 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
+        GGML_TYPE_TURBO2_0 = 43, // TurboQuant 2-bit KV cache: WHT + 2-bit PolarQuant (runtime-only KV type)
+        GGML_TYPE_TURBO3_0 = 44, // TurboQuant 3-bit KV cache: WHT + 3-bit PolarQuant (runtime-only KV type)
+        GGML_TYPE_TQ3_1S  = 45, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
+        GGML_TYPE_TQ4_1S  = 46, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
+        GGML_TYPE_TURBO4_0 = 47, // TurboQuant 4-bit KV cache: WHT + 4-bit PolarQuant (runtime-only KV type)
+        GGML_TYPE_Q8_CR   = 48, // Q8_0 blocks of a ConvRot-rotated tensor
+        GGML_TYPE_Q5_CR   = 49, // Q5_0 blocks of a ConvRot-rotated tensor
+        GGML_TYPE_Q6_CR   = 50, // Q6_K blocks of a ConvRot-rotated tensor
         // Prism-private Q2_0 at group size 128 (upstream Q2_0 is group 64). High id so it
-        // slots above upstream types; type_traits is sized to COUNT (143) with 43..141 unused.
+        // slots above upstream types; type_traits is sized to COUNT (144) with 51..141 unused
+        // (43..50 are the TurboQuant types).
         GGML_TYPE_PQ2_0 = 142,
         GGML_TYPE_PTQ1_0 = 143, // Prism-private ternary, group 128
         GGML_TYPE_COUNT   = 144,
@@ -479,6 +488,9 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q8_CR   = 29, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q5_CR   = 30, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q6_CR   = 31, // except 1d tensors
         GGML_FTYPE_MOSTLY_PQ2_0 = 128, // except 1d tensors (Prism-private group-128 Q2_0)
         GGML_FTYPE_MOSTLY_PTQ1_0 = 129, // except 1d tensors (Prism-private group-128 ternary)
     };
@@ -576,6 +588,7 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
+        GGML_OP_TURBO_WHT,
         GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
@@ -2627,6 +2640,16 @@ extern "C" {
             struct ggml_tensor  * gdn,
             struct ggml_tensor  * dt_bias,
             struct ggml_tensor  * a);
+
+    // TurboQuant Walsh-Hadamard Transform (O(d log d) rotation for KV cache compression)
+    // Applies WHT rotation to 128-element groups along ne[0]: sign1 -> butterfly -> sign2 -> normalize
+    // direction: 0 = forward (signs1 -> WHT -> signs2), 1 = inverse (signs2 -> WHT -> signs1)
+    GGML_API struct ggml_tensor * ggml_turbo_wht(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   direction,
+            int                   group_size,    // 0 = auto (64 or 128 from ne[0])
+            struct ggml_tensor  * scale);        // NULL = no InnerQ scaling
 
     // DSA lightning indexer
     //
