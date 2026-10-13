@@ -1022,7 +1022,7 @@ LLM_TN_IMPL::LLM_TN_IMPL(llm_arch arch, llm_tensor tensor, const char * suffix, 
 
 std::string LLM_TN_IMPL::str() const {
     if (LLM_TENSOR_NAMES.find(tensor) == LLM_TENSOR_NAMES.end()) {
-        GGML_ABORT("unknown tensor name for tensor id %d", static_cast<int>(tensor));
+        return "unknown";
     }
 
     std::string name = ::format(LLM_TENSOR_NAMES.at(tensor), bid, xid);
