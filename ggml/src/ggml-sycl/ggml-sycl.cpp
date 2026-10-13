@@ -4841,6 +4841,13 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
         return;  // Skip permutations and already reordered tensors
     }
 
+    // PQ2_0/PTQ1_0 on 16-wide DPAS devices belong to the XMX layout (ggml_sycl_pq2_xmx_use), which rewrites the same
+    // bytes in place; reordering them as well would leave one path reading the other's layout
+    if ((src0->type == GGML_TYPE_PQ2_0 || src0->type == GGML_TYPE_PTQ1_0) &&
+        (extra->optimized_feature.xmx_pq2 || (!ggml_sycl_xmx_disabled() && ggml_sycl_device_has_dpas16(ctx->device)))) {
+        return;
+    }
+
     switch (mm_algorithm) {
         case mul_mat_algo::DMMV:
             if (!ggml_sycl_supports_reorder_dmmv(src0->type)) {
@@ -4913,6 +4920,10 @@ static bool ggml_sycl_pq2_xmx_use(ggml_backend_sycl_context & ctx, const ggml_te
     ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
     if (extra && extra->optimized_feature.xmx_pq2) {
         return true;
+    }
+    // already in another in-place layout (MMVQ reorder or the TernSYCL 2-bit repack): rewriting it would corrupt it
+    if (extra && (extra->optimized_feature.reorder || extra->optimized_feature.t2)) {
+        return false;
     }
     if (!g_ggml_sycl_enable_optimize || ggml_sycl_xmx_disabled() || !ggml_sycl_device_has_dpas16(ctx.device)) {
         return false;
