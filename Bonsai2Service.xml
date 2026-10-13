@@ -1,0 +1,12 @@
+<service>
+  <id>Bonsai2Service</id>
+  <name>Ternary Bonsai 2 27B llama.cpp Service</name>
+  <description>Native Windows Service (WinSW) for PrismML Ternary Bonsai 2 27B (PQ2_0) with CUDA 13.4 GPU acceleration</description>
+  <executable>C:\Users\vonwa\.gemini\antigravity\scratch\prism_cuda\bin\llama-server.exe</executable>
+  <arguments>-m "C:\Users\vonwa\.gemini\antigravity\scratch\llama_gemma\models\Ternary-Bonsai-2-27B-PQ2_0.gguf" --host 0.0.0.0 --port 8080 -c 81920 -ctk q8_0 -ctv q8_0 -ngl 99 -fa on -t 16 -b 2048 -ub 1024 --reasoning off --reasoning-budget 0 --temp 0.7 --top-p 0.80 --top-k 20 --min-p 0.0 --presence-penalty 1.5</arguments>
+  <workingdirectory>C:\Users\vonwa\.gemini\antigravity\scratch\prism_cuda</workingdirectory>
+  <logpath>C:\Users\vonwa\.gemini\antigravity\scratch\prism_cuda\logs</logpath>
+  <log mode="roll"></log>
+  <startmode>Automatic</startmode>
+  <onfailure action="restart" delay="10 sec"/>
+</service>
