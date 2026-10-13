@@ -205,37 +205,51 @@ function Show-Dashboard {
 
 function Stop-GemmaService {
     Write-Host "[+] Stopping Gemma4Service (Port $($State.GemmaPort))..." -ForegroundColor Yellow
+    $p = Get-PortDetails -Port $State.GemmaPort
+    Set-Service -Name "Gemma4Service" -StartupType Manual -ErrorAction SilentlyContinue
+    if ($p) {
+        & taskkill /F /PID $p.PID 2>$null | Out-Null
+        Stop-Process -Id $p.PID -Force -ErrorAction SilentlyContinue
+    }
     if (Test-Path $GemmaExe) { & $GemmaExe stop 2>$null | Out-Null }
     Stop-Service -Name "Gemma4Service" -Force -ErrorAction SilentlyContinue
-    Set-Service -Name "Gemma4Service" -StartupType Manual -ErrorAction SilentlyContinue
-    $p = Get-PortDetails -Port $State.GemmaPort
-    if ($p) {
-        Stop-Process -Id $p.PID -Force -ErrorAction SilentlyContinue
-        & taskkill /F /PID $p.PID 2>$null | Out-Null
+    for ($i = 0; $i -lt 15; $i++) {
+        $svc = Get-Service -Name "Gemma4Service" -ErrorAction SilentlyContinue
+        if (-not $svc -or $svc.Status -eq "Stopped") { break }
+        Start-Sleep -Milliseconds 500
     }
-    Start-Sleep -Seconds 1
     Write-Host "[SUCCESS] Gemma4Service stopped." -ForegroundColor Green
 }
 
 function Stop-BonsaiService {
     Write-Host "[+] Stopping Bonsai2Service (Port $($State.BonsaiPort))..." -ForegroundColor Yellow
+    $p = Get-PortDetails -Port $State.BonsaiPort
+    Set-Service -Name "Bonsai2Service" -StartupType Manual -ErrorAction SilentlyContinue
+    if ($p) {
+        & taskkill /F /PID $p.PID 2>$null | Out-Null
+        Stop-Process -Id $p.PID -Force -ErrorAction SilentlyContinue
+    }
     if (Test-Path $BonsaiExe) { & $BonsaiExe stop 2>$null | Out-Null }
     Stop-Service -Name "Bonsai2Service" -Force -ErrorAction SilentlyContinue
-    Set-Service -Name "Bonsai2Service" -StartupType Manual -ErrorAction SilentlyContinue
-    $p = Get-PortDetails -Port $State.BonsaiPort
-    if ($p) {
-        Stop-Process -Id $p.PID -Force -ErrorAction SilentlyContinue
-        & taskkill /F /PID $p.PID 2>$null | Out-Null
+    for ($i = 0; $i -lt 15; $i++) {
+        $svc = Get-Service -Name "Bonsai2Service" -ErrorAction SilentlyContinue
+        if (-not $svc -or $svc.Status -eq "Stopped") { break }
+        Start-Sleep -Milliseconds 500
     }
-    Start-Sleep -Seconds 1
     Write-Host "[SUCCESS] Bonsai2Service stopped." -ForegroundColor Green
 }
 
 function Start-GemmaService {
+    for ($i = 0; $i -lt 10; $i++) {
+        $svc = Get-Service -Name "Gemma4Service" -ErrorAction SilentlyContinue
+        if (-not $svc -or $svc.Status -ne "StopPending") { break }
+        Start-Sleep -Milliseconds 500
+    }
     $p = Get-PortDetails -Port $State.GemmaPort
     if ($p) {
         $svcG = Get-Service -Name "Gemma4Service" -ErrorAction SilentlyContinue
         if (-not $svcG -or $svcG.Status -ne "Running") {
+            & taskkill /F /PID $p.PID 2>$null | Out-Null
             Stop-Process -Id $p.PID -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 1
         }
@@ -244,16 +258,25 @@ function Start-GemmaService {
     Ensure-WinSWRegistered
     Set-Service -Name "Gemma4Service" -StartupType Automatic -ErrorAction SilentlyContinue
     Write-Host "[+] Starting Gemma4Service via WinSW on Port $($State.GemmaPort)..." -ForegroundColor Green
-    & $GemmaExe start 2>$null | Out-Null
     Start-Service -Name "Gemma4Service" -ErrorAction SilentlyContinue
+    $svcG = Get-Service -Name "Gemma4Service" -ErrorAction SilentlyContinue
+    if (-not $svcG -or $svcG.Status -ne "Running") {
+        & $GemmaExe start 2>$null | Out-Null
+    }
     Wait-ForPortHealth -Port $State.GemmaPort -Label "Gemma 4 12B"
 }
 
 function Start-BonsaiService {
+    for ($i = 0; $i -lt 10; $i++) {
+        $svc = Get-Service -Name "Bonsai2Service" -ErrorAction SilentlyContinue
+        if (-not $svc -or $svc.Status -ne "StopPending") { break }
+        Start-Sleep -Milliseconds 500
+    }
     $p = Get-PortDetails -Port $State.BonsaiPort
     if ($p) {
         $svcB = Get-Service -Name "Bonsai2Service" -ErrorAction SilentlyContinue
         if (-not $svcB -or $svcB.Status -ne "Running") {
+            & taskkill /F /PID $p.PID 2>$null | Out-Null
             Stop-Process -Id $p.PID -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 1
         }
@@ -262,8 +285,11 @@ function Start-BonsaiService {
     Ensure-WinSWRegistered
     Set-Service -Name "Bonsai2Service" -StartupType Automatic -ErrorAction SilentlyContinue
     Write-Host "[+] Starting Bonsai2Service ($($State.BonsaiVariant), -c $($State.BonsaiCtx)) via WinSW on Port $($State.BonsaiPort)..." -ForegroundColor Green
-    & $BonsaiExe start 2>$null | Out-Null
     Start-Service -Name "Bonsai2Service" -ErrorAction SilentlyContinue
+    $svcB = Get-Service -Name "Bonsai2Service" -ErrorAction SilentlyContinue
+    if (-not $svcB -or $svcB.Status -ne "Running") {
+        & $BonsaiExe start 2>$null | Out-Null
+    }
     Wait-ForPortHealth -Port $State.BonsaiPort -Label "Ternary Bonsai 2 27B ($($State.BonsaiVariant))"
 }
 
