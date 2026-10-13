@@ -8030,7 +8030,6 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_F32:
                     case GGML_TYPE_Q1_0:
-                    case GGML_TYPE_PTQ1_0:
                     case GGML_TYPE_PQ2_0:
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_NVFP4:
