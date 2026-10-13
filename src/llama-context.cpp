@@ -826,12 +826,20 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
-// ARC-LAB: LLAMA_SYNC_TRIM bit mask (default all on; 0 = upstream behaviour): 1 = skip a context synchronize when the
+// ARC-LAB: LLAMA_SYNC_TRIM bit mask (default all on with a SYCL device, else 0; 0 = upstream behaviour): 1 = skip a context synchronize when the
 // context queued nothing since its last one, 2 = KV-cache rotation matrices kept on the device (llama-kv-cache.cpp)
+bool llama_sycl_present() {
+    static const bool v = [] {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("SYCL");
+        return reg != nullptr && ggml_backend_reg_dev_count(reg) > 0;
+    }();
+    return v;
+}
+
 int llama_sync_trim() {
     static const int v = [] {
         const char * e = getenv("LLAMA_SYNC_TRIM");
-        return e ? atoi(e) : 3;
+        return e ? atoi(e) : (llama_sycl_present() ? 3 : 0);
     }();
     return v;
 }
@@ -841,7 +849,7 @@ void llama_context::synchronize() {
         return;
     }
 
-    // ARC-LAB: LLAMA_SYNC_TRIM bit 1 (default on): every getter (logits, sampled tokens, nextn rows, ...) synchronizes,
+    // ARC-LAB: LLAMA_SYNC_TRIM bit 1 (default on with SYCL): every getter (logits, sampled tokens, nextn rows, ...) synchronizes,
     // and the device's one in-order queue is shared by all contexts. With nothing queued by this context since its
     // last synchronize, its results are already complete: skip the device wait.
     if ((llama_sync_trim() & 1) && !sync_pending && !cparams.pipeline_parallel) {

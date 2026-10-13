@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-impl.h"
 #include "llama-memory-recurrent.h"
 #include "llama-kv-cache.h"
 
@@ -758,14 +759,14 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     res->add_input(std::move(inp));
 
-    // ARC-LAB: KV-only pass (LLAMA_MTP_KV_ONLY, default on; independent implementation of the technique described by
+    // ARC-LAB: KV-only pass (LLAMA_MTP_KV_ONLY, default on with a SYCL device; independent implementation of the technique described by
     // GRIMOIRE). A decode with no output rows (the head's prompt catch-up) is only there to fill this layer's K/V, so
     // build up to the cache store and stop: no query, attention, output projection, FFN or head. The K/V ops are the
     // full graph's, in the same order, so the cache rows are bit-identical. Unmasked nextn readers copy h for every
     // token, so they keep the full graph.
     static const bool kv_only_on = [] {
         const char * e = getenv("LLAMA_MTP_KV_ONLY");
-        return e == nullptr || atoi(e) != 0;
+        return e ? atoi(e) != 0 : llama_sycl_present();
     }();
     const bool kv_only = kv_only_on && n_outputs == 0 && cparams.embeddings_nextn_masked;
 

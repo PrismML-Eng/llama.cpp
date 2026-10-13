@@ -77,6 +77,9 @@ static inline ggml_tensor * llama_mul_mat_hadamard(
 // ARC-LAB: LLAMA_SYNC_TRIM bit mask, see llama-context.cpp
 int llama_sync_trim();
 
+// true when a SYCL device is registered; the ARC-LAB defaults below were only measured there
+bool llama_sycl_present();
+
 struct time_meas {
     time_meas(int64_t & t_acc, bool disable = false);
     ~time_meas();
