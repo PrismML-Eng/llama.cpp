@@ -329,11 +329,17 @@ struct common_params_speculative_draft {
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
-    // stop drafting once the sequence is this long (0 = never). Deep in the context a step is bound
-    // by reading the KV cache, and the draft passes plus the multi-column verify add to that read
-    // without shortening it: on a 4070 with Bonsai 2 27B the draft is +85% at zero depth, breaks
-    // even near 24k tokens and costs 30% at 64k. Past the cutoff the slot decodes one token per step.
+    // stop drafting once the sequence is this long (0 = never). Measured when a deep verify batch ran on the
+    // vector FA kernel and the draft context grew with the conversation (Bonsai 2 27B on a 4070: +85% at zero
+    // depth, even near 24k, -30% at 64k). With quantized-KV decode on the MMA FA kernel and n_window below,
+    // drafting pays at every depth (64k: 48 -> 90 tok/s), so the server default is 0.
     int32_t n_depth_max = 0;
+
+    // draft (MTP) context window (0 = full history): it keeps only the last n_window rows and is sized for
+    // them, so its cells are reused, its cache stays small and on the device, and a draft pass costs the same
+    // at any depth. The MTP head predicts the next few tokens from recent context: 16k rows accept as many
+    // drafts as the full history at 131k.
+    int32_t n_window = 0;
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 

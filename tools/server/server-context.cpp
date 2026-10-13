@@ -22,6 +22,7 @@
 #include <cinttypes>
 #include <exception>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <filesystem>
 #include <utility>
@@ -972,6 +973,7 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -3685,6 +3687,31 @@ private:
             spec_process = false;
             for (int i = 0; i < batch_view.n_tokens && !spec_process; ++i) {
                 spec_process = batch_view.pos[i] <= params_base.speculative.draft.n_depth_max;
+            }
+        }
+
+        // --spec-draft-window: before feeding this view to the draft context, drop the rows of each sequence in the
+        // view that are older than the window, measured from that sequence's first position in the view. Sequences
+        // that are not in the view keep their rows. The draft context is sized for the window
+        // (common_speculative_init), so freed cells are reused and its attention span stays short.
+        if (spec_process && ctx_dft && params_base.speculative.draft.n_window > 0) {
+            std::map<llama_seq_id, llama_pos> seq_pos_min;
+            for (int i = 0; i < batch_view.n_tokens; ++i) {
+                for (int j = 0; j < batch_view.n_seq_id[i]; ++j) {
+                    const llama_seq_id sid = batch_view.seq_id[i][j];
+                    auto it = seq_pos_min.find(sid);
+                    if (it == seq_pos_min.end()) {
+                        seq_pos_min.emplace(sid, batch_view.pos[i]);
+                    } else {
+                        it->second = std::min(it->second, batch_view.pos[i]);
+                    }
+                }
+            }
+            for (const auto & [sid, pos_min] : seq_pos_min) {
+                const llama_pos hi = pos_min - params_base.speculative.draft.n_window;
+                if (hi > 0) {
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), sid, 0, hi);
+                }
             }
         }
 
