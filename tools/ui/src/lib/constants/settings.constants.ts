@@ -111,9 +111,8 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 				type: SettingsFieldType.CHECKBOX
 			},
 			{
-				defaultValue: false,
+				defaultValue: true,
 				help: 'Automatically show microphone button instead of send button when textarea is empty for models with audio modality support.',
-				isExperimental: true,
 				key: SETTINGS_KEYS.AUTO_MIC_ON_EMPTY,
 				label: 'Show microphone on empty input',
 				type: SettingsFieldType.CHECKBOX
@@ -124,6 +123,15 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 				isExperimental: true,
 				key: SETTINGS_KEYS.ENABLE_CONTINUE_GENERATION,
 				label: 'Enable "Continue" button',
+				type: SettingsFieldType.CHECKBOX
+			},
+			{
+				// Deliberately off for now: the natural place to turn it on is the first
+				// run experience, once onboarding exists to ask the user about it.
+				defaultValue: false,
+				help: 'Fetch model metadata (avatars, context length, chat template) from the Hugging Face Hub. When off, the UI only shows what the server reports for /v1/models and hides the org avatars.',
+				key: SETTINGS_KEYS.USE_HUGGING_FACE_HUB,
+				label: 'Use Hugging Face Hub API for models metadata',
 				type: SettingsFieldType.CHECKBOX
 			},
 			{
@@ -285,6 +293,20 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 			},
 			{
 				defaultValue: false,
+				help: 'Show the modality and capability icons (vision, audio, reasoning, tools) on the models selector rows.',
+				key: SETTINGS_KEYS.SHOW_MODEL_CAPABILITIES_IN_SELECTOR,
+				label: 'Show model modalities & capabilities in models selector',
+				type: SettingsFieldType.CHECKBOX
+			},
+			{
+				defaultValue: true,
+				help: 'Display the organization name alongside model names in the model selector, in the trigger and in the model rows.',
+				key: SETTINGS_KEYS.SHOW_MODEL_ORG_NAME,
+				label: 'Show organization name in model selector',
+				type: SettingsFieldType.CHECKBOX
+			},
+			{
+				defaultValue: false,
 				help: 'Display the current build version in the bottom-right corner of the interface.',
 				key: SETTINGS_KEYS.SHOW_BUILD_VERSION,
 				label: 'Show build version information',
@@ -295,6 +317,13 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 				help: 'Display the full file system path inside file and folder @-mention badges instead of just the file or folder name.',
 				key: SETTINGS_KEYS.SHOW_FULL_PATH_IN_MENTIONS,
 				label: 'Show full path in mentions',
+				type: SettingsFieldType.CHECKBOX
+			},
+			{
+				defaultValue: true,
+				help: 'Group models into families (e.g. "Qwen") in the model picker and the models manager. Turn it off to list every model on its own.',
+				key: SETTINGS_KEYS.GROUP_MODELS_BY_FAMILY,
+				label: 'Group models by family',
 				type: SettingsFieldType.CHECKBOX
 			}
 		],

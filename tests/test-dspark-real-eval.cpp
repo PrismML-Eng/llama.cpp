@@ -425,7 +425,7 @@ int main(int argc, char ** argv) {
     }
     printf("draft length per round: n_max=%d (block_size=%d)\n", n_draft, block_size);
 
-    llama_batch batch_tgt = llama_batch_init((int32_t) llama_n_batch(ctx_tgt), 0, 1);
+    common_batch batch_tgt(ctx_tgt);
 
     int64_t total_drafted = 0, total_accepted = 0, total_rounds = 0, total_predicted = 0;
     int64_t total_ar_predicted = 0;
@@ -498,12 +498,12 @@ int main(int argc, char ** argv) {
         const auto prefill = [&](const llama_tokens & tokens, bool capture) {
             for (size_t begin = 0; begin < tokens.size();) {
                 const size_t end = std::min(tokens.size(), begin + (size_t) eval_batch);
-                common_batch_clear(batch_tgt);
+                batch_tgt.clear();
                 for (size_t i = begin; i < end; ++i) {
-                    common_batch_add(batch_tgt, tokens[i], (llama_pos) i, { seq_id },
+                    batch_tgt.add(tokens[i], (llama_pos) i, seq_id,
                                      capture || i + 1 == tokens.size());
                 }
-                if (llama_decode(ctx_tgt, batch_tgt) != 0) {
+                if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch_tgt.get()) != 0) {
                     fail("prefill chunk failed");
                 }
                 if (capture && !common_speculative_process(spec, batch_tgt)) {
@@ -534,9 +534,9 @@ int main(int argc, char ** argv) {
         const auto t_ar_decode    = std::chrono::steady_clock::now();
 
         while (ar_n_predicted < n_predict_max && !ar_has_eos) {
-            common_batch_clear(batch_tgt);
-            common_batch_add(batch_tgt, ar_cur, (llama_pos) ar_n_past, { seq_id }, /* logits = */ true);
-            if (llama_decode(ctx_tgt, batch_tgt) != 0) {
+            batch_tgt.clear();
+            batch_tgt.add(ar_cur, (llama_pos) ar_n_past, seq_id, /* logits = */ true);
+            if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch_tgt.get()) != 0) {
                 fail("AR decode failed at prompt " + std::to_string(pi));
             }
 
@@ -635,14 +635,14 @@ int main(int argc, char ** argv) {
             if (split_prefill) {
                 for (size_t start = 0; start < ar_tokens.size();) {
                     const size_t count = std::min((size_t) oracle_rows, ar_tokens.size() - start);
-                    common_batch_clear(batch_tgt);
+                    batch_tgt.clear();
                     for (size_t j = 0; j < count; ++j) {
                         const size_t      output_index = start + j;
                         const llama_token token        = output_index == 0 ? inp.back() : ar_tokens[output_index - 1];
-                        common_batch_add(batch_tgt, token, (llama_pos) (inp.size() - 1 + output_index), { seq_id },
+                        batch_tgt.add(token, (llama_pos) (inp.size() - 1 + output_index), seq_id,
                                          true);
                     }
-                    if (llama_decode(ctx_tgt, batch_tgt) != 0) {
+                    if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch_tgt.get()) != 0) {
                         fail("split-prefill oracle decode failed");
                     }
                     for (size_t j = 0; j < count; ++j) {
@@ -654,12 +654,12 @@ int main(int argc, char ** argv) {
                 compare(0, -1);
                 for (size_t start = 0; start + 1 < ar_tokens.size();) {
                     const size_t count = std::min((size_t) oracle_rows, ar_tokens.size() - 1 - start);
-                    common_batch_clear(batch_tgt);
+                    batch_tgt.clear();
                     for (size_t j = 0; j < count; ++j) {
-                        common_batch_add(batch_tgt, ar_tokens[start + j], (llama_pos) (inp.size() + start + j),
-                                         { seq_id }, true);
+                        batch_tgt.add(ar_tokens[start + j], (llama_pos) (inp.size() + start + j),
+                                         seq_id, true);
                     }
-                    if (llama_decode(ctx_tgt, batch_tgt) != 0) {
+                    if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch_tgt.get()) != 0) {
                         fail("oracle decode failed");
                     }
                     for (size_t j = 0; j < count; ++j) {
@@ -718,7 +718,7 @@ int main(int argc, char ** argv) {
             common_speculative_draft_params & dp = common_speculative_get_draft_params(spec, seq_id);
             dp.drafting                          = true;
             dp.n_max                             = n_draft;
-            dp.n_past                            = n_past;
+            dp.pos0                              = n_past;
             dp.id_last                           = id_last;
             dp.prompt                            = nullptr;  // unused by dspark
             dp.result                            = &draft;
@@ -741,15 +741,15 @@ int main(int argc, char ** argv) {
 
             // target verify batch: [id_last, draft0, draft1, ..., draftN-1],
             // matching examples/speculative-simple/speculative-simple.cpp.
-            common_batch_clear(batch_tgt);
-            common_batch_add(batch_tgt, id_last, (llama_pos) n_past, { seq_id }, /* logits = */ true);
+            batch_tgt.clear();
+            batch_tgt.add(id_last, (llama_pos) n_past, seq_id, /* logits = */ true);
             for (size_t i = 0; i < draft.size(); ++i) {
-                common_batch_add(batch_tgt, draft[i], (llama_pos) (n_past + 1 + (int) i), { seq_id },
+                batch_tgt.add(draft[i], (llama_pos) (n_past + 1 + (int) i), seq_id,
                                  /* logits = */ true);
             }
 
             const auto t_verify = std::chrono::steady_clock::now();
-            if (llama_decode(ctx_tgt, batch_tgt) != 0) {
+            if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch_tgt.get()) != 0) {
                 fail("verify decode failed at prompt " + std::to_string(pi));
             }
             llama_synchronize(ctx_tgt);
@@ -937,7 +937,6 @@ int main(int argc, char ** argv) {
             sp_tok_per_sec_all, speedup_all);
     }
 
-    llama_batch_free(batch_tgt);
     common_speculative_free(spec);
     llama_free(ctx_dft);
     llama_free(ctx_tgt);

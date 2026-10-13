@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Iterable, TYPE_CHECKING
+from typing import Iterable, TYPE_CHECKING
 
 from .base import ModelBase, TextModel, gguf, logger
 

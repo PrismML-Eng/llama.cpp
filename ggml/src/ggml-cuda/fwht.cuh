@@ -1,5 +1,7 @@
 #include "common.cuh"
 
+bool ggml_cuda_op_mul_mat_use_fwht(const struct ggml_tensor * op);
+
 // In-register block FWHT over N floats held as NE = N/NT per thread, element i*NT + tid in reg[i].
 // Shared by the standalone kernel (fwht_cuda_block) and the fused FWHT + q8_1 quantizer so both
 // produce bit-identical transforms. `s` must hold N floats.

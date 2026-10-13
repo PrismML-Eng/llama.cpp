@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import logging
 import argparse
 import sys
 from pathlib import Path
@@ -47,6 +48,9 @@ TARGET_LAYERS = [1, 16]                       # n_capture = 2 (target-model indi
 BLOCK_SIZE    = 4
 MASK_TOKEN_ID = 255
 N_FREQ        = 128   # LogSnrEmbed.NUM_FREQ_FEATURES (fixed in dspark.cpp)
+
+
+logger = logging.getLogger("gen-tiny-dspark")
 
 
 def write_variant(out_path: str, conditioning: bool,
@@ -133,8 +137,8 @@ def write_variant(out_path: str, conditioning: bool,
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
     w.close()
-    print(f"wrote {out_path} (conditioning={int(conditioning)} "
-          f"min={min_log_snr} max={max_log_snr})")
+    logger.info(f"wrote {out_path} (conditioning={int(conditioning)} "
+                f"min={min_log_snr} max={max_log_snr})")
 
 
 # canonical suite consumed by tests/test-dspark-logsnr-meta.cpp: keep the
@@ -184,4 +188,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     main()

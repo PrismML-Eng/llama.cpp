@@ -14,6 +14,8 @@
 #define N_MM_SIMD_GROUP_X 2
 #define N_MM_SIMD_GROUP_Y 2
 
+#define N_MM_NPART_AMAX 256
+
 // kernel parameters for mat-vec threadgroups
 //
 // N_R0: number of src0 rows to process per simdgroup
@@ -75,24 +77,31 @@
 
 #define N_R0_IQ1_S 4
 #define N_SG_IQ1_S 2
+#define N_R0_IQ1_S_SPLIT 8
 
 #define N_R0_IQ1_M 4
 #define N_SG_IQ1_M 2
+#define N_R0_IQ1_M_SPLIT 8
 
 #define N_R0_IQ2_XXS 4
 #define N_SG_IQ2_XXS 2
+#define N_R0_IQ2_XXS_SPLIT 8
 
 #define N_R0_IQ2_XS 4
 #define N_SG_IQ2_XS 2
+#define N_R0_IQ2_XS_SPLIT 8
 
 #define N_R0_IQ2_S 4
 #define N_SG_IQ2_S 2
+#define N_R0_IQ2_S_SPLIT 8
 
 #define N_R0_IQ3_XXS 4
 #define N_SG_IQ3_XXS 2
+#define N_R0_IQ3_XXS_SPLIT 8
 
 #define N_R0_IQ3_S 4
 #define N_SG_IQ3_S 2
+#define N_R0_IQ3_S_SPLIT 8
 
 #define N_R0_IQ4_NL 2
 #define N_SG_IQ4_NL 2
@@ -123,16 +132,28 @@
 #define FC_GATED_DELTA_NET             1600
 #define FC_GATED_DELTA_NET_WRITE_ROWS  (FC_GATED_DELTA_NET + 4)
 #define FC_GATED_DELTA_NET_RAW_GATES   (FC_GATED_DELTA_NET + 5)
+#define FC_NORM                        1700
+#define FC_TOPK_MOE                    1800
+#define FC_MOE_REDUCE                  1900
+#define FC_DSV4_HC                     2000
+#define FC_PAD                         2100
+#define FC_FLASH_ATTN_EXT_TENSOR       2200
+#define FC_LIGHTNING_INDEXER           2200
+#define FC_MUL_MV_MMA                  2300
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
 #define OP_FLASH_ATTN_EXT_NCPSG 64
 
+#define OP_FLASH_ATTN_EXT_TENSOR_NQPSG       32
+#define OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE 16
+#define OP_FLASH_ATTN_EXT_TENSOR_NCPSG       64
+#define OP_FLASH_ATTN_EXT_TENSOR_NSG         8
+
 #define OP_FLASH_ATTN_EXT_VEC_NQPSG 1
 #define OP_FLASH_ATTN_EXT_VEC_NCPSG 32
 
 #define OP_LIGHTNING_INDEXER_DK    128
-#define OP_LIGHTNING_INDEXER_NH     64
 #define OP_LIGHTNING_INDEXER_NHPTG   8
 #define OP_LIGHTNING_INDEXER_NKPSG   8
 #define OP_LIGHTNING_INDEXER_NSG     8
@@ -174,6 +195,10 @@
 #define OP_SUM_ROWS_NUM_SUM_ROWS 10
 #define OP_SUM_ROWS_NUM_MEAN     11
 
+#define OP_SSM_SCAN_SSD_CS  64 // Metal-specific; Chunk Size; 64 is largest multiple of 8 (simdgroup tile) fitting into 32 KiB Metal threadgroup mem limit (~26.75 KiB shared mem; see smem layout comment in kernel_ssm_scan_ssd_mma_f32)
+#define OP_SSM_SCAN_SSD_HD  64 // Metal-specific; Head Dim the MMA kernel is specialized for (Mamba-2); use_mma gates on d_inner == this
+#define OP_SSM_SCAN_SSD_NSG 4  // Metal-specific; Number of SimdGroups per threadgroup; NSG*32 == threads dispatched per threadgroup
+
 // kernel argument structs
 //
 // - element counters (e.g. ne00) typically use int32_t to reduce register usage
@@ -207,6 +232,7 @@ typedef struct {
     uint64_t nb2;
     uint64_t nb3;
     int32_t  dim;
+    int32_t  nc0;
 } ggml_metal_kargs_concat;
 
 typedef struct {
@@ -470,7 +496,20 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    int32_t  n_kv_max_padded;
 } ggml_metal_kargs_flash_attn_ext_vec;
+
+typedef struct {
+    int32_t  ne30;
+    int32_t  ne31;
+    int32_t  ne32;
+    int32_t  ne33;
+    uint64_t nb31;
+    uint64_t nb32;
+    uint64_t nb33;
+    int32_t  n_kv_max;
+    int32_t  n_kv_max_padded;
+} ggml_metal_kargs_flash_attn_ext_vec_idx;
 
 typedef struct {
     int32_t  nrows;
@@ -564,6 +603,14 @@ typedef struct {
 
 typedef struct {
     int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    uint64_t nb01;
+    uint64_t nb02;
+} ggml_metal_kargs_mul_mm_id_amax;
+
+typedef struct {
+    int32_t  ne00;
     int32_t  ne02;
     uint64_t nb01;
     uint64_t nb02;
@@ -619,6 +666,7 @@ typedef struct {
     uint64_t nbf1[3];
     uint64_t nbf2[3];
     uint64_t nbf3[3];
+    float    scale;
 } ggml_metal_kargs_norm;
 
 typedef struct {
@@ -687,6 +735,7 @@ typedef struct {
     uint64_t nb0;
     uint64_t nb1;
     uint64_t nb2;
+    uint64_t nb3;
 } ggml_metal_kargs_conv_transpose_2d;
 
 typedef struct {
@@ -906,7 +955,6 @@ typedef struct {
     uint64_t nb00;
     uint64_t nb01;
     uint64_t nb02;
-    int64_t  ne10;
     int64_t  ne11;
     uint64_t nb10;
     uint64_t nb11;
@@ -924,6 +972,8 @@ typedef struct {
     int64_t  n_head;
     int64_t  n_group;
     int64_t  n_seq_tokens;
+    int64_t  n_seq_tokens_total;
+    int64_t  token_offset;
     int64_t  n_seqs;
     int64_t  K;
     uint64_t s_off;
@@ -989,6 +1039,7 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
+    uint64_t nb_out; // 0 => snapshots are appended after the attn scores (unfused)
 } ggml_metal_kargs_gated_delta_net;
 
 typedef struct {
@@ -1125,6 +1176,10 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
+    int32_t  lp0;
+    int32_t  lp1;
+    int32_t  lp2;
+    int32_t  lp3;
 } ggml_metal_kargs_pad;
 
 typedef struct {
@@ -1229,10 +1284,34 @@ typedef struct {
     int32_t  len;
 } ggml_metal_kargs_argsort_merge;
 
-// Block widths at or above this run the threadgroup-staged FWHT kernel: the
-// register-resident one keeps N/32 values per thread, which stops fitting here.
+typedef struct {
+    int32_t  ne00;   // number of columns (elements per row)
+    int32_t  ne01;   // rows
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb01;   // row stride in src0
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  top_k;  // k
+} ggml_metal_kargs_top_k;
+
+// widths at or above this use the threadgroup FWHT kernel, one row per threadgroup
+// with GGML_METAL_FWHT_TG_NT threads, instead of one row per simdgroup
 #define GGML_METAL_FWHT_TG_MIN_N 512
 #define GGML_METAL_FWHT_TG_NT    256
+
+typedef struct {
+    int32_t  ne01;      // n_tokens
+    uint64_t nb01;      // logits row stride
+    uint64_t nb1_ids;   // ids row stride
+    float    clamp;
+    float    scale;
+} ggml_metal_kargs_topk_moe;
+
+typedef struct {
+    int32_t ne00; // n_embd
+    int32_t ne02; // n_tokens
+} ggml_metal_kargs_moe_reduce;
 
 typedef struct {
     int32_t nrows;
@@ -1287,8 +1366,10 @@ typedef struct {
     uint64_t nb_x2;
     uint64_t nb_w0;
     uint64_t nb_w1;
+    uint64_t nb_w2;
     uint64_t nb_d0;
     uint64_t nb_d1;
+    float    scale;
 } ggml_metal_kargs_dsv4_hc_pre;
 
 typedef struct {

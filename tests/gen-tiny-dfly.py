@@ -7,6 +7,7 @@ n_layer deliberately != n_target so a transposed fusion axis cannot pass unnotic
 
     python3 tests/gen-tiny-dfly.py models/ggml-vocab-qwen2.gguf /tmp/tiny-dfly.gguf
 """
+import logging
 import sys
 from pathlib import Path
 
@@ -16,6 +17,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "gguf-py"))
 import gguf  # noqa: E402
 
 VOCAB_KEY_PREFIXES = ("tokenizer.",)
+
+
+logger = logging.getLogger("gen-tiny-dfly")
 
 
 def copy_vocab(writer: gguf.GGUFWriter, vocab_gguf: Path) -> int:
@@ -112,9 +116,10 @@ def main() -> None:
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
     writer.close()
-    print(f"wrote {out_path} (n_vocab={n_vocab}, n_layer={n_layer}, n_feat={n_feat}, "
-          f"expected n_embd_out={n_layer * n_embd})")
+    logger.info(f"wrote {out_path} (n_vocab={n_vocab}, n_layer={n_layer}, n_feat={n_feat}, "
+                f"expected n_embd_out={n_layer * n_embd})")
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     main()

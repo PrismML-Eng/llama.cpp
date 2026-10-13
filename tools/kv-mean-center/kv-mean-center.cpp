@@ -257,7 +257,7 @@ int main(int argc, char ** argv) {
 
     LOG_INF("%s: collecting K-cache statistics over %d chunk(s) of %d tokens\n", __func__, n_chunk, n_ctx);
 
-    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    common_batch batch(ctx);
 
     for (int i = 0; i < n_chunk; ++i) {
         const int start = i*n_ctx;
@@ -268,22 +268,19 @@ int main(int argc, char ** argv) {
         for (int j = 0; j < n_ctx; j += n_batch) {
             const int n_tok = std::min(n_batch, n_ctx - j);
 
-            common_batch_clear(batch);
+            batch.clear();
             for (int k = 0; k < n_tok; ++k) {
-                common_batch_add(batch, tokens[start + j + k], j + k, { 0 }, false);
+                batch.add(tokens[start + j + k], j + k, 0, false);
             }
 
-            if (llama_decode(ctx, batch)) {
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
                 LOG_ERR("%s: failed to decode chunk %d\n", __func__, i);
-                llama_batch_free(batch);
                 return 1;
             }
         }
 
         LOG_INF("%s: processed chunk %d / %d\n", __func__, i + 1, n_chunk);
     }
-
-    llama_batch_free(batch);
 
     auto layers = g_collector.finalize();
     if (layers.empty()) {

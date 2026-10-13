@@ -417,7 +417,7 @@ int main(int argc, char ** argv) {
         common_speculative_draft_params & dp = common_speculative_get_draft_params(spec, 0);
         dp.drafting                          = true;
         dp.n_max                             = -1;
-        dp.n_past                            = start;
+        dp.pos0                              = start;
         dp.id_last                           = id_last;
         dp.prompt                            = nullptr;  // unused by dspark
         llama_tokens result;
