@@ -641,8 +641,6 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
         switch (tensor->type) {
             case GGML_TYPE_Q4_0:
             case GGML_TYPE_Q8_0:
-            case GGML_TYPE_PQ2_0:
-            case GGML_TYPE_PTQ1_0:
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_Q4_K:

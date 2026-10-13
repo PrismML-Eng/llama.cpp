@@ -1258,56 +1258,6 @@ vec_dot_q2_0_q8_1(const void *__restrict__ vbq,
     return sum0 + sum1;
 }
 
-#define VDR_PQ2_0_Q8_1_MMVQ 1
-#define VDR_PTQ1_0_Q8_1_MMVQ 4  // one call takes a whole 128 block
-
-
-// Same codec as Q2_0 at group 128: each int of qs holds 16 codes, i.e. half of one q8_1 block.
-static __dpct_inline__ float
-vec_dot_pq2_0_q8_1(const void *__restrict__ vbq,
-                   const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
-
-    const block_pq2_0 * bq = (const block_pq2_0 *) vbq;
-
-    float sum = 0.0f;
-#pragma unroll
-    for (int h = 0; h < 2; ++h) {
-        const int k = iqs + h * QI_PQ2_0;
-        const int v = get_int_from_uint8(bq->qs, k);
-        const block_q8_1 & y = bq8_1[k / 2];
-        const int base = 4 * (k % 2);
-
-        int u[4];
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            u[j] = get_int_from_int8_aligned(y.qs, base + j);
-        }
-        sum += vec_dot_q2_0_q8_1_impl<VDR_PQ2_0_Q8_1_MMVQ>(&v, u, bq->d, y.ds);
-    }
-    return sum;
-}
-
-static __dpct_inline__ float
-vec_dot_ptq1_0_q8_1(const void *__restrict__ vbq,
-                    const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
-    GGML_UNUSED(iqs);
-    const block_ptq1_0 * bq = (const block_ptq1_0 *) vbq;
-
-    int8_t x[QK_PTQ1_0];
-    sycl::half2 ds[4];
-#pragma unroll
-    for (int k = 0; k < 4; ++k) {
-#pragma unroll
-        for (int j = 0; j < QK8_1 / 4; ++j) {
-            *(int *) (x + k * QK8_1 + 4 * j) = get_int_from_int8_aligned(bq8_1[k].qs, j);
-        }
-        ds[k] = bq8_1[k].ds;
-    }
-    int sumi[4] = { 0, 0, 0, 0 };
-    ptq1_0_dot_block(bq->qs, (uint32_t) bq->qh[0] | ((uint32_t) bq->qh[1] << 16), x, sumi);
-    return ptq1_0_finish(sumi, ds, bq->d);
-}
-
 static __dpct_inline__ float
 vec_dot_q4_1_q8_1(const void *__restrict__ vbq,
                   const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
