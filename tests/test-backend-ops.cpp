@@ -5062,13 +5062,23 @@ struct test_fwht_signed : public test_case {
 // shapes / token counts, and compares the fused outputs against the CPU backend. The graph's final node only keeps every
 // output alive; its operand order makes the graph come out in the model's node order. `seed` repeats a case with fresh
 // random data. Run with GGML_SYCL_PTQ1_T2=all so the ternary weights take the T2 (XMX) path the fusions feed.
+// portable popcount (MSVC has no __builtin_popcountll)
+static int arclab_popcount64(uint64_t x) {
+    int c = 0;
+    while (x) {
+        x &= x - 1;
+        c++;
+    }
+    return c;
+}
+
 static void arclab_init_hadamard(ggml_tensor * t) {
     const int64_t n = t->ne[0];
     std::vector<float> data(n * n);
     const float scale = 1.0f / sqrtf((float) n);
     for (int64_t r = 0; r < n; r++) {
         for (int64_t i = 0; i < n; i++) {
-            data[r * n + i] = (__builtin_popcountll((unsigned long long) (r & i)) % 2 == 0) ? scale : -scale;
+            data[r * n + i] = (arclab_popcount64((uint64_t) (r & i)) % 2 == 0) ? scale : -scale;
         }
     }
     ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
