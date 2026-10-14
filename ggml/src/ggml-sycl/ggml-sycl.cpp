@@ -1137,16 +1137,18 @@ static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_typ
 
 static bool ggml_sycl_device_has_dpas16(int device);
 
-// GGML_SYCL_DISABLE_XMX=1 keeps PQ2_0/PTQ1_0 off the XMX path (and its layout)
-static bool ggml_sycl_xmx_disabled() {
-    static const bool disabled = ggml_sycl_get_env("GGML_SYCL_DISABLE_XMX", 0);
-    return disabled;
+// GGML_SYCL_DISABLE_XMX=1 keeps PQ2_0/PTQ1_0 off the XMX path (and its layout), =0 keeps them on it. Unset, Xe3
+// leaves them to the MMVQ reorder: on an Arc B390 (PTQ1_0 weights) that is +16% decode and +6% prompt with ~0.9 GB less
+// memory, at a higher but still small KLD (6.7e-4 vs 2.4e-4)
+static bool ggml_sycl_xmx_disabled(int device) {
+    static const char * env = getenv("GGML_SYCL_DISABLE_XMX");
+    return env ? atoi(env) != 0 : ggml_sycl_device_is_xe3(device);
 }
 
 // PTQ1_0 weights are expanded into the 34-byte PQ2_0 XMX blocks on first use (pq2_xmx.hpp), so on devices
 // that run that path their allocation reserves room for the expanded form
 static bool ggml_sycl_ptq1_xmx_expands(int device, const ggml_tensor * tensor) {
-    return tensor->type == GGML_TYPE_PTQ1_0 && g_ggml_sycl_enable_optimize && !ggml_sycl_xmx_disabled() &&
+    return tensor->type == GGML_TYPE_PTQ1_0 && g_ggml_sycl_enable_optimize && !ggml_sycl_xmx_disabled(device) &&
            tensor->ne[2] == 1 && tensor->ne[3] == 1 && ggml_sycl_pq2_xmx_supports_ne0(tensor->ne[0]) &&
            ggml_sycl_device_has_dpas16(device);
 }
@@ -4939,10 +4941,12 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
         return;  // Skip permutations and already reordered tensors
     }
 
-    // PQ2_0/PTQ1_0 on 16-wide DPAS devices belong to the XMX layout (ggml_sycl_pq2_xmx_use), which rewrites the same
-    // bytes in place; reordering them as well would leave one path reading the other's layout
+    // PQ2_0/PTQ1_0 on 16-wide DPAS devices belong to the XMX layout (ggml_sycl_pq2_xmx_use) unless
+    // ggml_sycl_xmx_disabled; it rewrites the same bytes in place, so reordering them as well would leave one path
+    // reading the other's layout
     if ((src0->type == GGML_TYPE_PQ2_0 || src0->type == GGML_TYPE_PTQ1_0) &&
-        (extra->optimized_feature.xmx_pq2 || (!ggml_sycl_xmx_disabled() && ggml_sycl_device_has_dpas16(ctx->device)))) {
+        (extra->optimized_feature.xmx_pq2 ||
+         (!ggml_sycl_xmx_disabled(ctx->device) && ggml_sycl_device_has_dpas16(ctx->device)))) {
         return;
     }
 
@@ -5023,7 +5027,8 @@ static bool ggml_sycl_pq2_xmx_use(ggml_backend_sycl_context & ctx, const ggml_te
     if (extra && (extra->optimized_feature.reorder || extra->optimized_feature.t2)) {
         return false;
     }
-    if (!g_ggml_sycl_enable_optimize || ggml_sycl_xmx_disabled() || !ggml_sycl_device_has_dpas16(ctx.device)) {
+    if (!g_ggml_sycl_enable_optimize || ggml_sycl_xmx_disabled(ctx.device) ||
+        !ggml_sycl_device_has_dpas16(ctx.device)) {
         return false;
     }
     // op offload refills COMPUTE buffers from host memory every time, so an in-place layout there goes stale

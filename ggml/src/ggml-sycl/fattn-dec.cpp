@@ -1116,7 +1116,9 @@ static int fattn_dec_dpas_maxq() {  // 0 = DPAS kernel off; else it serves 1 .. 
         }
         return getenv("GGML_SYCL_FA_DEC_DPAS_ANYGPU") != nullptr || ggml_sycl_device_is_xe2();
     }();
-    const int v = ok ? ggml_sycl_knob("GGML_SYCL_FA_DEC_DPAS", 0) : 0;
+    // on by default on Xe3: Arc B390 q4_0 KV decode at 16K +4-6%, KLD vs the regular kernel within run-to-run error
+    const int v =
+        ok ? ggml_sycl_knob("GGML_SYCL_FA_DEC_DPAS", ggml_sycl_device_is_xe3(ggml_sycl_get_device()) ? 1 : 0) : 0;
     // =1 -> default cap 256: long n-gram verify batches stay on this kernel instead of oneDNN's f16 copy of the whole KV
     // cache (B580, per layer: 48K 64 tok 28.8 -> 4.9 ms, 115K 256 tok 253 -> 44 ms; KLD 0.01270 vs 0.01280, same within
     // error; whole model MTP 48K 73.2 -> 76.1 t/s, 115K 60.3 -> 65.1). =32 restores the old cap.

@@ -73,6 +73,13 @@ bool ggml_sycl_device_is_xe2() {
            hw.arch == gpu_arch::intel_gpu_ptl_u || hw.arch == gpu_arch::intel_gpu_wcl;
 }
 
+// Xe3 (Panther Lake, Wildcat Lake), for the defaults measured on an Arc B390
+bool ggml_sycl_device_is_xe3(int device) {
+    const auto & hw = ggml_sycl_info().devices[device].hw_info;
+    return hw.arch == gpu_arch::intel_gpu_ptl_h || hw.arch == gpu_arch::intel_gpu_ptl_u ||
+           hw.arch == gpu_arch::intel_gpu_wcl;
+}
+
 static bool t2_device_ok() {
     static const bool ok = [] {
         if (getenv("GGML_SYCL_PTQ1_T2_ANYGPU")) {
