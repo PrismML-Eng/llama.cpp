@@ -10946,6 +10946,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, 1, 64, k,
             false, 1, 1, false, false, true, false, {1, 1}));
     }
+    // gate fused PTQ1_0 mat-vec with 2 to 4 columns
+    for (int64_t m : {2, 3, 4}) {
+        for (int64_t k : {512, 5120}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, m, 100, k,
+                false, 1, 1, false, false, true, false, {1, 1}));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, 3, 17408, 5120,
+        false, 1, 1, false, false, true, false, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, 3, 5120, 17408,
+        false, 1, 1, false, false, true, false, {1, 1}));
 
     // ARC-LAB: the MTP draft head's Q6_K weights at their shapes, 1..6 tokens (draft steps, chain step 0): the mat-vecs
     // (GGML_SYCL_Q6K_GEMV / _U / _SG) and the FFN gate+up+SWIGLU (GGML_SYCL_Q6K_GLU=1 takes the fused kernel)
