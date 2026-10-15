@@ -1059,6 +1059,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             metadata[i].target_type = tensor->type;
         }
 
+        // PQ2_0 and PTQ1_0 weights are only valid in the Hadamard-rotated basis
+        if ((metadata[i].target_type == GGML_TYPE_PQ2_0 || metadata[i].target_type == GGML_TYPE_PTQ1_0) && model->hadamard_weight_blocks.empty()) {
+            throw std::runtime_error(format("%s requires an input model with prism.hadamard.* metadata (tensor %s)",
+                    ggml_type_name(metadata[i].target_type), metadata[i].name.c_str()));
+        }
+
         metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
 
         if (params->imatrix) {
