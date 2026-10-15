@@ -805,7 +805,9 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
             if (ti.t.type == GGML_TYPE_Q2_0) {
                 has_q2_0 = true;
                 const size_t nrows = ggml_nrows(&ti.t);
-                const size_t nbytes_legacy = ggml_row_size(GGML_TYPE_PQ2_0, ti.t.ne[0]) * nrows;
+                // only size rows the PQ2_0 codec can handle, keep the hint off assert-only paths
+                const size_t nbytes_legacy = ti.t.ne[0] % ggml_blck_size(GGML_TYPE_PQ2_0) == 0 ?
+                    ggml_row_size(GGML_TYPE_PQ2_0, ti.t.ne[0]) * nrows : padded_size;
                 size_if_legacy_q2 += GGML_PAD(nbytes_legacy, ctx->alignment);
             } else {
                 size_if_legacy_q2 += padded_size;
