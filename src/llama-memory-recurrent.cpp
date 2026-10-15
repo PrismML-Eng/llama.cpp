@@ -1268,8 +1268,12 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
         if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
             idx = mem->rs_idx[seq];
-            // reset rollback idx
-            mem->rs_idx[seq] = 0;
+        }
+        // The restored state advances every sequence sharing this cell.
+        for (const llama_seq_id id : mem->cells[cell_idx].seq_id) {
+            if (id >= 0 && (size_t) id < mem->rs_idx.size()) {
+                mem->rs_idx[id] = 0;
+            }
         }
     }
     return (int32_t)(idx * mem->size) + src0;

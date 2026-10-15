@@ -207,10 +207,11 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     return true;
 }
 
-// Fork a sequence with seq_cp while its partial rollback is pending, then decode one token on the fork.
-// The reference rolls back seq 1 directly. The fork must match it bitwise.
-// The tiny test weights make the recurrent part too small to show in the logits, so compare the state bytes.
-static bool test_seq_cp_pending_rollback(const common_params & params, llama_model * model, const int n_vocab) {
+// Tiny test weights can hide recurrent errors in the logits, so compare state bytes after a fork and optional shared continuation.
+static bool test_seq_cp_pending_rollback(const common_params & params,
+                                         llama_model *         model,
+                                         const int             n_vocab,
+                                         bool                  shared) {
     constexpr uint32_t  n_prompt   = 12;
     constexpr uint32_t  n_rollback = 3;
     constexpr llama_pos p0         = n_prompt - n_rollback;
@@ -221,7 +222,7 @@ static bool test_seq_cp_pending_rollback(const common_params & params, llama_mod
     cparams.n_ctx      = 256;
     cparams.n_batch    = 256;
     cparams.n_ubatch   = 256;
-    cparams.kv_unified = false;
+    cparams.kv_unified = shared;
 
     // fork: seq 0 -> rollback -> seq_cp to seq 1, ref: seq 1 -> rollback
     std::vector<uint8_t> state[2];
@@ -235,7 +236,7 @@ static bool test_seq_cp_pending_rollback(const common_params & params, llama_mod
         llama_memory_t     mem = llama_get_memory(ctx);
         const llama_seq_id src = fork ? 0 : 1;
 
-        llama_batch batch = llama_batch_init(n_prompt, 0, 1);
+        llama_batch batch = llama_batch_init(n_prompt, 0, 2);
         for (llama_pos pos = 0; pos < (llama_pos) n_prompt; ++pos) {
             common_batch_add(batch, (llama_token) ((5 * pos + 3) % n_vocab), pos, { src }, false);
         }
@@ -247,8 +248,15 @@ static bool test_seq_cp_pending_rollback(const common_params & params, llama_mod
         }
 
         common_batch_clear(batch);
-        common_batch_add(batch, (llama_token) (p0 % n_vocab), p0, { 1 }, true);
+        const std::vector<llama_seq_id> ids =
+            shared && fork ? std::vector<llama_seq_id>{ 0, 1 } : std::vector<llama_seq_id>{ 1 };
+        common_batch_add(batch, (llama_token) (p0 % n_vocab), p0, ids, true);
         ok = ok && llama_decode(ctx, batch) == 0;
+        if (shared) {
+            common_batch_clear(batch);
+            common_batch_add(batch, (llama_token) ((p0 + 1) % n_vocab), p0 + 1, { 1 }, true);
+            ok = ok && llama_decode(ctx, batch) == 0;
+        }
         llama_batch_free(batch);
 
         if (ok) {
@@ -269,7 +277,8 @@ static bool test_seq_cp_pending_rollback(const common_params & params, llama_mod
         return false;
     }
 
-    fprintf(stderr, "%s : forked seq matched the rolled-back state (%zu bytes)\n", __func__, state[0].size());
+    fprintf(stderr, "%s : forked seq matched the rolled-back state (shared=%d, %zu bytes)\n", __func__, shared,
+            state[0].size());
     return true;
 }
 
@@ -463,7 +472,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (!test_seq_cp_pending_rollback(params, model, n_vocab)) {
+    if (!test_seq_cp_pending_rollback(params, model, n_vocab, false) ||
+        !test_seq_cp_pending_rollback(params, model, n_vocab, true)) {
         return 1;
     }
 
