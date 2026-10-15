@@ -854,6 +854,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     const bool has_tensor = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor;
 
+    const char * direct_env     = getenv("GGML_METAL_Q2_DIRECT_MAX");
+    const char * direct_min_env = getenv("GGML_METAL_Q2_DIRECT_MIN");
+    const int    direct_min     = direct_min_env ? atoi(direct_min_env) : 8;
+    const bool   direct         = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor_direct &&
+                                  direct_env && op->ne[1] >= direct_min && op->ne[1] <= atoi(direct_env) &&
+                                  (tsrc0 == GGML_TYPE_Q2_0 || tsrc0 == GGML_TYPE_PQ2_0) &&
+                                  (tsrc1 == GGML_TYPE_F32 || tsrc1 == GGML_TYPE_F16);
+
     const bool bc_out = has_tensor
         ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
         : (op->ne[0] % 64  != 0 || op->ne[1] % 32  != 0);
@@ -865,6 +873,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
     snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    if (direct) {
+        snprintf(base, 256, "kernel_mul_mm_direct_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    }
     snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
              base, bc_inp, bc_out, ne12, ne13, r2, r3);
 
@@ -898,6 +909,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     }
 
     res.nsg = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
+
+    if (direct) {
+        res.nr0  = 32;
+        res.nr1  = 16;
+        res.nsg  = 1;
+        res.smem = 32;
+    }
 
     return res;
 }
