@@ -1112,6 +1112,13 @@ void launch_fattn(
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
     GGML_ASSERT(max_blocks_per_sm > 0);
+    // Batch-invariant mode: the KV split must not depend on which template instance runs. Occupancy differs
+    // between the 1-query and the multi-query instances (registers, shared memory), so size the split from a
+    // fixed blocks-per-SM instead; that only shifts work between waves.
+    // (Stream-k launches keep the real occupancy: their instance is fixed per batch size range already.)
+    if (ggml_cuda_batch_invariant() && !stream_k) {
+        max_blocks_per_sm = 4;
+    }
     int parallel_blocks = max_blocks_per_sm;
 
     const int ntiles_KV = (K->ne[1] + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
