@@ -2148,6 +2148,9 @@ static inline bool ggml_cuda_fattn_mma_kv_native_supported(const ggml_tensor * d
     if (!(Q->ne[0] == 128 || Q->ne[0] == 256) || V->ne[0] != Q->ne[0]) {
         return false;
     }
+    if (ggml_cuda_fattn_prefill_f16(dst)) {
+        return false;
+    }
     return ggml_cuda_is_aligned(K, 4) && ggml_cuda_is_aligned(V, 4);
 #endif
 }
