@@ -1321,6 +1321,26 @@ json oaicompat_chat_params_parse(
         }
     }
 
+    // --reasoning-effort-allow: an effort word the chat template does not accept (from the request or from
+    // chat_template_kwargs) becomes --reasoning-effort-fallback instead of reaching the template. Bonsai 2's
+    // template raises on "high", which Cline, Kilo and Open WebUI send: HTTP 500 on every request.
+    if (!opt.reasoning_effort_allow.empty()) {
+        auto it = inputs.chat_template_kwargs.find("reasoning_effort");
+        if (it != inputs.chat_template_kwargs.end()) {
+            std::string effort;
+            try {
+                effort = json::parse(it->second).get<std::string>();
+            } catch (...) {
+                effort = it->second;
+            }
+            const auto & allow = opt.reasoning_effort_allow;
+            if (std::find(allow.begin(), allow.end(), effort) == allow.end()) {
+                SRV_INF("reasoning_effort \"%s\" is not in --reasoning-effort-allow: using \"%s\"\n", effort.c_str(), opt.reasoning_effort_fallback.c_str());
+                it->second = json(opt.reasoning_effort_fallback).dump();
+            }
+        }
+    }
+
     inputs.force_pure_content = opt.force_pure_content;
 
     // Apply chat template to the list of messages
@@ -1385,6 +1405,21 @@ json oaicompat_chat_params_parse(
         // Exception: if "n_predict" is present, we overwrite the value specified earlier by "max_tokens"
         if (!llama_params.contains(item.key()) || item.key() == "n_predict") {
             llama_params[item.key()] = item.value();
+        }
+    }
+
+    // --reasoning-max-tokens-floor: with thinking on, a client output cap below the floor is raised to it. A
+    // thinking model spends its first thousands of tokens inside the thinking block; a 256-4096 token app cap
+    // ends the request there with no answer. The reasoning budget still bounds the thinking.
+    if (opt.reasoning_max_tokens_floor > 0 && inputs.enable_thinking && !chat_params.thinking_end_tags.empty()) {
+        for (const char * key : {"n_predict", "max_tokens", "max_completion_tokens"}) {
+            if (llama_params.contains(key) && llama_params.at(key).is_number_integer()) {
+                const int v = llama_params.at(key).get<int>();
+                if (v > 0 && v < opt.reasoning_max_tokens_floor) {
+                    SRV_INF("%s %d raised to %d (thinking on, --reasoning-max-tokens-floor)\n", key, v, opt.reasoning_max_tokens_floor);
+                    llama_params[key] = opt.reasoning_max_tokens_floor;
+                }
+            }
         }
     }
 
