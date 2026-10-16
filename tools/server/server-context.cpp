@@ -3538,8 +3538,11 @@ private:
                         slot.init_sampler();
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
-                        // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        // message, we are near the end of the prompt, or --checkpoint-every-nt is due
+                        const bool every_nt_due = params_base.checkpoint_every_nt > 0 &&
+                            n_tokens_start >= (slot.prompt.checkpoints.empty() ? 0 : slot.prompt.checkpoints.back().n_tokens) +
+                                              params_base.checkpoint_every_nt;
+                        if (!is_user_start && !near_prompt_end && !every_nt_due) {
                             do_checkpoint = false;
                         }
                     }
