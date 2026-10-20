@@ -15,6 +15,7 @@
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
@@ -72,6 +73,10 @@ struct llama_model_loader {
     int n_kv      = 0;
     int n_tensors = 0;
     int n_created = 0;
+
+    // tensors present in the file that create_tensor deliberately left unloaded (TENSOR_SKIP, e.g. the MTP
+    // block when speculation is off), so metadata that names them (prism.hadamard) can tell them from missing ones
+    std::unordered_set<std::string> skipped_tensors;
 
     uint64_t n_elements = 0;
     size_t   n_bytes    = 0;
