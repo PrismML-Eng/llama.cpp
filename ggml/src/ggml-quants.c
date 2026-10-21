@@ -2165,6 +2165,47 @@ size_t quantize_q1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     return nrow * row_size;
 }
 
+// ====================== PQ1_0 (Prism, Q1_0 codec at group 64) ======================
+
+void quantize_row_pq1_0_ref(const float * GGML_RESTRICT x, block_pq1_0 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_PQ1_0;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+    for (int i = 0; i < nb; i++) {
+        float sum_abs = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            sum_abs += fabsf(x[i*qk + j]);
+        }
+        y[i].d = GGML_FP32_TO_FP16(sum_abs / qk);
+        for (int j = 0; j < qk / 8; ++j) {
+            y[i].qs[j] = 0;
+        }
+        for (int j = 0; j < qk; ++j) {
+            if (x[i*qk + j] >= 0.0f) {
+                y[i].qs[j / 8] |= (1 << (j % 8));
+            }
+        }
+    }
+}
+
+void dequantize_row_pq1_0(const block_pq1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_PQ1_0;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < qk; ++j) {
+            y[i*qk + j] = ((x[i].qs[j / 8] >> (j % 8)) & 1) ? d : -d;
+        }
+    }
+}
+
+size_t quantize_pq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_pq1_0_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_PQ1_0, n_per_row);
+}
+
 size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     if (!quant_weights) {
         quantize_row_q2_0_ref(src, dst, (int64_t)nrow*n_per_row);
@@ -5703,6 +5744,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_Q1_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q1_0, data, nb);
+            } break;
+        case GGML_TYPE_PQ1_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_pq1_0, data, nb);
             } break;
         case GGML_TYPE_Q2_0:
             {
