@@ -3,10 +3,11 @@
 // Adapted from the Yukon cuda.fast Bonsai engine's J=128 PQ2_0 prefill kernel:
 // https://github.com/Layr-Labs/cudafast-bonsai2-9b-engine/tree/2c62b6cdd3ddabb4a418672e259c6be2baff20eb
 // (llama.cpp/ggml/src/ggml-cuda/mmq-pq2-j128.cuh), MIT licensed, see licenses/yukon-cudafast.
-// Port changes: ordinary launches (no programmatic stream serialization), no D1 activations, no fused GLU or
+// Port changes: ordinary launches (no programmatic stream serialization), no fused GLU or
 // plane-copy launches (no persistent weight copies); device code is compiled for sm_90+ only (the stream-k path
 // uses TMA bulk copies and mbarriers). The GLU/ADD/D1 template paths are kept to stay diffable with the source,
-// but only <PURE, ADD=false, GLU=false, COMPACT> is instantiated. Numerics are unchanged from the source.
+// but only <PURE, ADD=false, GLU=false, COMPACT, D1> is instantiated. Numerics are unchanged from the source.
+// D1 (opt-in, GGML_CUDA_PQ2_D1=1, not bit-exact): the activations carry one scale per 128 values (quantize.cu).
 
 // Originally written for GB10 (sm_121); runs on any NVIDIA sm_90+. J=128 PQ2_0 x q8_1 matmul (prefill) at 16 warps per SM.
 //
@@ -53,6 +54,19 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_mma(int (&d)[4], const
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(m));
 #else
     GGML_UNUSED_VARS(d, a, b0, b1);
+    NO_DEVICE_CODE;
+#endif
+}
+
+// Accumulating int8 mma (C in/out), used by the D1 consumer to sum the four 32-value sub-blocks in int32.
+static __device__ __forceinline__ void ggml_cuda_pq2_j16_mma(int (&c)[4], const int a0, const int a1, const int a2,
+                                                             const int a3, const int b0, const int b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE && !defined(GGML_USE_HIP)
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+        : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    GGML_UNUSED_VARS(c, a0, a1, a2, a3, b0, b1);
     NO_DEVICE_CODE;
 #endif
 }
@@ -352,7 +366,53 @@ static __device__ __forceinline__ void ggml_cuda_pq2_ws_compute_compact(float (&
     }
 }
 
-// (D1 compute not ported: prism has no D1 activation producer.)
+// D1 compute (GGML_CUDA_PQ2_D1=1, not bit-exact): the activation record holds one scale per 128 values (all four
+// D4 fields equal), so the four sub-block products are summed in int32 (|sum| <= 128*2*127 < 2^22) and scaled once.
+template<bool DT=false>static __device__ __forceinline__ void ggml_cuda_pq2_j128_d1_compute(
+ float (&acc)[2][4][4],uint32_t xs,uint32_t ys,uint32_t dbt=0){
+ const int lane=threadIdx.x,g=lane/4,c=lane%4;
+ constexpr int XS=4*ggml_cuda_pq2_j128_xs,YS=4*ggml_cuda_pq2_j128_ys;
+ const uint32_t xa=xs+(lane%16)*XS+(lane/16)*16;
+ const uint32_t ya=ys+(lane%8)*YS+16+((lane/8)%2)*16;
+ int C[2][4][4];
+#pragma unroll
+ for(int rt=0;rt<2;++rt){
+#pragma unroll
+  for(int ct=0;ct<4;++ct){
+#pragma unroll
+   for(int l=0;l<4;++l)C[rt][ct][l]=GGML_CUDA_PQ2_J128_MAGIC;
+  }
+ }
+#pragma unroll 1
+ for(int sub=0;sub<4;++sub){int A[2][4];
+#pragma unroll
+  for(int rt=0;rt<2;++rt)ggml_cuda_pq2_j128_ldsm_x4(A[rt],xa+rt*16*XS+sub*32);
+#pragma unroll
+  for(int ct=0;ct<4;++ct){int B[2];ggml_cuda_pq2_j128_ldsm_x2(B,ya+ct*8*YS+sub*32);
+#pragma unroll
+   for(int rt=0;rt<2;++rt)ggml_cuda_pq2_j16_mma(C[rt][ct],A[rt][0],A[rt][1],A[rt][2],A[rt][3],B[0],B[1]);
+  }
+ }
+ // Same original per-row dA, loaded after the integer reduction. The D1
+ // precondition is FOUR equal original F32 scale fields in each query record.
+ const uint32_t xd=xs+g*XS+128,yd=ys+2*c*YS;
+#pragma unroll
+ for(int rt=0;rt<2;++rt){
+  const float da0=ggml_cuda_pq2_j128_lds_f32(xd+rt*16*XS),da1=ggml_cuda_pq2_j128_lds_f32(xd+(rt*16+8)*XS);
+  const float neg0=-12582912.0f*da0,neg1=-12582912.0f*da1;
+#pragma unroll
+  for(int ct=0;ct<4;++ct){float2 db;
+   if constexpr(DT)db=ggml_cuda_pq2_j128_lds_v2f32(dbt+(ct*8+2*c)*4);
+   else{db.x=ggml_cuda_pq2_j128_lds_f32(yd+ct*8*YS);db.y=ggml_cuda_pq2_j128_lds_f32(yd+ct*8*YS+YS);}
+#pragma unroll
+   for(int l=0;l<4;++l){const float da=l/2?da1:da0,neg=l/2?neg1:neg0;
+    const float scaled=__fmaf_rn(__int_as_float(C[rt][ct][l]),da,neg);
+    acc[rt][ct][l]=__fmaf_rn(scaled,l%2?db.y:db.x,acc[rt][ct][l]);
+   }
+  }
+ }
+}
+
 
 template <bool PURE, bool COMPACT = false, bool D1 = false>
 static __device__ __forceinline__ void ggml_cuda_pq2_j128_segment(
@@ -413,7 +473,7 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_segment(
             if (hint_lane && kb + HINT_D < kb_stop) {
                 ggml_cuda_pq2_j128_hint(xblk + (HINT_D - 1)*BS + hint_off);
             }
-            if constexpr (D1) static_assert(!D1, "D1 not ported");
+            if constexpr (D1) ggml_cuda_pq2_j128_d1_compute<false>(acc, xw, yw + cur*YBYTES);
             else if constexpr (COMPACT) ggml_cuda_pq2_ws_compute_compact<false>(acc, xw, yw + cur*YBYTES);
             else ggml_cuda_pq2_j128_compute<false>(acc, xw, yw + cur*YBYTES);
             if (kb + 1 >= kb_stop) {
@@ -481,7 +541,7 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_segment(
             if (hint_lane && kb + HINT_D < kb_stop) {
                 ggml_cuda_pq2_j128_hint(xblk + (HINT_D - 1)*BS + hint_off);
             }
-            if constexpr (D1) static_assert(!D1, "D1 not ported");
+            if constexpr (D1) ggml_cuda_pq2_j128_d1_compute<true>(acc, xw, yw + cur*YBYTES, dbw + cur*2048);
             else if constexpr (COMPACT) ggml_cuda_pq2_ws_compute_compact<true>(acc, xw, yw + cur*YBYTES, dbw + cur*2048);
             else ggml_cuda_pq2_j128_compute<true>(acc, xw, yw + cur*YBYTES, dbw + cur*2048);
             if (kb + 1 >= kb_stop) {
@@ -843,6 +903,16 @@ static bool ggml_cuda_pq2_j128_enabled(const int cc) {
     return env >= 0 ? env == 1 : cc >= GGML_CUDA_CC_HOPPER && cc < 1000;
 }
 
+// GGML_CUDA_PQ2_D1=1 (opt-in, not bit-exact, needs the J=128 kernel): PQ2_0 activations with ne11 >= 128 are quantized
+// with one scale per 128 values instead of one per 32, and the J=128 kernel scales each 128-value block once.
+static bool ggml_cuda_pq2_d1_enabled(const int cc) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_PQ2_D1");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled && ggml_cuda_pq2_j128_enabled(cc);
+}
+
 // Same grid rule as launch_mul_mat_q for the PQ2_0 J=128 (stream-k) config on NVIDIA.
 static int ggml_cuda_mmq_pq2_j128_grid(const mmq_args & args, const int nsm) {
     const int nty    = (int) ((args.nrows_x + 127) / 128);
@@ -876,14 +946,15 @@ static void ggml_cuda_mmq_pq2_j128_launch(const mmq_args & args, const int grid,
     constexpr size_t smem = ggml_cuda_pq2_j128_smem() + (PURE ? 0 : 4096); // stream-k: + 2 x 2 KB transposed D4 scales
     const int nkb = (int) (args.ncols_x / QK_PQ2_0);
     const int ntx = (int) ((args.ncols_max + 127) / 128);
-    const auto kernel = (COMPACT || ggml_cuda_pq2_prefill_compact_mode() == 1)
+    const auto kernel = args.d1_y ? mul_mat_q_pq2_j128<PURE, ADD, false, true, true> :
+        (COMPACT || ggml_cuda_pq2_prefill_compact_mode() == 1)
         ? mul_mat_q_pq2_j128<PURE, ADD, false, true> : mul_mat_q_pq2_j128<PURE, ADD>;
-    static bool attr_set[GGML_CUDA_MAX_DEVICES] = {};
+    static bool attr_set[2][GGML_CUDA_MAX_DEVICES] = {};
     const int device = ggml_cuda_get_device();
-    if (!attr_set[device]) {
+    if (!attr_set[args.d1_y][device]) {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, (int) cudaSharedmemCarveoutMaxShared));
-        attr_set[device] = true;
+        attr_set[args.d1_y][device] = true;
     }
     kernel<<<dim3(2*grid, 1, 1), dim3(32, 8, 1), smem, stream>>>(args.x, args.y, args.dst, tmp_fixup, (int) args.nrows_x, nkb, (int) args.stride_row_x, (int) args.ncols_y,
         (int) args.nrows_dst, (int) args.ncols_dst, ntx, (const float *) nullptr, (float *) nullptr);
