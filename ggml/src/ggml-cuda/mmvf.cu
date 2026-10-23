@@ -804,6 +804,11 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
         case GGML_TYPE_F32:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 if (ampere_mma_available(cc)) {
+                    // A thin src0 (e.g. the 32-row GDN ssm_alpha/ssm_beta projections) gives the tiled mul_mat_f
+                    // only a block or two; the vector kernel is several times faster up to its batch limit.
+                    if (src0_ne[1] <= 512 && ne11 <= MMVF_MAX_BATCH_SIZE) {
+                        return true;
+                    }
                     return ne11 <= 3;
                 }
                 if (cc >= GGML_CUDA_CC_TURING) {
