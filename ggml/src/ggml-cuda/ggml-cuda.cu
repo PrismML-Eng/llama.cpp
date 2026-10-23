@@ -2702,8 +2702,19 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
+// A graph is cached under its first node. Speculative decoding (the MTP draft step) builds graphs whose first
+// node keeps its address but changes shape from one call to the next (1 to K+1 positions), and every change
+// reset the warmup of the one cached graph, so those steps ran eagerly. Mixing the first node's shape and the
+// node count into the key gives each shape its own cached graph; the property check still guards each one.
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    const ggml_tensor * n0 = cgraph->nodes[0];
+    uint64_t h = (uint64_t) (uintptr_t) n0;
+    const auto mix = [&h](uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); };
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        mix((uint64_t) n0->ne[d]);
+    }
+    mix((uint64_t) cgraph->n_nodes);
+    return (const void *) (uintptr_t) h;
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
