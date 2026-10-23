@@ -301,6 +301,12 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
         // The PT mat-vec path shares the weight decode across columns; with the branch-free PTQ1_0
         // MMQ tile loader the tile path overtakes it at 5+ columns on Ada (RTX 4070, Bonsai 2 27B:
         // mat-vec 155 t/s vs MMQ 244 t/s at n=8).
+        // On Hopper it is the other way round: H200, Bonsai 2 27B, one forward of n tokens at depth 4096,
+        // MMQ 17.99 / 18.76 ms vs PT mat-vec 12.64 / 15.71 ms at n = 5 / 8. The PT kernel's per-column
+        // arithmetic does not depend on the column count, so 5-8 column results equal the 2-4 column ones.
+        if (cc >= GGML_CUDA_CC_HOPPER && cc < GGML_CUDA_CC_BLACKWELL) {
+            return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
         return ne11 <= 4;
     }
 #endif
