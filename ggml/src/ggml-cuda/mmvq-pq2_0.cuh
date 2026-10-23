@@ -1,4 +1,4 @@
-// PQ2_0 mat-vec for 3-8 columns (plain 2D), tuned on Ada.
+// PQ2_0 mat-vec for 3-8 columns (plain 2D), tuned on Ada, also taken on Hopper.
 //
 // Why: the generic mmvq kernel loses most of its DRAM throughput from 3 columns on (RTX 4070, Bonsai 2 27B shapes:
 // 44% of peak at 4 columns). Here the activations use GGML_CUDA_Q8_1_PQ2: per column the qs bytes come first,
@@ -15,13 +15,21 @@
 
 template <int ncols>
 __global__ void __launch_bounds__(PQ2_0_MC_WARPS * 32, 3)
-mul_mat_vec_pq2_0_mc(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+mul_mat_vec_pq2_0_mc(const void * vx_, const void * vy_, float * dst_,
         const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst) {
+    // Plain pointer parameters, restrict-qualified locals: GGML_CUDA_RESTRICT differs between the host and device
+    // passes, which breaks the template stub. Same pattern as mul_mat_vec_q.
+    const void * GGML_CUDA_RESTRICT vx  = vx_;
+    const void * GGML_CUDA_RESTRICT vy  = vy_;
+    float      * GGML_CUDA_RESTRICT dst = dst_;
     const int lane = threadIdx.x & 31;
     const int row0 = ((blockIdx.x * blockDim.x + threadIdx.x) >> 5) * PQ2_0_MC_ROWS;
     if (row0 >= nrows_x) {
         return;
     }
+    // launched through ggml_cuda_kernel_launch, which opts into PDL on Hopper and newer: wait for the kernel
+    // that wrote vy (the q8_1 activation quantization) before reading it
+    ggml_cuda_pdl_sync();
 
     const int     nchunk    = ncols_x / QK8_1;
     const size_t  col_bytes = (size_t) stride_col_y * sizeof(block_q8_1);
@@ -79,6 +87,8 @@ mul_mat_vec_pq2_0_mc(const void * __restrict__ vx, const void * __restrict__ vy,
             }
         }
     }
+
+    ggml_cuda_pdl_lc();
 
 #pragma unroll
     for (int r = 0; r < PQ2_0_MC_ROWS; ++r) {
