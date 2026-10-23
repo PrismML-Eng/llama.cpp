@@ -4127,6 +4127,133 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// The decode conv chain of a gated delta net layer (one token, one sequence), as the hybrid models build it:
+// GET_ROWS (conv state row) -> CONCAT with the new token -> CPY of the last window back into a cache row,
+// SSM_CONV -> SILU -> L2_NORM of the leading q/k heads. The CUDA backend can run it as one launch
+// (GGML_CUDA_GDN_FUSION=1); the L2_NORM, the SILU output and the written cache row are all checked.
+struct test_gdn_conv_chain : public test_case {
+    const int64_t d_conv;
+    const int64_t head_dim;  // L2 row length
+    const int64_t n_qk_rows; // q + k heads
+    const int64_t n_ch;      // all channels (q, k and v)
+    const int     src_row;   // cache row read
+    const int     dst_row;   // cache row written
+    std::vector<ggml_tensor *> outs;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_CONV_CHAIN";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(d_conv, head_dim, n_qk_rows, n_ch, src_row, dst_row);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outs; }
+
+    test_gdn_conv_chain(int64_t d_conv = 4, int64_t head_dim = 128, int64_t n_qk_rows = 32, int64_t n_ch = 5120,
+            int src_row = 1, int dst_row = 1)
+        : d_conv(d_conv), head_dim(head_dim), n_qk_rows(n_qk_rows), n_ch(n_ch), src_row(src_row), dst_row(dst_row) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_rows = 3;
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (d_conv - 1) * n_ch, n_rows);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_ch);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, n_ch);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * state = ggml_get_rows(ctx, cache, ids);
+        state = ggml_reshape_3d(ctx, state, d_conv - 1, n_ch, 1);
+        x = ggml_scale(ctx, x, 1.0f); // a computed tensor, as the projection is in the model
+        ggml_tensor * xt = ggml_transpose(ctx, ggml_reshape_3d(ctx, x, n_ch, 1, 1));
+        ggml_tensor * conv_input = ggml_concat(ctx, state, xt, 0);
+
+        ggml_tensor * last = ggml_view_3d(ctx, conv_input, d_conv - 1, n_ch, 1, conv_input->nb[1], conv_input->nb[2],
+                                          ggml_row_size(conv_input->type, 1));
+        ggml_tensor * upd = ggml_view_2d(ctx, cache, (d_conv - 1) * n_ch, 1, cache->nb[1], dst_row * cache->nb[1]);
+        ggml_tensor * cpy = ggml_cpy(ctx, last, upd);
+        if (gf) {
+            ggml_build_forward_expand(gf, cpy);
+        }
+
+        ggml_tensor * y  = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, w));
+        ggml_tensor * qk = ggml_view_4d(ctx, y, head_dim, n_qk_rows, 1, 1, ggml_row_size(y->type, head_dim), y->nb[1],
+                                        y->nb[2], 0);
+        ggml_tensor * out = ggml_l2_norm(ctx, qk, 1e-6f);
+        ggml_set_name(out, "out");
+
+        outs = { out, y, cpy };
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                if (ggml_is_view_op(t->op)) {
+                    continue;
+                }
+                const int32_t row = src_row;
+                ggml_backend_tensor_set(t, &row, 0, sizeof(row));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// Two mat-vecs of one activation with same-shape float weights (the GDN alpha and beta projections); the CUDA backend
+// can run them as one launch (GGML_CUDA_GDN_FUSION=1). Both products are checked.
+struct test_mul_mat_vec_pair : public test_case {
+    const ggml_type type;
+    const int64_t   k;
+    const int64_t   m;
+    std::vector<ggml_tensor *> outs;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_VEC_PAIR";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, k, m);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outs; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    test_mul_mat_vec_pair(ggml_type type = GGML_TYPE_F32, int64_t k = 1024, int64_t m = 8) : type(type), k(k), m(m) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+        ggml_set_name(x, "x");
+        ggml_tensor * wa = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_set_name(wa, "wa");
+        ggml_tensor * wb = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_set_name(wb, "wb");
+        ggml_tensor * a = ggml_mul_mat(ctx, wa, x);
+        ggml_tensor * b = ggml_mul_mat(ctx, wb, x);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        if (gf) {
+            ggml_build_forward_expand(gf, a);
+            ggml_build_forward_expand(gf, b);
+        }
+        ggml_tensor * out = ggml_concat(ctx, a, b, 0);
+        ggml_set_name(out, "out");
+        outs = { a, b };
+        return out;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -9834,6 +9961,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}, fuse_bias));
             }
         }
+    }
+
+    // GDN decode conv chain: in place and across cache rows, several conv widths and head sizes
+    test_cases.emplace_back(new test_gdn_conv_chain(4, 128, 32, 4096 + 1024, 1, 1));
+    test_cases.emplace_back(new test_gdn_conv_chain(4, 128, 32, 4096 + 1024, 0, 2));
+    test_cases.emplace_back(new test_gdn_conv_chain(4, 128, 16, 4096, 2, 2));
+    test_cases.emplace_back(new test_gdn_conv_chain(4, 256, 8, 4096 + 2048, 1, 0));
+    test_cases.emplace_back(new test_gdn_conv_chain(3, 64, 4, 512, 1, 1));
+    test_cases.emplace_back(new test_gdn_conv_chain(5, 32, 6, 256, 0, 1));
+    for (ggml_type t : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+        test_cases.emplace_back(new test_mul_mat_vec_pair(t, 1024, 8));
+        test_cases.emplace_back(new test_mul_mat_vec_pair(t, 3072, 24));
+        test_cases.emplace_back(new test_mul_mat_vec_pair(t, 130, 3));
     }
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1

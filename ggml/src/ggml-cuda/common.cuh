@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1593,6 +1594,20 @@ struct ggml_cuda_gdn_gather_context {
     }
 };
 
+// GDN decode conv chain fused into one launch (GGML_CUDA_GDN_FUSION=1): the conv-state GET_ROWS is skipped and
+// registered under the CONCAT it feeds; the CONCAT launches the fused kernel, which also computes the conv-state CPY,
+// SSM_CONV + SILU and the q/k L2_NORM, and those nodes are marked done. Keyed by node identity, valid for one graph
+// evaluation, owned by the evaluating context (reset with the other per-evaluation registries).
+struct ggml_cuda_gdn_conv_context {
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *> gathers; // CONCAT -> the GET_ROWS it replaces
+    std::unordered_set<const ggml_tensor *>                      done;    // nodes computed by a fused launch
+
+    void reset() {
+        gathers.clear();
+        done.clear();
+    }
+};
+
 // A Hadamard transform (MUL_MAT with GGML_HINT_SRC0_IS_HADAMARD, optionally preceded by the sign
 // flip) whose only consumers are PTQ1_0 mat-vecs writes the q8_1-quantized activation into its own
 // output buffer instead of the F32 result (the quantized rows are 9/8 bytes per element, so they
@@ -1709,6 +1724,7 @@ struct ggml_backend_cuda_context {
     ggml_cuda_stream_context concurrent_stream_context;
     ggml_cuda_gdn_gather_context gdn_gather_context;
     ggml_cuda_fwht_q8_context    fwht_q8_context;
+    ggml_cuda_gdn_conv_context   gdn_conv_context;
 
     ~ggml_backend_cuda_context();
 
@@ -1727,6 +1743,8 @@ struct ggml_backend_cuda_context {
     ggml_cuda_gdn_gather_context & gdn_gathers() { return gdn_gather_context; }
 
     ggml_cuda_fwht_q8_context & fwht_q8() { return fwht_q8_context; }
+
+    ggml_cuda_gdn_conv_context & gdn_conv() { return gdn_conv_context; }
 
     cublasHandle_t cublas_handle() {
         if (cublas_handles[device][curr_stream_no] == nullptr) {

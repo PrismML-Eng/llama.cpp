@@ -12,3 +12,6 @@ void ggml_cuda_op_mul_mat_vec_f(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11);
+
+// two independent mat-vecs sharing src1 and the weight layout, as one launch (bit-identical); false: not launched
+bool ggml_cuda_mul_mat_vec_f_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst0, ggml_tensor * dst1);
