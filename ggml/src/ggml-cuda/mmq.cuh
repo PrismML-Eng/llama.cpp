@@ -1494,12 +1494,39 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + y_buffers*nbs_y_padded;
 }
 
+#include "mmq-pq2-j128.cuh"
+
 template <ggml_type type, int J, bool fallback>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // Bit-exact PQ2_0 J=128 (prefill) kernel at 16 warps per SM on NVIDIA sm_90+ (mmq-pq2-j128.cuh, adapted from the
+    // Yukon cuda.fast Bonsai engine): same work partition, same fixup, same FP32 order. Default on for Hopper,
+    // GGML_CUDA_PQ2_J128=0/1 overrides.
+    if constexpr (type == GGML_TYPE_PQ2_0 && J == 128 && !fallback) {
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_pq2_j128_enabled(cc) && cc >= GGML_CUDA_CC_HOPPER && warp_size == 32 &&
+                ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_HOPPER &&
+                ggml_cuda_mmq_get_config(type, J, fallback, cc).I == 128 && ggml_cuda_mmq_get_stream_k(type, J, fallback, cc) &&
+                ggml_cuda_mmq_pq2_j128_use(args, nsm)) {
+            const int grid = ggml_cuda_mmq_pq2_j128_grid(args, nsm);
+            ggml_cuda_pool_alloc<float> tmp_fixup(ctx.pool(id));
+            if (ggml_cuda_mmq_pq2_j128_needs_fixup(args, grid)) {
+                tmp_fixup.alloc((size_t) grid*128*128);
+            }
+            static bool logged = false;
+            if (!logged) {
+                GGML_LOG_INFO("%s: GGML_CUDA_PQ2_J128: using the PQ2_0 J=128 sm_90+ kernel\n", __func__);
+                logged = true;
+            }
+            ggml_cuda_mmq_pq2_j128_run<type>(args, grid, tmp_fixup.ptr, stream);
+            return;
+        }
+    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
     const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
     GGML_ASSERT(config.nthreads % warp_size == 0);
