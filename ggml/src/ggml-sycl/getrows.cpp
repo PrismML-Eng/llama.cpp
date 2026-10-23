@@ -15,6 +15,8 @@
 #include "dequantize.hpp"
 #include "getrows.hpp"
 
+#include <type_traits>
+
 
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static void k_get_rows(
@@ -213,6 +215,30 @@ static void get_rows_sycl_float(ggml_backend_sycl_context & ctx, const ggml_tens
                                 dst_t *dst_dd, queue_ptr stream) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    // copy 4 elements per work-item when the rows allow it: single 4-byte copies reach only
+    // about half the memory bandwidth on large rows (e.g. recurrent states)
+    if constexpr (std::is_same_v<src0_t, dst_t> && sizeof(src0_t) == 4) {
+        using vec_t = sycl::vec<src0_t, 4>;
+        if (ne00 % 4 == 0 && nb01 % 16 == 0 && nb02 % 16 == 0 && nb03 % 16 == 0 && nb1 % 16 == 0 && nb2 % 16 == 0 &&
+            nb3 % 16 == 0 && (uintptr_t) src0_dd % 16 == 0 && (uintptr_t) dst_dd % 16 == 0) {
+            const int64_t ne00_v = ne00 / 4;
+            const sycl::range<3> block_dims(1, 1, SYCL_GET_ROWS_BLOCK_SIZE);
+            const sycl::range<3> block_nums(ne11 * ne12, ne10, (ne00_v + SYCL_GET_ROWS_BLOCK_SIZE - 1) / SYCL_GET_ROWS_BLOCK_SIZE);
+            const size_t s1 = nb1 / sizeof(vec_t);
+            const size_t s2 = nb2 / sizeof(vec_t);
+            const size_t s3 = nb3 / sizeof(vec_t);
+            const size_t s10 = nb10 / ggml_element_size(src1);
+            const size_t s11 = nb11 / ggml_element_size(src1);
+            const size_t s12 = nb12 / ggml_element_size(src1);
+            const vec_t * src0_v = (const vec_t *) src0_dd;
+            vec_t *       dst_v  = (vec_t *) dst_dd;
+            stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
+                k_get_rows_float(src0_v, src1_dd, dst_v, ne00_v, ne12, s1, s2, s3, nb01, nb02, nb03, s10, s11, s12, item_ct1);
+            });
+            return;
+        }
+    }
 
     const sycl::range<3> block_dims(1, 1, SYCL_GET_ROWS_BLOCK_SIZE);
     const int block_num_x = (ne00 + SYCL_GET_ROWS_BLOCK_SIZE - 1) / SYCL_GET_ROWS_BLOCK_SIZE;
