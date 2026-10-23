@@ -3757,6 +3757,76 @@ static bool ggml_cuda_should_fuse_moe_weighted_reduce(const ggml_cgraph * cgraph
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// extent [first, last byte + 1) of a (possibly strided, non-negative stride) tensor view
+static void ggml_cuda_view_extent(const ggml_tensor * t, uintptr_t & beg, uintptr_t & end) {
+    size_t span = ggml_type_size(t->type);
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        span += (size_t) (t->ne[d] - 1) * t->nb[d];
+    }
+    beg = (uintptr_t) t->data;
+    end = beg + span;
+}
+
+// A run of independent F32 -> F32 CPY nodes that share shape and strides (only the data pointers differ), with only
+// view nodes in between: the recurrent rollback writes one conv-state snapshot per slot this way. One launch instead
+// of one per copy. Returns the number of extra nodes consumed (0: not applicable).
+static int ggml_cuda_try_batched_cpy(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * first = cgraph->nodes[i];
+    auto matches = [&](const ggml_tensor * n) {
+        if (n->op != GGML_OP_CPY || n->src[0]->type != GGML_TYPE_F32 || n->src[1]->type != GGML_TYPE_F32 ||
+                (n->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_nelements(n->src[0]) > INT_MAX) {
+            return false;
+        }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (n->src[0]->ne[d] != first->src[0]->ne[d] || n->src[0]->nb[d] != first->src[0]->nb[d] ||
+                    n->src[1]->ne[d] != first->src[1]->ne[d] || n->src[1]->nb[d] != first->src[1]->nb[d]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!matches(first)) {
+        return 0;
+    }
+
+    int idx[CUDA_CPY_BATCH_MAX];
+    int n = 0;
+    int last = i;
+    for (int j = i; j < cgraph->n_nodes && n < CUDA_CPY_BATCH_MAX; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (matches(node)) {
+            // independent of the copies before it: no earlier destination overlaps this source or destination
+            uintptr_t sb, se, db, de;
+            ggml_cuda_view_extent(node->src[0], sb, se);
+            ggml_cuda_view_extent(node->src[1], db, de);
+            bool ok = true;
+            for (int k = 0; k < n && ok; ++k) {
+                uintptr_t pb, pe;
+                ggml_cuda_view_extent(cgraph->nodes[idx[k]]->src[1], pb, pe);
+                ok = (pe <= sb || se <= pb) && (pe <= db || de <= pb);
+            }
+            if (!ok) {
+                break;
+            }
+            idx[n++] = j;
+            last = j;
+        } else if (!ggml_cuda_is_view_or_noop(node)) {
+            break;
+        }
+    }
+    if (n < 2) {
+        return 0;
+    }
+
+    ggml_cuda_cpy_batch batch;
+    for (int k = 0; k < n; ++k) {
+        batch.src[k] = (const char *) cgraph->nodes[idx[k]]->src[0]->data;
+        batch.dst[k] = (char *) cgraph->nodes[idx[k]]->src[1]->data;
+    }
+    ggml_cuda_cpy_f32_batched(*cuda_ctx, first->src[0], first->src[1], batch, n);
+    return last - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3769,6 +3839,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }();
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_CPY) {
+        static const bool batched_cpy = [] {
+            const char * env = getenv("GGML_CUDA_BATCHED_CPY");
+            return !env || std::atoi(env) != 0;
+        }();
+        if (batched_cpy) {
+            if (const int n = ggml_cuda_try_batched_cpy(cuda_ctx, cgraph, i)) {
+                return n;
+            }
+        }
+    }
 
     // GB10 prefill: apply SWIGLU while quantizing the activation consumed by the
     // following low-bit down projection. This avoids materializing and rereading

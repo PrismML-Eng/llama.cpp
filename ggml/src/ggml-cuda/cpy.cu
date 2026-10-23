@@ -615,3 +615,45 @@ void ggml_cuda_dup(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     ggml_cuda_cpy(ctx, src0, dst);
 }
+
+static __global__ void cpy_f32_batched(const ggml_cuda_cpy_batch batch, const int64_t ne,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02,
+        const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12,
+        const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= ne) {
+        return;
+    }
+
+    const int64_t i03 = i/(ne00 * ne01 * ne02);
+    const int64_t i02 = (i - i03*ne00*ne01*ne02 )/ (ne00*ne01);
+    const int64_t i01 = (i - i03*ne00*ne01*ne02  -  i02*ne01*ne00) / ne00;
+    const int64_t i00 = i - i03*ne00*ne01*ne02 - i02*ne01*ne00 - i01*ne00;
+    const int64_t x_offset = i00*nb00 + i01*nb01 + i02*nb02 + i03 * nb03;
+
+    const int64_t i13 = i/(ne10 * ne11 * ne12);
+    const int64_t i12 = (i - i13*ne10*ne11*ne12) / (ne10*ne11);
+    const int64_t i11 = (i - i13*ne10*ne11*ne12 - i12*ne10*ne11) / ne10;
+    const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
+    const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13 * nb13;
+
+    ggml_cuda_pdl_sync();
+    *(float *) (batch.dst[blockIdx.y] + dst_offset) = *(const float *) (batch.src[blockIdx.y] + x_offset);
+}
+
+void ggml_cuda_cpy_f32_batched(ggml_backend_cuda_context & ctx, const ggml_tensor * src_ref, const ggml_tensor * dst_ref,
+                               const ggml_cuda_cpy_batch & batch, const int n) {
+    GGML_ASSERT(n >= 1 && n <= CUDA_CPY_BATCH_MAX);
+    const int64_t ne = ggml_nelements(src_ref);
+    GGML_ASSERT(ne == ggml_nelements(dst_ref) && ne <= INT_MAX);
+
+    const int num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params(dim3(num_blocks, n, 1), dim3(CUDA_CPY_BLOCK_SIZE, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(cpy_f32_batched, launch_params, batch, ne,
+        src_ref->ne[0], src_ref->ne[1], src_ref->ne[2],
+        (int64_t) src_ref->nb[0], (int64_t) src_ref->nb[1], (int64_t) src_ref->nb[2], (int64_t) src_ref->nb[3],
+        dst_ref->ne[0], dst_ref->ne[1], dst_ref->ne[2],
+        (int64_t) dst_ref->nb[0], (int64_t) dst_ref->nb[1], (int64_t) dst_ref->nb[2], (int64_t) dst_ref->nb[3]);
+}

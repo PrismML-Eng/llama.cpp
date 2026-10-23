@@ -6775,6 +6775,53 @@ struct test_argsort : public test_case {
     }
 };
 
+// K consecutive CPYs of overlapping strided windows into separate slots of one tensor (the recurrent conv-state
+// rollback snapshots); the CUDA backend batches such runs into one launch
+struct test_cpy_snapshots : public test_case {
+    const int64_t w;      // window width (conv kernel - 1)
+    const int64_t c;      // channels
+    const int64_t n_tok;  // new tokens
+    const int64_t K;      // snapshot slots
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CPY_SNAPSHOTS";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(w, c, n_tok, K);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_cpy_snapshots(int64_t w = 3, int64_t c = 8192, int64_t n_tok = 16, int64_t K = 16)
+        : w(w), c(c), n_tok(n_tok), K(K) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w + n_tok, c);
+        ggml_set_name(x, "x");
+        x = ggml_scale(ctx, x, 1.0f); // a computed tensor, as in the model
+        ggml_tensor * slots = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w * c, K + 1);
+        ggml_set_name(slots, "slots");
+        slots = ggml_scale(ctx, slots, 1.0f);
+        ggml_tensor * last = slots;
+        for (int64_t t = 1; t <= K; ++t) {
+            const int64_t s_idx = std::max<int64_t>(0, n_tok - K + t);
+            ggml_tensor * src = ggml_view_2d(ctx, x, w, c, x->nb[1], s_idx * sizeof(float));
+            ggml_tensor * dst = ggml_view_2d(ctx, slots, w * c, 1, slots->nb[1], (K - t) * slots->nb[1]);
+            last = ggml_cpy(ctx, src, dst);
+            if (gf && t < K) {
+                ggml_build_forward_expand(gf, last);
+            }
+        }
+        // read every slot after the copies (the last copy orders them before the read)
+        ggml_tensor * out = ggml_add(ctx, ggml_view_2d(ctx, slots, w * c, K + 1, slots->nb[1], 0),
+                                     ggml_repeat(ctx, ggml_sum(ctx, last), ggml_view_2d(ctx, slots, w * c, K + 1, slots->nb[1], 0)));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_TOP_K
 struct test_top_k : public test_case {
     const ggml_type type;
@@ -10495,6 +10542,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2049, 2, 1, 3}, order));
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2, 8, 8192, 1}, order)); // bailingmoe2 (group selection)
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2048, 512, 1, 1}, order)); // test CUDA dispatching to radix sort for nrows > = 1 in graph mode
+    }
+
+    for (auto [n_tok, K] : std::vector<std::pair<int64_t, int64_t>>{{1, 4}, {4, 4}, {16, 16}, {3, 16}, {40, 33}}) {
+        test_cases.emplace_back(new test_cpy_snapshots(3, 8192, n_tok, K));
+        test_cases.emplace_back(new test_cpy_snapshots(3, 37, n_tok, K));
     }
 
     for (int n = 1; n < 5; ++n) {
