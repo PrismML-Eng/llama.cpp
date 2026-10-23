@@ -1,5 +1,8 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
+#include "top-k-select.cuh"
+
+#include <cstdlib>
 
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
@@ -71,6 +74,20 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
     }
 #elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
+    // Wide rows with a small k (the DFlash2 selector over the vocabulary): a
+    // full segmented radix sort per row costs far more than selecting k
+    // values. The streaming selection returns the same indices in the same
+    // order as the stable descending radix sort; GGML_CUDA_TOPK_SELECT=0
+    // restores the argsort route.
+    static const bool select_disabled = getenv("GGML_CUDA_TOPK_SELECT") != nullptr &&
+                                        atoi(getenv("GGML_CUDA_TOPK_SELECT")) == 0;
+    if (!select_disabled && ncols > 1024 && topk_select_supported(ncols, nrows, k)) {
+        ggml_cuda_pool_alloc<uint64_t> scratch(pool, topk_select_scratch_elems(ncols, nrows, k));
+        topk_select_launch(src0_d, dst_d, scratch.get(), ncols, nrows, k, stream);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
     // Fall back to argsort + copy
     const int    ncols_pad      = next_power_of_2(ncols);
     const size_t shared_mem     = ncols_pad * sizeof(int);
