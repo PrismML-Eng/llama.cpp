@@ -13,7 +13,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
 
     // keep type_KV: the F16 instantiation converts K/V to f16 into scratch that
     // ggml_cuda_flash_attn_ext_get_alloc_size does not reserve for the in-place quantized path
-    if (turing_mma_available(cc) && ggml_is_quantized(V->type) && Q->ne[1] > 2 && Q->ne[1] <= 4) {
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) > GGML_CUDA_CC_TURING && ggml_is_quantized(V->type) && Q->ne[1] > 2 && Q->ne[1] <= 4) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2, type_KV>(ctx, dst);
         return;
     }
