@@ -313,13 +313,14 @@ static void fwht_quantize_launch(
         case  512: fwht_quantize_launch_layout< 512, T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, stream); break;
         case 1024: fwht_quantize_launch_layout<1024, T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, stream); break;
         case 2048: fwht_quantize_launch_layout<2048, T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, stream); break;
+        case 4096: fwht_quantize_launch_layout<4096, T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, stream); break;
         default: GGML_ABORT("fused FWHT quantizer: unsupported transform width %d", n);
     }
 }
 
 bool ggml_cuda_fwht_quantize_supported(const int n, const int64_t ne00) {
     switch (n) {
-        case 64: case 128: case 256: case 512: case 1024: case 2048:
+        case 64: case 128: case 256: case 512: case 1024: case 2048: case 4096:
             break;
         default:
             return false;

@@ -5145,6 +5145,38 @@ struct test_arclab_glu_rot : public test_case {
     void initialize_tensors(ggml_context * ctx) override { arclab_init(ctx); }
 };
 
+// [SWIGLU ->] MUL(signs) -> RESHAPE -> Hadamard MUL_MAT (width blk) -> mat-vec of weight type `type`: the
+// CUDA fused FWHT + q8_1 quantizer path (GGML_CUDA_FWHT_FUSION, GGML_CUDA_FWHT_FUSION_PQ2 for PQ2_0).
+struct test_rot_matvec : public test_case {
+    const ggml_type type; const int64_t blk, K, M, N; const bool swiglu;
+    std::vector<ggml_tensor *> outs;
+    test_rot_matvec(ggml_type type, int64_t blk, int64_t K, int64_t M, int64_t N, bool swiglu)
+        : type(type), blk(blk), K(K), M(M), N(N), swiglu(swiglu) {}
+    std::string op_desc(ggml_tensor *) override { return "ROT_MATVEC"; }
+    std::string vars() override { return VARS_TO_STR6(type, blk, K, M, N, swiglu); }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outs; }
+    double max_nmse_err() override { return 5e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x;
+        if (swiglu) {
+            ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M); ggml_set_name(g, "gate");
+            ggml_tensor * u = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M); ggml_set_name(u, "up");
+            x = ggml_swiglu_split(ctx, g, u);
+        } else {
+            x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M); ggml_set_name(x, "x");
+        }
+        ggml_tensor * sg  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, K); ggml_set_name(sg, "signs");
+        ggml_tensor * had = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, blk, blk); ggml_set_name(had, "hadamard");
+        ggml_tensor * w   = ggml_new_tensor_2d(ctx, type, K, N); ggml_set_name(w, "w");
+        ggml_tensor * mm;
+        ggml_tensor * out = arclab_rot_matmul(ctx, x, sg, had, w, &mm);
+        outs = { out };
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override { arclab_init(ctx); }
+};
+
 // ADD -> RMS_NORM -> MUL(w) -> MUL(signs) -> RESHAPE -> Hadamard MUL_MAT -> T2 mat-vec (GGML_SYCL_PTQ1_T2_NORMQ). The
 // far variant (GGML_SYCL_NORM_ROT_FAR: cache ops between norm and rotation) cannot be built here: a single-output graph
 // has no node to put in between; it is covered by the whole-model checks (byte-identical outputs).
@@ -9841,6 +9873,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fwht_signed(128,  1024,  5,   GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_fwht_signed(2048, 8192,  3,   GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_fwht_signed(1024, 5120,  4,   GGML_TYPE_F16, true));
+    // fused FWHT + q8_1 into PQ2_0 / PTQ1_0 mat-vecs, rotation widths 512 and 4096
+    for (ggml_type t : {GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0}) {
+        for (int64_t M : {1, 2}) {
+            test_cases.emplace_back(new test_rot_matvec(t, 512,  1024, M, 3072, false));
+            test_cases.emplace_back(new test_rot_matvec(t, 512,  3072, M, 1024, true));
+            test_cases.emplace_back(new test_rot_matvec(t, 512,  1536, M, 2048, false));
+            test_cases.emplace_back(new test_rot_matvec(t, 4096, 4096, M, 1024, false));
+            test_cases.emplace_back(new test_rot_matvec(t, 4096, 8192, M, 512,  true));
+        }
+    }
     // ARC-LAB fusion tests (arctune): Bonsai 27B shapes and token counts, 3 seeds each
     for (int seed = 0; seed < 3; ++seed) {
         for (int64_t M : {1, 4, 5, 8}) {

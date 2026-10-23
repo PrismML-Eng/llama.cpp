@@ -2868,6 +2868,8 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
 // mat-vecs quantizes it to q8_1 straight away, so the transform kernel quantizes as it goes and writes
 // the q8_1 rows (in the layout the mat-vecs expect) into its own output buffer; the mat-vecs then skip
 // their quantize launch (ggml_cuda_fwht_q8). On Bonsai 2 that removes ~390 launches per decode step.
+// GGML_CUDA_FWHT_FUSION_PQ2=1 (off by default) also accepts PQ2_0 consumers on the q8_1 AoS layout: the
+// same butterfly and the same per-32 quantizer as the unfused pair, so the q8_1 rows are bit-identical.
 // The check walks every later node, so any other use of the output (or of a view of it) keeps the
 // plain transform, and use counts guard against consumers outside this graph. Returns the number of
 // nodes consumed (3 or 1) or 0 to fall through. GGML_CUDA_FWHT_FUSION=0 disables it.
@@ -2877,6 +2879,8 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
     if (disabled) {
         return 0;
     }
+    static const bool pq2_enabled = getenv("GGML_CUDA_FWHT_FUSION_PQ2") != nullptr &&
+                                    atoi(getenv("GGML_CUDA_FWHT_FUSION_PQ2")) != 0;
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_TURING) {
         return 0; // the PTQ1_0 mmvq predicate below is only meaningful there
@@ -2941,7 +2945,8 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
     const bool out_aliases_in = overlaps(x, mm) || (signs && overlaps(signs, mm));
 
     // every use of the transform output (directly or through a reshape view of the whole tensor)
-    // must be src1 of a PTQ1_0 MUL_MAT that ggml_cuda_mul_mat routes to ggml_cuda_mul_mat_vec_q.
+    // must be src1 of a PTQ1_0 (or, opted in, PQ2_0) MUL_MAT that ggml_cuda_mul_mat routes to
+    // ggml_cuda_mul_mat_vec_q, all consumers of one weight type so they share one q8_1 layout.
     // The consumers' src1 shape [K, ncols] is what gets quantized (x is only known to be
     // contiguous with the same element count; in the unsigned pattern it is the [n, rows] reshape).
     const ggml_tensor * aliases[8] = { mm };
@@ -2951,6 +2956,7 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
     int64_t K             = 0;
     int64_t ncols         = 0;
     int64_t ne0_padded    = 0;
+    ggml_type wtype       = GGML_TYPE_COUNT;
     ggml_cuda_q8_1_layout layout = GGML_CUDA_Q8_1_AOS;
     for (int j = i_mm + 1; j < cgraph->n_nodes; ++j) {
         ggml_tensor * t = cgraph->nodes[j];
@@ -2979,16 +2985,22 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
                 uses_expected += ggml_node_get_use_count(cgraph, j);
                 continue;
             }
-            if (t->op != GGML_OP_MUL_MAT || s != 1 || !t->src[0] || t->src[0]->type != GGML_TYPE_PTQ1_0 ||
+            const ggml_type ct = t->src[0] ? t->src[0]->type : GGML_TYPE_COUNT;
+            const bool type_ok = ct == GGML_TYPE_PTQ1_0 || (pq2_enabled && ct == GGML_TYPE_PQ2_0);
+            if (t->op != GGML_OP_MUL_MAT || s != 1 || !type_ok || (wtype != GGML_TYPE_COUNT && ct != wtype) ||
                     ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
                     t->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) ||
                     src->ne[2] != 1 || src->ne[3] != 1 ||
                     (K != 0 && (src->ne[0] != K || src->ne[1] != ncols)) ||
-                    !ggml_cuda_should_use_mmvq(GGML_TYPE_PTQ1_0, cc, src->ne[1])) {
+                    !ggml_cuda_should_use_mmvq(ct, cc, src->ne[1])) {
                 return 0;
+            }
+            if (ct == GGML_TYPE_PQ2_0 && cc >= GGML_CUDA_CC_PASCAL && cc < GGML_CUDA_CC_VOLTA) {
+                return 0; // ggml_cuda_mul_mat_pq2_0_ordered quantizes src1 itself
             }
             K     = src->ne[0];
             ncols = src->ne[1];
+            wtype = ct;
             // ggml_cuda_mul_mat sends a padded compute-buffer view to cuBLAS instead
             const ggml_tensor * w = t->src[0];
             if (ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
@@ -3003,9 +3015,15 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
     if (K % n != 0 || !ggml_cuda_fwht_quantize_supported(n, K) || (signs && signs->ne[0] != K)) {
         return 0;
     }
+    if (n > 2048 && !pq2_enabled) {
+        return 0; // 4096-wide fused transforms are part of the opt-in for now
+    }
 
     // same (type, ncols, ids) -> layout and padding as ggml_cuda_mul_mat_vec_q
-    layout     = ggml_cuda_q8_1_layout_host(GGML_TYPE_PTQ1_0, (int) ncols, false);
+    layout     = ggml_cuda_q8_1_layout_host(wtype, (int) ncols, false);
+    if (layout != GGML_CUDA_Q8_1_AOS && layout != GGML_CUDA_Q8_1_PT && layout != GGML_CUDA_Q8_1_SOA_ISUM) {
+        return 0; // e.g. the Ada PQ2_0 multi-column layout, which the fused quantizer does not write
+    }
     ne0_padded = GGML_PAD(K, MATRIX_ROW_PADDING);
     if (layout == GGML_CUDA_Q8_1_SOA_ISUM) {
         ne0_padded = GGML_PAD(ne0_padded, GGML_CUDA_PTQ1_K_PAD);
