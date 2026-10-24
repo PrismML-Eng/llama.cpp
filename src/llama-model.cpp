@@ -2011,6 +2011,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     throw std::runtime_error("prism.hadamard.tied_output is not bound to the token embedding");
                 }
             }
+            if (weight == nullptr && ml.skipped_tensors.count(weight_name)) {
+                // deliberately not loaded (e.g. the MTP block with speculation off): nothing to rotate
+                LLAMA_LOG_DEBUG("%s: prism.hadamard: skipping unloaded tensor %s\n", __func__, weight_name.c_str());
+                continue;
+            }
             if (weight == nullptr) {
                 throw std::runtime_error(format("prism.hadamard weight not found: %s", weight_name.c_str()));
             }
