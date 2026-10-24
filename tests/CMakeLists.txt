@@ -361,6 +361,7 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-metal-graph-optimize.cpp  LABEL "main behavior backend"  LINK ggml ggml-metal)
     target_include_directories(test-metal-graph-optimize PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
 endif()
+llama_build_and_test(test-prism-hadamard-skip.cpp  LABEL "main behavior")
 
 llama_build(test-backend-ops.cpp LINK ggml)
 
