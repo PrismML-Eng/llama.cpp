@@ -6711,7 +6711,7 @@ static float * ggml_sycl_ptq1_multi_slot(queue_ptr stream) {
     const int                     dev  = ggml_sycl_get_device();
     float *&                      buf  = scratch[dev];
     if (!buf) {
-        buf = (float *) sycl::malloc_device(PTQ1_MULTI_SLOTS * PTQ1_MULTI_SLOT_BYTES, *stream);
+        buf = (float *) ggml_sycl_malloc_device(PTQ1_MULTI_SLOTS * PTQ1_MULTI_SLOT_BYTES, *stream);
         if (!buf) {
             return nullptr;
         }
