@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
+#include <map>
 #include <mutex>
 #include <vector>
 
@@ -37,23 +38,24 @@ int t2_mode() {
     return mode;
 }
 
-// growing per-process scratch for the int8 activations and their scales (in-order queue: reuse is safe)
+// growing scratch for the int8 activations and their scales, one per device (in-order queue: reuse is safe)
 struct scratch {
     void * p     = nullptr;
     size_t bytes = 0;
 };
 
 void * scratch_get(sycl::queue & q, size_t bytes) {
-    static std::mutex mtx;
-    static scratch    s;
-    std::lock_guard<std::mutex> lock(mtx);
+    static std::mutex             mtx;
+    static std::map<int, scratch> per_dev;
+    std::lock_guard<std::mutex>   lock(mtx);
+    scratch &                     s = per_dev[ggml_sycl_get_device()];
     if (bytes > s.bytes) {
         if (s.p) {
             q.wait();
-            sycl::free(s.p, q);
+            ggml_sycl_free_device(s.p, q);
         }
         s.bytes = bytes + bytes / 4;
-        s.p     = sycl::malloc_device(s.bytes, q);
+        s.p     = ggml_sycl_malloc_device(s.bytes, q);
         if (!s.p) {
             fprintf(stderr, "ptq1-t2: no device memory for %zu bytes of activation scratch\n", s.bytes);
             abort();
@@ -121,7 +123,7 @@ bool ggml_sycl_t2_repack(sycl::queue & q, void * data, int64_t K, int64_t N, boo
     const int64_t nb        = K / QK;
     const int64_t blk_bytes = pq2 ? 34 : BLK_BYTES;  // block_pq2_0: fp16 d, then 32 bytes of 2-bit codes
     const size_t  src_bytes = (size_t) N * nb * blk_bytes;
-    uint8_t *     tmp       = (uint8_t *) sycl::malloc_device(src_bytes, q);
+    uint8_t *     tmp       = (uint8_t *) ggml_sycl_malloc_device(src_bytes, q);
     if (!tmp) {
         fprintf(stderr, "%s: no device memory for a %zu-byte repack buffer\n", __func__, src_bytes);
         abort();
@@ -129,7 +131,7 @@ bool ggml_sycl_t2_repack(sycl::queue & q, void * data, int64_t K, int64_t N, boo
     q.memcpy(tmp, data, src_bytes).wait();
     uint32_t * B   = (uint32_t *) data;
     uint16_t * SB  = (uint16_t *) ((char *) data + (size_t) (K / 16) * N * 4);
-    int *      bad = sycl::malloc_device<int>(1, q);
+    int *      bad = (int *) ggml_sycl_malloc_device(sizeof(int), q);
     q.memset(bad, 0, sizeof(int)).wait();
     q.parallel_for(sycl::range<2>((size_t) (K / 16), (size_t) N), [=](sycl::item<2> it) {
          const int64_t   kp = it[0], n = it[1];
@@ -176,8 +178,8 @@ bool ggml_sycl_t2_repack(sycl::queue & q, void * data, int64_t K, int64_t N, boo
      }).wait();
     int bad_h = 0;
     q.memcpy(&bad_h, bad, sizeof(int)).wait();
-    sycl::free(bad, q);
-    sycl::free(tmp, q);
+    ggml_sycl_free_device(bad, q);
+    ggml_sycl_free_device(tmp, q);
     // ARC-LAB experiment: GGML_SYCL_T2_ZERO_WEIGHTS=1 zeroes every T2 weight after the repack (output is garbage). The Xe2
     // memory compression then makes weight reads almost free, so a profile shows everything else a token costs (2026-10-05).
     static const bool zero_w = getenv("GGML_SYCL_T2_ZERO_WEIGHTS") && atoi(getenv("GGML_SYCL_T2_ZERO_WEIGHTS"));
@@ -809,11 +811,11 @@ namespace {
 // decode): the JIT of GemmMT alone took ~35 s at the first prompt otherwise
 void t2_precompile(sycl::queue & q) {
     constexpr int K = 128, N = 32, M = 16;
-    char *     w  = (char *) sycl::malloc_device(ggml_sycl_t2_bytes(K, N), q);
-    float *    x  = sycl::malloc_device<float>(M * K, q);
-    float *    d  = sycl::malloc_device<float>(M * N, q);
-    int8_t *   aq = sycl::malloc_device<int8_t>(M * K, q);
-    uint16_t * sa = sycl::malloc_device<uint16_t>(int8dpas::ldsa(M) * (K / 32) + 64, q);
+    char *     w  = (char *) ggml_sycl_malloc_device(ggml_sycl_t2_bytes(K, N), q);
+    float *    x  = (float *) ggml_sycl_malloc_device(sizeof(float) * M * K, q);
+    float *    d  = (float *) ggml_sycl_malloc_device(sizeof(float) * M * N, q);
+    int8_t *   aq = (int8_t *) ggml_sycl_malloc_device(M * K, q);
+    uint16_t * sa = (uint16_t *) ggml_sycl_malloc_device(sizeof(uint16_t) * (int8dpas::ldsa(M) * (K / 32) + 64), q);
     q.memset(w, 0, ggml_sycl_t2_bytes(K, N));
     q.memset(x, 0, sizeof(float) * M * K);
     const uint32_t * B  = (const uint32_t *) w;
@@ -838,10 +840,10 @@ void t2_precompile(sycl::queue & q) {
         }
     }
     q.wait();
-    sycl::free(w, q);
-    sycl::free(x, q);
-    sycl::free(d, q);
-    sycl::free(aq, q);
-    sycl::free(sa, q);
+    ggml_sycl_free_device(w, q);
+    ggml_sycl_free_device(x, q);
+    ggml_sycl_free_device(d, q);
+    ggml_sycl_free_device(aq, q);
+    ggml_sycl_free_device(sa, q);
 }
 }  // namespace
