@@ -277,12 +277,12 @@ static NSString * ggml_metal_library_flatten_source(NSString * path_source, NSEr
 }
 
 // tensor API headers need Metal 4.0, and an unset language version follows the build SDK
-static void ggml_metal_compile_options_set_lang(MTLCompileOptions * options, bool has_tensor) {
+static void ggml_metal_compile_options_set_lang(MTLCompileOptions * options, bool has_tensor, bool has_tensor_direct) {
     if (!has_tensor) {
         return;
     }
 
-    options.languageVersion = (MTLLanguageVersion) MTLLanguageVersion4_0_GGML;
+    options.languageVersion = (MTLLanguageVersion) (has_tensor_direct ? ((4 << 16) | 1) : MTLLanguageVersion4_0_GGML);
 }
 
 // Compile all per-kind libraries in parallel. `source_for_kind` returns the MSL
@@ -324,7 +324,7 @@ static bool ggml_metal_library_compile_all(
             @autoreleasepool {
                 MTLCompileOptions * options = [MTLCompileOptions new];
                 options.preprocessorMacros = prep;
-                ggml_metal_compile_options_set_lang(options, ggml_metal_device_get_props(res->dev)->has_tensor);
+                ggml_metal_compile_options_set_lang(options, ggml_metal_device_get_props(res->dev)->has_tensor, ggml_metal_device_get_props(res->dev)->has_tensor_direct);
 
                 lib = [device newLibraryWithSource:src options:options error:&error];
 
@@ -396,6 +396,9 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
     }
     if (ggml_metal_device_get_props(dev)->has_tensor) {
         [prep setObject:@"1" forKey:@"GGML_METAL_HAS_TENSOR"];
+    }
+    if (ggml_metal_device_get_props(dev)->has_tensor_direct) {
+        [prep setObject:@"1" forKey:@"GGML_METAL_HAS_TENSOR_DIRECT"];
     }
 #if GGML_METAL_EMBED_LIBRARY
     [prep setObject:@"1" forKey:@"GGML_METAL_EMBED_LIBRARY"];
@@ -569,7 +572,7 @@ ggml_metal_library_t ggml_metal_library_init_from_source(ggml_metal_device_t dev
 
         MTLCompileOptions * options = [MTLCompileOptions new];
         options.preprocessorMacros = prep;
-        ggml_metal_compile_options_set_lang(options, ggml_metal_device_get_props(dev)->has_tensor);
+        ggml_metal_compile_options_set_lang(options, ggml_metal_device_get_props(dev)->has_tensor, ggml_metal_device_get_props(dev)->has_tensor_direct);
 
         library = [device newLibraryWithSource:src options:options error:&error];
         if (error) {
@@ -1144,6 +1147,29 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
 
                     ggml_metal_library_free(lib);
                 }
+            }
+
+            // The direct operand layout has only been validated on M5 with the OS 27 runtime.
+#if TARGET_OS_OSX
+            if (@available(macOS 27.0, *)) {
+                dev->props.has_tensor_direct = dev->props.has_tensor &&
+                    [[dev->mtl_device name] containsString:@"M5"] &&
+                    getenv("GGML_METAL_Q2_DIRECT_MAX") && atoi(getenv("GGML_METAL_Q2_DIRECT_MAX")) > 0;
+            }
+
+#endif
+            if (dev->props.has_tensor_direct) {
+                MTLCompileOptions * options = [MTLCompileOptions new];
+                ggml_metal_compile_options_set_lang(options, true, true);
+                NSError * error = nil;
+                id<MTLLibrary> probe = [dev->mtl_device newLibraryWithSource:@"#include <metal_stdlib>\nkernel void direct_version_probe() {}"
+                                                                  options:options error:&error];
+                if (!probe) {
+                    dev->props.has_tensor_direct = false;
+                    GGML_LOG_WARN("%s: Metal 4.1 unavailable, direct operand path disabled\n", __func__);
+                }
+                [probe release];
+                [options release];
             }
 
             // try to compile a dummy kernel to determine if the tensor API is supported for bfloat

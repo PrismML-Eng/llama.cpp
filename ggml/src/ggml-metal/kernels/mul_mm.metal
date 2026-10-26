@@ -10,6 +10,79 @@ constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
+#ifdef GGML_METAL_HAS_TENSOR_DIRECT
+// Experimental M5 direct-operand Q2/PQ2 path, enabled only by an explicit host switch.
+template <typename Block, int QK, typename T>
+kernel void kernel_mul_mm_direct(constant ggml_metal_kargs_mul_mm & args,
+                                 const device char *                srcA,
+                                 const device char *                srcB,
+                                 device char *                      dst,
+                                 threadgroup char *                 shmem [[threadgroup(0)]],
+                                 uint3                              tile [[threadgroup_position_in_grid]],
+                                 ushort                             tiitg [[thread_index_in_threadgroup]],
+                                 ushort                             sgitg [[simdgroup_index_in_threadgroup]]) {
+    (void) shmem;
+    (void) sgitg;
+    const int           i12 = tile.z % args.ne12, i13 = tile.z / args.ne12;
+    const uint64_t      offset0 = (i12 / args.r2) * args.nb02 + (i13 / args.r3) * args.nb03;
+    const device char * weights = srcA + offset0;
+    const device T *    x       = (const device T *) (srcB + args.nb12 * i12 + args.nb13 * i13);
+    const int           stride  = args.nb11 / sizeof(T);
+    const int           qid     = tiitg >> 2;
+    const int           fm = (qid & 4) | ((tiitg >> 1) & 3), fn = ((qid & 2) | (tiitg & 1)) * 4;
+    const int           m0 = int(tile.x) * 16 + fm, n0 = int(tile.y) * 32 + fm;
+    constexpr auto      desc = mpp::tensor_ops::matmul2d_descriptor(
+        16, 32, 16, false, true, true, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, execution_simdgroup> mm;
+    auto a = mm.template get_left_input_cooperative_tensor<T, half, float>();
+    auto b = mm.template get_right_input_cooperative_tensor<T, half, float>();
+    auto c = mm.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a)>,
+                                                            metal::remove_addrspace_t<decltype(b)>, float>();
+    for (uint i = 0; i < c.get_capacity(); i++) {
+        c[i] = 0;
+    }
+    for (int g = 0; g < args.ne00 / QK; g++) {
+        float                scales[4];
+        const device Block * rows[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int n     = n0 + 8 * j;
+            rows[j]   = (const device Block *) (weights + min(n, args.ne0 - 1) * args.nb01) + g;
+            scales[j] = n < args.ne0 ? float(rows[j]->d) : 0;
+        }
+        for (int kk = 0; kk < QK; kk += 16) {
+            int k = g * QK + kk + fn;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                uchar packed = rows[j]->qs[(kk + fn) / 4];
+#pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    b[j * 4 + i] = half((float((packed >> (2 * i)) & 3) - 1.0f) * scales[j]);
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < 2; j++) {
+                int m = m0 + 8 * j;
+#pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    a[j * 4 + i] = m < args.ne1 ? x[m * stride + k + i] : T(0);
+                }
+            }
+            mm.run(a, b, c);
+        }
+    }
+    auto output = tensor((device float *) dst + tile.z * args.ne0 * args.ne1, dextents<int, 2>{ args.ne0, args.ne1 },
+                         array<int, 2>{ 1, args.ne0 });
+    c.store(output.slice(int(tile.y) * 32, int(tile.x) * 16));
+}
+
+typedef decltype(kernel_mul_mm_direct<block_pq2_0, QK_PQ2_0, float>) direct_mm_t;
+template [[host_name("kernel_mul_mm_direct_pq2_0_f32")]] kernel direct_mm_t kernel_mul_mm_direct<block_pq2_0, QK_PQ2_0, float>;
+template [[host_name("kernel_mul_mm_direct_pq2_0_f16")]] kernel direct_mm_t kernel_mul_mm_direct<block_pq2_0, QK_PQ2_0, half>;
+template [[host_name("kernel_mul_mm_direct_q2_0_f32")]]  kernel direct_mm_t kernel_mul_mm_direct<block_q2_0, QK2_0, float>;
+template [[host_name("kernel_mul_mm_direct_q2_0_f16")]]  kernel direct_mm_t kernel_mul_mm_direct<block_q2_0, QK2_0, half>;
+#endif // GGML_METAL_HAS_TENSOR_DIRECT
+
 template<
     typename SA, typename SA_4x4, typename SA_8x8,
     typename SB, typename SB_2x4, typename SB_8x8,
