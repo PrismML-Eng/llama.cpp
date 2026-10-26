@@ -11520,6 +11520,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PQ2_0, GGML_GLU_OP_SWIGLU, m_batch, 256, 4096,
                     false, 1, 1, false, with_bias, with_gate, false, {1, 1}));
             }
+            // the other GLU ops of the gate epilogue
+            for (ggml_glu_op glu_op : {GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI}) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PQ2_0, glu_op, m_batch, 256, 4096,
+                    false, 1, 1, false, with_bias, true, false, {1, 1}));
+            }
         }
     }
 

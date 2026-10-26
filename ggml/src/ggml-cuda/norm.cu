@@ -626,7 +626,8 @@ void ggml_cuda_op_add_rms_norm_fused(
 // With q8 the transformed row is not stored in F32 but quantized to q8_1 straight away, in the layout the consuming
 // mat-vecs expect (AOS: 1 column; PQ2: the PQ2_0 multi-column path), with the same per-32 arithmetic and stores as
 // quantize_q8_1<layout>, so the q8_1 rows are bit-identical to quantizing the F32 result. dst then holds the q8_1 rows
-// (N/32 block_q8_1 per row, the row width needs no padding).
+// (N/32 block_q8_1 per row, the row width needs no padding). ggml_cuda_norm_fwht_q8_prepare lets a single-row q8_1
+// output overlap a and b because every load of a and b happens before the first block_reduce: keep it that way.
 template <int N, int B, bool has_add, bool q8, ggml_cuda_q8_1_layout layout>
 static __global__ void __launch_bounds__(1024, 1) add_rms_norm_fwht_f32(
         const float * a, const float * b, const float * weight, const float * signs,

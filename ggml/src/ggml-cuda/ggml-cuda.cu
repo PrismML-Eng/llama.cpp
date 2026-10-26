@@ -2918,8 +2918,8 @@ static bool ggml_cuda_fwht_q8_find_uses(const ggml_cgraph * cgraph, const int i_
             uses_found++;
             if (t->op == GGML_OP_RESHAPE && t->view_src == mm && t->data == mm->data &&
                     ggml_nelements(t) == ggml_nelements(mm) && ggml_is_contiguous(t)) {
-                if (n_aliases == 8) {
-                    return false;
+                if (n_aliases == 8 || (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                    return false; // an output view of the transform must stay F32
                 }
                 aliases[n_aliases++] = t;
                 uses_expected += ggml_node_get_use_count(cgraph, j);
@@ -2962,7 +2962,9 @@ static bool ggml_cuda_fwht_q8_find_uses(const ggml_cgraph * cgraph, const int i_
 // their quantize launch (ggml_cuda_fwht_q8). On Bonsai 2 that removes ~390 launches per decode step.
 // PQ2_0 consumers are accepted too, on the q8_1 AoS layout or the PQ2 multi-column layout: the same butterfly and the
 // same per-32 quantizer as the unfused pair, so the q8_1 rows are bit-identical. GGML_CUDA_FWHT_FUSION_PQ2=0 limits
-// the fusion to PTQ1_0 consumers and transforms of at most 2048 (the previous default).
+// the fusion to PTQ1_0 consumers and transforms of at most 2048 (the previous default). It does not affect the q8_1
+// output of the fused norm + transform kernel (GGML_CUDA_NORM_FWHT_Q8=0 turns that off) or the PQ2_0 multi-column
+// mat-vec range (GGML_CUDA_PQ2_MC_MIN).
 // The check walks every later node, so any other use of the output (or of a view of it) keeps the
 // plain transform, and use counts guard against consumers outside this graph. Returns the number of
 // nodes consumed (3 or 1) or 0 to fall through. GGML_CUDA_FWHT_FUSION=0 disables it.
@@ -4331,7 +4333,15 @@ struct ggml_cuda_norm_fwht_q8_plan {
     ggml_cuda_q8_1_layout  layout = GGML_CUDA_Q8_1_AOS;
 };
 
+// srcs: the tensors the fused kernel reads (residual inputs or the norm input). The F32 output may exactly alias one of
+// them (each block reads its row before writing it), but the q8_1 rows are packed: block r writes bytes that lie in
+// earlier rows of the input, which other blocks may not have loaded yet. So with several rows any overlap keeps the F32
+// output. A single row is safe: add_rms_norm_fwht_f32 runs one 1024-thread block per row, the norm needs the sum of
+// squares of the whole row, so the block loads all of its input (a, b) before the block reduce's __syncthreads, and
+// every q8_1 store comes after it. That holds with and without the add (the lookahead site) and for every Hadamard block
+// width (only the butterfly depends on it). Decode thus keeps the q8_1 output when the allocator reuses an input buffer.
 static bool ggml_cuda_norm_fwht_q8_prepare(const ggml_cgraph * cgraph, const int i_mm, const int64_t n,
+                                           const ggml_tensor * const * srcs, const int n_srcs,
                                            ggml_cuda_norm_fwht_q8_plan & plan) {
     static const bool disabled = getenv("GGML_CUDA_NORM_FWHT_Q8") != nullptr && atoi(getenv("GGML_CUDA_NORM_FWHT_Q8")) == 0;
     if (disabled) {
@@ -4342,6 +4352,15 @@ static bool ggml_cuda_norm_fwht_q8_prepare(const ggml_cgraph * cgraph, const int
         return false;
     }
     const ggml_tensor * mm = cgraph->nodes[i_mm];
+    const char * m0 = (const char *) mm->data;
+    const char * m1 = m0 + ggml_nbytes(mm);
+    for (int k = 0; k < n_srcs && ggml_nelements(mm) > n; ++k) {
+        const char * s0 = (const char *) srcs[k]->data;
+        const char * s1 = s0 + ggml_nbytes(srcs[k]);
+        if (m0 < s1 && s0 < m1) {
+            return false;
+        }
+    }
     ggml_cuda_fwht_q8_uses & u = plan.uses;
     if (!ggml_cuda_fwht_q8_find_uses(cgraph, i_mm, cc, true, u) || u.wtype != GGML_TYPE_PQ2_0 || u.K != n ||
             u.K * u.ncols != ggml_nelements(mm) || GGML_PAD(u.K, MATRIX_ROW_PADDING) != u.K) {
@@ -4493,7 +4512,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_can_fuse_subgraph(cgraph, i, 6, ops, out_nodes, 2) &&
                     ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, out_nodes, 2, false, true)) {
                 ggml_cuda_norm_fwht_q8_plan plan;
-                if (ggml_cuda_norm_fwht_q8_prepare(cgraph, i + 5, ncols, plan)) {
+                const ggml_tensor * q8_srcs[2] = { a, b };
+                if (ggml_cuda_norm_fwht_q8_prepare(cgraph, i + 5, ncols, q8_srcs, 2, plan)) {
                     ggml_cuda_op_add_rms_norm_fwht_fused(*cuda_ctx, node, rms_norm, weight, signs, nullptr, mm, mm->data, plan.layout);
                     ggml_cuda_norm_fwht_q8_register(*cuda_ctx, mm, plan);
                 } else {
@@ -4579,7 +4599,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
             if (ok) {
                 ggml_cuda_norm_fwht_q8_plan plan;
-                if (ggml_cuda_norm_fwht_q8_prepare(cgraph, j + 2, ncols, plan)) {
+                const ggml_tensor * q8_srcs[1] = { x };
+                if (ggml_cuda_norm_fwht_q8_prepare(cgraph, j + 2, ncols, q8_srcs, 1, plan)) {
                     ggml_cuda_op_add_rms_norm_fwht_fused(*cuda_ctx, nullptr, node, weight, signs, mul_w, mm, mm->data, plan.layout);
                     ggml_cuda_norm_fwht_q8_register(*cuda_ctx, mm, plan);
                 } else {

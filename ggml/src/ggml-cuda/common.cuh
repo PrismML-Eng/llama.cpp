@@ -1295,7 +1295,8 @@ int ggml_cuda_get_device();
 // Smallest column count sent to the PQ2_0 multi-column kernel. On Hopper that includes the 1- and 2-column mat-vecs of
 // plain decode (with the bias / gate+GLU fusion in its epilogue): it needs no per-weight decode and reaches 2.3-2.9 TB/s
 // on the larger projections where the generic tall-row path stops at 1.7-2.2. Elsewhere it starts at 3 columns (not
-// measured below that). GGML_CUDA_PQ2_MC_MIN overrides it.
+// measured below that). GGML_CUDA_PQ2_MC_MIN=n (n >= 1) overrides it: 3 restores the pre-Hopper range, 9 or more sends
+// every column count to the generic kernels; 0 or unset keeps the default.
 static inline int ggml_cuda_pq2_mc_min(int cc) {
     static const int env = getenv("GGML_CUDA_PQ2_MC_MIN") ? atoi(getenv("GGML_CUDA_PQ2_MC_MIN")) : 0;
     if (env > 0) {
