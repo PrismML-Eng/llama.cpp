@@ -628,7 +628,7 @@ static ggml_tensor ggml_cuda_fattn_pad72_desc(const ggml_tensor * src, const ggm
     return t;
 }
 
-// only pad when the padded problem would run on the MMA kernel (mask, sinks, softcap, ALiBi and GQA rules unchanged)
+// only pad when the padded problem would run on the MMA kernel (mask, sinks, ALiBi and GQA rules unchanged)
 static bool ggml_cuda_fattn_pad72_selects_mma(const int device, const ggml_tensor * dst) {
     ggml_tensor Qp = ggml_cuda_fattn_pad72_desc(dst->src[0], GGML_TYPE_F32, nullptr);
     ggml_tensor Kp = ggml_cuda_fattn_pad72_desc(dst->src[1], GGML_TYPE_F16, nullptr);
@@ -646,8 +646,17 @@ static bool ggml_cuda_fattn_pad72_applies(const int device, const int cc, const 
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
+    float logit_softcap;
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    // the MMA launcher takes the Q strides and the K/V nb1/nb2 as int32, and padding grows them by 80/72
+    const bool strides_fit =
+        (int64_t) FATTN_PAD72_D*sizeof(float)*Q->ne[1]*Q->ne[2] <= INT_MAX &&
+        (int64_t) FATTN_PAD72_D*sizeof(half)*K->ne[1] <= INT_MAX &&
+        (int64_t) FATTN_PAD72_D*sizeof(half)*V->ne[1] <= INT_MAX;
+    // softcap is only implemented for head sizes 128/256/512, so leave it on its current path
     return enabled && turing_mma_available(cc) &&
         Q->ne[0] == 72 && K->ne[0] == 72 && V->ne[0] == 72 && Q->ne[1] > 8 &&
+        logit_softcap == 0.0f && strides_fit &&
         (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_F32) &&
         (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_F32) &&
         ggml_cuda_fattn_pad72_selects_mma(device, dst);
