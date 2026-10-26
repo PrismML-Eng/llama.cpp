@@ -415,9 +415,37 @@ You can download it from your Linux distro's package manager or from here: [ROCm
   If necessary, adapt `GPU_TARGETS` to the GPU arch you want to compile for. The above example uses `gfx1100` that corresponds to Radeon RX 7900XTX/XT/GRE. You can find a list of targets [here](https://llvm.org/docs/AMDGPUUsage.html#processors)
   Find your gpu version string by matching the most significant version information from `rocminfo | grep gfx | head -1 | awk '{print $2}'` with the list of processors, e.g. `gfx1035` maps to `gfx1030`.
 
+- Using `CMake` for Windows on RDNA2/RDNA3 consumer GPUs (e.g. `gfx103x`, `gfx110x`), where AMD publishes no full ROCm installer. The supported route - the one this repo's own `windows-rocm` release job in `.github/workflows/release.yml` uses - is the ROCm SDK from pip wheels, from an *x64 Native Tools Command Prompt for VS* (the SDK clang targets the MSVC triple and needs the MSVC CRT/STL and linker to be active):
+  ```powershell
+  python -m pip install --index-url https://repo.amd.com/rocm/whl-multi-arch/ "rocm[libraries,devel]"
+  rocm-sdk init   # expands the devel tree, idempotent
+  $env:HIP_PATH            = (rocm-sdk path --root)      # ...\site-packages\_rocm_sdk_devel
+  $env:CMAKE_PREFIX_PATH   = (rocm-sdk path --cmake)
+  $env:HIP_DEVICE_LIB_PATH = "$env:HIP_PATH\lib\llvm\amdgcn\bitcode"
+  $env:LLVM_PATH           = "$env:HIP_PATH\lib\llvm"
+  $env:HIP_PLATFORM        = "amd"
+  $env:PATH                = "$(rocm-sdk path --bin);$env:PATH"
+
+  cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+      -DGGML_HIP=ON -DAMDGPU_TARGETS="gfx1101" `
+      -DCMAKE_C_COMPILER="$env:HIP_PATH\lib\llvm\bin\clang.exe" `
+      -DCMAKE_CXX_COMPILER="$env:HIP_PATH\lib\llvm\bin\clang++.exe" `
+      -DCMAKE_HIP_COMPILER="$env:HIP_PATH\lib\llvm\bin\clang.exe" `
+      -DHIP_PATH="$env:HIP_PATH" -DCMAKE_PREFIX_PATH="$env:HIP_PATH" `
+      -DCMAKE_C_FLAGS="-Wno-error=incompatible-pointer-types"
+  cmake --build build --config Release
+  ```
+  Replace `gfx1101` in `AMDGPU_TARGETS` with your own ISA: `HSA_OVERRIDE_GFX_VERSION` is not supported on Windows, so the build only runs on the targets it was compiled for. (`rocminfo` ships neither with the pip SDK nor the display driver; a quick way to see your ISA is `llama-server --list-devices` from a Windows HIP release bundle.)
+
 
 The environment variable [`HIP_VISIBLE_DEVICES`](https://rocm.docs.amd.com/en/latest/understand/gpu_isolation.html#hip-visible-devices) can be used to specify which GPU(s) will be used.
 If your GPU is not officially supported you can use the environment variable [`HSA_OVERRIDE_GFX_VERSION`] set to a similar GPU, for example 10.3.0 on RDNA2 (e.g. gfx1030, gfx1031, or gfx1035) or 11.0.0 on RDNA3. Note that [`HSA_OVERRIDE_GFX_VERSION`] is [not supported on Windows](https://github.com/ROCm/ROCm/issues/2654)
+
+### Windows runtime notes
+
+- The HIP backend is loaded as `ggml-hip.dll` at startup and needs the ROCm runtime chain to be resolvable. Windows display drivers do **not** install `amdhip64_*.dll` into `System32`, so next to your executables you need the full chain: `amdhip64_7.dll` (itself requiring `rocm_kpack.dll` and `amd_comgr.dll`), `hipblas.dll` (+ `rocsolver.dll`, `rocblas.dll` and the `rocblas\library\` data dir), and `libhipblaslt.dll` (+ `hipblaslt\library\`, including per-ISA kernel subfolders such as `gfx1101\`). With a pip-SDK install these live under `_rocm_sdk_core\bin` / `_rocm_sdk_libraries\bin`; the Windows HIP release bundles ship them colocated.
+- An incomplete chain makes `LoadLibrary` fail **silently**: the ROCm backend is never registered and inference quietly falls back to CPU (1-2 t/s, easily mistaken for "GPU works but is slow"). Verify with `llama-server --list-devices` before suspecting the model.
+- The fused `fattn-mma` kernels used by rocWMMA flash attention compile as many multi-GB template instances. On a 64 GB-RAM machine, `--parallel 24` was observed to abort mid-build with `clang frontend command failed due to signal` - that is the compiler running out of memory, not a source bug; build with `--parallel 6..12`.
 
 ### Unified Memory
 
