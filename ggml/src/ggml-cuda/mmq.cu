@@ -165,6 +165,12 @@ void ggml_cuda_mul_mat_q(
             src1_scale.alloc(ne13*ne12*ne11);
         }
 
+        // GGML_CUDA_PQ2_D1: one activation scale per 128 values for PQ2_0 prefill (not bit-exact). Only when this call
+        // quantizes y itself; a consumer of a shared external_q8 keeps reading all four scales.
+        const bool d1 = src0->type == GGML_TYPE_PQ2_0 && !use_native_fp4 && ne11 >= 128 &&
+            GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_HOPPER && (!external_q8 || quantize_external) &&
+            ggml_cuda_pq2_d1_enabled(cc);
+
         if (!external_q8 || quantize_external) {
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
@@ -185,15 +191,15 @@ void ggml_cuda_mul_mat_q(
                     quantize_mmq_q8_1_rms_cuda(src1_d, (const float *) norm_weight->data,
                                                external_norm_scale ? external_norm_scale : (const float *) norm_scale->data,
                                                src1_q8_ptr, src0->type,
-                                               ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+                                               ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream, d1);
                 } else if (gate) {
                     GGML_ASSERT(ggml_are_same_shape(src1, gate));
                     GGML_ASSERT(ggml_is_contiguous(gate));
                     quantize_mmq_q8_1_swiglu_cuda(src1_d, (const float *) gate->data, src1_q8_ptr, src0->type,
-                                                  ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+                                                  ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream, d1);
                 } else {
                     quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_ptr, src0->type, ne10, s11, s12, s13, ne10_padded,
-                                           ne11, ne12, ne13, stream);
+                                           ne11, ne12, ne13, stream, d1);
                 }
             }
             CUDA_CHECK(cudaGetLastError());
@@ -211,7 +217,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1};
+            ne1, d1};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
