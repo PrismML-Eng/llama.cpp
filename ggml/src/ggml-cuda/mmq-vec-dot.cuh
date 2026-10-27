@@ -280,6 +280,98 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
 }
 
 
+#if !defined(GGML_USE_HIP)
+// PTQ1_0 (NVIDIA tensor cores only): the weight scale is one value per 128-weight block, so it is identical for the four
+// 32-wide MMA steps of one call (the tile loader writes the block scale into all four x_df entries). The generic
+// Q8_0 routine above scales every MMA result with dA and dB separately (I2F, FMUL, FFMA per element and step; 62 % of all
+// executed instructions of the kernel, followings/10 A1b). Here the four steps are accumulated with dB only (I2F, FFMA)
+// and the block scale is applied once per element and call. Same value up to float rounding, not bit-identical.
+template <ggml_type type, int J, bool fallback, mmq_q8_1_ds_layout ds_layout>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_ptq1_0_q8_1_mma(
+    const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+    typedef tile<16, 8, int> tile_A;
+    typedef tile< 8, 8, int> tile_B;
+    typedef tile<16, 8, int> tile_C;
+
+    constexpr int sram_stride   = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+    constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
+    constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
+    static_assert(MMQ_TILE_NE_K / QI8_0 == 4, "one PTQ1_0 block (128 weights) per call");
+    static_assert(ds_layout == MMQ_Q8_1_DS_LAYOUT_D4, "PTQ1_0 uses the D4 activation layout");
+
+    y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
+
+    const int   * x_qs = (const int   *) x;
+    const float * x_df = (const float *) x_qs + 2*MMQ_TILE_NE_K;
+    const int   * y_qs = (const int   *) y + 4;
+    const float * y_df = (const float *) y;
+
+    tile_A A[ntx][MMQ_TILE_NE_K/QI8_0];
+    float dA[ntx][tile_C::ne/2];
+
+    const int i0 = (threadIdx.y/ntx)*rows_per_warp;
+
+#pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+            load_ldmatrix(A[n][k01/QI8_0], x_qs + (i0 + n*tile_A::I)*sram_stride + k00 + k01, sram_stride);
+        }
+
+#pragma unroll
+        for (int l = 0; l < tile_C::ne/2; ++l) {
+            const int i = i0 + n*tile_A::I + tile_C::get_i(2*l);
+            dA[n][l] = x_df[i*sram_stride + k00/QI8_0];
+        }
+    }
+
+#pragma unroll
+    for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+        float acc[ntx][tile_C::ne];
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                acc[n][l] = 0.0f;
+            }
+        }
+
+#pragma unroll
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+            tile_B B;
+            float dB[tile_C::ne/2];
+
+            load_generic(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K); // faster than load_ldmatrix
+
+#pragma unroll
+            for (int l = 0; l < tile_C::ne/2; ++l) {
+                const int j = j0 + tile_C::get_j(l);
+                dB[l] = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+            }
+
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                tile_C C;
+                mma(C, A[n][k01/QI8_0], B);
+
+#pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) {
+                    acc[n][l] += C.x[l]*dB[l%2];
+                }
+            }
+        }
+
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                sum[(j0/tile_C::J + n)*tile_C::ne + l] += acc[n][l]*dA[n][l/2];
+            }
+        }
+    }
+}
+#endif // !defined(GGML_USE_HIP)
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_1_q8_1_dp4a(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
