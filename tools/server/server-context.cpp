@@ -3684,6 +3684,13 @@ private:
             }
         }
 
+        // with one slot and no window, common_speculative_init sizes the draft context for depth-max: a view that
+        // reaches it starts at or below the cutoff and holds at most n_batch tokens
+        if (spec_process && params_base.speculative.draft.n_depth_max > 0 && params_base.speculative.draft.n_window == 0 &&
+                params_base.n_parallel == 1) {
+            GGML_ASSERT(batch_view.pos[batch_view.n_tokens - 1] < params_base.speculative.draft.n_depth_max + params_base.n_batch);
+        }
+
         // --spec-draft-window: before feeding this view to the draft context, drop the rows of each sequence in the
         // view that are older than the window, measured from that sequence's first position in the view. Sequences
         // that are not in the view keep their rows. The draft context is sized for the window

@@ -3815,13 +3815,16 @@ common_speculative_init_result::common_speculative_init_result(
 
     // the draft context holds as many tokens per sequence as the target context, unless the MTP draft only
     // ever sees a bounded part of the sequence: the last --spec-draft-window rows (the server drops older ones
-    // before each batch), or rows up to --spec-draft-depth-max (never fed past it). Sizing it for that keeps
-    // its cache small; with the window its cells are reused and its attention span stays that short.
+    // of each sequence before each batch), or, with one sequence, rows up to --spec-draft-depth-max (the server
+    // feeds a batch only when it starts at or below that depth, and asserts that it ends below depth + n_batch).
+    // With several sequences one batch can mix a shallow and a deep sequence, so depth-max does not bound the
+    // rows of each sequence there and the draft context keeps the full size. Sizing it for the bound keeps its
+    // cache small; with the window its cells are reused and its attention span stays that short.
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
     if (spec_mtp) {
         const int32_t window    = params.speculative.draft.n_window;
         const int32_t depth_max = params.speculative.draft.n_depth_max;
-        const int32_t span      = window > 0 ? window : depth_max;
+        const int32_t span      = window > 0 ? window : (cparams.n_seq_max <= 1 ? depth_max : 0);
         if (span > 0) {
             const uint32_t n_seq  = std::max<uint32_t>(1, cparams.n_seq_max);
             const uint32_t need   = (uint32_t) span + 2*std::max<uint32_t>(cparams.n_batch, cparams.n_ubatch) + 256;
