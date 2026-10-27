@@ -1705,7 +1705,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-cent", "--checkpoint-every-nt"}, "N",
         string_format("also create a context checkpoint inside a long message every N prompt tokens, so a later prompt\n"
                       "that diverges inside that message restores the nearest checkpoint instead of processing the whole\n"
-                      "prompt again (hybrid / recurrent models; default: %d, 0 = only at user messages and the prompt end)",
+                      "prompt again (hybrid / recurrent models; default: %d, 0 = only at user messages and the prompt end);\n"
+                      "it also lowers --checkpoint-min-step to N, so these checkpoints are not filtered or evicted as too close",
                       params.checkpoint_every_nt),
         [](common_params & params, int value) {
             if (value < 0) {
