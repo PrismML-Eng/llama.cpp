@@ -4549,7 +4549,6 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.path_kv_mean_center         =*/ nullptr,
         /*.moe_cache_size              =*/ 0,
-        /*.n_kv_vram_cells             =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -4561,6 +4560,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.n_kv_vram_cells             =*/ 0,
     };
 
     return result;
