@@ -1788,7 +1788,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const ggml_tensor * bias0 = nullptr, const ggml_tensor * bias1 = nullptr) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -1805,8 +1805,14 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+    //we only support fusion for ncols_dst = 1, except the dedicated PTQ1_0 kernel (2..4 columns)
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 && !ggml_cuda_mmvq_ptq1_0_can_fuse_mc(src0, (int) dst->ne[1])) {
+        return false;
+    }
+
+    // the 2..4 column kernel indexes the bias like dst
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 &&
+            ((bias0 && !ggml_is_contiguous(bias0)) || (bias1 && !ggml_is_contiguous(bias1)))) {
         return false;
     }
 
@@ -3035,13 +3041,31 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
         const char * b1 = b0 + ggml_nbytes(b);
         return a0 < b1 && b0 < a1;
     };
-    const bool out_aliases_in = overlaps(x, mm) || (signs && overlaps(signs, mm));
+    bool out_aliases_in = overlaps(x, mm) || (signs && overlaps(signs, mm));
 
     // x is only known to be contiguous with the same element count as the consumers' src1 [K, ncols];
     // in the unsigned pattern it is the [n, rows] reshape
     ggml_cuda_fwht_q8_uses u;
     if (!ggml_cuda_fwht_q8_find_uses(cgraph, i_mm, cc, pq2_enabled, u)) {
         return 0;
+    }
+    // a gate/up pair that the mat-vec fuses with its SwiGLU writes that GLU output while other blocks still read the q8 rows:
+    // when the allocator put the GLU output over this buffer, the rows have to go to a pool block (see out_aliases_in)
+    for (int j = i_mm + 1; j < cgraph->n_nodes && !out_aliases_in; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (t->op != GGML_OP_MUL_MAT) {
+            continue;
+        }
+        bool uses_x = false;
+        for (int a = 0; a < u.n_aliases; ++a) {
+            uses_x = uses_x || t->src[1] == u.aliases[a];
+        }
+        for (int j2 = j + 1; uses_x && j2 < std::min(j + 4, cgraph->n_nodes); ++j2) {
+            const ggml_tensor * g = cgraph->nodes[j2];
+            if (g->op == GGML_OP_GLU && (g->src[0] == t || g->src[1] == t) && overlaps(g, mm)) {
+                out_aliases_in = true;
+            }
+        }
     }
     const int64_t K     = u.K;
     const int64_t ncols = u.ncols;
@@ -3737,6 +3761,10 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
 }
 
 // returns whether the write (out) nodes overwrite the read nodes in operation
+// the evaluating context's q8 rows registry, set while a graph is evaluated; lets the fusion memory check see that an input's
+// quantized rows live in a pool block and not in the tensor's own buffer
+static thread_local const ggml_cuda_fwht_q8_context * g_fwht_q8_ctx = nullptr;
+
 static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_idx,
                                                  const int           node_count,
@@ -3790,6 +3818,13 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                 }
 
                 if (nodes_overlap(dst, src) && !is_exact_alias(dst, src)) {
+                    // the mat-vec reads the q8 rows from a pool block, not from this tensor: overlapping it is harmless
+                    if (g_fwht_q8_ctx != nullptr) {
+                        const auto it = g_fwht_q8_ctx->entries.find(src);
+                        if (it != g_fwht_q8_ctx->entries.end() && it->second.data != src->data) {
+                            continue;
+                        }
+                    }
                     bool found = false;
 
                     for (int k = node_idx; k < j; ++k) {
@@ -5004,7 +5039,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate_scale = gate_scale;
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
 
-                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n, up_bias, gate_bias)) {
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
@@ -5097,7 +5132,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate_scale = gate_scale;
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
 
-                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n, up_bias, gate_bias)) {
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
@@ -5159,7 +5194,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n, up_bias_tensor, gate_bias_tensor)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate_n->src[0];
                 fusion_data.x_bias    = up_bias_tensor;
@@ -5290,7 +5325,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             fusion_data.x_bias  = bias;
             fusion_data.x_scale = scale;
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node, bias)) {
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = n_ops;
@@ -5355,7 +5390,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             break;
         }
 
-        if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+        if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node, bias_tensor)) {
             ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
@@ -5425,6 +5460,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+    // the q8 rows registry is only valid while this graph is evaluated
+    struct fwht_q8_ctx_scope {
+        explicit fwht_q8_ctx_scope(const ggml_cuda_fwht_q8_context * c) { g_fwht_q8_ctx = c; }
+        ~fwht_q8_ctx_scope() { g_fwht_q8_ctx = nullptr; }
+    } fwht_q8_ctx_guard(&cuda_ctx->fwht_q8());
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
