@@ -96,6 +96,13 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         }
     }
 
+    // gqa_ratio 6 (e.g. 24 Q heads on 4 KV heads): with ncols2 = 8 two of the eight head slots of every MMA tile are padding (25 % of the MMA work).
+    // For many query tokens (prompt processing) that waste outweighs the repeated K/V loads of ncols2 = 2; for few tokens (decode, MTP verify) it does not.
+    if (use_gqa_opt && gqa_ratio == 6 && Q->ne[1] >= 64) {
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2, type_KV>(ctx, dst);
+        return;
+    }
+
     if (use_gqa_opt && gqa_ratio > 4) {
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8, type_KV>(ctx, dst);
         return;
