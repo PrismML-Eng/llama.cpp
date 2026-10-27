@@ -5424,6 +5424,90 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// GGML_CUDA_OP_TIMING=1 (with CUDA graphs off): an event on the main stream before every node that launches work
+// (views and no-ops get none); the time to the next event is charged to that node (a fused group to its first
+// node). Events come from a pool and are read back only for the report, every 100 graphs, so the stream does not
+// stop after each graph. The key of a node is kept as numbers: the graph's tensors can be gone at report time.
+struct ggml_cuda_op_timing {
+    struct rec {
+        cudaEvent_t  ev;
+        const char * desc;   // nullptr: the end of a graph
+        ggml_type    type0;
+        int64_t      ne00;
+        int64_t      ne01;
+        int64_t      ne1;
+        bool         mul_mat;
+    };
+
+    std::vector<cudaEvent_t> pool;
+    std::vector<rec>         recs;
+    int64_t                  n_graphs = 0;
+
+    cudaEvent_t next_event() {
+        const size_t i = recs.size();
+        if (i == pool.size()) {
+            cudaEvent_t e;
+            CUDA_CHECK(cudaEventCreate(&e));
+            pool.push_back(e);
+        }
+        return pool[i];
+    }
+
+    void record(const ggml_tensor * t, cudaStream_t stream) {
+        rec r = { next_event(), ggml_op_desc(t), t->src[0] ? t->src[0]->type : GGML_TYPE_COUNT,
+                  t->src[0] ? t->src[0]->ne[0] : 0, t->src[0] ? t->src[0]->ne[1] : 0, t->ne[1], t->op == GGML_OP_MUL_MAT && t->src[0] };
+        CUDA_CHECK(cudaEventRecord(r.ev, stream));
+        recs.push_back(r);
+    }
+
+    void end_graph(cudaStream_t stream) {
+        rec r = { next_event(), nullptr, GGML_TYPE_COUNT, 0, 0, 0, false };
+        CUDA_CHECK(cudaEventRecord(r.ev, stream));
+        recs.push_back(r);
+        if (++n_graphs < 100) {
+            return;
+        }
+        CUDA_CHECK(cudaEventSynchronize(r.ev));
+        struct acc { double ms = 0; int64_t n = 0; };
+        std::map<std::string, acc> totals;
+        double ms_graphs = 0.0;
+        for (size_t k = 0; k + 1 < recs.size(); ++k) {
+            const rec & a = recs[k];
+            if (a.desc == nullptr) {
+                continue;
+            }
+            float ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, a.ev, recs[k + 1].ev));
+            char key[160];
+            if (a.mul_mat) {
+                snprintf(key, sizeof(key), "MUL_MAT %s %lldx%lld cols=%lld", ggml_type_name(a.type0),
+                    (long long) a.ne00, (long long) a.ne01, (long long) a.ne1);
+            } else {
+                snprintf(key, sizeof(key), "%s%s%s cols=%lld", a.desc, a.type0 != GGML_TYPE_COUNT ? " " : "",
+                    a.type0 != GGML_TYPE_COUNT ? ggml_type_name(a.type0) : "", (long long) a.ne1);
+            }
+            auto & s = totals[key];
+            s.ms += ms;
+            s.n  += 1;
+            ms_graphs += ms;
+        }
+        std::vector<std::pair<std::string, acc>> v(totals.begin(), totals.end());
+        std::sort(v.begin(), v.end(), [](auto & x, auto & y) { return x.second.ms > y.second.ms; });
+        GGML_LOG_WARN("op timing over %lld graphs: %.3f ms per graph\n", (long long) n_graphs, ms_graphs / n_graphs);
+        for (size_t k = 0; k < v.size() && k < 30; ++k) {
+            GGML_LOG_WARN("  %8.3f ms/graph %6.1f%%  x%-7.1f %s\n", v[k].second.ms / n_graphs,
+                100.0 * v[k].second.ms / ms_graphs, (double) v[k].second.n / n_graphs, v[k].first.c_str());
+        }
+        recs.clear();
+        n_graphs = 0;
+    }
+};
+
+static ggml_cuda_op_timing & ggml_cuda_op_timing_of(int device) {
+    static ggml_cuda_op_timing state[GGML_CUDA_MAX_DEVICES];
+    return state[device];
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -5577,20 +5661,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->gdn_conv().reset();
 
 
-            // GGML_CUDA_OP_TIMING=1 (with CUDA graphs off): an event on the main stream before every node; the
-            // time to the next event is charged to that node (a fused group to its first node). Printed below.
+            // GGML_CUDA_OP_TIMING=1: see ggml_cuda_op_timing
             static const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
             const bool timing = op_timing && !use_cuda_graph;
-            std::vector<std::pair<const ggml_tensor *, cudaEvent_t>> op_events;
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (timing) {
-                    cudaEvent_t e;
-                    CUDA_CHECK(cudaEventCreate(&e));
-                    CUDA_CHECK(cudaEventRecord(e, cuda_ctx->stream(cuda_ctx->device, 0)));
-                    op_events.push_back({ node, e });
-                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -5633,6 +5709,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                     continue;
+                }
+
+                if (timing) {
+                    ggml_cuda_op_timing_of(cuda_ctx->device).record(node, cuda_ctx->stream(cuda_ctx->device, 0));
                 }
 
                 // GDN decode conv chain: the conv-state gather moves into the fused launch at its CONCAT, which
@@ -5807,48 +5887,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                }
             }
 
-            if (timing && !op_events.empty()) {
-                cudaEvent_t end;
-                CUDA_CHECK(cudaEventCreate(&end));
-                CUDA_CHECK(cudaEventRecord(end, cuda_ctx->stream(cuda_ctx->device, 0)));
-                CUDA_CHECK(cudaEventSynchronize(end));
-                struct acc { double ms = 0; int64_t n = 0; };
-                static std::map<std::string, acc> totals;
-                static int64_t n_graphs = 0;
-                static double  ms_graphs = 0;
-                for (size_t k = 0; k < op_events.size(); ++k) {
-                    float ms = 0.0f;
-                    CUDA_CHECK(cudaEventElapsedTime(&ms, op_events[k].second, k + 1 < op_events.size() ? op_events[k + 1].second : end));
-                    const ggml_tensor * t = op_events[k].first;
-                    char key[160];
-                    if (t->op == GGML_OP_MUL_MAT && t->src[0]) {
-                        snprintf(key, sizeof(key), "MUL_MAT %s %lldx%lld cols=%lld", ggml_type_name(t->src[0]->type),
-                            (long long) t->src[0]->ne[0], (long long) t->src[0]->ne[1], (long long) t->ne[1]);
-                    } else {
-                        snprintf(key, sizeof(key), "%s%s%s cols=%lld", ggml_op_desc(t), t->src[0] ? " " : "",
-                            t->src[0] ? ggml_type_name(t->src[0]->type) : "", (long long) t->ne[1]);
-                    }
-                    auto & a = totals[key];
-                    a.ms += ms;
-                    a.n  += 1;
-                    ms_graphs += ms;
-                }
-                for (auto & pe : op_events) {
-                    CUDA_CHECK(cudaEventDestroy(pe.second));
-                }
-                CUDA_CHECK(cudaEventDestroy(end));
-                if (++n_graphs % 100 == 0) {
-                    std::vector<std::pair<std::string, acc>> v(totals.begin(), totals.end());
-                    std::sort(v.begin(), v.end(), [](auto & x, auto & y) { return x.second.ms > y.second.ms; });
-                    GGML_LOG_INFO("op timing over %lld graphs: %.3f ms per graph\n", (long long) n_graphs, ms_graphs / n_graphs);
-                    for (size_t k = 0; k < v.size() && k < 30; ++k) {
-                        GGML_LOG_INFO("  %8.3f ms/graph %6.1f%%  x%-5lld %s\n", v[k].second.ms / n_graphs,
-                            100.0 * v[k].second.ms / ms_graphs, (long long) (v[k].second.n / n_graphs), v[k].first.c_str());
-                    }
-                    totals.clear();
-                    n_graphs  = 0;
-                    ms_graphs = 0;
-                }
+            if (timing) {
+                ggml_cuda_op_timing_of(cuda_ctx->device).end_graph(cuda_ctx->stream(cuda_ctx->device, 0));
             }
         }
 
