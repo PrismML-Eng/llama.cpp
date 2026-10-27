@@ -1085,6 +1085,18 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
     ph.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
     ph.location.type = CU_MEM_LOCATION_TYPE_HOST;
     ph.location.id   = 0;
+#if !defined(_WIN32) && CUDA_VERSION >= 12020
+    // the Linux driver does not accept CU_MEM_LOCATION_TYPE_HOST for cuMemCreate: use the GPU's host NUMA node
+    {
+        CUdevice cu_dev;
+        int numa_id = -1;
+        if (cuDeviceGet(&cu_dev, physical) == CUDA_SUCCESS &&
+                cuDeviceGetAttribute(&numa_id, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, cu_dev) == CUDA_SUCCESS && numa_id >= 0) {
+            ph.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+            ph.location.id   = numa_id;
+        }
+    }
+#endif
 
     size_t gd = 0, gh = 0;
     CU_CHECK(cuMemGetAllocationGranularity(&gd, &pd, CU_MEM_ALLOC_GRANULARITY_MINIMUM));

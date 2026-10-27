@@ -2461,7 +2461,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--kv-vram-cells"}, "N",
         "tiered KV cache: keep the first N cells of each layer's K/V in VRAM and the rest in pinned system RAM\n"
         "mapped into the same device range (CUDA VMM), so the context can exceed VRAM. Positions past N are\n"
-        "read over PCIe once a sequence is that deep; output is identical to an all-VRAM cache. 0 = off (default)",
+        "read over PCIe once a sequence is that deep; output is identical to an all-VRAM cache. It is slower past N:\n"
+        "decode at a depth with most of the cache in host memory can drop several times (H200, 72% of the cache in\n"
+        "host memory: 250 -> 60 t/s), so use it only when the cache does not fit in VRAM. If the tiered buffer\n"
+        "cannot be allocated, the cache falls back to the plain device buffer with a warning. 0 = off (default)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");

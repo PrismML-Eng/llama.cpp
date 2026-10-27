@@ -165,6 +165,8 @@ llama_kv_cache::llama_kv_cache(
     const bool is_mla = hparams.is_mla();
 
     const uint32_t tier_cells = GGML_PAD(n_kv_vram_cells, n_pad);
+    // tier buffer type -> the plain device buffer type, used when the tiered allocation fails
+    std::map<ggml_backend_buffer_type_t, ggml_backend_buffer_type_t> tier_fallback;
     if (tier_cells > 0 && tier_cells < kv_size) {
         LLAMA_LOG_INFO("%s: tiered KV: cells [0, %u) in VRAM, [%u, %u) in host memory\n",
                 __func__, tier_cells, tier_cells, kv_size);
@@ -247,6 +249,7 @@ llama_kv_cache::llama_kv_cache(
                     snprintf(tag, sizeof(tag), "kv%p_l%u", (void *) this, il);
                     ggml_backend_buffer_type_t tb = fn(dev_idx, (double) tier_cells / (double) kv_size, 2, tag);
                     if (tb) {
+                        tier_fallback[tb] = buft;
                         buft = tb;
                     }
                 }
@@ -316,6 +319,11 @@ llama_kv_cache::llama_kv_cache(
             }
         } else {
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+            const auto it = tier_fallback.find(buft);
+            if (!buf && it != tier_fallback.end()) {
+                LLAMA_LOG_WARN("%s: the tiered KV buffer could not be allocated, using the plain device buffer (the whole cache in VRAM)\n", __func__);
+                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), it->second);
+            }
         }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");
