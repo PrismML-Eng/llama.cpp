@@ -4363,6 +4363,12 @@ static void ggml_cuda_norm_fwht_q8_register(ggml_backend_cuda_context & ctx, con
     }
 }
 
+struct ggml_cuda_tail_verify_entry { float * scratch; int tag; };
+static std::map<const ggml_tensor *, ggml_cuda_tail_verify_entry> & ggml_cuda_tail_verify_pending() {
+    static std::map<const ggml_tensor *, ggml_cuda_tail_verify_entry> m;
+    return m;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4375,6 +4381,61 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }();
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // Gemma 4 MoE layer tail: [RMS_NORM, MUL] [RMS_NORM, MUL, ADD] [RMS_NORM, MUL, ADD] MUL(layer scalar) -> one launch.
+    // GGML_CUDA_TAIL_FUSION=1 enables; GGML_CUDA_TAIL_VERIFY=1 additionally checks it bit-for-bit against the unfused nodes.
+    if (node->op == GGML_OP_RMS_NORM && i + 8 < cgraph->n_nodes) {
+        static const bool tail_on = getenv("GGML_CUDA_TAIL_FUSION") != nullptr && atoi(getenv("GGML_CUDA_TAIL_FUSION")) != 0;
+        static const bool tail_verify = getenv("GGML_CUDA_TAIL_VERIFY") != nullptr && atoi(getenv("GGML_CUDA_TAIL_VERIFY")) != 0;
+        if (tail_on) {
+            ggml_tensor * const * n = cgraph->nodes + i;
+            static const ggml_op ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD,
+                                           GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL };
+            bool ok = true;
+            for (int q = 0; q < 9 && ok; ++q) ok = n[q]->op == ops[q] && n[q]->type == GGML_TYPE_F32;
+            auto has = [](const ggml_tensor * t, const ggml_tensor * s) { return t->src[0] == s || t->src[1] == s; };
+            auto other = [](const ggml_tensor * t, const ggml_tensor * s) { return t->src[0] == s ? t->src[1] : t->src[0]; };
+            if (ok) {
+                ok = has(n[1], n[0]) && has(n[3], n[2]) && has(n[4], n[1]) && has(n[4], n[3]) && n[5]->src[0] == n[4] &&
+                     has(n[6], n[5]) && has(n[7], n[6]) && has(n[8], n[7]);
+            }
+            if (ok) {
+                const int64_t nc = n[0]->src[0]->ne[0];
+                const ggml_tensor * ws[3] = { other(n[1], n[0]), other(n[3], n[2]), other(n[6], n[5]) };
+                const ggml_tensor * rs = other(n[7], n[6]);
+                const ggml_tensor * ls = other(n[8], n[7]);
+                float e0, e2, e5;
+                memcpy(&e0, n[0]->op_params, 4); memcpy(&e2, n[2]->op_params, 4); memcpy(&e5, n[5]->op_params, 4);
+                ok = nc <= 3*1024 && nc % 1 == 0 && e0 == e2 && e0 == e5 &&
+                     n[0]->src[0]->ne[2] == 1 && n[0]->src[0]->ne[3] == 1 && n[2]->src[0]->ne[0] == nc &&
+                     n[2]->src[0]->ne[1] == n[0]->src[0]->ne[1] && n[2]->src[0]->ne[2] == 1 && n[2]->src[0]->ne[3] == 1 &&
+                     n[0]->src[0]->type == GGML_TYPE_F32 && n[2]->src[0]->type == GGML_TYPE_F32 &&
+                     n[0]->src[0]->nb[0] == 4 && n[2]->src[0]->nb[0] == 4 &&
+                     ggml_are_same_shape(n[4], n[0]) && ggml_are_same_shape(n[8], n[0]) && ggml_are_same_shape(rs, n[0]) &&
+                     rs->type == GGML_TYPE_F32 && rs->nb[0] == 4 && ggml_is_contiguous(n[8]) &&
+                     ls->type == GGML_TYPE_F32 && ggml_nelements(ls) == 1;
+                for (int q = 0; q < 3 && ok; ++q) {
+                    ok = ws[q]->type == GGML_TYPE_F32 && ggml_is_contiguous(ws[q]) && ws[q]->ne[0] == nc && ggml_nrows(ws[q]) == 1;
+                }
+                const int outs[] = { i + 8 };
+                ok = ok && ggml_can_fuse_subgraph(cgraph, i, 9, ops, outs, 1) && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 9, outs, 1, false, true);
+            }
+            if (ok) {
+                if (tail_verify) {
+                    static float * scratch = nullptr; static int tag = 0;
+                    if (!scratch) { CUDA_CHECK(cudaMalloc(&scratch, (size_t) 32*1024*1024)); }
+                    const size_t need = ggml_nelements(n[8])*sizeof(float);
+                    if (need <= (size_t) 32*1024*1024 && tag < 1000000) {
+                        ggml_cuda_op_tail_fused(*cuda_ctx, n, scratch);
+                        ggml_cuda_tail_verify_pending()[n[8]] = { scratch, tag++ };
+                    }
+                    return 0;
+                }
+                ggml_cuda_op_tail_fused(*cuda_ctx, n, nullptr);
+                return 8;
+            }
+        }
+    }
 
     if (node->op == GGML_OP_CPY) {
         static const bool batched_cpy = [] {
@@ -5789,6 +5850,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                if (!ggml_cuda_tail_verify_pending().empty()) {
+                    auto it = ggml_cuda_tail_verify_pending().find(node);
+                    if (it != ggml_cuda_tail_verify_pending().end()) {
+                        ggml_cuda_op_tail_verify_cmp(*cuda_ctx, node, it->second.scratch, it->second.tag);
+                        static int nlaunch = 0;
+                        ++nlaunch;
+                        if ((nlaunch & (nlaunch - 1)) == 0) fprintf(stderr, "TAILVERIFY compare launches captured/issued: %d\n", nlaunch);
+                    }
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
