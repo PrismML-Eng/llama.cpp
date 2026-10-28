@@ -582,6 +582,12 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
 // rows of the weight matrix per CTA for a tall one-column mat-vec (see should_use_tall below)
 #define MMVQ_TALL_ROWS_PER_BLOCK 8
 
+// Types besides PQ2_0 that also take the tall geometry (one instantiation more each): the common quantized types.
+static constexpr bool mmvq_tall_ext_type(ggml_type type) {
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q2_0 ||
+           type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K;
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool has_gate, bool small_k = false, bool halve_iters = false, bool y_soa = false, bool tall = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -1343,8 +1349,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
     // (Bonsai 2 9B LM head, 248320 x 4096: 249 us, about 1.1 TB/s on an H200). Eight rows per CTA keep the same K
     // partition and reduction order for every row (each row's sum is bit-identical) and cut that to 121 us; the
     // 4096-12288 row trunk projections gain 28-42% as well. Matrices under 4096 rows have too few CTAs for it.
+    // The same geometry helps any type whose one-column default gives one 128-thread CTA per row (tall output heads).
+    // GGML_CUDA_MMVQ_TALL_EXT=0 keeps it PQ2_0-only.
     const auto should_use_tall = [&] {
-        return type == GGML_TYPE_PQ2_0 && table_id == MMVQ_PARAMETERS_GENERIC && GGML_CUDA_CC_IS_NVIDIA(cc) &&
+        static const bool ext = !getenv("GGML_CUDA_MMVQ_TALL_EXT") || atoi(getenv("GGML_CUDA_MMVQ_TALL_EXT")) != 0;
+        return (type == GGML_TYPE_PQ2_0 || (ext && mmvq_tall_ext_type(type))) && table_id == MMVQ_PARAMETERS_GENERIC && GGML_CUDA_CC_IS_NVIDIA(cc) &&
                cc >= GGML_CUDA_CC_HOPPER && cc < GGML_CUDA_CC_BLACKWELL && !has_ids && !y_soa && nrows_x >= 4096 &&
                nrows_x % MMVQ_TALL_ROWS_PER_BLOCK == 0; // whole CTAs: rows past the end would be read, not only skipped
     };
@@ -1388,7 +1397,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 launch(std::true_type{},  std::false_type{}, std::false_type{});
             } else if (should_halve_iters()) {
                 launch(std::false_type{}, std::true_type{},  std::false_type{});
-            } else if constexpr (type == GGML_TYPE_PQ2_0) {
+            } else if constexpr (type == GGML_TYPE_PQ2_0 || mmvq_tall_ext_type(type)) {
                 if (should_use_tall()) {
                     launch(std::false_type{}, std::false_type{}, std::true_type{});
                 } else {
