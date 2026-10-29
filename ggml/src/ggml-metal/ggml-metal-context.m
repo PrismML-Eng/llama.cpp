@@ -324,6 +324,10 @@ static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_te
 }
 
 void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (size == 0) {
+        return;
+    }
+
     @autoreleasepool {
         // wrap the source data into a Metal buffer
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);

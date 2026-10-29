@@ -2663,8 +2663,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return false;
         }
 
-        const size_t row_bytes = (size_t) n_embd * sizeof(float);
-
         g_mtp_dt.lap(g_mtp_dt.pre);
         common_sampler_reset(smpls[0].get());
         batch.clear();
@@ -2965,7 +2963,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void draft_impl(common_speculative_draft_params_vec & dparams) {
         auto & ctx_dft = params.ctx_dft;
 
-        const size_t row_bytes = (size_t) n_embd * sizeof(float);
         last_draft_chained = false;
 
         // deferred catch-up rows that do not lead straight into this draft position are decoded

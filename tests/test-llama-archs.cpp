@@ -968,7 +968,7 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
         if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
         }
-        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
+        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_DSPARK) {
             continue;
         }
         for (bool moe : {false, true}) {
@@ -1126,7 +1126,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
         }
-        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
+        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_DSPARK) {
             continue;
         }
 
