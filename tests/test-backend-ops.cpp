@@ -6208,6 +6208,8 @@ struct test_add_rms_norm_fwht : public test_case {
 
     bool run_whole_graph() override { return true; }
 
+    int n_eval() override { return n == 5120 ? 3 : 1; }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t bw = blk ? blk : n;
         ggml_tensor * h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, bw, bw);
@@ -6302,6 +6304,8 @@ struct test_rms_norm_fwht_lookahead : public test_case {
 
     bool run_whole_graph() override { return true; }
 
+    int n_eval() override { return n == 5120 ? 3 : 1; }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t bw = blk ? blk : n;
         ggml_tensor * h  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, bw, bw);
@@ -6356,6 +6360,13 @@ struct test_rms_norm_fwht_lookahead : public test_case {
                         }
                         data[r*n_cols + i] = (pop % 2 == 0) ? scale : -scale;
                     }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (n == 5120 && strcmp(t->name, "w_alpha") == 0) {
+                // Keep the unrelated projection exact so it does not obscure transform errors.
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                for (int64_t row = 0; row < t->ne[1]; ++row) {
+                    data[row * n + row] = 1.0f;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
             } else if (strcmp(t->name, "s") == 0) {
@@ -12298,6 +12309,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rms_norm_fwht_lookahead(2048, n_tokens, GGML_TYPE_COUNT, blk));
             test_cases.emplace_back(new test_add_rms_norm_fwht(2048, n_tokens, GGML_TYPE_PQ2_0, blk));
             test_cases.emplace_back(new test_rms_norm_fwht_lookahead(2048, n_tokens, GGML_TYPE_PQ2_0, blk));
+        }
+    }
+    // Five 1024-element segments: the 27B row width is not a power of two.
+    for (int64_t blk : { 512, 1024 }) {
+        for (int64_t n_tokens : { 1, 2, 8, 9, 33 }) {
+            for (ggml_type type_mm : { GGML_TYPE_COUNT, GGML_TYPE_PQ2_0 }) {
+                test_cases.emplace_back(new test_add_rms_norm_fwht(5120, n_tokens, type_mm, blk));
+                test_cases.emplace_back(new test_rms_norm_fwht_lookahead(5120, n_tokens, type_mm, blk));
+            }
         }
     }
     // the same with PQ2_0 consumers: q8_1 quantized in the fused kernel (1 column: AoS, 3-8 columns: PQ2 layout)
