@@ -1320,7 +1320,7 @@ private:
 
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
-                    params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
+                    params_base.n_ctx_checkpoints, checkpoint_min_spacing());
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
         }
@@ -2237,6 +2237,13 @@ private:
         return true;
     }
 
+    // --checkpoint-every-nt N places checkpoints N tokens apart, so it also lowers the minimum spacing: the checks
+    // use "more than spacing", so N - 1 keeps checkpoints exactly N apart (creation and eviction)
+    int32_t checkpoint_min_spacing() const {
+        const int32_t every_nt = params_base.checkpoint_every_nt;
+        return every_nt > 0 ? std::min(params_base.checkpoint_min_step, every_nt - 1) : params_base.checkpoint_min_step;
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
@@ -2253,7 +2260,7 @@ private:
         // created by the current task
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + checkpoint_min_spacing()) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
@@ -3480,7 +3487,7 @@ private:
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + checkpoint_min_spacing()) {
                                 break;
                             }
                         }
@@ -3532,8 +3539,11 @@ private:
                         slot.init_sampler();
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
-                        // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        // message, we are near the end of the prompt, or --checkpoint-every-nt is due
+                        const bool every_nt_due = params_base.checkpoint_every_nt > 0 &&
+                            n_tokens_start >= (slot.prompt.checkpoints.empty() ? 0 : slot.prompt.checkpoints.back().n_tokens) +
+                                              params_base.checkpoint_every_nt;
+                        if (!is_user_start && !near_prompt_end && !every_nt_due) {
                             do_checkpoint = false;
                         }
                     }
@@ -3554,7 +3564,7 @@ private:
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
-                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + checkpoint_min_spacing());
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
