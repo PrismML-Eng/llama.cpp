@@ -783,6 +783,76 @@ static __global__ void mul_mat_vec_q(
     }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
+    // PTQ1_0 MoE (ids), one column, K small enough for one block per lane: the generic loop below puts one
+    // 128-weight block on each thread of the whole CTA, so with K <= 4096 only warp 0 loads while warps 1..3 idle.
+    // Warp-per-row instead: warp w owns row row0+w and its lanes read that row's blocks (planar PT layout).
+    // With at most 32 blocks per row every lane holds one block and the lane sums then go through the same
+    // warp_reduce_sum butterfly as the generic path, so the result is unchanged.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (small_k && type == GGML_TYPE_PTQ1_0 && ncols_dst == 1 && !y_soa && nwarps > 1 && rows_per_cuda_block == nwarps) {
+        if (ids != nullptr && blocks_per_row_x <= warp_size) {
+            const int  warp   = threadIdx.y;
+            const int  lane   = threadIdx.x;
+            const bool row_ok = uint32_t(row0 + warp) < nrows_dst;
+
+            float acc      = 0.0f;
+            float acc_gate = 0.0f;
+            if (row_ok && lane < blocks_per_row_x) {
+                const int nblk = ptq1_0_pt_nblk(ncols_x);
+                const char * ycol[1] = { (const char *) y };
+                const block_ptq1_0 * bq[1] = { (const block_ptq1_0 *) vx + kbx_offset + warp*stride_row_x + lane };
+                float dots[1][1];
+                ptq1_0_pt_block_dot<1, 1>(bq, ycol, lane, nblk, dots);
+                acc += dots[0][0];
+                if constexpr (has_fusion && has_gate) {
+                    const block_ptq1_0 * bg[1] = { (const block_ptq1_0 *) vgate + kbx_offset + warp*stride_row_x + lane };
+                    ptq1_0_pt_block_dot<1, 1>(bg, ycol, lane, nblk, dots);
+                    acc_gate += dots[0][0];
+                }
+            }
+            acc = warp_reduce_sum<warp_size>(acc);
+            if constexpr (has_fusion && has_gate) {
+                acc_gate = warp_reduce_sum<warp_size>(acc_gate);
+            }
+            if (lane == 0 && row_ok) {
+                float * dst_row = dst + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0 + warp;
+                [[maybe_unused]] const uint32_t channel_bias = ids ? channel_x : channel_dst;
+                [[maybe_unused]] const int64_t  bias_off     = sample_dst*stride_sample_dst + channel_bias*stride_channel_dst + row0 + warp;
+                float result = acc;
+                if constexpr (has_fusion) {
+                    if (use_bias) {
+                        result += ((const float *) fusion.x_bias)[bias_off];
+                    }
+                    if constexpr (has_gate) {
+                        float gate_value = acc_gate;
+                        if (use_gate_bias) {
+                            gate_value += ((const float *) fusion.gate_bias)[bias_off];
+                        }
+                        switch (active_glu) {
+                            case GGML_GLU_OP_SWIGLU:
+                                result *= ggml_cuda_op_silu_single(gate_value);
+                                break;
+                            case GGML_GLU_OP_GEGLU:
+                                result *= ggml_cuda_op_gelu_single(gate_value);
+                                break;
+                            case GGML_GLU_OP_SWIGLU_OAI:
+                                result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                                break;
+                            default:
+                                result = result * gate_value;
+                                break;
+                        }
+                    }
+                }
+                dst_row[0] = result;
+            }
+            GGML_UNUSED_VARS(use_gate, use_scale, use_gate_scale, gate_bias, x_bias, x_scale, gate_scale, x_scales,
+                             gate_scales, x_biases, gate_biases, tmp, tmp_gate, vec_dot_q_cuda, blocks_per_iter);
+            return;
+        }
+    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
     if constexpr ((type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_PQ2_0) &&
                   table_id == MMVQ_PARAMETERS_GB10) {
         using block_t = std::conditional_t<type == GGML_TYPE_Q1_0, block_q1_0,
