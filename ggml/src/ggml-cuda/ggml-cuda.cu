@@ -4927,6 +4927,17 @@ static void ggml_cuda_norm_fwht_q8_register(ggml_backend_cuda_context & ctx, con
     }
 }
 
+struct ggml_cuda_tail_verify_entry {
+    float * scratch; int tag;
+    // q8_1 check of the attn_norm output (GGML_CUDA_TAIL_FUSION=3): the fused rows and a scratch for the reference quantize
+    const void * q8_fused = nullptr; void * q8_ref = nullptr; const ggml_tensor * norm_out = nullptr;
+    int64_t ne0_pad = 0; int64_t nrows = 0;
+};
+static std::map<const ggml_tensor *, ggml_cuda_tail_verify_entry> & ggml_cuda_tail_verify_pending() {
+    static std::map<const ggml_tensor *, ggml_cuda_tail_verify_entry> m;
+    return m;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -4938,6 +4949,133 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }();
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // Gemma 4 MoE layer tail: [RMS_NORM, MUL] [RMS_NORM, MUL, ADD] [RMS_NORM, MUL, ADD] MUL(layer scalar) -> one launch.
+    // With GGML_CUDA_TAIL_FUSION=2 the next layer's attn_norm [RMS_NORM, MUL] joins the same launch; =3 also writes its q8_1 rows for the mat-vecs.
+    // GGML_CUDA_TAIL_FUSION=1/2 enables; GGML_CUDA_TAIL_VERIFY=1 additionally checks it bit-for-bit against the unfused nodes.
+    if (node->op == GGML_OP_RMS_NORM && i + 8 < cgraph->n_nodes) {
+        static const int  tail_level  = getenv("GGML_CUDA_TAIL_FUSION") != nullptr ? atoi(getenv("GGML_CUDA_TAIL_FUSION")) : 0;
+        static const bool tail_verify = getenv("GGML_CUDA_TAIL_VERIFY") != nullptr && atoi(getenv("GGML_CUDA_TAIL_VERIFY")) != 0;
+        if (tail_level > 0) {
+            ggml_tensor * const * n = cgraph->nodes + i;
+            static const ggml_op ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD,
+                                           GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL, GGML_OP_RMS_NORM, GGML_OP_MUL };
+            bool ok = true;
+            for (int q = 0; q < 9 && ok; ++q) ok = n[q]->op == ops[q] && n[q]->type == GGML_TYPE_F32;
+            auto has = [](const ggml_tensor * t, const ggml_tensor * s) { return t->src[0] == s || t->src[1] == s; };
+            auto other = [](const ggml_tensor * t, const ggml_tensor * s) { return t->src[0] == s ? t->src[1] : t->src[0]; };
+            if (ok) {
+                ok = has(n[1], n[0]) && has(n[3], n[2]) && has(n[4], n[1]) && has(n[4], n[3]) && n[5]->src[0] == n[4] &&
+                     has(n[6], n[5]) && has(n[7], n[6]) && has(n[8], n[7]);
+            }
+            if (ok) {
+                const int64_t nc = n[0]->src[0]->ne[0];
+                const ggml_tensor * ws[3] = { other(n[1], n[0]), other(n[3], n[2]), other(n[6], n[5]) };
+                const ggml_tensor * rs = other(n[7], n[6]);
+                const ggml_tensor * ls = other(n[8], n[7]);
+                float e0, e2, e5;
+                memcpy(&e0, n[0]->op_params, 4); memcpy(&e2, n[2]->op_params, 4); memcpy(&e5, n[5]->op_params, 4);
+                ok = nc <= 3*1024 && nc % 1 == 0 && e0 == e2 && e0 == e5 &&
+                     n[0]->src[0]->ne[2] == 1 && n[0]->src[0]->ne[3] == 1 && n[2]->src[0]->ne[0] == nc &&
+                     n[2]->src[0]->ne[1] == n[0]->src[0]->ne[1] && n[2]->src[0]->ne[2] == 1 && n[2]->src[0]->ne[3] == 1 &&
+                     n[0]->src[0]->type == GGML_TYPE_F32 && n[2]->src[0]->type == GGML_TYPE_F32 &&
+                     n[0]->src[0]->nb[0] == 4 && n[2]->src[0]->nb[0] == 4 &&
+                     ggml_are_same_shape(n[4], n[0]) && ggml_are_same_shape(n[8], n[0]) && ggml_are_same_shape(rs, n[0]) &&
+                     rs->type == GGML_TYPE_F32 && rs->nb[0] == 4 && ggml_is_contiguous(n[8]) &&
+                     ls->type == GGML_TYPE_F32 && ggml_nelements(ls) == 1;
+                for (int q = 0; q < 3 && ok; ++q) {
+                    ok = ws[q]->type == GGML_TYPE_F32 && ggml_is_contiguous(ws[q]) && ws[q]->ne[0] == nc && ggml_nrows(ws[q]) == 1;
+                }
+                // the next layer's attn_norm: RMS_NORM(l_out) * weight, not followed by a sign MUL (that is the
+                // norm+Hadamard fusion, which keeps its own path)
+                int n_fused = 9;
+                if (ok && tail_level >= 2 && i + 10 < cgraph->n_nodes && n[9]->op == ops[9] && n[10]->op == ops[10] &&
+                        n[9]->src[0] == n[8] && has(n[10], n[9]) && n[9]->type == GGML_TYPE_F32 && n[10]->type == GGML_TYPE_F32 &&
+                        strncmp(n[10]->name, "attn_norm", 9) == 0 && ggml_are_same_shape(n[10], n[8]) && ggml_is_contiguous(n[10])) {
+                    const ggml_tensor * w4 = other(n[10], n[9]);
+                    float e9;
+                    memcpy(&e9, n[9]->op_params, 4);
+                    bool ext = e9 == e0 && w4->type == GGML_TYPE_F32 && ggml_is_contiguous(w4) && w4->ne[0] == nc && ggml_nrows(w4) == 1;
+                    for (int k = i + 11; ext && k < cgraph->n_nodes && k <= i + 26; ++k) {
+                        ext = !(cgraph->nodes[k]->op == GGML_OP_MUL && has(cgraph->nodes[k], n[10]));
+                    }
+                    if (ext) n_fused = 11;
+                }
+                int outs[] = { i + 8, i + 10 };
+                if (n_fused == 11 && !(ggml_can_fuse_subgraph(cgraph, i, 11, ops, outs, 2) &&
+                                       ggml_cuda_check_fusion_memory_ranges(cgraph, i, 11, outs, 2, false, true))) {
+                    n_fused = 9;
+                }
+                if (n_fused == 9) {
+                    ok = ggml_can_fuse_subgraph(cgraph, i, 9, ops, outs, 1) && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 9, outs, 1, false, true);
+                }
+                // level 3: also write the q8_1 rows of the normalized activation that the mat-vecs of the next
+                // attention block would quantize (all consumers are plain MUL_MATs with the AOS layout)
+                bool with_q8 = false;
+                int64_t ne0_pad = 0;
+                if (ok && n_fused == 11 && tail_level >= 3) {
+                    const int64_t nrows = n[0]->src[0]->ne[1];
+                    ne0_pad = GGML_PAD(nc, MATRIX_ROW_PADDING);
+                    int uses_found = 0;
+                    with_q8 = nc % QK8_1 == 0 && ne0_pad <= 3*1024 && nrows <= 8 && n[10]->ne[2] == 1 && n[10]->ne[3] == 1;
+                    for (int k = i + 11; with_q8 && k < cgraph->n_nodes && k <= i + 40; ++k) {
+                        const ggml_tensor * t = cgraph->nodes[k];
+                        for (int q = 0; with_q8 && q < GGML_MAX_SRC; ++q) {
+                            if (t->src[q] != n[10]) continue;
+                            ++uses_found;
+                            with_q8 = t->op == GGML_OP_MUL_MAT && q == 1 && t->src[0]->ne[2] == 1 && t->src[0]->ne[3] == 1 &&
+                                      ggml_cuda_q8_1_layout_host(t->src[0]->type, (int) nrows, false) == GGML_CUDA_Q8_1_AOS;
+                        }
+                    }
+                    with_q8 = with_q8 && uses_found > 0 && uses_found == ggml_node_get_use_count(cgraph, i + 10);
+                }
+                if (ok) {
+                    if (tail_verify) {
+                        static float * scratch = nullptr; static int tag = 0;
+                        const size_t cap = (size_t) 32*1024*1024;
+                        if (!scratch) { CUDA_CHECK(cudaMalloc(&scratch, 4*cap)); }
+                        const size_t need = ggml_nelements(n[8])*sizeof(float);
+                        if (need <= cap && tag < 1000000) {
+                            float * scratch2 = (float *) ((char *) scratch + cap);
+                            char * q8_fused = (char *) scratch + 2*cap;
+                            char * q8_ref   = (char *) scratch + 3*cap;
+                            ggml_cuda_op_tail_fused(*cuda_ctx, n, n_fused, scratch, scratch2, with_q8 ? (block_q8_1 *) q8_fused : nullptr, (int) ne0_pad);
+                            ggml_cuda_tail_verify_pending()[n[8]] = { scratch, tag };
+                            if (n_fused == 11) {
+                                ggml_cuda_tail_verify_entry e = { scratch2, 1000000 + tag };
+                                if (with_q8) {
+                                    e.q8_fused = q8_fused; e.q8_ref = q8_ref; e.norm_out = n[10]; e.ne0_pad = ne0_pad; e.nrows = n[0]->src[0]->ne[1];
+                                }
+                                ggml_cuda_tail_verify_pending()[n[10]] = e;
+                            }
+                            static int n_with_norm = 0, n_with_q8 = 0;
+                            n_with_norm += n_fused == 11;
+                            n_with_q8 += with_q8;
+                            ++tag;
+                            if ((tag & (tag - 1)) == 0) fprintf(stderr, "TAILVERIFY groups verified: %d, of which with the next attn_norm: %d, with q8_1: %d\n", tag, n_with_norm, n_with_q8);
+                        }
+                        return 0;
+                    }
+                    if (with_q8) {
+                        const size_t q8_bytes = (size_t) (n[0]->src[0]->ne[1] * ne0_pad) * sizeof(block_q8_1) / QK8_1;
+                        auto blk = std::make_unique<ggml_cuda_pool_alloc<char>>(cuda_ctx->pool(), q8_bytes);
+                        char * q8 = blk->get();
+                        cuda_ctx->fwht_q8().held.push_back(std::move(blk));
+                        ggml_cuda_op_tail_fused(*cuda_ctx, n, n_fused, nullptr, nullptr, (block_q8_1 *) q8, (int) ne0_pad);
+                        ggml_cuda_fwht_q8 e;
+                        e.layout = GGML_CUDA_Q8_1_AOS;
+                        e.ne0    = ne0_pad;
+                        e.ncols  = n[0]->src[0]->ne[1];
+                        e.data   = q8;
+                        cuda_ctx->fwht_q8().set(n[10], e);
+                    } else {
+                        ggml_cuda_op_tail_fused(*cuda_ctx, n, n_fused, nullptr, nullptr, nullptr, 0);
+                    }
+                    return n_fused - 1;
+                }
+            }
+        }
+    }
 
     if (node->op == GGML_OP_CPY) {
         static const bool batched_cpy = [] {
@@ -6443,6 +6581,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                if (!ggml_cuda_tail_verify_pending().empty()) {
+                    auto it = ggml_cuda_tail_verify_pending().find(node);
+                    if (it != ggml_cuda_tail_verify_pending().end()) {
+                        ggml_cuda_op_tail_verify_cmp(*cuda_ctx, node, it->second.scratch, it->second.tag);
+                        if (it->second.q8_fused) {
+                            const ggml_cuda_tail_verify_entry & ve = it->second;
+                            quantize_row_q8_1_cuda((const float *) ve.norm_out->data, nullptr, ve.q8_ref, GGML_CUDA_Q8_1_AOS, ve.norm_out->ne[0],
+                                                   ve.norm_out->nb[1] / sizeof(float), 0, 0, ve.ne0_pad, ve.nrows, 1, 1, cuda_ctx->stream());
+                            ggml_cuda_op_tail_verify_cmp_q8(*cuda_ctx, ve.q8_ref, ve.q8_fused, (size_t) (ve.nrows * ve.ne0_pad) * sizeof(block_q8_1) / QK8_1, ve.tag);
+                        }
+                        static int nlaunch = 0;
+                        ++nlaunch;
+                        if ((nlaunch & (nlaunch - 1)) == 0) fprintf(stderr, "TAILVERIFY compare launches captured/issued: %d\n", nlaunch);
+                    }
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);

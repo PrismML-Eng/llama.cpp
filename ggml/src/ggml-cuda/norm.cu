@@ -1149,3 +1149,181 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
+
+// Gemma 4 MoE layer tail in one launch (one block per row, ncols <= 3*1024):
+//   mlp = rms_norm(x1)*w1 ; comb = rms_norm(x2)*w2 + mlp ; res = rms_norm(comb)*w3 + resid ; dst = res * layer_scalar
+// Same per-thread partial sums, same warp/block reduction (float2 reduce is component-wise identical) and same
+// expression forms (fused multiply-add where the unfused rms_norm+mul+add kernel contracts) as the 4 unfused kernels.
+template <int block_size, bool next_norm, bool quant>
+static __global__ void __launch_bounds__(block_size) tail_fused_f32(
+        const float * x1, const float * w1, const float * x2, const float * w2, const float * w3,
+        const float * resid, const float * lscale, float * dst, const float * w4, float * dst4, block_q8_1 * q8, const int ne0_pad,
+        const int ncols, const int64_t x1_stride, const int64_t x2_stride, const int64_t resid_stride, const float eps) {
+    ggml_cuda_pdl_lc();
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ float2 s_sum2[32];
+    __shared__ float  s_sum1[32];
+    __shared__ float  s_sum4[32];
+
+    ggml_cuda_pdl_sync();
+
+    const float * x1r = x1 + row*x1_stride;
+    const float * x2r = x2 + row*x2_stride;
+    const float * rr  = resid + row*resid_stride;
+    float *       dr  = dst + (int64_t) row*ncols;
+
+    float a[3], b[3];
+    float t1 = 0.0f, t2 = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 3; ++k) {
+        const int col = tid + k*block_size;
+        if (col < ncols) {
+            a[k] = x1r[col];
+            b[k] = x2r[col];
+            t1 += a[k] * a[k];
+            t2 += b[k] * b[k];
+        }
+    }
+    const float2 r12 = block_reduce<block_reduce_method::SUM, block_size>(make_float2(t1, t2), s_sum2);
+    const float scale1 = rsqrtf(r12.x / ncols + eps);
+    const float scale2 = rsqrtf(r12.y / ncols + eps);
+
+    float c[3];
+    float o[3];
+    [[maybe_unused]] float y4[3];
+    float t3 = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 3; ++k) {
+        const int col = tid + k*block_size;
+        if (col < ncols) {
+            const float mlp = __fmul_rn(__fmul_rn(scale1, a[k]), w1[col]);
+            c[k] = __fmaf_rn(__fmul_rn(scale2, b[k]), w2[col], mlp);
+            t3 += c[k] * c[k];
+        }
+    }
+    const float r3 = block_reduce<block_reduce_method::SUM, block_size>(t3, s_sum1);
+    const float scale3 = rsqrtf(r3 / ncols + eps);
+    const float ls = lscale[0];
+    float t4 = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 3; ++k) {
+        const int col = tid + k*block_size;
+        if (col < ncols) {
+            const float res = __fmaf_rn(__fmul_rn(scale3, c[k]), w3[col], rr[col]);
+            o[k] = __fmul_rn(res, ls);
+            dr[col] = o[k];
+            if constexpr (next_norm) {
+                t4 += o[k] * o[k];
+            }
+        }
+    }
+    if constexpr (next_norm) {
+        // the next layer's attn_norm: rms_norm(l_out) * w4
+        const float r4 = block_reduce<block_reduce_method::SUM, block_size>(t4, s_sum4);
+        const float scale4 = rsqrtf(r4 / ncols + eps);
+        float * d4 = dst4 + (int64_t) row*ncols;
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            const int col = tid + k*block_size;
+            if (col < ncols) {
+                y4[k] = __fmul_rn(__fmul_rn(scale4, o[k]), w4[col]);
+                d4[col] = y4[k];
+            }
+        }
+        if constexpr (quant) {
+            // the q8_1 activation quantize of the normalized row (ggml_cuda_mul_mat_vec_q's quantize_q8_1<AOS>,
+            // same expressions), padded to ne0_pad with zero blocks; one warp holds one 32-block (ncols % 32 == 0)
+#pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                const int col = tid + k*block_size;
+                if (col < ne0_pad) {
+                    const float xi = col < ncols ? y4[k] : 0.0f;
+                    float amax = fabsf(xi);
+                    float sum  = xi;
+                    amax = warp_reduce_max<QK8_1>(amax);
+                    sum  = warp_reduce_sum<QK8_1>(sum);
+                    const float  d = amax / 127.0f;
+                    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+                    const int64_t i_cont = (int64_t) row*ne0_pad + col;
+                    const int64_t ib  = i_cont / QK8_1;
+                    const int     iqs = i_cont % QK8_1;
+                    q8[ib].qs[iqs] = q;
+                    if (iqs == 0) {
+                        q8[ib].ds = make_half2(d, sum);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static __global__ void tail_verify_cmp_f32(const float * a, const float * b, const int64_t n, const int tag) {
+    for (int64_t i = blockIdx.x*(int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x*blockDim.x) {
+        if (__float_as_uint(a[i]) != __float_as_uint(b[i])) {
+            printf("TAILVERIFY MISMATCH tag=%d i=%lld ref=%.9g fused=%.9g\n", tag, (long long) i, a[i], b[i]);
+        }
+    }
+}
+
+// nodes: rms1, mul1, rms2, mul2, add2, rms3, mul3, add3, lscale_mul[, rms4, mul4 (next layer attn_norm) when n_fused == 11].
+// verify_scratch != nullptr: write there (verify_scratch2 for the attn_norm output) instead of the graph tensors.
+void ggml_cuda_op_tail_fused(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_fused,
+                             float * verify_scratch, float * verify_scratch2, block_q8_1 * q8, int ne0_pad) {
+    const ggml_tensor * rms1 = nodes[0]; const ggml_tensor * mul1 = nodes[1];
+    const ggml_tensor * rms2 = nodes[2]; const ggml_tensor * mul2 = nodes[3];
+    const ggml_tensor * rms3 = nodes[5]; const ggml_tensor * mul3 = nodes[6]; const ggml_tensor * add3 = nodes[7];
+    ggml_tensor * out = nodes[8];
+    const float * w1 = (const float *) (mul1->src[0] == rms1 ? mul1->src[1] : mul1->src[0])->data;
+    const float * w2 = (const float *) (mul2->src[0] == rms2 ? mul2->src[1] : mul2->src[0])->data;
+    const float * w3 = (const float *) (mul3->src[0] == rms3 ? mul3->src[1] : mul3->src[0])->data;
+    const ggml_tensor * resid_t = add3->src[0] == mul3 ? add3->src[1] : add3->src[0];
+    const ggml_tensor * ls_t    = out->src[0] == nodes[7] ? out->src[1] : out->src[0];
+    const float * w4 = nullptr;
+    float * dst4 = nullptr;
+    if (n_fused == 11) {
+        const ggml_tensor * mul4 = nodes[10];
+        w4   = (const float *) (mul4->src[0] == nodes[9] ? mul4->src[1] : mul4->src[0])->data;
+        dst4 = verify_scratch2 ? verify_scratch2 : (float *) mul4->data;
+    }
+    float eps;
+    memcpy(&eps, rms1->op_params, sizeof(float));
+    const int ncols = rms1->src[0]->ne[0];
+    const int nrows = rms1->src[0]->ne[1];
+    const dim3 blocks_num(nrows, 1, 1);
+    const dim3 block_dims(1024, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params{ blocks_num, block_dims, 0, ctx.stream() };
+    float * dst = verify_scratch ? verify_scratch : (float *) out->data;
+    const int64_t s1 = rms1->src[0]->nb[1] / sizeof(float);
+    const int64_t s2 = rms2->src[0]->nb[1] / sizeof(float);
+    const int64_t sr = resid_t->nb[1] / sizeof(float);
+    if (n_fused == 11 && q8) {
+        ggml_cuda_kernel_launch(tail_fused_f32<1024, true, true>, launch_params,
+            (const float *) rms1->src[0]->data, w1, (const float *) rms2->src[0]->data, w2, w3,
+            (const float *) resid_t->data, (const float *) ls_t->data, dst, w4, dst4, q8, ne0_pad, ncols, s1, s2, sr, eps);
+    } else if (n_fused == 11) {
+        ggml_cuda_kernel_launch(tail_fused_f32<1024, true, false>, launch_params,
+            (const float *) rms1->src[0]->data, w1, (const float *) rms2->src[0]->data, w2, w3,
+            (const float *) resid_t->data, (const float *) ls_t->data, dst, w4, dst4, q8, ne0_pad, ncols, s1, s2, sr, eps);
+    } else {
+        ggml_cuda_kernel_launch(tail_fused_f32<1024, false, false>, launch_params,
+            (const float *) rms1->src[0]->data, w1, (const float *) rms2->src[0]->data, w2, w3,
+            (const float *) resid_t->data, (const float *) ls_t->data, dst, w4, dst4, q8, ne0_pad, ncols, s1, s2, sr, eps);
+    }
+}
+
+void ggml_cuda_op_tail_verify_cmp(ggml_backend_cuda_context & ctx, const ggml_tensor * out, const float * scratch, int tag) {
+    tail_verify_cmp_f32<<<8, 256, 0, ctx.stream()>>>((const float *) out->data, scratch, ggml_nelements(out), tag);
+}
+
+static __global__ void tail_verify_cmp_words(const int * a, const int * b, const int64_t n, const int tag) {
+    for (int64_t i = blockIdx.x*(int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x*blockDim.x) {
+        if (a[i] != b[i]) {
+            printf("TAILVERIFY MISMATCH q8 tag=%d word=%lld ref=%08x fused=%08x\n", tag, (long long) i, (unsigned) a[i], (unsigned) b[i]);
+        }
+    }
+}
+
+void ggml_cuda_op_tail_verify_cmp_q8(ggml_backend_cuda_context & ctx, const void * ref, const void * fused, size_t nbytes, int tag) {
+    tail_verify_cmp_words<<<8, 256, 0, ctx.stream()>>>((const int *) ref, (const int *) fused, (int64_t) (nbytes/4), tag);
+}

@@ -48,6 +48,13 @@ static void test_any(testing & t) {
         auto doc = parse(R"({"description": "x", "format": "email", "additionalProperties": true})");
         root<common_chat_schema_any>(t, doc);
     });
+
+    // Empty unions are dropped rather than rejected, so generators that emit them still get a grammar (#333).
+    t.test("empty unions", [](testing & t) {
+        root<common_chat_schema_any>(t, parse(R"({"type": []})"));
+        root<common_chat_schema_any>(t, parse(R"({"oneOf": []})"));
+        root<common_chat_schema_any>(t, parse(R"({"anyOf": []})"));
+    });
 }
 
 static void test_primitives(testing & t) {
@@ -451,7 +458,6 @@ static void test_errors(testing & t) {
 
     t.test("type", [](testing & t) {
         assert_error(t, R"({"type": 5})", "#: type must be a string or an array of strings");
-        assert_error(t, R"({"type": []})", "#: type must not be empty");
         assert_error(t, R"({"type": ["string", "bad"]})", "#/type/1: unrecognized type bad");
     });
 
@@ -466,7 +472,6 @@ static void test_errors(testing & t) {
     });
 
     t.test("alternatives", [](testing & t) {
-        assert_error(t, R"({"oneOf": []})", "#/oneOf: must not be empty");
         assert_error(t, R"({"anyOf": {}})", "#/anyOf: must be an array of schemas");
         assert_error(t, R"({"anyOf": [{"type": "string"}, {"items": {"type": "x"}}]})", "#/anyOf/1/items: unrecognized type x");
     });

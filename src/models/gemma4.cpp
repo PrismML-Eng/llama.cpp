@@ -371,6 +371,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
         // residual connection
         cur = ggml_add(ctx0, cur, attn_out);
+        cb(cur, "ffn_res", il);
 
         // per-layer embedding
         if (inp_per_layer) {

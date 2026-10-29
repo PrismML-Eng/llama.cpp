@@ -659,6 +659,12 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
 // rows of the weight matrix per CTA for a tall one-column mat-vec (see should_use_tall below)
 #define MMVQ_TALL_ROWS_PER_BLOCK 8
 
+// Types besides PQ2_0 that also take the tall geometry (one instantiation more each): the common quantized types.
+static constexpr bool mmvq_tall_ext_type(ggml_type type) {
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q2_0 ||
+           type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K;
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool has_gate, bool small_k = false, bool halve_iters = false, bool y_soa = false, bool tall = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -868,6 +874,79 @@ static __global__ void mul_mat_vec_q(
                          gate_scales, x_biases, gate_biases, tmp, tmp_gate, vec_dot_q_cuda, blocks_per_iter);
         return;
       }
+    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+    // PTQ1_0 MoE (ids), one column, K small enough for one block per lane: the generic loop below puts one
+    // 128-weight block on each thread of the whole CTA, so with K <= 4096 only warp 0 loads while warps 1..3 idle.
+    // Warp-per-row instead: warp w owns row row0+w and its lanes read that row's blocks (planar PT layout).
+    // With at most 32 blocks per row every lane holds one block and the lane sums then go through the same
+    // warp_reduce_sum butterfly as the generic path, so the result is unchanged.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (small_k && type == GGML_TYPE_PTQ1_0 && ncols_dst == 1 && !y_soa && nwarps > 1 && rows_per_cuda_block == nwarps) {
+        if (ids != nullptr && blocks_per_row_x <= warp_size) {
+            const int  warp   = threadIdx.y;
+            const int  lane   = threadIdx.x;
+            const bool row_ok = uint32_t(row0 + warp) < nrows_dst;
+
+            float acc      = 0.0f;
+            float acc_gate = 0.0f;
+            if (row_ok && lane < blocks_per_row_x) {
+                const int nblk = ptq1_0_pt_nblk(ncols_x);
+                const char * ycol[1] = { (const char *) y };
+                const block_ptq1_0 * bq[1] = { (const block_ptq1_0 *) vx + kbx_offset + warp*stride_row_x + lane };
+                float dots[1][1];
+                ptq1_0_pt_block_dot<1, 1>(bq, ycol, lane, nblk, dots);
+                acc += dots[0][0];
+                if constexpr (has_fusion && has_gate) {
+                    const block_ptq1_0 * bg[1] = { (const block_ptq1_0 *) vgate + kbx_offset + warp*stride_row_x + lane };
+                    ptq1_0_pt_block_dot<1, 1>(bg, ycol, lane, nblk, dots);
+                    acc_gate += dots[0][0];
+                }
+            }
+            acc = warp_reduce_sum<warp_size>(acc);
+            if constexpr (has_fusion && has_gate) {
+                acc_gate = warp_reduce_sum<warp_size>(acc_gate);
+            }
+            if (lane == 0 && row_ok) {
+                float * dst_row = dst + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0 + warp;
+                [[maybe_unused]] const uint32_t channel_bias = ids ? channel_x : channel_dst;
+                [[maybe_unused]] const int64_t  bias_off     = sample_dst*stride_sample_dst + channel_bias*stride_channel_dst + row0 + warp;
+                float result = acc;
+                if constexpr (has_fusion) {
+                    if (use_bias) {
+                        result += ((const float *) fusion.x_bias)[bias_off];
+                    }
+                    if constexpr (has_gate) {
+                        float gate_value = acc_gate;
+                        if (use_gate_bias) {
+                            gate_value += ((const float *) fusion.gate_bias)[bias_off];
+                        }
+                        switch (active_glu) {
+                            case GGML_GLU_OP_SWIGLU:
+                                result *= ggml_cuda_op_silu_single(gate_value);
+                                break;
+                            case GGML_GLU_OP_GEGLU:
+                                result *= ggml_cuda_op_gelu_single(gate_value);
+                                break;
+                            case GGML_GLU_OP_SWIGLU_OAI:
+                                result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                                break;
+                            case GGML_GLU_OP_SWIGLU_CLAMP:
+                                result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, glu_limit);
+                                break;
+                            default:
+                                result = result * gate_value;
+                                break;
+                        }
+                    }
+                }
+                dst_row[0] = result;
+            }
+            GGML_UNUSED_VARS(use_gate, use_scale, use_gate_scale, gate_bias, x_bias, x_scale, gate_scale, x_scales,
+                             gate_scales, x_biases, gate_biases, tmp, tmp_gate, vec_dot_q_cuda, blocks_per_iter);
+            return;
+        }
     }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
@@ -1566,8 +1645,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
     // (Bonsai 2 9B LM head, 248320 x 4096: 249 us, about 1.1 TB/s on an H200). Eight rows per CTA keep the same K
     // partition and reduction order for every row (each row's sum is bit-identical) and cut that to 121 us; the
     // 4096-12288 row trunk projections gain 28-42% as well. Matrices under 4096 rows have too few CTAs for it.
+    // The same geometry helps any type whose one-column default gives one 128-thread CTA per row (tall output heads).
+    // GGML_CUDA_MMVQ_TALL_EXT=0 keeps it PQ2_0-only.
     const auto should_use_tall = [&] {
-        return type == GGML_TYPE_PQ2_0 && table_id == MMVQ_PARAMETERS_GENERIC && GGML_CUDA_CC_IS_NVIDIA(cc) &&
+        static const bool ext = !getenv("GGML_CUDA_MMVQ_TALL_EXT") || atoi(getenv("GGML_CUDA_MMVQ_TALL_EXT")) != 0;
+        return (type == GGML_TYPE_PQ2_0 || (ext && mmvq_tall_ext_type(type))) && table_id == MMVQ_PARAMETERS_GENERIC && GGML_CUDA_CC_IS_NVIDIA(cc) &&
                cc >= GGML_CUDA_CC_HOPPER && cc < GGML_CUDA_CC_BLACKWELL && !has_ids && !y_soa && nrows_x >= 4096 &&
                nrows_x % MMVQ_TALL_ROWS_PER_BLOCK == 0; // whole CTAs: rows past the end would be read, not only skipped
     };
@@ -1611,7 +1693,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 launch(std::true_type{},  std::false_type{}, std::false_type{});
             } else if (should_halve_iters()) {
                 launch(std::false_type{}, std::true_type{},  std::false_type{});
-            } else if constexpr (type == GGML_TYPE_PQ2_0) {
+            } else if constexpr (type == GGML_TYPE_PQ2_0 || mmvq_tall_ext_type(type)) {
                 if (should_use_tall()) {
                     launch(std::false_type{}, std::false_type{}, std::true_type{});
                 } else {
