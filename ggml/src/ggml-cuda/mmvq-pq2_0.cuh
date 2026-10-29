@@ -5,7 +5,7 @@
 // permuted inside each 16-element group (position k*4+m holds element m*4+k), then one half2 per 32-block
 // with d and the raw int16 sum of q. With that, (code_word >> 2k) & 0x03030303 pairs the raw 2-bit codes 0..3
 // with the right activation bytes, so there is no per-weight decode. The digit bias is one integer subtraction:
-// sum(q*(c-1)) = sum(q*c) - sum(q). Each warp handles 4 rows and reuses the activation slice of a 32-block for all of them.
+// sum(q*(c-1)) = sum(q*c) - sum(q). Each warp handles up to 4 rows and reuses the activation slice of a 32-block for all of them.
 #pragma once
 
 #include "common.cuh"
@@ -18,7 +18,7 @@
 // second weight matrix (gate, same layout and strides) is dotted against the same activations, gate_bias is added to
 // it and the GLU op combines the two. Without fusion the epilogue is a plain store: a runtime bias check there costs
 // the 8-column verify kernel ~12% on H200.
-template <int ncols, bool has_fusion, bool has_gate>
+template <int ncols, bool has_fusion, bool has_gate, int rows = PQ2_0_MC_ROWS>
 __global__ void __launch_bounds__(PQ2_0_MC_WARPS * 32, 3)
 mul_mat_vec_pq2_0_mc(const void * vx_, const void * vy_, float * dst_,
         const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
@@ -29,7 +29,7 @@ mul_mat_vec_pq2_0_mc(const void * vx_, const void * vy_, float * dst_,
     const void * GGML_CUDA_RESTRICT vy  = vy_;
     float      * GGML_CUDA_RESTRICT dst = dst_;
     const int lane = threadIdx.x & 31;
-    const int row0 = ((blockIdx.x * blockDim.x + threadIdx.x) >> 5) * PQ2_0_MC_ROWS;
+    const int row0 = ((blockIdx.x * blockDim.x + threadIdx.x) >> 5) * rows;
     if (row0 >= nrows_x) {
         return;
     }
@@ -42,17 +42,17 @@ mul_mat_vec_pq2_0_mc(const void * vx_, const void * vy_, float * dst_,
     const size_t  ds_off    = (size_t) stride_col_y * QK8_1; // qs region of a column, padded length
     const char *  y         = (const char *) vy;
 
-    float acc[PQ2_0_MC_ROWS][ncols] = {};
-    [[maybe_unused]] float accg[PQ2_0_MC_ROWS][ncols] = {};
+    float acc[rows][ncols] = {};
+    [[maybe_unused]] float accg[rows][ncols] = {};
     [[maybe_unused]] const void * GGML_CUDA_RESTRICT vgate = vgate_;
 
     for (int c = lane; c < nchunk; c += WARP_SIZE) {
-        uint32_t w0[PQ2_0_MC_ROWS], w1[PQ2_0_MC_ROWS];
-        float    d2[PQ2_0_MC_ROWS];
-        [[maybe_unused]] uint32_t g0[PQ2_0_MC_ROWS], g1[PQ2_0_MC_ROWS];
-        [[maybe_unused]] float    e2[PQ2_0_MC_ROWS];
+        uint32_t w0[rows], w1[rows];
+        float    d2[rows];
+        [[maybe_unused]] uint32_t g0[rows], g1[rows];
+        [[maybe_unused]] float    e2[rows];
 #pragma unroll
-        for (int r = 0; r < PQ2_0_MC_ROWS; ++r) {
+        for (int r = 0; r < rows; ++r) {
             const int row = min(row0 + r, nrows_x - 1); // clamped rows are computed but not stored
             const block_pq2_0 * blk = (const block_pq2_0 *) vx + (int64_t) row*stride_row_x + (c >> 2);
             const uint16_t    * qp  = (const uint16_t *) (blk->qs + (c & 3)*8); // blocks are only 2-byte aligned
@@ -82,7 +82,7 @@ mul_mat_vec_pq2_0_mc(const void * vx_, const void * vy_, float * dst_,
         }
 
 #pragma unroll
-        for (int r = 0; r < PQ2_0_MC_ROWS; ++r) {
+        for (int r = 0; r < rows; ++r) {
             int t[8];
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
@@ -129,7 +129,7 @@ mul_mat_vec_pq2_0_mc(const void * vx_, const void * vy_, float * dst_,
     ggml_cuda_pdl_lc();
 
 #pragma unroll
-    for (int r = 0; r < PQ2_0_MC_ROWS; ++r) {
+    for (int r = 0; r < rows; ++r) {
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {
             float v = warp_reduce_sum<WARP_SIZE>(acc[r][j]);
@@ -163,25 +163,49 @@ mul_mat_vec_pq2_0_mc(const void * vx_, const void * vy_, float * dst_,
     }
 }
 
-template <int ncols>
-static void mul_mat_vec_pq2_0_mc_launch(
+template <int ncols, int rows = PQ2_0_MC_ROWS>
+static void mul_mat_vec_pq2_0_mc_launch_rows(
         const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x,
         const int stride_row_x, const int stride_col_y, const int stride_col_dst, cudaStream_t stream,
         const ggml_cuda_mm_fusion_args_device & fusion) {
-    const int nwarps = (nrows_x + PQ2_0_MC_ROWS - 1) / PQ2_0_MC_ROWS;
+    const int nwarps = (nrows_x + rows - 1) / rows;
     const dim3 block_nums((nwarps + PQ2_0_MC_WARPS - 1) / PQ2_0_MC_WARPS, 1, 1);
     const dim3 block_dims(PQ2_0_MC_WARPS * WARP_SIZE, 1, 1);
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
     if (fusion.gate) {
-        ggml_cuda_kernel_launch(mul_mat_vec_pq2_0_mc<ncols, true, true>, lp, vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+        ggml_cuda_kernel_launch(mul_mat_vec_pq2_0_mc<ncols, true, true, rows>, lp, vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
             (const float *) fusion.x_bias, fusion.gate, (const float *) fusion.gate_bias, fusion.glu_op, fusion.glu_limit);
     } else if (fusion.x_bias) {
-        ggml_cuda_kernel_launch(mul_mat_vec_pq2_0_mc<ncols, true, false>, lp, vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+        ggml_cuda_kernel_launch(mul_mat_vec_pq2_0_mc<ncols, true, false, rows>, lp, vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
             (const float *) fusion.x_bias, nullptr, nullptr, fusion.glu_op, fusion.glu_limit);
     } else {
-        ggml_cuda_kernel_launch(mul_mat_vec_pq2_0_mc<ncols, false, false>, lp, vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+        ggml_cuda_kernel_launch(mul_mat_vec_pq2_0_mc<ncols, false, false, rows>, lp, vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
             nullptr, nullptr, nullptr, fusion.glu_op, fusion.glu_limit);
     }
+}
+
+template <int ncols>
+static void mul_mat_vec_pq2_0_mc_launch(const void *                            vx,
+                                        const void *                            vy,
+                                        float *                                 dst,
+                                        const int                               ncols_x,
+                                        const int                               nrows_x,
+                                        const int                               stride_row_x,
+                                        const int                               stride_col_y,
+                                        const int                               stride_col_dst,
+                                        cudaStream_t                            stream,
+                                        const ggml_cuda_mm_fusion_args_device & fusion) {
+    if constexpr (ncols == 1) {
+        // Smaller Hopper projections need more CTAs; keep four-row reuse for the vocabulary head.
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        if (cc == GGML_CUDA_CC_HOPPER && nrows_x <= 17408) {
+            mul_mat_vec_pq2_0_mc_launch_rows<ncols, 2>(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y,
+                                                       stride_col_dst, stream, fusion);
+            return;
+        }
+    }
+    mul_mat_vec_pq2_0_mc_launch_rows<ncols>(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                                            stream, fusion);
 }
 
 static void mul_mat_vec_pq2_0_mc_switch(

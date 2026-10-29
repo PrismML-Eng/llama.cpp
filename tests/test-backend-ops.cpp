@@ -12436,6 +12436,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // Hopper two-row decode tiles: partial warps/CTAs and both sides of the row-count cutoff.
+    for (int64_t m : { 1, 7, 8, 9, 15, 16, 17, 17408, 17409 }) {
+        for (int64_t n : { 1, 2 }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, m, n, 1024, { 1, 1 }, { 1, 1 }));
+        }
+    }
+    for (bool with_bias : { false, true }) {
+        for (int64_t m : { 67, 17408 }) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PQ2_0, GGML_GLU_OP_SWIGLU, 1, m, 5120, false,
+                                                                1, 1, false, with_bias, true, false, { 1, 1 }));
+        }
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PQ2_0, GGML_GLU_OP_SWIGLU, 1, 5120, 17408, false,
+                                                            1, 1, false, with_bias, false, false, { 1, 1 }));
+    }
+
     // PTQ1_0 / PQ2_0 integer-dot mat-vec: Bonsai-2 shapes, odd row counts (row tail), batches and multi-column B
     for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8}) {
         for (int64_t k : {1024, 5120, 6144, 17408}) {
