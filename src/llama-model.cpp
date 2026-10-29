@@ -1287,6 +1287,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             case LLM_ARCH_QWEN35MOE:
             case LLM_ARCH_QWEN3NEXT:
             case LLM_ARCH_DSPARK:
+            case LLM_ARCH_DFLASH:
                 break;
             default:
                 throw std::runtime_error(format(
@@ -1294,7 +1295,10 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                     llm_arch_name(arch)));
         }
 
-        const auto is_foldable_weight = [](const std::string & name) {
+        const auto is_foldable_weight = [this](const std::string & name) {
+            if (arch == LLM_ARCH_DFLASH && name == "fc.weight") {
+                return true;
+            }
             static const char * kinds[] = {
                 "attn_q", "attn_k", "attn_v", "attn_qkv", "attn_gate", "attn_output",
                 "ffn_gate", "ffn_up", "ffn_down",
@@ -1317,6 +1321,11 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 return false;
             }
             pos++;
+            if (arch == LLM_ARCH_DFLASH &&
+                (name.compare(pos, std::string::npos, "attn_conv_proj.weight") == 0 ||
+                 name.compare(pos, std::string::npos, "ffn_conv_proj.weight") == 0)) {
+                return true;
+            }
             for (const char * kind : kinds) {
                 const std::string suffix = std::string(kind) + ".weight";
                 if (name.compare(pos, std::string::npos, suffix) == 0) {
