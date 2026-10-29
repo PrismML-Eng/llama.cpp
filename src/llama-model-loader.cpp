@@ -1145,6 +1145,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
             size_data -= nbytes;
             n_created++;
+            if (flags & TENSOR_SKIP) {
+                skipped_tensors.insert(tn.str());
+            }
 
             return nullptr;
         }
