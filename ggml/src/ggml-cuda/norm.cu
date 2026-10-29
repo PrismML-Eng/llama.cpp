@@ -2,6 +2,26 @@
 #include "fwht.cuh"
 #include <cstdint>
 
+// The float4 path reorders the row reduction, so outputs are not bit-identical to the scalar path.
+// GGML_CUDA_RMS_NORM_VECTOR=0 restores the scalar reduction order.
+static bool rms_norm_vector_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_RMS_NORM_VECTOR");
+        return !env || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// Sum of squares of one float4 and the row scale in a fixed rounding order (no fast-math contraction choice), so
+// kernels that fuse rms_norm can reproduce the float4 path bit for bit.
+static __device__ __forceinline__ float rms_norm_sumsq4(const float4 v) {
+    return __fmaf_rn(v.w, v.w, __fmaf_rn(v.z, v.z, __fmaf_rn(v.y, v.y, __fmul_rn(v.x, v.x))));
+}
+
+static __device__ __forceinline__ float rms_norm_row_scale(const float sum, const int ncols, const float eps) {
+    return rsqrtf(__fadd_rn(__fdiv_rn(sum, (float) ncols), eps));
+}
+
 template <int block_size>
 static __global__ void norm_f32(
         const float * x, float * dst, const int ncols, const int nchannels, const int nsamples,
@@ -158,30 +178,31 @@ static __global__ void rms_norm_f32(const float * x,
                     const int i = tid + k*block_size;
                     if (i < ncols4) {
                         xs[k] = x4[i];
-                        tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
+                        tmp = __fadd_rn(tmp, rms_norm_sumsq4(xs[k]));
                     }
                 }
                 tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
-                const float scale = rsqrtf(tmp / ncols + eps);
+                const float scale = rms_norm_row_scale(tmp, ncols, eps);
 
 #pragma unroll
                 for (int k = 0; k < vpt; k++) {
                     const int i = tid + k*block_size;
                     if (i < ncols4) {
-                        float4 r = make_float4(scale*xs[k].x, scale*xs[k].y, scale*xs[k].z, scale*xs[k].w);
-                        if constexpr (do_multiply) {
+                        float4 r = make_float4(__fmul_rn(scale, xs[k].x), __fmul_rn(scale, xs[k].y),
+                                               __fmul_rn(scale, xs[k].z), __fmul_rn(scale, xs[k].w));
+                        if constexpr (do_multiply && do_add) {
                             const float4 m = mul4[i];
-                            r.x *= m.x;
-                            r.y *= m.y;
-                            r.z *= m.z;
-                            r.w *= m.w;
-                        }
-                        if constexpr (do_add) {
                             const float4 a = add4[i];
-                            r.x += a.x;
-                            r.y += a.y;
-                            r.z += a.z;
-                            r.w += a.w;
+                            r.x = __fmaf_rn(r.x, m.x, a.x);
+                            r.y = __fmaf_rn(r.y, m.y, a.y);
+                            r.z = __fmaf_rn(r.z, m.z, a.z);
+                            r.w = __fmaf_rn(r.w, m.w, a.w);
+                        } else if constexpr (do_multiply) {
+                            const float4 m = mul4[i];
+                            r.x = __fmul_rn(r.x, m.x);
+                            r.y = __fmul_rn(r.y, m.y);
+                            r.z = __fmul_rn(r.z, m.z);
+                            r.w = __fmul_rn(r.w, m.w);
                         }
                         if constexpr (do_scale) {
                             r.x *= scale_out;
@@ -467,13 +488,7 @@ static void rms_norm_f32_dispatch(
     const float * add = add_t ? (const float *) add_t->data : nullptr;
 
     // dst is written at row * ncols, i.e. always at a multiple of ncols, so only its base needs checking here
-    // Preserve the scalar reduction order for Prism packed-model parity. The vector
-    // path changes quantization decisions downstream, so keep it opt-in for now.
-    static const bool vector_enabled = [] {
-        const char * env = getenv("GGML_CUDA_RMS_NORM_VECTOR");
-        return env && std::atoi(env) != 0;
-    }();
-    bool vec = vector_enabled && ncols % 4 == 0 && ncols > 0 && ((uintptr_t) dst & 15) == 0;
+    bool vec = rms_norm_vector_enabled() && ncols % 4 == 0 && ncols > 0 && ((uintptr_t) dst & 15) == 0;
     vec = vec && ggml_cuda_is_aligned(x_t, 16);
     if constexpr (do_multiply) {
         vec = vec && mul_ncols_packed.z == (uint32_t) ncols
