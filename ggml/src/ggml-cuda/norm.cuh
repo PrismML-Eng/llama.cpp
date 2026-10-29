@@ -35,5 +35,7 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 // Gemma 4 MoE layer tail (3 rms_norm+mul(+add) groups and the layer-scalar mul, optionally the next attn_norm) in one launch; nodes are the 9 or 11 graph nodes
 void ggml_cuda_op_tail_fused(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_fused,
                              float * verify_scratch, float * verify_scratch2, block_q8_1 * q8, int ne0_pad);
+// false when the fused kernel cannot match the unfused norms bit for bit (mixed float4/scalar paths, unsupported width)
+bool ggml_cuda_tail_fused_exact(ggml_tensor * const * nodes, int n_fused);
 void ggml_cuda_op_tail_verify_cmp(ggml_backend_cuda_context & ctx, const ggml_tensor * out, const float * scratch, int tag);
 void ggml_cuda_op_tail_verify_cmp_q8(ggml_backend_cuda_context & ctx, const void * ref, const void * fused, size_t nbytes, int tag);

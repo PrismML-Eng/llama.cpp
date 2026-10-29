@@ -1150,7 +1150,9 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 //   mlp = rms_norm(x1)*w1 ; comb = rms_norm(x2)*w2 + mlp ; res = rms_norm(comb)*w3 + resid ; dst = res * layer_scalar
 // Same per-thread partial sums, same warp/block reduction (float2 reduce is component-wise identical) and same
 // expression forms (fused multiply-add where the unfused rms_norm+mul+add kernel contracts) as the 4 unfused kernels.
-template <int block_size, bool next_norm, bool quant>
+// vec: the unfused norms take the float4 path of rms_norm_f32 (1024 threads, one float4 per thread, 512 < ncols/4 <= 1024),
+// so each thread owns 4 consecutive columns and sums their squares in that kernel's expression order.
+template <int block_size, bool next_norm, bool quant, bool vec>
 static __global__ void __launch_bounds__(block_size) tail_fused_f32(
         const float * x1, const float * w1, const float * x2, const float * w2, const float * w3,
         const float * resid, const float * lscale, float * dst, const float * w4, float * dst4, block_q8_1 * q8, const int ne0_pad,
@@ -1168,6 +1170,92 @@ static __global__ void __launch_bounds__(block_size) tail_fused_f32(
     const float * x2r = x2 + row*x2_stride;
     const float * rr  = resid + row*resid_stride;
     float *       dr  = dst + (int64_t) row*ncols;
+
+    if constexpr (vec) {
+        static_assert(block_size == 1024, "the float4 rms_norm path uses 1024 threads for 512 < ncols/4 <= 1024");
+        const int  n4 = ncols / 4;
+        const bool on = tid < n4;
+        float4 a = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float4 b = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float t1 = 0.0f, t2 = 0.0f;
+        if (on) {
+            a = ((const float4 *) x1r)[tid];
+            b = ((const float4 *) x2r)[tid];
+            t1 = rms_norm_sumsq4(a);
+            t2 = rms_norm_sumsq4(b);
+        }
+        const float2 r12 = block_reduce<block_reduce_method::SUM, block_size>(make_float2(t1, t2), s_sum2);
+        const float scale1 = rms_norm_row_scale(r12.x, ncols, eps);
+        const float scale2 = rms_norm_row_scale(r12.y, ncols, eps);
+
+        float4 c = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float t3 = 0.0f;
+        if (on) {
+            const float4 v1 = ((const float4 *) w1)[tid];
+            const float4 v2 = ((const float4 *) w2)[tid];
+            c.x = __fmaf_rn(__fmul_rn(scale2, b.x), v2.x, __fmul_rn(__fmul_rn(scale1, a.x), v1.x));
+            c.y = __fmaf_rn(__fmul_rn(scale2, b.y), v2.y, __fmul_rn(__fmul_rn(scale1, a.y), v1.y));
+            c.z = __fmaf_rn(__fmul_rn(scale2, b.z), v2.z, __fmul_rn(__fmul_rn(scale1, a.z), v1.z));
+            c.w = __fmaf_rn(__fmul_rn(scale2, b.w), v2.w, __fmul_rn(__fmul_rn(scale1, a.w), v1.w));
+            t3 = rms_norm_sumsq4(c);
+        }
+        const float r3 = block_reduce<block_reduce_method::SUM, block_size>(t3, s_sum1);
+        const float scale3 = rms_norm_row_scale(r3, ncols, eps);
+        const float ls = lscale[0];
+        float4 o = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float t4 = 0.0f;
+        if (on) {
+            const float4 v3 = ((const float4 *) w3)[tid];
+            const float4 rv = ((const float4 *) rr)[tid];
+            o.x = __fmul_rn(__fmaf_rn(__fmul_rn(scale3, c.x), v3.x, rv.x), ls);
+            o.y = __fmul_rn(__fmaf_rn(__fmul_rn(scale3, c.y), v3.y, rv.y), ls);
+            o.z = __fmul_rn(__fmaf_rn(__fmul_rn(scale3, c.z), v3.z, rv.z), ls);
+            o.w = __fmul_rn(__fmaf_rn(__fmul_rn(scale3, c.w), v3.w, rv.w), ls);
+            ((float4 *) dr)[tid] = o;
+            if constexpr (next_norm) {
+                t4 = rms_norm_sumsq4(o);
+            }
+        }
+        if constexpr (next_norm) {
+            const float r4 = block_reduce<block_reduce_method::SUM, block_size>(t4, s_sum4);
+            const float scale4 = rms_norm_row_scale(r4, ncols, eps);
+            float * d4 = dst4 + (int64_t) row*ncols;
+            if (on) {
+                const float4 v4 = ((const float4 *) w4)[tid];
+                float4 y;
+                y.x = __fmul_rn(__fmul_rn(scale4, o.x), v4.x);
+                y.y = __fmul_rn(__fmul_rn(scale4, o.y), v4.y);
+                y.z = __fmul_rn(__fmul_rn(scale4, o.z), v4.z);
+                y.w = __fmul_rn(__fmul_rn(scale4, o.w), v4.w);
+                ((float4 *) d4)[tid] = y;
+            }
+            if constexpr (quant) {
+                // same q8_1 quantize as the scalar layout below; the row is read back from d4, written by this block
+                __syncthreads();
+#pragma unroll
+                for (int k = 0; k < 3; ++k) {
+                    const int col = tid + k*block_size;
+                    if (col < ne0_pad) {
+                        const float xi = col < ncols ? d4[col] : 0.0f;
+                        float amax = fabsf(xi);
+                        float sum  = xi;
+                        amax = warp_reduce_max<QK8_1>(amax);
+                        sum  = warp_reduce_sum<QK8_1>(sum);
+                        const float  d = amax / 127.0f;
+                        const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+                        const int64_t i_cont = (int64_t) row*ne0_pad + col;
+                        const int64_t ib  = i_cont / QK8_1;
+                        const int     iqs = i_cont % QK8_1;
+                        q8[ib].qs[iqs] = q;
+                        if (iqs == 0) {
+                            q8[ib].ds = make_half2(d, sum);
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
 
     float a[3], b[3];
     float t1 = 0.0f, t2 = 0.0f;
@@ -1262,6 +1350,45 @@ static __global__ void tail_verify_cmp_f32(const float * a, const float * b, con
     }
 }
 
+// whether rms_norm_f32_dispatch takes the float4 path for norm(x)*mul(+add) written to dst (same conditions as there)
+static bool tail_norm_takes_vec(const ggml_tensor * x, const ggml_tensor * mul, const ggml_tensor * add, const ggml_tensor * dst) {
+    const int64_t ncols = x->ne[0];
+    bool vec = rms_norm_vector_enabled() && ncols % 4 == 0 && ncols > 0 && ((uintptr_t) dst->data & 15) == 0 &&
+               ggml_cuda_is_aligned(x, 16) && mul->ne[0] == ncols && ggml_cuda_is_aligned(mul, 16);
+    if (add) {
+        vec = vec && add->ne[0] == ncols && ggml_cuda_is_aligned(add, 16);
+    }
+    return vec;
+}
+
+// The reduction order the unfused norms of this tail use: 1 = float4 path, 0 = scalar path, -1 = a mix or a block size
+// the fused kernel does not reproduce (then it must not be fused, or it would not be bit-identical).
+static int tail_fused_mode(ggml_tensor * const * nodes, int n_fused) {
+    auto other = [](const ggml_tensor * t, const ggml_tensor * s) { return t->src[0] == s ? t->src[1] : t->src[0]; };
+    const int64_t nc = nodes[0]->src[0]->ne[0];
+    bool v[4];
+    int  nv = 3;
+    v[0] = tail_norm_takes_vec(nodes[0]->src[0], other(nodes[1], nodes[0]), nullptr, nodes[1]);
+    v[1] = tail_norm_takes_vec(nodes[2]->src[0], other(nodes[3], nodes[2]), other(nodes[4], nodes[3]), nodes[4]);
+    v[2] = tail_norm_takes_vec(nodes[5]->src[0], other(nodes[6], nodes[5]), other(nodes[7], nodes[6]), nodes[7]);
+    if (n_fused == 11) {
+        v[3] = tail_norm_takes_vec(nodes[9]->src[0], other(nodes[10], nodes[9]), nullptr, nodes[10]);
+        nv = 4;
+    }
+    bool all = true, none = true;
+    for (int k = 0; k < nv; ++k) {
+        all  = all  &&  v[k];
+        none = none && !v[k];
+    }
+    if (all) {
+        return nc/4 > 512 && nc/4 <= 1024 ? 1 : -1;
+    }
+    if (none) {
+        return nc >= 1024 && nc <= 3*1024 ? 0 : -1;
+    }
+    return -1;
+}
+
 // nodes: rms1, mul1, rms2, mul2, add2, rms3, mul3, add3, lscale_mul[, rms4, mul4 (next layer attn_norm) when n_fused == 11].
 // verify_scratch != nullptr: write there (verify_scratch2 for the attn_norm output) instead of the graph tensors.
 void ggml_cuda_op_tail_fused(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_fused,
@@ -1293,19 +1420,24 @@ void ggml_cuda_op_tail_fused(ggml_backend_cuda_context & ctx, ggml_tensor * cons
     const int64_t s1 = rms1->src[0]->nb[1] / sizeof(float);
     const int64_t s2 = rms2->src[0]->nb[1] / sizeof(float);
     const int64_t sr = resid_t->nb[1] / sizeof(float);
+    const int mode = tail_fused_mode(nodes, n_fused);
+    GGML_ASSERT(mode >= 0);
+#define TAIL_FUSED_LAUNCH(NEXT, QUANT, VEC) \
+        ggml_cuda_kernel_launch(tail_fused_f32<1024, NEXT, QUANT, VEC>, launch_params, \
+            (const float *) rms1->src[0]->data, w1, (const float *) rms2->src[0]->data, w2, w3, \
+            (const float *) resid_t->data, (const float *) ls_t->data, dst, w4, dst4, q8, ne0_pad, ncols, s1, s2, sr, eps)
     if (n_fused == 11 && q8) {
-        ggml_cuda_kernel_launch(tail_fused_f32<1024, true, true>, launch_params,
-            (const float *) rms1->src[0]->data, w1, (const float *) rms2->src[0]->data, w2, w3,
-            (const float *) resid_t->data, (const float *) ls_t->data, dst, w4, dst4, q8, ne0_pad, ncols, s1, s2, sr, eps);
+        if (mode == 1) { TAIL_FUSED_LAUNCH(true, true, true); } else { TAIL_FUSED_LAUNCH(true, true, false); }
     } else if (n_fused == 11) {
-        ggml_cuda_kernel_launch(tail_fused_f32<1024, true, false>, launch_params,
-            (const float *) rms1->src[0]->data, w1, (const float *) rms2->src[0]->data, w2, w3,
-            (const float *) resid_t->data, (const float *) ls_t->data, dst, w4, dst4, q8, ne0_pad, ncols, s1, s2, sr, eps);
+        if (mode == 1) { TAIL_FUSED_LAUNCH(true, false, true); } else { TAIL_FUSED_LAUNCH(true, false, false); }
     } else {
-        ggml_cuda_kernel_launch(tail_fused_f32<1024, false, false>, launch_params,
-            (const float *) rms1->src[0]->data, w1, (const float *) rms2->src[0]->data, w2, w3,
-            (const float *) resid_t->data, (const float *) ls_t->data, dst, w4, dst4, q8, ne0_pad, ncols, s1, s2, sr, eps);
+        if (mode == 1) { TAIL_FUSED_LAUNCH(false, false, true); } else { TAIL_FUSED_LAUNCH(false, false, false); }
     }
+#undef TAIL_FUSED_LAUNCH
+}
+
+bool ggml_cuda_tail_fused_exact(ggml_tensor * const * nodes, int n_fused) {
+    return tail_fused_mode(nodes, n_fused) >= 0;
 }
 
 void ggml_cuda_op_tail_verify_cmp(ggml_backend_cuda_context & ctx, const ggml_tensor * out, const float * scratch, int tag) {

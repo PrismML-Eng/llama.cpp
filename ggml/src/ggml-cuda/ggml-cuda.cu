@@ -5009,6 +5009,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (n_fused == 9) {
                     ok = ggml_can_fuse_subgraph(cgraph, i, 9, ops, outs, 1) && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 9, outs, 1, false, true);
                 }
+                // the fused kernel reproduces either reduction order of the unfused norms, not a mix of them
+                if (ok && n_fused == 11 && !ggml_cuda_tail_fused_exact(n, 11)) {
+                    n_fused = 9;
+                    ok = ggml_can_fuse_subgraph(cgraph, i, 9, ops, outs, 1) && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 9, outs, 1, false, true);
+                }
+                ok = ok && ggml_cuda_tail_fused_exact(n, n_fused);
                 // level 3: also write the q8_1 rows of the normalized activation that the mat-vecs of the next
                 // attention block would quantize (all consumers are plain MUL_MATs with the AOS layout)
                 bool with_q8 = false;
