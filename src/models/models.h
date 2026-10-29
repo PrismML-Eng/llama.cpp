@@ -79,7 +79,7 @@ struct llm_build_delta_net_base : public llm_graph_context {
     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
     //
-    // state_rows (optional, ring path only): when set, `s` is instead the 2D
+    // state_rows (optional): when set, `s` is instead the 2D
     // cache view from build_rs_cache_view and the fused op reads each seq's
     // live state directly at cache row state_rows[seq] (inp->s_copy_main) --
     // no gathered scratch; the snapshot write becomes a SET_ROWS the Metal

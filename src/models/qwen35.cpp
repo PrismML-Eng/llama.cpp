@@ -483,7 +483,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    // ring path: read per-seq live state directly from the cache inside the
+    // Read per-seq live state directly from the cache inside the
     // fused GDN op (rows mode) instead of a gather per layer.
     // GGML_GDN_STATE_GATHER=1 restores the legacy gathered path (A/B).
     // rows mode (the src[6] variant) is implemented on CPU and Metal only;
@@ -496,7 +496,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // row in plane 0, gathered with its own row indices (s_copy carries the conv rollback plane)
     const bool gdn_rpl = inp->s_rpl_ctrl != nullptr;
 
-    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0 && !gdn_rpl;
+    // Extra relocation can overwrite a source row before GDN reads it. Multiple sequences also need read-before-write ordering.
+    const bool gdn_state_rows_safe = n_seqs == 1 && mctx_cur->get_n_rs() == 1;
+    const bool gdn_state_rows_path = cparams.n_rs_seq > 0 || (n_seq_tokens == 1 && cparams.fused_gdn_ar);
+    const bool gdn_state_rows =
+        gdn_state_rows_env && gdn_state_rows_dev_ok && gdn_state_rows_safe && gdn_state_rows_path && !gdn_rpl;
 
     ggml_tensor * state;
     if (gdn_rpl) {
