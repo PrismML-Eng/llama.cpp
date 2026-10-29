@@ -106,6 +106,31 @@ def test_different_draft_min_draft_max():
         last_content = res.body["content"]
 
 
+def test_draft_window_keeps_output():
+    # a 64-row draft window with a longer prompt: every batch trims the draft context (the trim path),
+    # drafting goes on, and the greedy output is the same as without the window
+    global server
+    request = {
+        "prompt": "Once upon a time there was a little girl named Lily. " * 12,
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 32,
+        "return_tokens": True,
+    }
+    server.start()
+    res = server.make_request("POST", "/completion", data=request)
+    assert res.status_code == 200
+    tokens_full = res.body["tokens"]
+    server.stop()
+
+    server.spec_draft_window = 64
+    server.start()
+    res = server.make_request("POST", "/completion", data=request)
+    assert res.status_code == 200
+    assert res.body["timings"]["draft_n"] > 0
+    assert res.body["tokens"] == tokens_full
+
+
 def test_slot_ctx_not_exceeded():
     global server
     server.n_ctx = 256
