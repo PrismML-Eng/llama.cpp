@@ -11330,6 +11330,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // GQA ratio 6 (Qwen3.5: 24 Q heads on 4 KV heads), head size 256: prompt batches use ncols2 = 2, decode and small batches ncols2 = 8.
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        for (int kv : {512, 1024}) {
+            for (int nb : {1, 3, 8, 32, 63, 64, 65, 128, 512}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV));
+            }
+        }
+    }
+
     // mixed quant and Q1_0 test cases
     // ARC-LAB: q4_0-cache decode kernel (SYCL fattn-dec): Bonsai 27B shape (D 256, 4 KV heads x GQA 6), 1-4 query tokens
     for (int64_t kv : {256, 512, 4096, 16384}) {
