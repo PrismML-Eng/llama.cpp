@@ -570,6 +570,25 @@ static common_chat_tool edit_tool{
     })",
 };
 
+static common_chat_tool query_entities_tool{
+    /* .name = */ "query_entities",
+    /* .description = */ "Query entities by type",
+    /* .parameters = */ R"({
+        "type": "object",
+        "properties": {
+            "entity_type": {
+                "type": "string",
+                "description": "Type of entity to query"
+            },
+            "filters": {
+                "type": "array",
+                "description": "List of [field, operator, value] filters"
+            }
+        },
+        "required": ["entity_type", "filters"]
+    })",
+};
+
 static common_chat_tool manage_todo_list_tool{
     /* .name = */ "manage_todo_list",
     /* .description = */ "Create or update the todo list",
@@ -2442,6 +2461,29 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         })
             .expect_tool_calls({
                 { "edit", "{\"filename\": \"foo.c\", \"oldString\": \"#iclunde\", \"newString\": \"#include\\n\"}", {} },
+            })
+            .run();
+
+        // a string argument followed by a JSON argument, both closed by the canonical
+        // "\n</parameter>\n": the grammar must accept the newline before </function>
+        tst.test(
+               "<tool_call>\n"
+               "<function=query_entities>\n"
+               "<parameter=entity_type>\n"
+               "Note\n"
+               "</parameter>\n"
+               "<parameter=filters>\n"
+               "[[\"updated_at\", \"between\", [\"2026-09-21T00:00:00Z\", \"2026-09-21T23:59:59Z\"]]]\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({
+                query_entities_tool
+        })
+            .expect_tool_calls({
+                { "query_entities", R"({"entity_type": "Note", "filters": [["updated_at", "between", ["2026-09-21T00:00:00Z", "2026-09-21T23:59:59Z"]]]})", {} },
             })
             .run();
 
