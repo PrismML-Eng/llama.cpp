@@ -710,6 +710,38 @@ static __device__ __forceinline__ int q2_0_symbols4_hip(const uint32_t b) {
 }
 #endif  // defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// Q1_0 dot on the GGML_CUDA_Q8_1_Q1B activation layout (see quantize_q8_1): bit j of every weight byte lines up with word j of
+// the activations, sum((2b - 1) a) = 2*sum(b a) - sum(a), all in int32, so the result equals vec_dot_q1_0_q8_1 exactly.
+// chunk_global = 4 * block index + chunk in block, yrow is the start of the activation row, ne0 its padded length.
+static __device__ __forceinline__ float vec_dot_q1_0_q1b(
+        const block_q1_0 * bq1_0, const char * __restrict__ yrow, const int ne0, const int chunk_global, const int iqs) {
+
+    const uint16_t * qs = (const uint16_t *) bq1_0->qs + iqs * 2;
+    const uint32_t   q  = (uint32_t) qs[0] | ((uint32_t) qs[1] << 16);
+
+    const int4 * yv = (const int4 *) (yrow + (size_t) chunk_global * QK8_1);
+    const int4 y0 = yv[0];
+    const int4 y1 = yv[1];
+    const half2 ds = ((const half2 *) (yrow + ne0))[chunk_global];
+
+    int s = 0;
+    s = ggml_cuda_dp4a((q >> 0) & 0x01010101, y0.x, s);
+    s = ggml_cuda_dp4a((q >> 1) & 0x01010101, y0.y, s);
+    s = ggml_cuda_dp4a((q >> 2) & 0x01010101, y0.z, s);
+    s = ggml_cuda_dp4a((q >> 3) & 0x01010101, y0.w, s);
+    s = ggml_cuda_dp4a((q >> 4) & 0x01010101, y1.x, s);
+    s = ggml_cuda_dp4a((q >> 5) & 0x01010101, y1.y, s);
+    s = ggml_cuda_dp4a((q >> 6) & 0x01010101, y1.z, s);
+    s = ggml_cuda_dp4a((q >> 7) & 0x01010101, y1.w, s);
+
+    const int   sumi = 2*s - (int) __half_as_short(__high2half(ds));
+    const float d1   = bq1_0->d;
+    const float d8   = __low2float(ds);
+    return d1 * d8 * sumi;
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
 static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 

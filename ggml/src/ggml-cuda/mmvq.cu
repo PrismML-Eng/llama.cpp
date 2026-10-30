@@ -1110,6 +1110,20 @@ static __global__ void mul_mat_vec_q(
             for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+                    if constexpr (type == GGML_TYPE_Q1_0 && y_soa) {
+                        // GGML_CUDA_Q8_1_Q1B activations (one column): bit-serial dot, see vec_dot_q1_0_q1b
+                        const char * yrow = (const char *) (y + j * stride_col_y);
+                        const int    ne0y = (ids ? stride_channel_y : stride_col_y) * QK8_1;
+                        tmp[j][i] += vec_dot_q1_0_q1b((const block_q1_0 *) vx + kbx_offset + i * stride_row_x + kbx, yrow, ne0y, kby + kqs, kqs);
+                        if constexpr (has_fusion) {
+                            if constexpr (has_gate) {
+                                tmp_gate[j][i] += vec_dot_q1_0_q1b((const block_q1_0 *) vgate + kbx_offset + i * stride_row_x + kbx, yrow, ne0y, kby + kqs, kqs);
+                            }
+                        }
+                        continue;
+                    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
                     tmp[j][i] +=
                         vec_dot_q_cuda(vx, &y[j * stride_col_y + kby], kbx_offset + i * stride_row_x + kbx, kqs);
                     if constexpr (has_fusion) {
@@ -1425,7 +1439,12 @@ static std::pair<dim3, dim3> calc_launch_params(
 // only for PTQ1_0 at one column, so every other type/column count compiles exactly one kernel body.
 template<ggml_type type, int c_ncols_dst, bool has_fusion, bool has_gate, bool small_k, bool halve_iters, bool tall, typename... Args>
 static void mul_mat_vec_q_launch(const bool y_soa, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {
-    if constexpr (type == GGML_TYPE_PTQ1_0 && c_ncols_dst == 1) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    constexpr bool y_soa_type = type == GGML_TYPE_PTQ1_0 || type == GGML_TYPE_Q1_0;
+#else
+    constexpr bool y_soa_type = type == GGML_TYPE_PTQ1_0;
+#endif
+    if constexpr (y_soa_type && c_ncols_dst == 1) {
         if (y_soa) {
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, has_fusion, has_gate, small_k, halve_iters, true, tall>,
                                     launch_params, std::forward<Args>(args)...);
@@ -1525,7 +1544,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
     // Same layout the caller handed the quantizer. Do not recompute from ncols_dst here:
     // ggml_cuda_mul_mat_vec_q derives the column count as (ids ? ne2 : ne11).
-    const bool y_soa = y_layout == GGML_CUDA_Q8_1_SOA_ISUM;
+    const bool y_soa = y_layout == GGML_CUDA_Q8_1_SOA_ISUM || y_layout == GGML_CUDA_Q8_1_Q1B;
 
 #if !defined(GGML_USE_HIP)
     if constexpr (type == GGML_TYPE_PQ2_0) {

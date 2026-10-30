@@ -1069,6 +1069,7 @@ enum ggml_cuda_q8_1_layout : int {
     GGML_CUDA_Q8_1_SOA_ISUM = 1, // PTQ1_0, one column: warp-transposed, exact int sums (ggml_cuda_ptq1_q8_word)
     GGML_CUDA_Q8_1_PT       = 2, // PTQ1_0, 2-8 columns or MoE ids: planar-transposed (mmvq-ptq1_0.cuh)
     GGML_CUDA_Q8_1_PQ2      = 3, // PQ2_0, 3-8 columns, plain 2D, Ada: permuted qs plus half2 (d, int sum) per block (mmvq-pq2_0.cuh)
+    GGML_CUDA_Q8_1_Q1B      = 4, // Q1_0, one column: per 32-block, word j = elements j, 8+j, 16+j, 24+j (bit-serial dot), then half2 (d, exact int sum) per block
 };
 
 // Column-count helper, not the layout decision. 2-8 columns and MoE (ids) take the planar
@@ -1080,6 +1081,9 @@ static constexpr __host__ __device__ ggml_cuda_q8_1_layout ggml_cuda_q8_1_layout
     GGML_UNUSED(type_src0); GGML_UNUSED(ncols_dst); GGML_UNUSED(has_ids);
     return GGML_CUDA_Q8_1_AOS;
 #else
+    if (type_src0 == GGML_TYPE_Q1_0) {
+        return ncols_dst == 1 ? GGML_CUDA_Q8_1_Q1B : GGML_CUDA_Q8_1_AOS;
+    }
     if (type_src0 != GGML_TYPE_PTQ1_0) {
         return GGML_CUDA_Q8_1_AOS;
     }
@@ -1351,6 +1355,12 @@ static inline ggml_cuda_q8_1_layout ggml_cuda_q8_1_layout_host(ggml_type type_sr
         return GGML_CUDA_Q8_1_PQ2;
     }
     const ggml_cuda_q8_1_layout l = ggml_cuda_q8_1_layout_for(type_src0, ncols_dst, has_ids);
+    if (l == GGML_CUDA_Q8_1_Q1B) {
+        // GGML_CUDA_Q1_BITSERIAL=0 keeps the plain block_q8_1 layout (A/B switch)
+        static const bool q1b_on = getenv("GGML_CUDA_Q1_BITSERIAL") == nullptr || atoi(getenv("GGML_CUDA_Q1_BITSERIAL")) != 0;
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        return q1b_on && !ggml_cuda_batch_invariant() && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING && cc != GGML_CUDA_CC_DGX_SPARK ? GGML_CUDA_Q8_1_Q1B : GGML_CUDA_Q8_1_AOS;
+    }
     if (l == GGML_CUDA_Q8_1_SOA_ISUM && ggml_cuda_batch_invariant()) {
         return GGML_CUDA_Q8_1_PT;
     }

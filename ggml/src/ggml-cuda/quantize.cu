@@ -147,6 +147,26 @@ static __global__ void quantize_q8_1(
         *ds = make_half2(__float2half(d), __short_as_half((short) isum));
         return;
     }
+    if constexpr (layout == GGML_CUDA_Q8_1_Q1B) {
+        const int64_t row_cont = (i3*ne2.z + i2) * ne1 + i1;
+        char * ycol = (char *) vy + row_cont * (ne0 * 9 / 8); // same row stride as block_q8_1
+        const int64_t kb = i0 / QK8_1;
+        const int     e  = i0 % QK8_1;
+        // word j of the 32-block holds elements j, 8+j, 16+j, 24+j (byte i = element 8*i + j)
+        ((int8_t *) ycol)[kb*QK8_1 + 4*(e % 8) + e / 8] = q;
+
+        int isum = q;
+        isum = warp_reduce_sum<QK8_1>(isum);
+
+        if (iqs > 0) {
+            return;
+        }
+
+        // |isum| <= 32*127 fits int16; keep the raw bits in the half slot.
+        half2 * ds = (half2 *) (ycol + ne0) + kb;
+        *ds = make_half2(__float2half(d), __short_as_half((short) isum));
+        return;
+    }
     if constexpr (layout == GGML_CUDA_Q8_1_SOA_ISUM) {
         // Warp-transposed layout (see ggml_cuda_ptq1_q8_word); ne0 is padded to GGML_CUDA_PTQ1_K_PAD.
         int isum = q;
@@ -935,6 +955,9 @@ void quantize_row_q8_1_cuda(
             break;
         case GGML_CUDA_Q8_1_PQ2:
             ggml_cuda_kernel_launch(quantize_q8_1<GGML_CUDA_Q8_1_PQ2>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+            break;
+        case GGML_CUDA_Q8_1_Q1B:
+            ggml_cuda_kernel_launch(quantize_q8_1<GGML_CUDA_Q8_1_Q1B>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
             break;
         default:
             ggml_cuda_kernel_launch(quantize_q8_1<GGML_CUDA_Q8_1_AOS>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
