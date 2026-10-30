@@ -1649,7 +1649,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
     // GGML_CUDA_MMVQ_TALL_EXT=0 keeps it PQ2_0-only.
     const auto should_use_tall = [&] {
         static const bool ext = !getenv("GGML_CUDA_MMVQ_TALL_EXT") || atoi(getenv("GGML_CUDA_MMVQ_TALL_EXT")) != 0;
-        return (type == GGML_TYPE_PQ2_0 || (ext && mmvq_tall_ext_type(type))) && table_id == MMVQ_PARAMETERS_GENERIC && GGML_CUDA_CC_IS_NVIDIA(cc) &&
+        // The extended types are left on the default geometry when a gate matrix is fused (gate+up pair): there 8 rows per CTA ran slower.
+        const bool ext_ok = ext && mmvq_tall_ext_type(type) && fusion.gate == nullptr;
+        return (type == GGML_TYPE_PQ2_0 || ext_ok) && table_id == MMVQ_PARAMETERS_GENERIC && GGML_CUDA_CC_IS_NVIDIA(cc) &&
                cc >= GGML_CUDA_CC_HOPPER && cc < GGML_CUDA_CC_BLACKWELL && !has_ids && !y_soa && nrows_x >= 4096 &&
                nrows_x % MMVQ_TALL_ROWS_PER_BLOCK == 0; // whole CTAs: rows past the end would be read, not only skipped
     };
