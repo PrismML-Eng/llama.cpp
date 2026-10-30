@@ -107,7 +107,10 @@ public:
         args.insert({ DNNL_ARG_WEIGHTS, dnnl::memory(w_md, eng, const_cast<uint8_t *>(w4)) });
         args.insert({ DNNL_ARG_DST, dnnl::memory(pd.dst_desc(), eng, dst) });
         args.insert({ DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, dnnl::memory(sc_md, eng, const_cast<float *>(scales)) });
-        args.insert({ DNNL_ARG_SCRATCHPAD, ctx.get_scratchpad_mem(pd.scratchpad_desc(), eng, q) });
+        const auto scratchpad_md = pd.scratchpad_desc();
+        ggml_sycl_pool_alloc<uint8_t> scratchpad(ctx.pool());
+        void * scratchpad_ptr = scratchpad_md.get_size() > 0 ? scratchpad.alloc(scratchpad_md.get_size()) : nullptr;
+        args.insert({ DNNL_ARG_SCRATCHPAD, dnnl::memory(scratchpad_md, eng, scratchpad_ptr) });
         prim.execute(stream, args);
     }
 
@@ -127,7 +130,10 @@ public:
         args.insert({ DNNL_ARG_SRC, dnnl::memory(act_md, eng, const_cast<int8_t *>(act)) });
         args.insert({ DNNL_ARG_WEIGHTS, dnnl::memory(w_md, eng, const_cast<int8_t *>(w)) });
         args.insert({ DNNL_ARG_DST, dnnl::memory(pd.dst_desc(), eng, dst) });
-        args.insert({ DNNL_ARG_SCRATCHPAD, ctx.get_scratchpad_mem(pd.scratchpad_desc(), eng, q) });
+        const auto scratchpad_md = pd.scratchpad_desc();
+        ggml_sycl_pool_alloc<uint8_t> scratchpad(ctx.pool());
+        void * scratchpad_ptr = scratchpad_md.get_size() > 0 ? scratchpad.alloc(scratchpad_md.get_size()) : nullptr;
+        args.insert({ DNNL_ARG_SCRATCHPAD, dnnl::memory(scratchpad_md, eng, scratchpad_ptr) });
         prim.execute(stream, args);
     }
 
