@@ -1,0 +1,12 @@
+<service>
+  <id>Gemma4Service</id>
+  <name>Gemma 4 12B llama.cpp Service</name>
+  <description>Native Windows Service (WinSW) for Google Gemma 4 12B LLM inference engine with CUDA 13.4 GPU acceleration</description>
+  <executable>C:\Users\vonwa\.gemini\antigravity\scratch\llama_gemma\bin\llama-server.exe</executable>
+  <arguments>-m "C:\Users\vonwa\.gemini\antigravity\scratch\llama_gemma\models\gemma-4-12B-it-Q4_K_M.gguf" --host 0.0.0.0 --port 8081 -c 16384 -ngl 99 -fa 1 -t 16 -b 2048 -ub 512 -sps 0.5 --reasoning-budget 0 --spec-type ngram-simple</arguments>
+  <workingdirectory>C:\Users\vonwa\.gemini\antigravity\scratch\llama_gemma</workingdirectory>
+  <logpath>C:\Users\vonwa\.gemini\antigravity\scratch\llama_gemma\logs</logpath>
+  <log mode="roll"></log>
+  <startmode>Manual</startmode>
+  <onfailure action="restart" delay="10 sec"/>
+</service>
