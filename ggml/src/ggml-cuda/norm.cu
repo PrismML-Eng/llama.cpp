@@ -952,6 +952,85 @@ void ggml_cuda_op_add_rms_norm_scale_fused(
     }
 }
 
+// RMS_NORM -> SCALE -> MUL(weight): same reduction and expression order as the rms_norm_f32 kernel the unfused RMS_NORM takes
+// (the scalar path, or with vec the float4 path with one float4 per thread), followed by the elementwise scale and multiply,
+// so the result is bit-identical to the three separate nodes.
+template <bool vec>
+static __global__ void rms_norm_scale_mul_f32(const float * x, const float * w, float * dst, const int ncols,
+                                              const int64_t stride_row, const float eps, const float scale_out) {
+    ggml_cuda_pdl_lc();
+    extern __shared__ float s_sum[];
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    ggml_cuda_pdl_sync();
+    const float * xc   = x + row*stride_row;
+    float *       dstc = dst + (int64_t) row*ncols;
+    if constexpr (vec) {
+        const int n4 = ncols / 4;
+        float4 xv = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float  tmp = 0.0f;
+        if (tid < n4) {
+            xv  = ((const float4 *) xc)[tid];
+            tmp = __fadd_rn(tmp, rms_norm_sumsq4(xv));
+        }
+        tmp = block_reduce<block_reduce_method::SUM, 1024>(tmp, s_sum);
+        const float scale = rms_norm_row_scale(tmp, ncols, eps);
+        if (tid < n4) {
+            const float4 wv = ((const float4 *) w)[tid];
+            float4 r;
+            r.x = __fmul_rn(__fmul_rn(scale_out, __fmul_rn(scale, xv.x)), wv.x);
+            r.y = __fmul_rn(__fmul_rn(scale_out, __fmul_rn(scale, xv.y)), wv.y);
+            r.z = __fmul_rn(__fmul_rn(scale_out, __fmul_rn(scale, xv.z)), wv.z);
+            r.w = __fmul_rn(__fmul_rn(scale_out, __fmul_rn(scale, xv.w)), wv.w);
+            ((float4 *) dstc)[tid] = r;
+        }
+    } else {
+        float tmp = 0.0f;
+        for (int col = tid; col < ncols; col += 1024) {
+            const float xi = xc[col];
+            tmp += xi * xi;
+        }
+        tmp = block_reduce<block_reduce_method::SUM, 1024>(tmp, s_sum);
+        const float mean  = tmp / ncols;
+        const float scale = rsqrtf(mean + eps);
+        for (int col = tid; col < ncols; col += 1024) {
+            dstc[col] = (scale_out * (scale * xc[col])) * w[col];
+        }
+    }
+}
+
+bool ggml_cuda_op_rms_norm_scale_mul_fused(ggml_backend_cuda_context & ctx, ggml_tensor * rms, ggml_tensor * scale_t, ggml_tensor * mul_t, float * verify_scratch) {
+    const ggml_tensor * src0 = rms->src[0];
+    const ggml_tensor * w    = mul_t->src[0] == scale_t ? mul_t->src[1] : mul_t->src[0];
+    if (src0->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || mul_t->type != GGML_TYPE_F32 || scale_t->type != GGML_TYPE_F32 ||
+            src0->ne[0] < 1024 || src0->ne[2] != 1 || src0->ne[3] != 1 || src0->nb[0] != sizeof(float) ||
+            !ggml_is_contiguous(w) || ggml_nelements(w) != src0->ne[0] || !ggml_is_contiguous(mul_t) ||
+            !ggml_are_same_shape(mul_t, src0)) {
+        return false;
+    }
+    float eps, scale;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    memcpy(&scale, (const float *) scale_t->op_params + 0, sizeof(float));
+    if (!(eps >= 0.0f) || ((const float *) scale_t->op_params)[1] != 0.0f) {
+        return false;
+    }
+    // The unfused RMS_NORM takes the float4 path when its operands are 16-byte aligned and ncols/4 <= 1024 fits one float4
+    // per thread; wider rows use a different float4 geometry that this kernel does not reproduce, so they are not fused.
+    const int  ncols = (int) src0->ne[0];
+    const bool vec = rms_norm_vector_enabled() && ncols % 4 == 0 && ggml_cuda_is_aligned(src0, 16) &&
+                     ((uintptr_t) rms->data & 15) == 0;
+    if (vec && ncols / 4 > 1024) {
+        return false;
+    }
+    if (vec && (!ggml_cuda_is_aligned(w, 16) || ((uintptr_t) scale_t->data & 15) != 0 || ((uintptr_t) mul_t->data & 15) != 0)) {
+        return false;
+    }
+    const ggml_cuda_kernel_launch_params lp{ dim3(src0->ne[1], 1, 1), dim3(1024, 1, 1), 32 * sizeof(float), ctx.stream() };
+    ggml_cuda_kernel_launch(vec ? rms_norm_scale_mul_f32<true> : rms_norm_scale_mul_f32<false>, lp, (const float *) src0->data, (const float *) w->data, verify_scratch ? verify_scratch : (float *) mul_t->data,
+                            (int) src0->ne[0], (int64_t) (src0->nb[1] / sizeof(float)), eps, scale);
+    return true;
+}
+
 void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor) {
     const ggml_tensor * src0   = dst->src[0];
     float *             dst_d  = (float *) scale_tensor->data;

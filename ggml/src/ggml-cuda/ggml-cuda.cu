@@ -4341,6 +4341,65 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 }
 
 
+// GGML_CUDA_MOE_EP_VERIFY=1: compare against the existing fused reduction (REPEAT/GET_ROWS result input);
+// =2: compare against the fully unfused MUL, MUL, VIEW, ADD nodes
+static int ggml_cuda_moe_ep_verify_mode() {
+    static const int m = getenv("GGML_CUDA_MOE_EP_VERIFY") ? atoi(getenv("GGML_CUDA_MOE_EP_VERIFY")) : 0;
+    return m;
+}
+
+// GGML_CUDA_MOE_EP_FUSION bit mask: 1 = scale gather into the weighted reduction, 2 = router RMS_NORM+SCALE+MUL, 4 = router matvec + top-k
+static int ggml_cuda_moe_ep_bits() {
+    static const int bits = getenv("GGML_CUDA_MOE_EP_FUSION") ? atoi(getenv("GGML_CUDA_MOE_EP_FUSION")) : 0;
+    return bits;
+}
+static bool ggml_cuda_moe_ep_fusion_enabled() {
+    return (ggml_cuda_moe_ep_bits() & 1) != 0;
+}
+
+// REPEAT(w_s [1,n_expert,1] -> [1,n_expert,n_tokens]) -> GET_ROWS(.., ids) -> MUL(experts, .) -> weighted reduction.
+// The gather and the repeat only feed the expert-scale MUL, so the reduction kernel can read w_s[ids] directly.
+static bool ggml_cuda_match_moe_scale_gather(
+        const ggml_cgraph * cgraph,
+        int node_idx,
+        ggml_cuda_moe_weighted_reduction_match & match,
+        const ggml_tensor *& table,
+        const ggml_tensor *& ids) {
+    if (node_idx + 3 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * rep = cgraph->nodes[node_idx];
+    const ggml_tensor * get = cgraph->nodes[node_idx + 1];
+    if (rep->op != GGML_OP_REPEAT || get->op != GGML_OP_GET_ROWS || get->src[0] != rep ||
+            rep->type != GGML_TYPE_F32 || get->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const ggml_tensor * w_s = rep->src[0];
+    ids = get->src[1];
+    if (!w_s || !ids || w_s->type != GGML_TYPE_F32 || !ggml_is_contiguous(w_s) || w_s->ne[0] != 1 || w_s->ne[2] != 1 ||
+            w_s->ne[3] != 1 || ids->type != GGML_TYPE_I32 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+            ids->nb[0] != sizeof(int32_t) || ids->nb[1] % sizeof(int32_t) != 0 ||
+            rep->ne[0] != 1 || rep->ne[1] != w_s->ne[1] || rep->ne[3] != 1 ||
+            get->ne[0] != 1 || get->ne[1] != ids->ne[0] || get->ne[2] != ids->ne[1] || get->ne[3] != 1 ||
+            rep->ne[2] != ids->ne[1] || !ggml_is_contiguous(rep) || !ggml_is_contiguous(get)) {
+        return false;
+    }
+    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, node_idx + 2, match) || match.expert_scale != get) {
+        return false;
+    }
+    const int count = match.node_count + 2;
+    std::vector<ggml_op> ops(count);
+    for (int j = 0; j < count; ++j) {
+        ops[j] = cgraph->nodes[node_idx + j]->op;
+    }
+    const int output_idx = node_idx + count - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, count, ops.data(), &output_idx, 1)) {
+        return false;
+    }
+    table = w_s;
+    return true;
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -5395,13 +5454,51 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    if (node->op == GGML_OP_MUL) {
+    // GGML_CUDA_MOE_EP_FUSION=1: fold the per-expert scale gather (REPEAT + GET_ROWS of down_exps_s by the selected ids)
+    // into the weighted reduction kernel
+    if (node->op == GGML_OP_REPEAT && ggml_cuda_moe_ep_fusion_enabled()) {
+        ggml_cuda_moe_weighted_reduction_match match;
+        const ggml_tensor * table = nullptr;
+        const ggml_tensor * ids   = nullptr;
+        if (ggml_cuda_match_moe_scale_gather(cgraph, i, match, table, ids)) {
+            const int count      = match.node_count + 2;
+            const int output_idx = i + count - 1;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, &output_idx, 1)) {
+                // GGML_CUDA_MOE_EP_VERIFY=1: run the fused kernel into scratch, run the unfused nodes, compare bit-for-bit at the output
+                if (ggml_cuda_moe_ep_verify_mode() != 0) {
+                    static float * scratch = nullptr; static int tag = 0;
+                    if (!scratch) { CUDA_CHECK(cudaMalloc(&scratch, (size_t) 32*1024*1024)); }
+                    const size_t need = ggml_nelements(match.dst)*sizeof(float);
+                    if (need <= (size_t) 32*1024*1024 && tag < 1000000) {
+                        ggml_tensor tmp = *match.dst;
+                        tmp.data = scratch;
+                        ggml_cuda_op_moe_weighted_reduction(*cuda_ctx, match.experts, nullptr, match.weights, &tmp, table, ids);
+                        ggml_cuda_tail_verify_pending()[match.dst] = { scratch, tag++ };
+                    }
+                    return 0;
+                }
+                ggml_cuda_op_moe_weighted_reduction(
+                    *cuda_ctx, match.experts, nullptr, match.weights, match.dst, table, ids);
+                return count - 1;
+            }
+        }
+    }
+
+    if (node->op == GGML_OP_MUL && !(ggml_cuda_moe_ep_verify_mode() == 2 && ggml_cuda_moe_ep_fusion_enabled())) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
             const int output_idx = i + match.node_count - 1;
             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
                 ggml_cuda_op_moe_weighted_reduction(
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
+                if (!ggml_cuda_tail_verify_pending().empty()) {
+                    auto it = ggml_cuda_tail_verify_pending().find(match.dst);
+                    if (it != ggml_cuda_tail_verify_pending().end()) {
+                        ggml_cuda_op_tail_verify_cmp(*cuda_ctx, match.dst, it->second.scratch, it->second.tag);
+                        static int nl = 0;
+                        if ((++nl & (nl - 1)) == 0) fprintf(stderr, "TAILVERIFY compare launches captured/issued: %d\n", nl);
+                    }
+                }
                 return match.node_count - 1;
             }
         }
@@ -6162,6 +6259,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    const int ep_out2 = i + 2;
+    if ((ggml_cuda_moe_ep_bits() & 2) && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_SCALE &&
+            cgraph->nodes[i + 1]->src[0] == node && cgraph->nodes[i + 2]->op == GGML_OP_MUL &&
+            (cgraph->nodes[i + 2]->src[0] == cgraph->nodes[i + 1] || cgraph->nodes[i + 2]->src[1] == cgraph->nodes[i + 1]) &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_MUL }, { i + 2 }) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, &ep_out2, 1)) {
+        if (ggml_cuda_moe_ep_verify_mode() != 0) {
+            static float * scratch = nullptr; static int tag = 0;
+            if (!scratch) { CUDA_CHECK(cudaMalloc(&scratch, (size_t) 32*1024*1024)); }
+            ggml_tensor * mul_n = cgraph->nodes[i + 2];
+            if (ggml_nelements(mul_n)*sizeof(float) <= (size_t) 32*1024*1024 && tag < 1000000 &&
+                    ggml_cuda_op_rms_norm_scale_mul_fused(*cuda_ctx, node, cgraph->nodes[i + 1], mul_n, scratch)) {
+                ggml_cuda_tail_verify_pending()[mul_n] = { scratch, tag++ };
+            }
+        } else if (ggml_cuda_op_rms_norm_scale_mul_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+            return 2;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
         ggml_cuda_op_rms_norm_scale_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
@@ -6820,6 +6936,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 if (match.expert_scale != nullptr) {
                     params->add_alloc_dep(
                         params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
+                    if (ggml_cuda_moe_ep_fusion_enabled() && match.expert_scale->op == GGML_OP_GET_ROWS && match.expert_scale->src[1]) {
+                        params->add_alloc_dep(
+                            params->user_data, const_cast<ggml_tensor *>(match.expert_scale->src[1]), match.dst);
+                    }
                 }
                 i += match.node_count - 1;
             }
