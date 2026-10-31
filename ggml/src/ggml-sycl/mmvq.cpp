@@ -4840,49 +4840,6 @@ static bool dispatch_mul_mat_vec_q_glu_plain(const void * vgate, const void * vu
     return false;
 }
 
-bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu_op glu_op, const void * vx,
-                                         const void * vgate, const void * vy, float * dst, int ncols, int nrows,
-                                         int ncols_dst, int stride_col_y_bytes, int stride_col_dst,
-                                         dpct::queue_ptr stream) {
-    if (glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_GEGLU) {
-        return false;
-    }
-    switch (src0_type) {
-        case GGML_TYPE_Q4_K:
-            return mul_mat_vec_q_glu_reorder_type<GGML_TYPE_Q4_K>(glu_op, vx, vgate, vy, dst, ncols, nrows, ncols_dst,
-                                                                  stride_col_y_bytes, stride_col_dst, stream);
-        case GGML_TYPE_PQ2_0:
-            return mul_mat_vec_q_glu_reorder_type<GGML_TYPE_PQ2_0>(glu_op, vx, vgate, vy, dst, ncols, nrows, ncols_dst,
-                                                                   stride_col_y_bytes, stride_col_dst, stream);
-        case GGML_TYPE_Q6_K:  // ARC-LAB: GGML_SYCL_Q6K_GLU (fusion.cpp)
-            return mul_mat_vec_q_glu_reorder_type<GGML_TYPE_Q6_K>(glu_op, vx, vgate, vy, dst, ncols, nrows, ncols_dst,
-                                                                  stride_col_y_bytes, stride_col_dst, stream);
-        case GGML_TYPE_PTQ1_0:
-            if (ncols_dst == 1 && ggml_sycl_ptq1_0_glu_n1_enabled()) {
-                static const int glu_nr = getenv("GGML_SYCL_PTQ1_GLU1_NR") ? atoi(getenv("GGML_SYCL_PTQ1_GLU1_NR")) : 2;
-                if (glu_nr == 4) {
-                    launch_ptq1_0_pairs_glu<4>(vx, vgate, vy, dst, ncols, nrows, glu_op, stream);
-                } else {
-                    launch_ptq1_0_pairs_glu<2>(vx, vgate, vy, dst, ncols, nrows, glu_op, stream);
-                }
-                return true;
-            }
-            if (ptq1_0_ncols_dec_enabled() && ncols_dst >= 1 && ncols_dst <= 8) {
-#define PTQ1_DEC_GLU(N) case N: launch_ptq1_0_ncols_dec<N, true>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, \
-                                                                  stride_col_dst, glu_op, stream); return true;
-                switch (ncols_dst) {
-                    PTQ1_DEC_GLU(1) PTQ1_DEC_GLU(2) PTQ1_DEC_GLU(3) PTQ1_DEC_GLU(4)
-                    PTQ1_DEC_GLU(5) PTQ1_DEC_GLU(6) PTQ1_DEC_GLU(7) PTQ1_DEC_GLU(8)
-                }
-#undef PTQ1_DEC_GLU
-            }
-            return mul_mat_vec_q_glu_reorder_type<GGML_TYPE_PTQ1_0>(glu_op, vx, vgate, vy, dst, ncols, nrows, ncols_dst,
-                                                                    stride_col_y_bytes, stride_col_dst, stream);
-        default:
-            return false;
-    }
-}
-
 // ARC-LAB: reordered q4_0 x f32 for 5..64 columns (speculative verify / n-gram drafts) on XMX via s8 x s4 DPAS
 // (inline vISA, xe2-dpas.hpp; Xe2). The MMVQ column kernels re-read the weights per 8 columns and the dequantize
 // + GEMM path converts the whole matrix; here each weight row streams once for all columns. One lane per weight row: B =
@@ -5074,6 +5031,33 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu
             // fusion declines q5_K past 5 columns
             return mul_mat_vec_q_glu_reorder_ncols<GGML_TYPE_Q5_K, 1, 2, 3, 4, 5>(
                 glu_op, vx, vgate, vy, dst, ncols, nrows, ncols_dst, stride_col_y_bytes, stride_col_dst, stream);
+        case GGML_TYPE_PQ2_0:
+            return mul_mat_vec_q_glu_reorder_type<GGML_TYPE_PQ2_0>(glu_op, vx, vgate, vy, dst, ncols, nrows, ncols_dst,
+                                                                   stride_col_y_bytes, stride_col_dst, stream);
+        case GGML_TYPE_Q6_K:  // ARC-LAB: GGML_SYCL_Q6K_GLU (fusion.cpp)
+            return mul_mat_vec_q_glu_reorder_type<GGML_TYPE_Q6_K>(glu_op, vx, vgate, vy, dst, ncols, nrows, ncols_dst,
+                                                                  stride_col_y_bytes, stride_col_dst, stream);
+        case GGML_TYPE_PTQ1_0:
+            if (ncols_dst == 1 && ggml_sycl_ptq1_0_glu_n1_enabled()) {
+                static const int glu_nr = getenv("GGML_SYCL_PTQ1_GLU1_NR") ? atoi(getenv("GGML_SYCL_PTQ1_GLU1_NR")) : 2;
+                if (glu_nr == 4) {
+                    launch_ptq1_0_pairs_glu<4>(vx, vgate, vy, dst, ncols, nrows, glu_op, stream);
+                } else {
+                    launch_ptq1_0_pairs_glu<2>(vx, vgate, vy, dst, ncols, nrows, glu_op, stream);
+                }
+                return true;
+            }
+            if (ptq1_0_ncols_dec_enabled() && ncols_dst >= 1 && ncols_dst <= 8) {
+#define PTQ1_DEC_GLU(N) case N: launch_ptq1_0_ncols_dec<N, true>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, \
+                                                                  stride_col_dst, glu_op, stream); return true;
+                switch (ncols_dst) {
+                    PTQ1_DEC_GLU(1) PTQ1_DEC_GLU(2) PTQ1_DEC_GLU(3) PTQ1_DEC_GLU(4)
+                    PTQ1_DEC_GLU(5) PTQ1_DEC_GLU(6) PTQ1_DEC_GLU(7) PTQ1_DEC_GLU(8)
+                }
+#undef PTQ1_DEC_GLU
+            }
+            return mul_mat_vec_q_glu_reorder_type<GGML_TYPE_PTQ1_0>(glu_op, vx, vgate, vy, dst, ncols, nrows, ncols_dst,
+                                                                    stride_col_y_bytes, stride_col_dst, stream);
         default:
             return false;
     }
