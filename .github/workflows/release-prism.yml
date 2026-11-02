@@ -478,7 +478,7 @@ jobs:
       matrix:
         include:
           - ROCM_VERSION: "7.2.1"
-            gpu_targets: "gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102;gfx1151;gfx1150;gfx1200;gfx1201"
+            gpu_targets: "gfx908;gfx90a;gfx942;gfx1030;gfx1035;gfx1103;gfx1100;gfx1101;gfx1102;gfx1151;gfx1150;gfx1200;gfx1201"
             build: 'x64'
 
     steps:
@@ -562,7 +562,7 @@ jobs:
       matrix:
         include:
           - name: "radeon"
-            gpu_targets: "gfx1150;gfx1151;gfx1200;gfx1201;gfx1100;gfx1101;gfx1102;gfx1030;gfx1031;gfx1032"
+            gpu_targets: "gfx1150;gfx1151;gfx1200;gfx1201;gfx1100;gfx1101;gfx1102;gfx1030;gfx1031;gfx1032;gfx1035;gfx1103"
 
     steps:
       - name: Clone
