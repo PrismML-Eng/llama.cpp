@@ -1927,6 +1927,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_buffer_get_type(input_cpy->buffer) != ggml_backend_get_default_buffer_type(split_backend)) {
                 return false;
             }
+            if (ggml_nbytes(input) == 0) {
+                // nothing to upload (e.g. an empty view); some backends cannot wrap a zero-size source (Metal)
+                return true;
+            }
             GGML_ASSERT(ggml_are_same_layout(input, input_cpy) && "cannot copy tensors with different layouts");
             sync_split_backend();
             ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
