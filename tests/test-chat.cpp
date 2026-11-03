@@ -2289,6 +2289,46 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             })
             .run();
 
+        for (const std::string code : { "print('<parameter=')", "print('</function>')" }) {
+            tst.test("<tool_call>\n<function=python>\n<parameter=code>\n" + code +
+                     "\n</parameter>\n</function>\n</tool_call>")
+                .enable_thinking(false)
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .tools({
+                    python_tool
+            })
+                .expect_tool_calls({ { "python", json({ { "code", code } }).dump(), {} } })
+                .run();
+        }
+
+        {
+            auto                         tmpls = read_templates("models/templates/Qwen3.5-4B.jinja");
+            common_chat_templates_inputs inputs;
+            inputs.messages              = { message_user };
+            inputs.tools                 = { query_entities_tool };
+            inputs.enable_thinking       = false;
+            inputs.add_generation_prompt = true;
+            inputs.reasoning_format      = COMMON_REASONING_FORMAT_AUTO;
+            auto parser                  = make_peg_parser(tmpls.get(), inputs);
+            auto expected = simple_assist_msg("", "", "query_entities", R"({"entity_type":"Note","filters":[]})");
+            const std::vector<std::string> closes = { "\n</parameter>\n", "\n</parameter>", "</parameter>\n",
+                                                      "</parameter>" };
+            for (const auto & string_close : closes) {
+                for (const auto & json_close : closes) {
+                    const std::string call = "<tool_call>\n<function=query_entities>\n<parameter=entity_type>\nNote" +
+                                             string_close + "<parameter=filters>\n[]" + json_close +
+                                             "</function>\n</tool_call>";
+                    assert_msg_equals(expected, parser.parse(call, false), true);
+                    tst.test(call)
+                        .enable_thinking(false)
+                        .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                        .tools({ query_entities_tool })
+                        .is_partial(true)
+                        .expect(expected)
+                        .run();
+                }
+            }
+        }
 
         // test code that starts with indent
         tst.test(
