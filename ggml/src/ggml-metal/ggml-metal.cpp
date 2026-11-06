@@ -9,6 +9,8 @@
 #include "ggml-metal-ops.h"
 #include "ggml-metal-tuning.h"
 
+#include <TargetConditionals.h>
+
 #include <mutex>
 #include <string>
 
@@ -586,6 +588,14 @@ static void ggml_backend_metal_graph_optimize(ggml_backend_t backend, ggml_cgrap
     ggml_metal_graph_optimize(ctx, cgraph);
 }
 
+// iOS can stop a GPU command buffer that runs for more than a few seconds.
+// Use more, shorter command buffers there so large prompt batches stay under that limit.
+#if TARGET_OS_IPHONE
+#define GGML_METAL_DEFAULT_N_CB 8
+#else
+#define GGML_METAL_DEFAULT_N_CB 1
+#endif
+
 static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
     GGML_ASSERT(ggml_backend_is_metal(backend));
 
@@ -637,7 +647,7 @@ ggml_backend_t ggml_backend_metal_init(void) {
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, GGML_METAL_DEFAULT_N_CB);
 
     return backend;
 }
@@ -732,7 +742,7 @@ static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t 
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, GGML_METAL_DEFAULT_N_CB);
 
     return backend;
 
