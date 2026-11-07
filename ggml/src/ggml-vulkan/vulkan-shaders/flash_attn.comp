@@ -370,8 +370,12 @@ void main() {
 
                 // Q4_*/Q5_* take the block-8 fast path when one step covers a full
                 // block; Q8_0 always goes through the per-int get_k_qs* helpers
-                // (its qs is byte-packed, not nibble-packed).
-                const bool block8_fast = (d_per_step == 8) && (FaTypeK != GGML_TYPE_Q8_0);
+                // (its qs layout is byte-packed, not nibble-packed). PQ2_0 uses 128-elem
+                // ggml blocks (4x Q4_0), so the block-8 fast path (which assumes a
+                // 32-elem block) doesn't apply; it also takes the per-int path.
+                const bool block8_fast = (d_per_step == 8) &&
+                                         (FaTypeK != GGML_TYPE_Q8_0) &&
+                                         (FaTypeK != GGML_TYPE_PQ2_0);
 
                 if (SHMEM_STAGING != 0) {
                     const uint k_block_idx = (d_tid * (HSK_per_thread / 4) + d_block) / 8;

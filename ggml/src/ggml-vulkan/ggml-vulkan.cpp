@@ -1662,7 +1662,8 @@ static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type
            !ggml_vk_fa_type_needs_shmem(v_type) &&
            (k_type == GGML_TYPE_Q4_0 || k_type == GGML_TYPE_Q4_1 ||
             k_type == GGML_TYPE_Q5_0 || k_type == GGML_TYPE_Q5_1 ||
-            k_type == GGML_TYPE_Q8_0);
+            k_type == GGML_TYPE_Q8_0 ||
+            k_type == GGML_TYPE_PQ2_0);
 #else
     GGML_UNUSED(device);
     GGML_UNUSED(k_type);

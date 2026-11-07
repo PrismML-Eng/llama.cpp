@@ -39,6 +39,21 @@ int32_t get_k_qs(uint ib, uint iqs, uint a_offset) {
             return pack32(i16vec2(k_packed_q8_0.data[a_offset + ib].qs[iqs / 2],
                                   k_packed_q8_0.data[a_offset + ib].qs[iqs / 2 + 1]));
         }
+        case GGML_TYPE_PQ2_0: {
+            // 4 two-bit codes per byte; 128-elem block -> qs[0..31]. iqs is the
+            // element offset within the base block (multiple of 4); it can exceed
+            // 128 when a quad spans into the next block, so derive the block and
+            // byte from the absolute offset (this also guards against the rare
+            // boundary straddle that the per-ib Q4_0 straddle assumes away).
+            const uint elem = iqs;
+            const uint byte = (elem % 128) / 4;
+            const uint bits = k_packed_pq2_0.data[a_offset + ib + elem / 128].qs[byte];
+            return pack32(i8vec4(
+                int8_t(bits & 3u),
+                int8_t((bits >> 2u) & 3u),
+                int8_t((bits >> 4u) & 3u),
+                int8_t(bits >> 6u)));
+        }
         default: return 0;
     }
 }
@@ -52,6 +67,7 @@ FLOAT_TYPEV2 get_k_scale(uint ib, uint a_offset) {
         case GGML_TYPE_Q5_0: return FLOAT_TYPEV2(FLOAT_TYPE(k_packed_q5_0.data[a_offset + ib].d), 0.0);
         case GGML_TYPE_Q5_1: return FLOAT_TYPEV2(k_packed_q5_1_p32.data[a_offset + ib].dm);
         case GGML_TYPE_Q8_0: return FLOAT_TYPEV2(FLOAT_TYPE(k_packed_q8_0.data[a_offset + ib].d), 0.0);
+        case GGML_TYPE_PQ2_0: return FLOAT_TYPEV2(FLOAT_TYPE(k_packed_pq2_0.data[a_offset + ib].d), 0.0);
         default: return FLOAT_TYPEV2(0);
     }
 }
@@ -91,6 +107,18 @@ void k_block_to_shmem(const uint buf_ib, const uint global_ib, const uint iqs, c
                                                       k_packed_q8_0.data[a_offset + global_ib].qs[iqs * 2 + 1]));
             break;
         }
+        case GGML_TYPE_PQ2_0: {
+            // SHMEM path: iqs is the vec4 index (0..7) within the sub-block; one
+            // byte per vec4 (4 two-bit codes). global_ib indexes the K buffer like
+            // the Q4_0 case.
+            const uint bits = k_packed_pq2_0.data[a_offset + global_ib].qs[iqs];
+            kblocksh[buf_ib].qs[iqs] = pack32(i8vec4(
+                int8_t(bits & 3u),
+                int8_t((bits >> 2u) & 3u),
+                int8_t((bits >> 4u) & 3u),
+                int8_t(bits >> 6u)));
+            break;
+        }
     }
 
     if (iqs == 0) {
@@ -101,6 +129,7 @@ void k_block_to_shmem(const uint buf_ib, const uint global_ib, const uint iqs, c
             case GGML_TYPE_Q5_0: kblocksh[buf_ib].dm = FLOAT_TYPEV2(FLOAT_TYPE(k_packed_q5_0.data[a_offset + global_ib].d), 0.0); break;
             case GGML_TYPE_Q5_1: kblocksh[buf_ib].dm = FLOAT_TYPEV2(k_packed_q5_1_p32.data[a_offset + global_ib].dm); break;
             case GGML_TYPE_Q8_0: kblocksh[buf_ib].dm = FLOAT_TYPEV2(FLOAT_TYPE(k_packed_q8_0.data[a_offset + global_ib].d), 0.0); break;
+            case GGML_TYPE_PQ2_0: kblocksh[buf_ib].dm = FLOAT_TYPEV2(FLOAT_TYPE(k_packed_pq2_0.data[a_offset + buf_ib / 4].d), 0.0); break;
         }
     }
 }
@@ -181,6 +210,10 @@ int32_t get_k_qs_shmem(const uint buf_ib, const uint pos) {
         case GGML_TYPE_Q8_0: {
             return kblocksh[buf_ib].qs[pos];
         }
+        case GGML_TYPE_PQ2_0: {
+            // Already stored as raw 0..3 codes in each byte; no unpack needed.
+            return kblocksh[buf_ib].qs[pos];
+        }
         default: return 0;
     }
 }
@@ -191,6 +224,7 @@ ACC_TYPE k_dot_correction(const uint qib, const ACC_TYPEV2 k_dm) {
         case GGML_TYPE_Q5_0: return -ACC_TYPE(16.0) * ACC_TYPE(Qf[qib].ds.y) * k_dm.x;
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_1: return ACC_TYPE(Qf[qib].ds.y) * k_dm.y;
+        case GGML_TYPE_PQ2_0: return -ACC_TYPE(1.0) * ACC_TYPE(Qf[qib].ds.y) * k_dm.x;
         default: return ACC_TYPE(0.0);
     }
 }
