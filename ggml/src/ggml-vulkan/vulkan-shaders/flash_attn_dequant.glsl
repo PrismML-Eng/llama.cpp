@@ -30,6 +30,13 @@ layout (binding = 2) readonly buffer V_PACKED_Q8_0 { block_q8_0_packed16 data[];
 layout (binding = 1) readonly buffer K_PACKED_IQ4_NL { block_iq4_nl_packed16 data[]; } k_packed_iq4_nl;
 layout (binding = 2) readonly buffer V_PACKED_IQ4_NL { block_iq4_nl_packed16 data[]; } v_packed_iq4_nl;
 
+// PQ2_0 (Prism Q2_0 at group 128): 128 floats per block, one float16 d, 32 bytes
+// of 2-bit codes. Same 2-bit codec as Q2_0, with 4 consecutive K-positions per
+// byte. The cm1 gather fetches 4-element vec4s (iqs is a multiple of 4), so byte
+// (iqs/4) holds the whole vec4 and the decode is the same as Q2_0.
+layout (binding = 1) readonly buffer K_PACKED_PQ2_0 { block_pq2_0 data[]; } k_packed_pq2_0;
+layout (binding = 2) readonly buffer V_PACKED_PQ2_0 { block_pq2_0 data[]; } v_packed_pq2_0;
+
 layout (binding = 1) readonly buffer K_PACKED_BF16 { u16vec4 data[]; } k_packed_bf16;
 layout (binding = 2) readonly buffer V_PACKED_BF16 { u16vec4 data[]; } v_packed_bf16;
 
@@ -118,6 +125,16 @@ layout (binding = 1) readonly buffer K_PACKED_Q5_1_P32 { block_q5_1_packed32 dat
 #define FA_DEQUANT4_BF16(BUF) \
     return FLOAT_TYPEV4(bf16_to_fp32(uvec4(BUF.data[(a_offset + ib) / 4])));
 
+// PQ2_0: 4 consecutive K-positions per byte. iqs is a multiple of 4, so byte
+// (iqs/4) holds the 4-element vec4 directly.
+#define FA_DEQUANT4_PQ2_0(BUF) { \
+    const uint ibb = (a_offset) + (ib); \
+    const uint byte = iqs / 4; \
+    const uint bits = uint(BUF.data[ibb].qs[byte]); \
+    const FLOAT_TYPE d = FLOAT_TYPE(BUF.data[ibb].d); \
+    return d * (FLOAT_TYPEV4(bits & 3u, (bits >> 2u) & 3u, (bits >> 4u) & 3u, bits >> 6u) - FLOAT_TYPEV4(FLOAT_TYPE(1.0))); \
+}
+
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
     if (binding_idx == BINDING_IDX_K) {
         switch (FaTypeK) {
@@ -129,6 +146,7 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             case GGML_TYPE_Q8_0: FA_DEQUANT4_Q8_0(k_packed_q8_0)
             case GGML_TYPE_IQ4_NL: FA_DEQUANT4_IQ4_NL(k_packed_iq4_nl)
             case GGML_TYPE_BF16: FA_DEQUANT4_BF16(k_packed_bf16)
+            case GGML_TYPE_PQ2_0: FA_DEQUANT4_PQ2_0(k_packed_pq2_0)
         }
     } else {
         switch (FaTypeV) {
@@ -140,6 +158,7 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             case GGML_TYPE_Q8_0: FA_DEQUANT4_Q8_0(v_packed_q8_0)
             case GGML_TYPE_IQ4_NL: FA_DEQUANT4_IQ4_NL(v_packed_iq4_nl)
             case GGML_TYPE_BF16: FA_DEQUANT4_BF16(v_packed_bf16)
+            case GGML_TYPE_PQ2_0: FA_DEQUANT4_PQ2_0(v_packed_pq2_0)
         }
     }
     return FLOAT_TYPEV4(0);

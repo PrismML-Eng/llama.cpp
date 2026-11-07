@@ -346,6 +346,7 @@ llama_build_and_test(test-thread-safety.cpp  LABEL "main backend"  ARGS -m "${MO
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
+llama_build_and_test(test-kv-cache-pq2-0.cpp)
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 llama_build_and_test(test-mtp-catchup-batch.cpp LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately
