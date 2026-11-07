@@ -2482,6 +2482,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_MEAN_CENTER"));
     add_opt(common_arg(
+        {"--kv-mean-center-per-block"},
+        "when generating a K-cache mean-centering bias file (tools/kv-mean-center),\n"
+        "compute one per-128-channel-block mean (PQ2_0 block) instead of one\n"
+        "per-channel mean; matches the 128-elem PQ2_0 quantization block so the\n"
+        "bias aligns with the asymmetric codebook center. see docs/kv-mean-center.md",
+        [](common_params & params) {
+            params.kv_mean_center_per_block = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_KV_MEAN_CENTER}));
+    add_opt(common_arg(
+        {"--kv-mean-center-recenter"},
+        "when generating a K-cache mean-centering bias file (tools/kv-mean-center)\n"
+        "for a PQ2_0 K cache, re-center each 128-channel block to the codebook\n"
+        "center (offset = block_mean - 0.5*d, d = max |K_raw| over the block)\n"
+        "instead of to 0, so the stored K sits at the middle of the PQ2_0 codebook\n"
+        "(-d..+2d). implies the per-block layout. see docs/kv-mean-center.md",
+        [](common_params & params) {
+            params.kv_mean_center_recenter = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_KV_MEAN_CENTER}));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {

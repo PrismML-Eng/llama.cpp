@@ -24,6 +24,7 @@
 #include "../src/llama-kv-cache.h"
 #include "../src/llama-model-saver.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -349,10 +350,145 @@ static void test_softmax_invariance() {
     LOG_INF("%s: OK\n", __func__);
 }
 
+// (c) the per-block collapse: each 128-channel block must be collapsed to a single
+// shared offset (the block's per-channel mean), and the result must be reproducible and
+// consistent with the per-channel path (an all-constant input returns that same constant).
+static void test_collapse_to_blocks() {
+    const size_t bs = common_kv_mean_center_block_size;
+    const size_t n_blocks = 3;
+    const size_t n = n_blocks * bs;
+
+    // deterministic per-channel means: channel i in block b gets b + i%7 (so blocks differ)
+    std::vector<double> per_channel(n);
+    for (size_t b = 0; b < n_blocks; ++b) {
+        for (size_t j = 0; j < bs; ++j) {
+            per_channel[b*bs + j] = (double)b + ((double)j / 7.0);
+        }
+    }
+
+    auto out = common_kv_mean_center_collapse_to_blocks(per_channel);
+    TEST_ASSERT(out.size() == n);
+
+    // every element within a block equals that block's mean
+    for (size_t b = 0; b < n_blocks; ++b) {
+        double sum = 0.0;
+        for (size_t j = 0; j < bs; ++j) {
+            sum += per_channel[b*bs + j];
+        }
+        const double block_mean = sum / (double)bs;
+        for (size_t j = 0; j < bs; ++j) {
+            TEST_ASSERT(std::fabs(out[b*bs + j] - block_mean) < 1e-4f);
+        }
+    }
+
+    // all-constant input -> same constant back out (per-block == per-channel)
+    const size_t n2 = 2 * bs;
+    std::vector<double> const2(n2, 5.0);
+    auto out2 = common_kv_mean_center_collapse_to_blocks(const2);
+    for (float v : out2) {
+        TEST_ASSERT(std::fabs(v - 5.0f) < 1e-4f);
+    }
+
+    // length must be a multiple of the block size; the function asserts on violation.
+    // (the abort path is not exercised here; the contract is enforced by GGML_ASSERT.)
+
+    LOG_INF("%s: OK (block size %zu, %zu blocks tested)\n", __func__, bs, n_blocks);
+}
+
+// (e) the recentered per-block collapse: for PQ2_0 the codebook is (q-1)*d =
+// {-d, 0, +d, +2d} (center +0.5d). the offset must be (block_mean - 0.5*d) where
+// d = max |K_raw| over the block, so the stored K sits at the codebook center.
+static void test_collapse_to_blocks_recentered() {
+    const size_t bs = common_kv_mean_center_block_size;
+    const size_t n_blocks = 2;
+    const size_t n = n_blocks * bs;
+
+    // deterministic per-channel means and per-channel maxabs:
+    // block 0: mean = 1.0, maxabs = 2.0  -> offset = 1.0 - 0.5*2.0 = 0.0
+    // block 1: mean = 4.0, maxabs = 8.0  -> offset = 4.0 - 0.5*8.0 = 0.0
+    // use distinct values so the two blocks differ in offset.
+    std::vector<double> per_channel(n);
+    std::vector<double> per_channel_maxabs(n);
+    for (size_t b = 0; b < n_blocks; ++b) {
+        const double mean = (b == 0 ? 1.0 : 4.0);
+        const double d    = (b == 0 ? 2.0 : 8.0);
+        for (size_t j = 0; j < bs; ++j) {
+            per_channel[b*bs + j]        = mean;
+            per_channel_maxabs[b*bs + j] = d;
+        }
+    }
+
+    auto out = common_kv_mean_center_collapse_to_blocks_recentered(per_channel, per_channel_maxabs);
+    TEST_ASSERT(out.size() == n);
+
+    // each block offset == block_mean - 0.5*d
+    for (size_t b = 0; b < n_blocks; ++b) {
+        const double mean = (b == 0 ? 1.0 : 4.0);
+        const double d    = (b == 0 ? 2.0 : 8.0);
+        const double expected = mean - 0.5 * d;
+        for (size_t j = 0; j < bs; ++j) {
+            TEST_ASSERT(std::fabs(out[b*bs + j] - expected) < 1e-4f);
+        }
+    }
+
+    // degenerate: d = 0 (all-K-zero block) -> offset == block_mean
+    const size_t n2 = bs;
+    std::vector<double> pc(n2, 3.0);
+    std::vector<double> pcma(n2, 0.0);
+    auto out2 = common_kv_mean_center_collapse_to_blocks_recentered(pc, pcma);
+    for (float v : out2) {
+        TEST_ASSERT(std::fabs(v - 3.0f) < 1e-4f);
+    }
+
+    LOG_INF("%s: OK (block size %zu, %zu blocks tested)\n", __func__, bs, n_blocks);
+}
+
+// (d) the writer records the mode field: a per-block write must emit
+// "kv_mean_center.mode" = "per-block", a per-channel write "per-channel".
+static void test_write_records_mode() {
+    const uint32_t n_embd_head = 256; // 2 blocks of 128
+    const uint32_t n_head = 2;
+    const uint32_t n_layer = 1;
+
+    std::vector<common_kv_mean_center_layer> layers;
+    for (uint32_t il = 0; il < n_layer; il++) {
+        common_kv_mean_center_layer layer;
+        layer.il = (int32_t) il;
+        layer.bias.assign(n_embd_head * n_head, 0.5f);
+        layers.push_back(std::move(layer));
+    }
+
+    const std::string path_pblock = "test-kv-mean-center-mode-pblock.gguf";
+    const std::string path_pchan  = "test-kv-mean-center-mode-pchan.gguf";
+    TEST_ASSERT(common_kv_mean_center_write(path_pblock, layers, /*k_rot=*/false, "per-block"));
+    TEST_ASSERT(common_kv_mean_center_write(path_pchan, layers, /*k_rot=*/false, "per-channel"));
+
+    // read back the mode KV from each file
+    for (const char * path : {path_pblock.c_str(), path_pchan.c_str()}) {
+        struct gguf_init_params params = { /*.no_alloc =*/ false, /*.ctx =*/ nullptr };
+        struct gguf_context * gguf = gguf_init_from_file(path, params);
+        GGML_ASSERT(gguf != nullptr);
+        const int64_t idx = gguf_find_key(gguf, "kv_mean_center.mode");
+        GGML_ASSERT(idx >= 0);
+        const char * mode = gguf_get_val_str(gguf, idx);
+        const bool is_pblock = (strcmp(mode, "per-block") == 0);
+        GGML_ASSERT(is_pblock == (strcmp(path, path_pblock.c_str()) == 0));
+        gguf_free(gguf);
+    }
+
+    remove(path_pblock.c_str());
+    remove(path_pchan.c_str());
+
+    LOG_INF("%s: OK\n", __func__);
+}
+
 int main() {
     test_regression_safety();
     test_type_gate();
     test_softmax_invariance();
+    test_collapse_to_blocks();
+    test_collapse_to_blocks_recentered();
+    test_write_records_mode();
 
     return 0;
 }

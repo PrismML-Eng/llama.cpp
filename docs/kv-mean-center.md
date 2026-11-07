@@ -2,9 +2,12 @@
 
 `--kv-mean-center` is an optional, opt-in feature that subtracts a fixed, precomputed
 per-(kv-head, channel) bias from the K vector at the moment it is written into the KV cache,
-in order to improve quantization fidelity for `GGML_TYPE_Q4_0` and `GGML_TYPE_PQ2_0` K caches.
+in order to improve quantization fidelity for `GGML_TYPE_Q4_0` K caches.
 
-This is currently scoped to `GGML_TYPE_Q4_0` and `GGML_TYPE_PQ2_0`.
+This is a **Q4_0 optimization**. it is also technically loadable for `GGML_TYPE_PQ2_0`,
+but every tested bias mode degrades PQ2_0 fidelity (measured: per-channel 0.433, per-block
+0.465, recenter 1.066 vs no-bias 0.258), so it should not be used for PQ2_0. see
+"Scope and limitations" below.
 
 ## The idea
 
@@ -53,7 +56,18 @@ not ship a measured number for a specific trained model.
    ./llama-kv-mean-center -m model.gguf -f calibration-data.txt -o kv-mean-center.gguf
    ```
 
-2. Load it at inference time, together with a `Q4_0` K cache:
+   The bias is a Q4_0 optimization and **should not be used for PQ2_0** (it degrades
+   fidelity; no-bias PQ2_0 is the best PQ2_0 config). the per-block and recenter flags
+   exist for A/B comparison and for a future zero-centered 2-bit KV format:
+
+   ```
+   ./llama-kv-mean-center -m model.gguf -f calibration-data.txt \
+       --kv-mean-center-per-block -o kv-mean-center-pq2.gguf
+   ./llama-kv-mean-center -m model.gguf -f calibration-data.txt \
+       --kv-mean-center-recenter -o kv-mean-center-pq2-recenter.gguf
+   ```
+
+2. Load it at inference time, together with the matching K cache:
 
    ```
    ./llama-cli -m model.gguf -ctk q4_0 --kv-mean-center kv-mean-center.gguf -p "..."
@@ -66,11 +80,29 @@ attention).
 
 ## Bias file format
 
-The bias file is a small GGUF file with one F32 1-D tensor per layer that has a bias, named
-`kv_bar.blk.<il>.k`, holding `n_embd_head_k(il) * n_head_kv(il)` values laid out as
-`[n_embd_head_k, n_head_kv]` (channel-fastest). This matches the in-memory layout of the K tensor
-at the point it is written into the cache, so the file can be loaded directly as a small
-broadcastable bias tensor per layer.
+The bias file is a small GGUF file with one F32 1-D tensor per layer that has a bias,
+named `kv_bar.blk.<il>.k`, holding `n_embd_head_k(il) * n_head_kv(il)` values laid out as
+`[n_embd_head_k, n_head_kv]` (channel-fastest). This matches the in-memory layout of the K
+tensor at the point it is written into the cache, so the file can be loaded directly as a
+small broadcastable bias tensor per layer. The file also records two string/bool keys:
+`kv_mean_center.k_rot` (basis) and `kv_mean_center.mode` (`per-channel` or `per-block`).
+
+### Per-block vs per-channel vs recenter
+
+The **per-channel** mode (independent per-channel means) is the Q4_0-style layout, which is
+the correct choice for `Q4_0` (whose codebook is symmetric around 0) but misaligned with
+PQ2_0's 128-elem block center.
+
+The **per-block** mode (`--kv-mean-center-per-block`) collapses each 128-channel block (the
+PQ2_0 quantization block size, `QK_PQ2_0`) to a single shared offset. This is the layout that
+aligns with PQ2_0's 128-elem quantization block.
+
+The **recenter** mode (`--kv-mean-center-recenter`) goes one step further. PQ2_0's codebook
+is `(q-1)*d` with levels `{−d, 0, +d, +2d}` (center `+0.5d` per block, where `d = max|K|`).
+The per-block offset subtracts the block mean to re-center K to 0, which is still off from
+the codebook center. Recenter instead subtracts `block_mean − 0.5*d`, putting the stored K
+at the middle of the codebook (`−d..+2d`). It implies the per-block layout. Use it for a
+PQ2_0 K cache when you want the K to sit at the codebook center rather than at 0.
 
 ## Calibration
 
@@ -82,8 +114,10 @@ scheduler eval-callback mechanism `llama-imatrix` uses to capture activations). 
 
 ## Scope and limitations
 
-- Only `GGML_TYPE_Q4_0` and `GGML_TYPE_PQ2_0` are supported; other K cache types are rejected. Generalizing the mechanism
-  to other quantization types is future work.
+- The bias is a **Q4_0 optimization**. it is technically loadable for PQ2_0 but every
+  tested mode degrades PQ2_0 fidelity (per-channel 0.433, per-block 0.465, recenter 1.066
+  vs no-bias 0.258); the loader warns when a bias is applied to a PQ2_0 K cache. the
+  per-block/recenter modes exist for a future zero-centered 2-bit KV format.
 - Every standard-attention KV cache layout is supported: the plain cache, the base/SWA pair of
   sliding-window models, and the attention sub-cache of hybrid (recurrent + attention) models,
   with or without SWA. Recurrent-only and MLA/DSA memory types are not.

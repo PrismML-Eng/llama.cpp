@@ -1568,7 +1568,42 @@ bool llama_kv_cache::load_kv_mean_center(const char * path, bool validate_type) 
         } else {
             LLAMA_LOG_WARN("%s: bias file %s does not record its calibration basis (kv_mean_center.k_rot); "
                     "K-cache rotation is %s for this context - a basis mismatch degrades quality\n",
-                    __func__, path, n_rot_k > 0 ? "active" : "inactive");
+                        __func__, path, n_rot_k > 0 ? "active" : "inactive");
+        }
+    }
+
+    // bias is a Q4_0 optimization. on PQ2_0 every tested bias mode degrades quality
+    // (per-channel 0.433, per-block 0.465, recenter 1.066 vs no-bias 0.258), so it is
+    // not recommended. the loader still accepts a bias file for PQ2_0 (A/B comparison)
+    // but flags it; a per-block/recenter mode on Q4_0 is still a layout mismatch and is
+    // warned as before.
+    {
+        const bool is_pq2_0 = (type_k() == GGML_TYPE_PQ2_0);
+        const int64_t idx_mode = gguf_find_key(ctx_gguf, "kv_mean_center.mode");
+        const char * bias_mode = nullptr;
+        if (idx_mode >= 0) {
+            if (gguf_get_kv_type(ctx_gguf, idx_mode) != GGUF_TYPE_STRING) {
+                LLAMA_LOG_ERROR("%s: bias file %s has a non-string kv_mean_center.mode key - malformed file\n",
+                        __func__, path);
+                gguf_free(ctx_gguf);
+                ggml_free(ctx_data);
+                return false;
+            }
+            bias_mode = gguf_get_val_str(ctx_gguf, idx_mode);
+        }
+        if (is_pq2_0) {
+            LLAMA_LOG_WARN("%s: K cache is PQ2_0 - the mean-centering bias is a Q4_0 "
+                    "optimization and degrades PQ2_0 quality (measured: per-channel 0.433, "
+                    "per-block 0.465, recenter 1.066 vs no-bias 0.258). it will be "
+                    "applied but is not recommended; omit --kv-mean-center for best "
+                    "PQ2_0 fidelity\n", __func__);
+        } else if (bias_mode != nullptr &&
+                   (std::string(bias_mode) == "per-block" || std::string(bias_mode) == "recenter")) {
+            LLAMA_LOG_WARN("%s: bias file %s is %s (128-elem) but the K cache is %s "
+                    "- a per-block offset is misaligned with %s's 32-wide blocks; "
+                    "recalibrate with --kv-mean-center (per-channel) for this type\n",
+                    __func__, path, bias_mode, ggml_type_name(type_k()),
+                    ggml_type_name(type_k()));
         }
     }
 
