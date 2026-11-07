@@ -206,6 +206,19 @@ typedef struct {
 } block_pq2_0;
 static_assert(sizeof(block_pq2_0) == sizeof(ggml_half) + QK_PQ2_0 / 4, "wrong pq2_0 block size/padding");
 
+// PQ2_0M: min/max (range-scale) variant of PQ2_0, KV-cache only. Same 2-bit
+// codec (raw codes q in {0, 1, 2, 3}) but with a per-block range step
+// d = (max - min) / 3 and a per-block offset m = min, so all four levels span
+// the full data range [min, min+d, min+2d, min+3d=max]. Dequant: y = m + q * d.
+// The +16 B over PQ2_0 (one extra fp16 for m) is the price of covering [min, max]
+// with 4 levels.
+typedef struct {
+    ggml_half d;                   // delta (range step)
+    ggml_half m;                   // offset (block min)
+    uint8_t qs[QK_PQ2_0 / 4];     // 2 bits per element
+} block_pq2_0m;
+static_assert(sizeof(block_pq2_0m) == 2 * sizeof(ggml_half) + QK_PQ2_0 / 4, "wrong pq2_0m block size/padding");
+
 // PTQ1_0: Prism-private ternary at group size 128. Same base-3 trit packing as
 // upstream TQ1_0 (type 34) but one fp16 scale per 128 weights instead of per 256.
 // 1.75 bpw vs PQ2_0's 2.125, and lossless for checkpoints that are already ternary

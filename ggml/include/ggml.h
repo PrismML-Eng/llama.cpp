@@ -434,7 +434,8 @@ extern "C" {
         // slots above upstream types; type_traits is sized to COUNT (143) with 43..141 unused.
         GGML_TYPE_PQ2_0 = 142,
         GGML_TYPE_PTQ1_0 = 143, // Prism-private ternary, group 128
-        GGML_TYPE_COUNT   = 144,
+        GGML_TYPE_PQ2_0M = 144, // Prism min/max (range-scale) Q2_0, group 128, KV-only
+        GGML_TYPE_COUNT   = 145,
     };
 
     // [TAG_GGML_PREC]
