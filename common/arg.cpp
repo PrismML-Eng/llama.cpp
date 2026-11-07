@@ -2476,7 +2476,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--kv-mean-center"}, "FNAME",
         "path to a K-cache mean-centering bias file (GGUF), generated with tools/kv-mean-center\n"
         "subtracts a fixed per-(head,channel) bias from K before it is quantized into the cache;\n"
-        "requires --cache-type-k q4_0 (see docs/kv-mean-center.md)",
+        "requires --cache-type-k q4_0 or pq2_0 (see docs/kv-mean-center.md)",
         [](common_params & params, const std::string & value) {
             params.kv_mean_center_path = value;
         }

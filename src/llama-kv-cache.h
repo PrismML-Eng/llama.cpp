@@ -213,14 +213,15 @@ public:
     // mean-centering for every layer it covers: the bias is subtracted from the K vector
     // right before it is written into the cache in cpy_k().
     //
-    // when require_q4_0 is true (the default, used by the --kv-mean-center CLI flag), loading
-    // fails for any layer whose K cache type is not GGML_TYPE_Q4_0, since that is the only case
-    // this feature is intended/validated for. require_q4_0 = false is used by tests to exercise
-    // the exact same subtraction code path against an unquantized (e.g. F32) K cache, in order to
-    // validate the softmax-invariance argument without confounding it with quantization error.
+    // when validate_type is true (the default, used by the --kv-mean-center CLI flag), loading
+    // fails for any layer whose K cache type is not GGML_TYPE_Q4_0 or GGML_TYPE_PQ2_0, the two
+    // quantized K-cache types this feature is intended/validated for. validate_type = false is
+    // used by tests to exercise the exact same subtraction code path against an unquantized
+    // (e.g. F32) K cache, in order to validate the softmax-invariance argument without
+    // confounding it with quantization error.
     //
     // returns false (and logs an error) on failure; the cache is left with centering disabled.
-    bool load_kv_mean_center(const char * path, bool require_q4_0 = true);
+    bool load_kv_mean_center(const char * path, bool validate_type = true);
 
     //
     // preparation API

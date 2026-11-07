@@ -2,9 +2,9 @@
 
 `--kv-mean-center` is an optional, opt-in feature that subtracts a fixed, precomputed
 per-(kv-head, channel) bias from the K vector at the moment it is written into the KV cache,
-in order to improve quantization fidelity for `GGML_TYPE_Q4_0` K caches.
+in order to improve quantization fidelity for `GGML_TYPE_Q4_0` and `GGML_TYPE_PQ2_0` K caches.
 
-This is currently scoped to `GGML_TYPE_Q4_0` only.
+This is currently scoped to `GGML_TYPE_Q4_0` and `GGML_TYPE_PQ2_0`.
 
 ## The idea
 
@@ -59,7 +59,7 @@ not ship a measured number for a specific trained model.
    ./llama-cli -m model.gguf -ctk q4_0 --kv-mean-center kv-mean-center.gguf -p "..."
    ```
 
-`--kv-mean-center` requires `--cache-type-k q4_0`. If the K cache type is anything else, context
+`--kv-mean-center` requires `--cache-type-k q4_0` or `pq2_0`. If the K cache type is anything else, context
 creation fails with a clear error rather than silently doing nothing, matching this codebase's
 existing convention for other cache-type-gated options (e.g. quantized V cache requiring flash
 attention).
@@ -82,7 +82,7 @@ scheduler eval-callback mechanism `llama-imatrix` uses to capture activations). 
 
 ## Scope and limitations
 
-- Only `GGML_TYPE_Q4_0` is supported; other K cache types are rejected. Generalizing the mechanism
+- Only `GGML_TYPE_Q4_0` and `GGML_TYPE_PQ2_0` are supported; other K cache types are rejected. Generalizing the mechanism
   to other quantization types is future work.
 - Every standard-attention KV cache layout is supported: the plain cache, the base/SWA pair of
   sliding-window models, and the attention sub-cache of hybrid (recurrent + attention) models,

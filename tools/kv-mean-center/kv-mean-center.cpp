@@ -197,7 +197,7 @@ static void print_usage(int, char ** argv) {
     LOG("\n    %s -m model.gguf -f calibration-data.txt -o kv-mean-center.gguf [-c 512] [--chunks N]\n", argv[0]);
     LOG("\n");
     LOG("Computes a per-layer K-cache mean-centering bias file for use with --kv-mean-center\n");
-    LOG("(which requires --cache-type-k q4_0). See docs/kv-mean-center.md.\n\n");
+    LOG("(which requires --cache-type-k q4_0 or pq2_0). See docs/kv-mean-center.md.\n\n");
 }
 
 int main(int argc, char ** argv) {
