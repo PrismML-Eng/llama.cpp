@@ -144,6 +144,49 @@ void quantize_row_pq2_0_ref(const float * GGML_RESTRICT x, block_pq2_0 * GGML_RE
     }
 }
 
+// PQ2_0M (Prism min/max Q2_0 at group 128): same 2-bit codec as PQ2_0 but with a
+// range-based scale (d = (max - min) / 3) and a per-block offset (m = min), so
+// all four levels span the full data range [min, max]. KV-only; model weights
+// keep PQ2_0. Dequant: y = m + q * d (levels {min, min+d, min+2d, min+3d=max}).
+// The +16 B over PQ2_0 (one extra fp16 for m) is the price of covering [min, max]
+// with 4 levels.
+void quantize_row_pq2_0m_ref(const float * GGML_RESTRICT x, block_pq2_0m * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_PQ2_0;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float min = FLT_MAX;
+        float max = -FLT_MAX;
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            if (v < min) min = v;
+            if (v > max) max = v;
+        }
+        const float d = (max - min) / 3.0f;
+        const float id = d > 0.0f ? 1.0f / d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+        y[i].m = GGML_FP32_TO_FP16(min);
+
+        for (int j = 0; j < qk / 4; ++j) {
+            y[i].qs[j] = 0;
+        }
+
+        for (int j = 0; j < qk; ++j) {
+            const float w = x[i*qk + j];
+            int q = (int)roundf((w - min) * id);
+            if (q < 0) q = 0;
+            if (q > 3) q = 3;
+            const int byte_index = j / 4;
+            const int bit_offset = (j % 4) * 2;
+            y[i].qs[byte_index] |= ((uint8_t)q << bit_offset);
+        }
+    }
+}
+
 // reference implementation for deterministic creation of model files
 void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK4_0;
@@ -507,6 +550,27 @@ void dequantize_row_pq2_0(const block_pq2_0 * GGML_RESTRICT x, float * GGML_REST
             const uint8_t q = (x[i].qs[byte_index] >> bit_offset) & 0x03;
             // 00=-1, 01=0, 10=+1, 11=+2
             y[i*qk + j] = ((int)q - 1) * d;
+        }
+    }
+}
+
+// PQ2_0M dequant: y = m + (q - 1) * d, q in {0, 1, 2, 3}.
+void dequantize_row_pq2_0m(const block_pq2_0m * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_PQ2_0;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const float m = GGML_FP16_TO_FP32(x[i].m);
+
+        for (int j = 0; j < qk; ++j) {
+            const int byte_index = j / 4;
+            const int bit_offset = (j % 4) * 2;
+            const uint8_t q = (x[i].qs[byte_index] >> bit_offset) & 0x03;
+            y[i*qk + j] = m + q * d;
         }
     }
 }

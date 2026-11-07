@@ -54,6 +54,18 @@ int32_t get_k_qs(uint ib, uint iqs, uint a_offset) {
                 int8_t((bits >> 4u) & 3u),
                 int8_t(bits >> 6u)));
         }
+        case GGML_TYPE_PQ2_0M: {
+            // Same packing as PQ2_0 (4 two-bit codes per byte, 128-elem block) but
+            // the buffer is block_pq2_0m (d, m, qs).
+            const uint elem = iqs;
+            const uint byte = (elem % 128) / 4;
+            const uint bits = k_packed_pq2_0m.data[a_offset + ib + elem / 128].qs[byte];
+            return pack32(i8vec4(
+                int8_t(bits & 3u),
+                int8_t((bits >> 2u) & 3u),
+                int8_t((bits >> 4u) & 3u),
+                int8_t(bits >> 6u)));
+        }
         default: return 0;
     }
 }
@@ -68,6 +80,12 @@ FLOAT_TYPEV2 get_k_scale(uint ib, uint a_offset) {
         case GGML_TYPE_Q5_1: return FLOAT_TYPEV2(k_packed_q5_1_p32.data[a_offset + ib].dm);
         case GGML_TYPE_Q8_0: return FLOAT_TYPEV2(FLOAT_TYPE(k_packed_q8_0.data[a_offset + ib].d), 0.0);
         case GGML_TYPE_PQ2_0: return FLOAT_TYPEV2(FLOAT_TYPE(k_packed_pq2_0.data[a_offset + ib].d), 0.0);
+        case GGML_TYPE_PQ2_0M: {
+            // (d, m): the min/max type stores both a range step and a block offset.
+            return FLOAT_TYPEV2(
+                FLOAT_TYPE(k_packed_pq2_0m.data[a_offset + ib].d),
+                FLOAT_TYPE(k_packed_pq2_0m.data[a_offset + ib].m));
+        }
         default: return FLOAT_TYPEV2(0);
     }
 }
@@ -119,6 +137,16 @@ void k_block_to_shmem(const uint buf_ib, const uint global_ib, const uint iqs, c
                 int8_t(bits >> 6u)));
             break;
         }
+        case GGML_TYPE_PQ2_0M: {
+            // Same as PQ2_0 but from the (d, m, qs) buffer.
+            const uint bits = k_packed_pq2_0m.data[a_offset + global_ib].qs[iqs];
+            kblocksh[buf_ib].qs[iqs] = pack32(i8vec4(
+                int8_t(bits & 3u),
+                int8_t((bits >> 2u) & 3u),
+                int8_t((bits >> 4u) & 3u),
+                int8_t(bits >> 6u)));
+            break;
+        }
     }
 
     if (iqs == 0) {
@@ -130,6 +158,8 @@ void k_block_to_shmem(const uint buf_ib, const uint global_ib, const uint iqs, c
             case GGML_TYPE_Q5_1: kblocksh[buf_ib].dm = FLOAT_TYPEV2(k_packed_q5_1_p32.data[a_offset + global_ib].dm); break;
             case GGML_TYPE_Q8_0: kblocksh[buf_ib].dm = FLOAT_TYPEV2(FLOAT_TYPE(k_packed_q8_0.data[a_offset + global_ib].d), 0.0); break;
             case GGML_TYPE_PQ2_0: kblocksh[buf_ib].dm = FLOAT_TYPEV2(FLOAT_TYPE(k_packed_pq2_0.data[a_offset + buf_ib / 4].d), 0.0); break;
+            case GGML_TYPE_PQ2_0M: kblocksh[buf_ib].dm = FLOAT_TYPEV2(FLOAT_TYPE(k_packed_pq2_0m.data[a_offset + buf_ib / 4].d),
+                                                              FLOAT_TYPE(k_packed_pq2_0m.data[a_offset + buf_ib / 4].m)); break;
         }
     }
 }
@@ -214,6 +244,10 @@ int32_t get_k_qs_shmem(const uint buf_ib, const uint pos) {
             // Already stored as raw 0..3 codes in each byte; no unpack needed.
             return kblocksh[buf_ib].qs[pos];
         }
+        case GGML_TYPE_PQ2_0M: {
+            // Already stored as raw 0..3 codes in each byte; no unpack needed.
+            return kblocksh[buf_ib].qs[pos];
+        }
         default: return 0;
     }
 }
@@ -225,6 +259,8 @@ ACC_TYPE k_dot_correction(const uint qib, const ACC_TYPEV2 k_dm) {
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_1: return ACC_TYPE(Qf[qib].ds.y) * k_dm.y;
         case GGML_TYPE_PQ2_0: return -ACC_TYPE(1.0) * ACC_TYPE(Qf[qib].ds.y) * k_dm.x;
+        // PQ2_0M: K = m + q*d (Bk=0).  Correction = ds.y * (m - 0*d) = ds.y * m.
+        case GGML_TYPE_PQ2_0M: return ACC_TYPE(Qf[qib].ds.y) * k_dm.y;
         default: return ACC_TYPE(0.0);
     }
 }
