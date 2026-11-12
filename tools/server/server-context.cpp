@@ -28,6 +28,7 @@
 #include <deque>
 #include <exception>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <filesystem>
 #include <random>
@@ -1202,6 +1203,7 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -4696,6 +4698,41 @@ private:
             spec_process = false;
             for (int32_t i = 0; i < batch.view.size() && !spec_process; ++i) {
                 spec_process = batch.view.tokens[i].pos[0] <= params_base.speculative.draft.n_depth_max;
+            }
+        }
+
+        // with one slot and no window, common_speculative_init sizes the draft context for depth-max: a view that
+        // reaches it starts at or below the cutoff and holds at most n_batch tokens
+        if (spec_process && params_base.speculative.draft.n_depth_max > 0 && params_base.speculative.draft.n_window == 0 &&
+                params_base.n_parallel == 1) {
+            GGML_ASSERT(batch.view.tokens.back().pos[0] < params_base.speculative.draft.n_depth_max + params_base.n_batch);
+        }
+
+        // --spec-draft-window: before feeding this view to the draft context, drop the rows of each sequence in the
+        // view that are older than the window, measured from that sequence's first position in the view. Sequences
+        // that are not in the view keep their rows. The draft context is sized for the window
+        // (common_speculative_init), so freed cells are reused and its attention span stays short.
+        if (spec_process && ctx_dft && params_base.speculative.draft.n_window > 0) {
+            std::map<llama_seq_id, llama_pos> seq_pos_min;
+            const auto add_pos = [&](llama_seq_id sid, llama_pos pos) {
+                auto it = seq_pos_min.find(sid);
+                if (it == seq_pos_min.end()) {
+                    seq_pos_min.emplace(sid, pos);
+                } else {
+                    it->second = std::min(it->second, pos);
+                }
+            };
+            for (const auto & tok : batch.view.tokens) {
+                add_pos(tok.seq_id, tok.pos[0]);
+                for (const llama_seq_id sid : tok.seq_ids_extra) {
+                    add_pos(sid, tok.pos[0]);
+                }
+            }
+            for (const auto & [sid, pos_min] : seq_pos_min) {
+                const llama_pos hi = pos_min - params_base.speculative.draft.n_window;
+                if (hi > 0) {
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), sid, 0, hi);
+                }
             }
         }
 
