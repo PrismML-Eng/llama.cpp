@@ -554,7 +554,7 @@ void dequantize_row_pq2_0(const block_pq2_0 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
-// PQ2_0M dequant: y = m + (q - 1) * d, q in {0, 1, 2, 3}.
+// PQ2_0M dequant: y = m + q * d, q in {0, 1, 2, 3}.
 void dequantize_row_pq2_0m(const block_pq2_0m * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_PQ2_0;
 
