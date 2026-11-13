@@ -257,6 +257,33 @@ struct block_pq2_0_packed16
 #define A_TYPE_PACKED16 block_pq2_0_packed16
 #endif
 
+// PQ2_0M: min/max (range-scale) variant of PQ2_0, KV-only. d + m + qs.
+// Dequant: y = m + q * d. Two fp16 aux (d, m).
+#define QUANT_K_PQ2_0M 128
+#define QUANT_R_PQ2_0M 1
+
+struct block_pq2_0m
+{
+    float16_t d;
+    float16_t m;
+    uint8_t qs[QUANT_K_PQ2_0M / 4];
+};
+
+struct block_pq2_0m_packed16
+{
+    float16_t d;
+    float16_t m;
+    uint16_t qs[QUANT_K_PQ2_0M / 8];
+};
+
+#if defined(DATA_A_PQ2_0M)
+#define QUANT_K QUANT_K_PQ2_0M
+#define QUANT_R QUANT_R_PQ2_0M
+#define QUANT_AUXF 2
+#define A_TYPE block_pq2_0m
+#define A_TYPE_PACKED16 block_pq2_0m_packed16
+#endif
+
 #define QUANT_K_Q2_0 64
 #define QUANT_R_Q2_0 1
 

@@ -14,6 +14,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -31,13 +32,36 @@ public:
 
     bool saw_k_rot() const { return m_saw_k_rot; }
 
+    void set_per_block(bool per_block) { m_per_block = per_block; }
+
+    // when recentering, also request the per-block layout (the recentered offset is one
+    // value per 128-channel block), so the user only has to flip this single flag.
+    void set_recenter(bool recenter) {
+        m_recenter = recenter;
+        if (recenter) {
+            m_per_block = true;
+        }
+    }
+
 private:
     std::mutex m_mutex;
     std::vector<uint8_t> m_host_buf;
     std::vector<float>   m_f32_buf; // scratch space for F16/BF16 -> F32 conversion
 
     std::unordered_map<int32_t, std::vector<double>> m_sum;   // il -> [n_embd_head * n_head]
+    std::unordered_map<int32_t, std::vector<double>> m_maxabs; // il -> [n_embd_head * n_head], max |K| per channel
     std::unordered_map<int32_t, int64_t>              m_count; // il -> total tokens seen
+
+    // when true, finalize() collapses each 128-channel block (the PQ2_0
+    // quantization block) into a single shared offset, so every bias entry in the block
+    // equals the block's mean. this aligns the bias with PQ2_0's asymmetric codebook.
+    bool m_per_block = false;
+
+    // when true, finalize() re-centers the K block to the PQ2_0 codebook center
+    // (offset = block_mean - 0.5*d, d = max |K_raw| per block) instead of to 0.
+    // this requires the per-channel max|K| tracked in m_maxabs and is only meaningful
+    // for PQ2_0. it implies per-block layout.
+    bool m_recenter = false;
 
     // whether the captured K tensors were produced with the Hadamard K-cache rotation
     // active, detected from the graph itself: the rotation is a mul_mat against the
@@ -128,8 +152,14 @@ bool kv_mean_collector::collect(struct ggml_tensor * t, bool ask) {
     }
     GGML_ASSERT(sum.size() == (size_t) (n_embd_head*n_head));
 
+    auto & maxabs = m_maxabs[il];
+    if (maxabs.empty()) {
+        maxabs.assign(n_embd_head*n_head, 0.0);
+    }
+    GGML_ASSERT(maxabs.size() == (size_t) (n_embd_head*n_head));
+
     // the raw bytes are only directly reinterpretable as float* for F32; F16/BF16 need to be
-    // converted to F32 first, otherwise the mean below is computed over garbage
+    // converted to F32 first, otherwise the mean/max below is computed over garbage
     const float * f;
     if (t->type == GGML_TYPE_F32) {
         f = (const float *) data;
@@ -146,7 +176,11 @@ bool kv_mean_collector::collect(struct ggml_tensor * t, bool ask) {
     for (int64_t i2 = 0; i2 < n_tokens; ++i2) {
         for (int64_t i1 = 0; i1 < n_head; ++i1) {
             for (int64_t i0 = 0; i0 < n_embd_head; ++i0) {
-                sum[i1*n_embd_head + i0] += f[(i2*n_head + i1)*n_embd_head + i0];
+                const int64_t idx = i1*n_embd_head + i0;
+                const float v = f[(i2*n_head + i1)*n_embd_head + i0];
+                sum[idx] += v;
+                const float av = fabsf(v);
+                if (av > maxabs[idx]) maxabs[idx] = av;
             }
         }
     }
@@ -162,6 +196,7 @@ std::vector<common_kv_mean_center_layer> kv_mean_collector::finalize() const {
     for (const auto & kv : m_sum) {
         const int32_t il    = kv.first;
         const auto &  sum   = kv.second;
+        const auto &  maxabs = m_maxabs.at(il);
         const int64_t count = m_count.at(il);
 
         if (count == 0) {
@@ -171,8 +206,28 @@ std::vector<common_kv_mean_center_layer> kv_mean_collector::finalize() const {
         common_kv_mean_center_layer layer;
         layer.il = il;
         layer.bias.resize(sum.size());
-        for (size_t i = 0; i < sum.size(); ++i) {
-            layer.bias[i] = (float) (sum[i] / (double) count);
+        // per-block mode: collapse each 128-channel block into a single shared offset
+        // (matches the PQ2_0 quantization block, aligning the bias with the asymmetric
+        // codebook center). per-channel mode is the Q4_0-style independent per-channel mean.
+        if (m_recenter) {
+            std::vector<double> per_channel(sum.size());
+            std::vector<double> per_channel_maxabs(maxabs.size());
+            for (size_t i = 0; i < sum.size(); ++i) {
+                per_channel[i] = sum[i] / (double) count;
+                per_channel_maxabs[i] = maxabs[i];
+            }
+            layer.bias = common_kv_mean_center_collapse_to_blocks_recentered(per_channel, per_channel_maxabs);
+        } else if (m_per_block) {
+            std::vector<double> per_channel(sum.size());
+            for (size_t i = 0; i < sum.size(); ++i) {
+                per_channel[i] = sum[i] / (double) count;
+            }
+            layer.bias = common_kv_mean_center_collapse_to_blocks(per_channel);
+        } else {
+            layer.bias.resize(sum.size());
+            for (size_t i = 0; i < sum.size(); ++i) {
+                layer.bias[i] = (float) (sum[i] / (double) count);
+            }
         }
 
         out.push_back(std::move(layer));
@@ -197,7 +252,7 @@ static void print_usage(int, char ** argv) {
     LOG("\n    %s -m model.gguf -f calibration-data.txt -o kv-mean-center.gguf [-c 512] [--chunks N]\n", argv[0]);
     LOG("\n");
     LOG("Computes a per-layer K-cache mean-centering bias file for use with --kv-mean-center\n");
-    LOG("(which requires --cache-type-k q4_0). See docs/kv-mean-center.md.\n\n");
+    LOG("(which requires --cache-type-k q4_0 or pq2_0). See docs/kv-mean-center.md.\n\n");
 }
 
 int main(int argc, char ** argv) {
@@ -226,6 +281,14 @@ int main(int argc, char ** argv) {
     params.cb_eval           = kv_mean_center_cb_eval;
     params.cb_eval_user_data = nullptr;
     params.warmup            = false;
+
+    // per-block mode (one offset per 128-elem PQ2_0 block) is only meaningful for PQ2_0;
+    // it aligns the bias with the asymmetric codebook center. the recenter mode goes
+    // one step further: it re-centers each block to the codebook center (+0.5d) instead
+    // of to 0, so the stored K sits at the middle of the PQ2_0 codebook (-d..+2d).
+    // the default per-channel mode is the Q4_0-style independent per-channel mean.
+    g_collector.set_per_block(params.kv_mean_center_per_block);
+    g_collector.set_recenter(params.kv_mean_center_recenter);
 
     common_init_result_ptr llama_init = common_init_from_params(params);
 
@@ -289,12 +352,24 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (!common_kv_mean_center_write(params.out_file, layers, g_collector.saw_k_rot())) {
+    // the loader will reject a PQ2_0 bias whose mode doesn't match the per-block codec,
+    // so record which mode this file was generated in
+    const char * mode;
+    if (params.kv_mean_center_recenter) {
+        mode = "recenter";
+    } else if (params.kv_mean_center_per_block) {
+        mode = "per-block";
+    } else {
+        mode = "per-channel";
+    }
+    if (!common_kv_mean_center_write(params.out_file, layers, g_collector.saw_k_rot(), mode)) {
         return 1;
     }
 
-    LOG_INF("%s: wrote K-cache mean-centering bias for %zu layer(s) to %s (measured with K rotation %s)\n",
-            __func__, layers.size(), params.out_file.c_str(), g_collector.saw_k_rot() ? "active" : "inactive");
+    LOG_INF("%s: wrote K-cache mean-centering bias for %zu layer(s) to %s "
+            "(mode: %s, measured with K rotation %s)\n",
+            __func__, layers.size(), params.out_file.c_str(), mode,
+            g_collector.saw_k_rot() ? "active" : "inactive");
 
     llama_backend_free();
 

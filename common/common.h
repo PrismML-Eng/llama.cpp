@@ -609,8 +609,19 @@ struct common_params {
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
     // path to a K-cache mean-centering bias file (GGUF), or empty to disable.
-    // only takes effect when cache_type_k == GGML_TYPE_Q4_0; see docs/kv-mean-center.md
+    // only takes effect when cache_type_k is q4_0 or pq2_0; see docs/kv-mean-center.md
     std::string kv_mean_center_path = "";
+
+    // when generating a K-cache mean-centering bias file (tools/kv-mean-center),
+    // if true each bias entry is the mean over a 128-channel PQ2_0 block rather than
+    // over a single channel. only meaningful for PQ2_0; see docs/kv-mean-center.md
+    bool kv_mean_center_per_block = false;
+
+    // when generating a K-cache mean-centering bias file (tools/kv-mean-center),
+    // if true each 128-channel PQ2_0 block is re-centered to the codebook center
+    // (offset = block_mean - 0.5*d, d = max |K_raw| over the block) instead of to 0.
+    // only meaningful for PQ2_0. it implies the per-block layout; see docs/kv-mean-center.md
+    bool kv_mean_center_recenter = false;
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;

@@ -4571,8 +4571,9 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if (params.path_kv_mean_center != nullptr && params.type_k != GGML_TYPE_Q4_0) {
-        LLAMA_LOG_ERROR("%s: path_kv_mean_center requires the K cache type to be Q4_0 (got %s)\n",
+    if (params.path_kv_mean_center != nullptr &&
+        params.type_k != GGML_TYPE_Q4_0 && params.type_k != GGML_TYPE_PQ2_0) {
+        LLAMA_LOG_ERROR("%s: path_kv_mean_center requires the K cache type to be q4_0 or pq2_0 (got %s)\n",
                 __func__, ggml_type_name(params.type_k));
         return nullptr;
     }

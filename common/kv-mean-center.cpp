@@ -5,12 +5,67 @@
 #include "ggml.h"
 #include "gguf.h"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstring>
+#include <vector>
+
+std::vector<float> common_kv_mean_center_collapse_to_blocks(const std::vector<double> & per_channel) {
+    const size_t bs = common_kv_mean_center_block_size;
+    GGML_ASSERT(per_channel.size() % bs == 0);
+
+    std::vector<float> out(per_channel.size());
+
+    for (size_t b = 0; b < per_channel.size(); b += bs) {
+        double sum = 0.0;
+        for (size_t j = b; j < b + bs; ++j) {
+            sum += per_channel[j];
+        }
+        const float block_mean = static_cast<float>(sum / static_cast<double>(bs));
+        for (size_t j = b; j < b + bs; ++j) {
+            out[j] = block_mean;
+        }
+    }
+
+    return out;
+}
+
+std::vector<float> common_kv_mean_center_collapse_to_blocks_recentered(
+        const std::vector<double> & per_channel, const std::vector<double> & per_channel_maxabs) {
+    const size_t bs = common_kv_mean_center_block_size;
+    GGML_ASSERT(per_channel.size() % bs == 0);
+    GGML_ASSERT(per_channel_maxabs.size() == per_channel.size());
+
+    std::vector<float> out(per_channel.size());
+
+    for (size_t b = 0; b < per_channel.size(); b += bs) {
+        double sum = 0.0;
+        for (size_t j = b; j < b + bs; ++j) {
+            sum += per_channel[j];
+        }
+        const double block_mean = sum / static_cast<double>(bs);
+
+        // d = max |K_raw| over the block. the quantizer scales the re-centered K (K_raw - offset)
+        // to [-d, d]; its codebook (q-1)*d has center +0.5d. to put the re-centered K at the
+        // codebook center, offset = block_mean - 0.5d, so the re-centered K sits at -0.5d..+1.5d.
+        double d = 0.0;
+        for (size_t j = b; j < b + bs; ++j) {
+            if (per_channel_maxabs[j] > d) d = per_channel_maxabs[j];
+        }
+        const float block_offset = static_cast<float>(block_mean - 0.5 * d);
+        for (size_t j = b; j < b + bs; ++j) {
+            out[j] = block_offset;
+        }
+    }
+
+    return out;
+}
 
 bool common_kv_mean_center_write(
         const std::string & fname,
         const std::vector<common_kv_mean_center_layer> & layers,
-        bool k_rot) {
+        bool k_rot,
+        const char * mode) {
     size_t n_with_bias = 0;
     for (const auto & layer : layers) {
         if (!layer.bias.empty()) {
@@ -48,6 +103,7 @@ bool common_kv_mean_center_write(
 
     gguf_set_val_str(ctx_gguf, "general.type", "kv-mean-center");
     gguf_set_val_bool(ctx_gguf, "kv_mean_center.k_rot", k_rot);
+    gguf_set_val_str(ctx_gguf, "kv_mean_center.mode", mode);
 
     for (const auto & layer : layers) {
         if (layer.bias.empty()) {

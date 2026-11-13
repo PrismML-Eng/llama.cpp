@@ -1508,7 +1508,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     return ggml_set_rows(ctx, v_view, v_cur, v_idxs);
 }
 
-bool llama_kv_cache::load_kv_mean_center(const char * path, bool require_q4_0) {
+bool llama_kv_cache::load_kv_mean_center(const char * path, bool validate_type) {
     GGML_ASSERT(path != nullptr);
     GGML_ASSERT(k_bar.empty() && "K-cache mean-centering already loaded");
 
@@ -1527,11 +1527,11 @@ bool llama_kv_cache::load_kv_mean_center(const char * path, bool require_q4_0) {
 
     // validate the cache type first, so an unsupported cache type gets its actionable error
     // even when the bias file's basis would also mismatch
-    if (require_q4_0) {
+    if (validate_type) {
         for (const auto & layer : layers) {
-            if (layer.k->type != GGML_TYPE_Q4_0) {
-                LLAMA_LOG_ERROR("%s: K-cache mean-centering requires K cache type %s, but layer %d has type %s\n",
-                        __func__, ggml_type_name(GGML_TYPE_Q4_0), layer.il, ggml_type_name(layer.k->type));
+            if (layer.k->type != GGML_TYPE_Q4_0 && layer.k->type != GGML_TYPE_PQ2_0 && layer.k->type != GGML_TYPE_PQ2_0M) {
+                LLAMA_LOG_ERROR("%s: K-cache mean-centering requires K cache type q4_0 or pq2_0, but layer %d has type %s\n",
+                        __func__, layer.il, ggml_type_name(layer.k->type));
                 gguf_free(ctx_gguf);
                 ggml_free(ctx_data);
                 return false;
@@ -1568,7 +1568,48 @@ bool llama_kv_cache::load_kv_mean_center(const char * path, bool require_q4_0) {
         } else {
             LLAMA_LOG_WARN("%s: bias file %s does not record its calibration basis (kv_mean_center.k_rot); "
                     "K-cache rotation is %s for this context - a basis mismatch degrades quality\n",
-                    __func__, path, n_rot_k > 0 ? "active" : "inactive");
+                        __func__, path, n_rot_k > 0 ? "active" : "inactive");
+        }
+    }
+
+    // bias is a Q4_0 optimization. on PQ2_0 every tested bias mode degrades quality
+    // (per-channel 0.433, per-block 0.465, recenter 1.066 vs no-bias 0.258), so it is
+    // not recommended. the loader still accepts a bias file for PQ2_0 (A/B comparison)
+    // but flags it; a per-block/recenter mode on Q4_0 is still a layout mismatch and is
+    // warned as before.
+    {
+        const bool is_pq2_0 = (type_k() == GGML_TYPE_PQ2_0);
+        const bool is_pq2_0m = (type_k() == GGML_TYPE_PQ2_0M);
+        const int64_t idx_mode = gguf_find_key(ctx_gguf, "kv_mean_center.mode");
+        const char * bias_mode = nullptr;
+        if (idx_mode >= 0) {
+            if (gguf_get_kv_type(ctx_gguf, idx_mode) != GGUF_TYPE_STRING) {
+                LLAMA_LOG_ERROR("%s: bias file %s has a non-string kv_mean_center.mode key - malformed file\n",
+                        __func__, path);
+                gguf_free(ctx_gguf);
+                ggml_free(ctx_data);
+                return false;
+            }
+            bias_mode = gguf_get_val_str(ctx_gguf, idx_mode);
+        }
+        if (is_pq2_0) {
+            LLAMA_LOG_WARN("%s: K cache is PQ2_0 - the mean-centering bias is a Q4_0 "
+                    "optimization and degrades PQ2_0 quality (measured: per-channel 0.433, "
+                    "per-block 0.465, recenter 1.066 vs no-bias 0.258). it will be "
+                    "applied but is not recommended; omit --kv-mean-center for best "
+                    "PQ2_0 fidelity\n", __func__);
+        } else if (is_pq2_0m) {
+            LLAMA_LOG_WARN("%s: K cache is PQ2_0M (min/max) - the mean-centering bias is a "
+                    "Q4_0 optimization and may not be calibrated for the PQ2_0M codec. "
+                    "it will be applied but is not recommended; omit --kv-mean-center "
+                    "for best PQ2_0M fidelity\n", __func__);
+        } else if (bias_mode != nullptr &&
+                   (std::string(bias_mode) == "per-block" || std::string(bias_mode) == "recenter")) {
+            LLAMA_LOG_WARN("%s: bias file %s is %s (128-elem) but the K cache is %s "
+                    "- a per-block offset is misaligned with %s's 32-wide blocks; "
+                    "recalibrate with --kv-mean-center (per-channel) for this type\n",
+                    __func__, path, bias_mode, ggml_type_name(type_k()),
+                    ggml_type_name(type_k()));
         }
     }
 
