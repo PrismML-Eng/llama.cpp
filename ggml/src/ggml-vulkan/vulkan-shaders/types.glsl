@@ -258,7 +258,7 @@ struct block_pq2_0_packed16
 #endif
 
 // PQ2_0M: min/max (range-scale) variant of PQ2_0, KV-only. d + m + qs.
-// Dequant: y = m + (q - 1) * d. Two fp16 aux (d, m).
+// Dequant: y = m + q * d. Two fp16 aux (d, m).
 #define QUANT_K_PQ2_0M 128
 #define QUANT_R_PQ2_0M 1
 

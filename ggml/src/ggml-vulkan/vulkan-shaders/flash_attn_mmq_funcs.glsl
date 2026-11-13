@@ -157,9 +157,9 @@ void k_block_to_shmem(const uint buf_ib, const uint global_ib, const uint iqs, c
             case GGML_TYPE_Q5_0: kblocksh[buf_ib].dm = FLOAT_TYPEV2(FLOAT_TYPE(k_packed_q5_0.data[a_offset + global_ib].d), 0.0); break;
             case GGML_TYPE_Q5_1: kblocksh[buf_ib].dm = FLOAT_TYPEV2(k_packed_q5_1_p32.data[a_offset + global_ib].dm); break;
             case GGML_TYPE_Q8_0: kblocksh[buf_ib].dm = FLOAT_TYPEV2(FLOAT_TYPE(k_packed_q8_0.data[a_offset + global_ib].d), 0.0); break;
-            case GGML_TYPE_PQ2_0: kblocksh[buf_ib].dm = FLOAT_TYPEV2(FLOAT_TYPE(k_packed_pq2_0.data[a_offset + buf_ib / 4].d), 0.0); break;
-            case GGML_TYPE_PQ2_0M: kblocksh[buf_ib].dm = FLOAT_TYPEV2(FLOAT_TYPE(k_packed_pq2_0m.data[a_offset + buf_ib / 4].d),
-                                                              FLOAT_TYPE(k_packed_pq2_0m.data[a_offset + buf_ib / 4].m)); break;
+            case GGML_TYPE_PQ2_0: kblocksh[buf_ib].dm = FLOAT_TYPEV2(FLOAT_TYPE(k_packed_pq2_0.data[a_offset + global_ib].d), 0.0); break;
+            case GGML_TYPE_PQ2_0M: kblocksh[buf_ib].dm = FLOAT_TYPEV2(FLOAT_TYPE(k_packed_pq2_0m.data[a_offset + global_ib].d),
+                      FLOAT_TYPE(k_packed_pq2_0m.data[a_offset + global_ib].m)); break;
         }
     }
 }
