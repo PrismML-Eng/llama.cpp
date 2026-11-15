@@ -513,13 +513,22 @@ static void mul_mat_vec_ptq1_0_pt_launch(
             const char * value = std::getenv("GGML_CUDA_PTQ1_0_FFN_DOWN");
             return value == nullptr || std::atoi(value) != 0;
         }();
-        if (ffn_down_enabled && ncols_x == 17408 && nrows_x == 5120 && !has_gate &&
-                !ggml_cuda_batch_invariant() && ggml_cuda_info().devices[ggml_cuda_get_device()].cc == 860) {
-            // Shorter CTA work queues improve the long-K FFN down projection on SM86.
-            constexpr int rows = 16;
+        // Same 16-row tile as the 128-thread launcher. 256 threads halve that
+        // tile's block-dot queue, which is the SM86 win at 136 blocks/row
+        // (K = 17408: 17 iterations -> 9). Require at least that queue:
+        // 16*bpr/256 > 8, so bpr > 128. The grid is exact, so M must be a
+        // multiple of 16. cc 870 and 890 stay on the 128-thread path; only
+        // SM86 was timed. Shared memory grows with K, so a row that would
+        // exceed smpb keeps the generic launcher.
+        constexpr int rows = 16;
+        const int device = ggml_cuda_get_device();
+        const int cc = ggml_cuda_info().devices[device].cc;
+        const size_t smem = (size_t) rows * (bpr + 1) * sizeof(float);
+        if (ffn_down_enabled && bpr > 128 && nrows_x % rows == 0 && !has_gate &&
+                !ggml_cuda_batch_invariant() && GGML_CUDA_CC_IS_NVIDIA(cc) && cc == 860 &&
+                smem <= ggml_cuda_info().devices[device].smpb) {
             const uint3 bpr_fd = init_fastdiv_values((uint32_t) bpr);
             const uint3 rpc_fd = init_fastdiv_values((uint32_t) rows);
-            const size_t smem = rows * (bpr + 1) * sizeof(float);
             const ggml_cuda_kernel_launch_params lp(dim3(nrows_x / rows), dim3(256), smem, stream);
             if (has_fusion) {
                 ggml_cuda_kernel_launch(mul_mat_vec_ptq1_0_pt<1, 1, true, false, 256>, lp,
