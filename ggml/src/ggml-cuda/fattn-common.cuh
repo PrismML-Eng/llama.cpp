@@ -674,7 +674,7 @@ static __device__ __forceinline__ void dequantize_V_pq2_0m(const void * __restri
         ((float *) dst)[2] = m + c2 * d;
         ((float *) dst)[3] = m + c3 * d;
     } else {
-        static_assert(std::is_same<T, void>, "bad type");
+        static_assert(std::is_same_v<T, void>, "bad type");
     }
 }
 
