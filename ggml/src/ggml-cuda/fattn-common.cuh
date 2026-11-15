@@ -652,29 +652,29 @@ static __device__ __forceinline__ void dequantize_V_pq2_0m(const void * __restri
     const int64_t ib  = i0 / QK_PQ2_0;
     const int     iqs = i0 % QK_PQ2_0 / 4;
 
-    static_assert(ne % 2 == 0, "bad ne");
+    static_assert(ne == 4, "bad ne");
     const float d = x[ib].d;
     const float m = x[ib].m;
 
-    uint8_t byte = x[ib].qs[iqs];
+    const uint8_t byte = x[ib].qs[iqs];
+    const int c0 = byte & 0x03;
+    const int c1 = (byte >> 2) & 0x03;
+    const int c2 = (byte >> 4) & 0x03;
+    const int c3 = (byte >> 6) & 0x03;
 
     #ifdef FP16_AVAILABLE
     if constexpr (std::is_same<T, half>::value) {
-        #pragma unroll
-        for (int l = 0; l < ne; l += 2) {
-            int b0 = (byte >> (l/2 * 2)) & 0x03;
-            ((half2 *) dst)[l/2] = __half2half2(m + b0 * d);
-        }
+        ((half2 *) dst)[0] = make_half2((__half)(m + c0 * d), (__half)(m + c1 * d));
+        ((half2 *) dst)[1] = make_half2((__half)(m + c2 * d), (__half)(m + c3 * d));
     } else
     #endif // FP16_AVAILABLE
     if constexpr (std::is_same<T, float>::value) {
-        #pragma unroll
-        for (int l = 0; l < ne; ++l) {
-            int c = (byte >> ((l/2) * 2)) & 0x03;
-            ((float *) dst)[l] = m + c * d;
-        }
+        ((float *) dst)[0] = m + c0 * d;
+        ((float *) dst)[1] = m + c1 * d;
+        ((float *) dst)[2] = m + c2 * d;
+        ((float *) dst)[3] = m + c3 * d;
     } else {
-        static_assert(std::is_same_v<T, void>, "unsupported type");
+        static_assert(std::is_same<T, void>, "bad type");
     }
 }
 
