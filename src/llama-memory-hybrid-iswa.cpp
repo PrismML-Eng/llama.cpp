@@ -154,6 +154,10 @@ bool llama_memory_hybrid_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_p
     return mem_attn->seq_rm(seq_id, p0, p1);
 }
 
+bool llama_memory_hybrid_iswa::seq_rs_snapshots(llama_seq_id seq_id, uint32_t n_snap) {
+    return mem_recr->seq_rs_snapshots(seq_id, n_snap);
+}
+
 void llama_memory_hybrid_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);

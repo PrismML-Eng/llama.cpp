@@ -154,14 +154,11 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
             gdn_raw_gates_dev_ok     = false;
             break;
         }
-        // integrated GPUs (e.g. unified-memory CUDA devices) report IGPU, not GPU
-        const bool is_gpu = ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
-                            ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
-        if (is_gpu) {
+        if (!supports_gdn_state_inplace(ldev.dev)) {
             // the cache-writing GDN op mutates one of its sources; only the CPU backend implements it
             gdn_state_inplace_dev_ok = false;
         }
-        if (is_gpu && strcmp(reg_name, "MTL") != 0) {
+        if (!supports_gdn_state_rows(ldev.dev, strcmp(reg_name, "MTL") == 0)) {
             gdn_state_rows_dev_ok = false;
         }
         if (strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "CUDA") != 0 &&

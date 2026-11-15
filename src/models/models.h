@@ -2273,8 +2273,18 @@ struct llama_model_qwen35 : public llama_model_base {
 
         // device-dependent path choices, scanned once per graph build (not per layer)
         bool gdn_state_rows_dev_ok    = true; // every GPU device is Metal: fused GDN may read state rows in place
-        bool gdn_state_inplace_dev_ok = true; // no GPU/IGPU device at all: the in-place (cache-writing) GDN is CPU-only
+        bool gdn_state_inplace_dev_ok = true; // the in-place (cache-writing) GDN is CPU-only
         bool gdn_raw_gates_dev_ok     = true; // every device is CPU/Metal/CUDA/ROCm/MUSA: fused GDN takes raw gates
+
+        static bool supports_gdn_state_inplace(ggml_backend_dev_t dev) {
+            return ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        }
+
+        static bool supports_gdn_state_rows(ggml_backend_dev_t dev, bool is_metal) {
+            const auto type = ggml_backend_dev_type(dev);
+            return type == GGML_BACKEND_DEVICE_TYPE_CPU ||
+                (is_metal && (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU));
+        }
     private:
         ggml_tensor * build_layer_attn(
         llm_graph_input_attn_kv * inp_attn,

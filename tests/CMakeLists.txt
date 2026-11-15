@@ -176,6 +176,11 @@ llama_build_and_test(test-gdn-inplace.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
+    add_executable(test-gdn-snapshot-policy test-gdn-snapshot-policy.cpp)
+    target_link_libraries(test-gdn-snapshot-policy PRIVATE llama)
+    target_include_directories(test-gdn-snapshot-policy PRIVATE ../src)
+    llama_test(test-gdn-snapshot-policy)
+
     llama_build_and_test(test-unicode.cpp)
     llama_build_and_test(test-sampling.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
