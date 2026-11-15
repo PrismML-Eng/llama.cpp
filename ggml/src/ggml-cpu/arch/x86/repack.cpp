@@ -6439,6 +6439,17 @@ static inline void __q1_0_expand_x4(const uint8_t * qs, __m512i * w01, __m512i *
 // Expand one 32-value sub-block of a block_pq2_0x4 (32 bytes, 8 packed bytes
 // per column) to {0..3} code bytes: w01 = [col0 x32 | col1 x32], w23 likewise.
 static inline void __q2_0_expand_x4(const uint8_t * qs, __m512i * w01, __m512i * w23) {
+#if defined(__AVX512VBMI__)
+    // vpmultishiftqb: control picks bits 0,2,4,6 of the lane's low dword and 32,34,36,38 of its high dword,
+    // so each 64-bit lane expands its two code bytes to eight code bytes in order.
+    const __m512i m3     = _mm512_set1_epi8(3);
+    const __m512i ctrl   = _mm512_set1_epi64(0x2624222006040200LL);
+    const __m256i packed = _mm256_loadu_si256((const __m256i *) qs);
+    const __m512i v01    = _mm512_cvtepu8_epi32(_mm256_castsi256_si128(packed));
+    const __m512i v23    = _mm512_cvtepu8_epi32(_mm256_extracti128_si256(packed, 1));
+    *w01 = _mm512_and_si512(_mm512_multishift_epi64_epi8(ctrl, v01), m3);
+    *w23 = _mm512_and_si512(_mm512_multishift_epi64_epi8(ctrl, v23), m3);
+#else
     const __m512i m3 = _mm512_set1_epi32(0x03030303);
     const __m256i packed = _mm256_loadu_si256((const __m256i *) qs);
     // dword d = packed byte d; spread the four 2-bit fields to byte lanes
@@ -6450,6 +6461,7 @@ static inline void __q2_0_expand_x4(const uint8_t * qs, __m512i * w01, __m512i *
                                         _mm512_or_si512(_mm512_slli_epi32(v23, 12), _mm512_slli_epi32(v23, 18)));
     *w01 = _mm512_and_si512(r01, m3);
     *w23 = _mm512_and_si512(r23, m3);
+#endif
 }
 #endif // AVX512 VNNI
 
@@ -6865,6 +6877,19 @@ void ggml_gemv_pq2_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
         const __m512i idx23 = _mm512_set_epi32(3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2);
 
         const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
+
+        // sum(q) depends only on (l,k), not on the output-column tile: compute it once per call.
+        const int nq = nb * (QK_PQ2_0 / QK8_0);
+        static thread_local std::vector<__m512i> sqv;
+        sqv.resize(nq);
+        for (int l = 0; l < nb; l++) {
+            for (int k = 0; k < QK_PQ2_0 / QK8_0; ++k) {
+                const block_q8_0 * a_blk = a_ptr + l * (QK_PQ2_0 / QK8_0) + k;
+                const __m512i qa = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i *) a_blk->qs));
+                sqv[l * (QK_PQ2_0 / QK8_0) + k] = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, qa);
+            }
+        }
+
         for (int x = 0; x < nc / 4; x++) {
             const block_pq2_0x4 * b_ptr = (const block_pq2_0x4 *) vx + (x * nb);
 
@@ -6883,7 +6908,7 @@ void ggml_gemv_pq2_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
                     __q2_0_expand_x4((const uint8_t *) b_ptr[l].qs + 32 * k, &w01, &w23);
 
                     const __m512i qa  = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i *) a_blk->qs));
-                    const __m512i sq  = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, qa);
+                    const __m512i sq  = sqv[l * (QK_PQ2_0 / QK8_0) + k];
                     const __m512i i01 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w01, qa);
                     const __m512i i23 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w23, qa);
 
