@@ -24,14 +24,22 @@
 // llama_memory_recurrent
 //
 
+void llama_memory_recurrent::rs_mmap_deleter::operator()(void * ptr) const noexcept {
+#ifdef __linux__
+    munmap(ptr, size);
+#else
+    GGML_UNUSED(ptr);
+#endif
+}
+
 #ifdef __linux__
 // One anonymous, private mapping for every tensor of ctx, placed exactly as
 // ggml_backend_alloc_ctx_tensors_from_buft would place them (same padded sizes,
 // same alignment, same order) but wrapped with ggml_backend_cpu_buffer_from_ptr,
 // which does not own the memory: the caller munmaps it after the buffer is
 // freed. Returns nullptr (and touches nothing) when the mapping cannot be made.
-static ggml_backend_buffer_t rs_alloc_lazy_zero_host_buffer(
-        ggml_context * ctx, ggml_backend_buffer_type_t buft, void ** ptr_out, size_t * size_out) {
+ggml_backend_buffer_t llama_memory_recurrent::alloc_lazy_zero_host_buffer(
+        ggml_context * ctx, ggml_backend_buffer_type_t buft, rs_mmap_region & mapping) {
     const size_t size = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft);
     if (size == 0) {
         return nullptr;
@@ -44,28 +52,25 @@ static ggml_backend_buffer_t rs_alloc_lazy_zero_host_buffer(
         return nullptr;
     }
 
+    mapping.ptr = rs_mmap_ptr(ptr, rs_mmap_deleter{size});
+
     // mmap returns page-aligned memory, which satisfies the CPU buffer alignment
-    ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    ggml_backend_buffer_ptr buf(ggml_backend_cpu_buffer_from_ptr(ptr, size));
     if (!buf) {
-        munmap(ptr, size);
         return nullptr;
     }
 
-    ggml_tallocr talloc = ggml_tallocr_new(buf);
+    ggml_tallocr talloc = ggml_tallocr_new(buf.get());
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
         if (t->data == nullptr && t->view_src == nullptr) {
             if (ggml_tallocr_alloc(&talloc, t) != GGML_STATUS_SUCCESS) {
-                ggml_backend_buffer_free(buf);
-                munmap(ptr, size);
                 return nullptr;
             }
         }
     }
 
-    *ptr_out  = ptr;
-    *size_out = size;
-
-    return buf;
+    mapping.buf = buf.get();
+    return buf.release();
 }
 #endif
 
@@ -162,7 +167,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     //
     // Host (CPU) buffers, Linux: by default the whole RS buffer is one anonymous
-    // private mmap (rs_alloc_lazy_zero_host_buffer) and is NOT memset. The
+    // private mmap (alloc_lazy_zero_host_buffer) and is NOT memset. The
     // kernel hands out zero pages on first touch, so the "no NaN padding"
     // guarantee of the eager clear holds without making every cell of every
     // snapshot plane resident at construction: the buffer is
@@ -193,30 +198,29 @@ llama_memory_recurrent::llama_memory_recurrent(
 #endif
 
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf  = nullptr;
-        bool                  lazy = false;
+        rs_mmap_region mapping;
+        ggml_backend_buffer_ptr buf;
+        bool lazy = false;
 
 #ifdef __linux__
         if (!rs_eager_zero && buft == ggml_backend_cpu_buffer_type()) {
-            void * ptr  = nullptr;
-            size_t size = 0;
-            buf = rs_alloc_lazy_zero_host_buffer(ctx.get(), buft, &ptr, &size);
+            buf.reset(alloc_lazy_zero_host_buffer(ctx.get(), buft, mapping));
             if (buf) {
-                mmaps.push_back({ buf, ptr, size });
+                mmaps.push_back(std::move(mapping));
                 lazy = true;
             }
         }
 #endif
         if (!buf) {
-            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+            buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
             if (!buf) {
                 throw std::runtime_error("failed to allocate buffer for rs cache");
             }
-            ggml_backend_buffer_clear(buf, 0);
+            ggml_backend_buffer_clear(buf.get(), 0);
         }
-        LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB%s\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0,
+        LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB%s\n", __func__, ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get())/1024.0/1024.0,
                 lazy ? " (anonymous mmap, lazily zeroed)" : "");
-        ctxs_bufs.emplace_back(std::move(ctx), buf);
+        ctxs_bufs.emplace_back(std::move(ctx), std::move(buf));
     }
 
     {
@@ -230,16 +234,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     }
 }
 
-llama_memory_recurrent::~llama_memory_recurrent() {
-    // the from_ptr buffers do not own their memory: free them first, then unmap
-    ctxs_bufs.clear();
-#ifdef __linux__
-    for (const auto & m : mmaps) {
-        munmap(m.ptr, m.size);
-    }
-#endif
-    mmaps.clear();
-}
+llama_memory_recurrent::~llama_memory_recurrent() = default;
 
 void llama_memory_recurrent::clear(bool data) {
     for (int32_t i = 0; i < (int32_t) size; ++i) {
@@ -260,7 +255,7 @@ void llama_memory_recurrent::clear(bool data) {
                 if (m.buf == buf.get()) {
                     // drop the pages instead of memset: a private anonymous
                     // mapping reads back as zero and stays non-resident
-                    dropped = madvise(m.ptr, m.size, MADV_DONTNEED) == 0;
+                    dropped = madvise(m.ptr.get(), m.ptr.get_deleter().size, MADV_DONTNEED) == 0;
                     break;
                 }
             }

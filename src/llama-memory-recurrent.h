@@ -5,6 +5,7 @@
 #include "llama-memory.h"
 
 #include <map>
+#include <memory>
 #include <set>
 #include <vector>
 
@@ -134,20 +135,25 @@ private:
 
     const uint32_t n_seq_max = 1;
 
-    // ggml contexts for the KV cache along with the allocated backend buffers:
+    struct rs_mmap_deleter {
+        size_t size = 0;
+        void operator()(void * ptr) const noexcept;
+    };
+    using rs_mmap_ptr = std::unique_ptr<void, rs_mmap_deleter>;
+
+    struct rs_mmap_region {
+        ggml_backend_buffer_t buf = nullptr;
+        rs_mmap_ptr ptr = rs_mmap_ptr(nullptr, rs_mmap_deleter{});
+    };
+
+    // Declared first so wrappers are freed before their mappings during unwind.
+    std::vector<rs_mmap_region> mmaps;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
-    // host RS buffers backed by an anonymous private mmap (kernel zero pages,
-    // resident only where written) and wrapped with
-    // ggml_backend_cpu_buffer_from_ptr, which does not own the memory: unmapped
-    // in the destructor after the buffers are freed. Empty when
-    // LLAMA_RS_EAGER_ZERO=1 or on non-Linux hosts (eager alloc + memset).
-    struct rs_mmap_region {
-        ggml_backend_buffer_t buf;
-        void *                ptr;
-        size_t                size;
-    };
-    std::vector<rs_mmap_region> mmaps;
+#ifdef __linux__
+    static ggml_backend_buffer_t alloc_lazy_zero_host_buffer(
+            ggml_context * ctx, ggml_backend_buffer_type_t buft, rs_mmap_region & mapping);
+#endif
 
     size_t total_size() const;
 
