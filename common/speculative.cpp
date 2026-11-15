@@ -3572,6 +3572,9 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 
     std::vector<seq_info> sinfos;
 
+    // Shared by sequences, which draft() visits serially.
+    llama_tokens inp;
+
     common_speculative_impl_ngram_cache(
             const common_params_speculative & params,
             uint32_t n_seq,
@@ -3651,11 +3654,9 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 
         const auto & prompt = *dparams.prompt;
 
-        llama_tokens inp;
+        inp.clear();
         inp.reserve(prompt.size() + 1);
-        for (size_t j = 0; j < prompt.size(); ++j) {
-            inp.push_back(prompt[j]);
-        }
+        inp.insert(inp.end(), prompt.begin(), prompt.end());
         inp.push_back(dparams.id_last);
 
         if (sinfo.cache_size < inp.size()) {
