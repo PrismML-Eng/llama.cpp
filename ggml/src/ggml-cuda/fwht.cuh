@@ -65,6 +65,12 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
 bool ggml_cuda_op_fwht_signed(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
                               const ggml_tensor * signs, ggml_tensor * dst);
 
+// silu(gate) * up, the sign flip and the transform in one launch (the GLU node, the MUL by the signs and the Hadamard
+// MUL_MAT of an FFN down input). Same arithmetic and order as the three nodes, so the result is bit-identical.
+// Returns false (nothing launched) when the shapes or the width are not covered.
+bool ggml_cuda_op_swiglu_fwht_signed(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up,
+                                     const ggml_tensor * signs, ggml_tensor * dst);
+
 // Threads per block for the one-block-per-transform FWHT kernels (fwht_cuda_block, fwht_quantize_q8_1) at width n.
 // 256 by default; with few transforms in flight (decode and speculative verify: 64 or fewer) min(n/2, 1024), so each
 // thread keeps at least two elements and the few blocks there are use more of the SM. The butterfly runs its stages

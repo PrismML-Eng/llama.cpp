@@ -1678,6 +1678,7 @@ struct ggml_cuda_fwht_q8 {
     int64_t               ncols  = 0;       // rows quantized (src1->ne[1] of every consumer)
     const void *          data   = nullptr; // the q8_1 rows: the transform's own output buffer, or a pool block
                                             // held for the rest of the graph when that buffer aliases the input
+    bool                  mmq    = false;   // the rows are block_q8_1_mmq (D4, for a PTQ1_0 mul_mat_q), not a mat-vec layout
 };
 
 struct ggml_cuda_fwht_q8_context {

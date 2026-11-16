@@ -6107,14 +6107,25 @@ struct test_fwht_signed : public test_case {
     const int64_t n_tokens;
     const ggml_type type_x;
     const bool swiglu; // x is the SwiGLU of a gate and an up projection (the ffn_down input)
+    const ggml_type type_w; // != COUNT: the transform feeds a mat-mul with a weight of this type (the ffn_down; the CUDA backend quantizes the rows in the same launch)
+    const bool strided;     // gate and up are views with a row stride larger than the width (not contiguous): the fused launches must not be used
 
     test_fwht_signed(int64_t blk = 1024, int64_t width = 5120, int64_t n_tokens = 7,
-                     ggml_type type_x = GGML_TYPE_F32, bool swiglu = false)
-        : blk(blk), width(width), n_tokens(n_tokens), type_x(type_x), swiglu(swiglu) {}
+                     ggml_type type_x = GGML_TYPE_F32, bool swiglu = false, ggml_type type_w = GGML_TYPE_COUNT, bool strided = false)
+        : blk(blk), width(width), n_tokens(n_tokens), type_x(type_x), swiglu(swiglu), type_w(type_w), strided(strided) {}
 
     std::string vars() override {
-        return VARS_TO_STR5(blk, width, n_tokens, type_x, swiglu);
+        std::string res = VARS_TO_STR5(blk, width, n_tokens, type_x, swiglu);
+        if (type_w != GGML_TYPE_COUNT) {
+            res += "," + std::string(VAR_TO_STR(type_w));
+        }
+        if (strided) {
+            res += ",strided=1";
+        }
+        return res;
     }
+
+    double max_nmse_err() override { return type_w == GGML_TYPE_COUNT ? 1e-7 : 5e-4; }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -6130,10 +6141,15 @@ struct test_fwht_signed : public test_case {
         ggml_set_name(a, "a");
         ggml_tensor * x;
         if (swiglu) {
-            ggml_tensor * g = ggml_new_tensor_2d(ctx, type_x, width, n_tokens);
+            ggml_tensor * g = ggml_new_tensor_2d(ctx, type_x, strided ? 2 * width : width, n_tokens);
             ggml_set_name(g, "g");
-            ggml_tensor * u = ggml_new_tensor_2d(ctx, type_x, width, n_tokens);
+            ggml_tensor * u = ggml_new_tensor_2d(ctx, type_x, strided ? 2 * width : width, n_tokens);
             ggml_set_name(u, "u");
+            if (strided) {
+                // the first half of every row: the row stride is twice the width
+                g = ggml_view_2d(ctx, g, width, n_tokens, g->nb[1], 0);
+                u = ggml_view_2d(ctx, u, width, n_tokens, u->nb[1], 0);
+            }
             x = ggml_swiglu_split(ctx, g, u);
         } else {
             x = ggml_new_tensor_2d(ctx, type_x, width, n_tokens);
@@ -6146,6 +6162,12 @@ struct test_fwht_signed : public test_case {
         cur = ggml_reshape_2d(ctx, cur, blk, width / blk * n_tokens);
         ggml_tensor * out = ggml_mul_mat(ctx, a, cur);
         ggml_mul_mat_set_hint(out, GGML_HINT_SRC0_IS_HADAMARD);
+        if (type_w != GGML_TYPE_COUNT) {
+            out = ggml_reshape_2d(ctx, out, width, n_tokens);
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, type_w, width, 96);
+            ggml_set_name(w, "w_down");
+            out = ggml_mul_mat(ctx, w, out);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -6172,7 +6194,21 @@ struct test_fwht_signed : public test_case {
                     data[i] = (i % 3 == 0) ? -1.0f : 1.0f;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
-            } else if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) {
+            } else if (t->view_src != nullptr) {
+                // views share the data of their source, which is initialized through its own tensor
+            } else if (strided && (strcmp(t->name, "g") == 0 || strcmp(t->name, "u") == 0)) {
+                // the first half of each row (the part the views see) is random, the second half is a large constant:
+                // a kernel that reads the gate or up as a flat array of the view's shape gets wrong values for every row after the first
+                const int64_t n_cols = t->ne[0];
+                std::vector<float> data(ggml_nelements(t));
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    for (int64_t c = 0; c < n_cols; c++) {
+                        data[r * n_cols + c] = c < n_cols / 2 ? (float) ((r * 131 + c * 7) % 2001 - 1000) / 500.0f : 3.0f;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else {
+                // also the quantized weight of the ffn_down (without data both backends give zeros and the comparison is empty)
                 init_tensor_uniform(t);
             }
         }
@@ -12334,6 +12370,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fwht_signed(1024, 17408, 1,   GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_fwht_signed(1024, 17408, 8,   GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_fwht_signed(1024, 17408, 512, GGML_TYPE_F32, true));
+    // prompt batches (more than 8 tokens) take the fused SwiGLU + sign flip + transform launch on CUDA
+    test_cases.emplace_back(new test_fwht_signed(1024, 17408, 9,   GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_fwht_signed(1024, 17408, 33,  GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_fwht_signed(1024, 5120,  64,  GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_fwht_signed(512,  6144,  17,  GGML_TYPE_F32, true));
+    // ... and the MMQ activation quantization of a PTQ1_0 ffn_down in the same launch
+    test_cases.emplace_back(new test_fwht_signed(1024, 17408, 9,   GGML_TYPE_F32, true, GGML_TYPE_PTQ1_0));
+    test_cases.emplace_back(new test_fwht_signed(1024, 17408, 33,  GGML_TYPE_F32, true, GGML_TYPE_PTQ1_0));
+    test_cases.emplace_back(new test_fwht_signed(1024, 17408, 512, GGML_TYPE_F32, true, GGML_TYPE_PTQ1_0));
+    test_cases.emplace_back(new test_fwht_signed(1024, 5120,  64,  GGML_TYPE_F32, true, GGML_TYPE_PTQ1_0));
+    test_cases.emplace_back(new test_fwht_signed(512,  6144,  17,  GGML_TYPE_F32, true, GGML_TYPE_PTQ1_0));
+    // strided gate and up (views): neither fused launch may read them as flat arrays, the unfused nodes give the result
+    test_cases.emplace_back(new test_fwht_signed(1024, 5120,  64,  GGML_TYPE_F32, true, GGML_TYPE_COUNT, true));
+    test_cases.emplace_back(new test_fwht_signed(1024, 5120,  64,  GGML_TYPE_F32, true, GGML_TYPE_PTQ1_0, true));
+    test_cases.emplace_back(new test_fwht_signed(1024, 17408, 33,  GGML_TYPE_F32, true, GGML_TYPE_PTQ1_0, true));
     test_cases.emplace_back(new test_fwht_signed(128,  1024,  5,   GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_fwht_signed(2048, 8192,  3,   GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_fwht_signed(1024, 5120,  4,   GGML_TYPE_F16, true));
