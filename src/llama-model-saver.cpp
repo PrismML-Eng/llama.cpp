@@ -437,6 +437,12 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_TOKENIZER_TOKEN_TYPE_COUNT,        vocab.n_token_types());
     add_kv(LLM_KV_TOKENIZER_SCORES,                  scores);
     add_kv(LLM_KV_TOKENIZER_MERGES,                  vocab.get_bpe_merges());
+    const auto & eog_set = vocab.get_eog_tokens();
+    const std::vector<uint32_t> eog_ids(eog_set.begin(), eog_set.end());
+    const uint32_t empty_eog = 0;
+    // Empty is authoritative too; the generic array helper omits empty values.
+    gguf_set_arr_data(gguf_ctx, llm_kv(LLM_KV_TOKENIZER_EOG_IDS).c_str(), GGUF_TYPE_UINT32,
+                      eog_ids.empty() ? &empty_eog : eog_ids.data(), eog_ids.size());
     // FIXME llama_token is type i32 but when reading in a GGUF file u32 is expected, not an issue for writing though
     if (vocab.token_bos()  != LLAMA_TOKEN_NULL) { add_kv(LLM_KV_TOKENIZER_BOS_ID, uint32_t(vocab.token_bos()));  }
     if (vocab.token_eos()  != LLAMA_TOKEN_NULL) { add_kv(LLM_KV_TOKENIZER_EOS_ID, uint32_t(vocab.token_eos()));  }
@@ -453,6 +459,7 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_TOKENIZER_ADD_PREFIX,              vocab.get_add_space_prefix());
     add_kv(LLM_KV_TOKENIZER_REMOVE_EXTRA_WS,         vocab.get_remove_extra_whitespaces());
     add_kv(LLM_KV_TOKENIZER_CLEAN_SPACES,            vocab.get_clean_spaces());
+    add_kv(LLM_KV_TOKENIZER_NORMALIZER_NFC,          vocab.get_normalizer_opts().nfc);
     add_kv(LLM_KV_TOKENIZER_PRECOMPILED_CHARSMAP,    vocab.get_precompiled_charsmap());
     // add_kv(LLM_KV_TOKENIZER_HF_JSON,                 ???);
     // add_kv(LLM_KV_TOKENIZER_RWKV,                    ???);

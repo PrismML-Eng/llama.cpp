@@ -153,6 +153,12 @@ llama_test(test-tokenizer-0 NAME test-tokenizer-0-qwen35          LABEL behavior
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-refact          LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-refact.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-starcoder       LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-starcoder.gguf)
 
+llama_build(test-tokenizer-normalization.cpp LINK llama ggml)
+llama_test(test-tokenizer-normalization NAME test-tokenizer-normalization-gpt2 LABEL behavior ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-gpt-2.gguf)
+llama_test(test-tokenizer-normalization NAME test-tokenizer-normalization-qwen35 LABEL behavior ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen35.gguf)
+llama_test(test-tokenizer-normalization NAME test-tokenizer-eog-policy LABEL behavior ARGS --eog-policy)
+llama_test(test-tokenizer-normalization NAME test-tokenizer-eog-roundtrip LABEL behavior ARGS --eog-roundtrip)
+
 if (NOT WIN32)
     llama_test_cmd(
         ${CMAKE_CURRENT_SOURCE_DIR}/test-tokenizers-repo.sh
