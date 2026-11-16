@@ -143,12 +143,16 @@ jobs:
     strategy:
       matrix:
         include:
+          # The ggml default list plus 75-real: Turing gets machine code, not only PTX (#332)
           - cuda: '12.4'
             cuda_pkg: '12-4'
+            cuda_archs: '50-virtual;61-virtual;70-virtual;75-real;80-virtual;86-real;89-real;90-virtual'
           - cuda: '12.8'
             cuda_pkg: '12-8'
+            cuda_archs: '50-virtual;61-virtual;70-virtual;75-real;80-virtual;86-real;89-real;90-virtual;120a-real'
           - cuda: '13.3'
             cuda_pkg: '13-3'
+            cuda_archs: '75-real;80-virtual;86-real;89-real;90-virtual;120a-real;121a-real'
 
     steps:
       - name: Clone
@@ -181,6 +185,7 @@ jobs:
             -DGGML_BACKEND_DL=ON \
             -DGGML_CPU_ALL_VARIANTS=ON \
             -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="${{ matrix.cuda_archs }}" \
             ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release -j $(nproc) 2>&1 | grep -v "^nvcc warning"
 
@@ -265,12 +270,13 @@ jobs:
     strategy:
       matrix:
         include:
+          # x64: the ggml default list plus 75-real (#332)
           - cuda: '12.4'
             arch: x64
-            defines: ''
+            defines: '-DCMAKE_CUDA_ARCHITECTURES="50-virtual;61-virtual;70-virtual;75-real;80-virtual;86-real;89-real;90-virtual"'
           - cuda: '13.3'
             arch: x64
-            defines: ''
+            defines: '-DCMAKE_CUDA_ARCHITECTURES="75-real;80-virtual;86-real;89-real;90-virtual;120a-real;121a-real"'
           - cuda: '13.4'
             arch: arm64
             defines: '-DCMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-msvc-cuda.cmake'
