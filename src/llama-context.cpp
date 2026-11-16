@@ -189,6 +189,9 @@ llama_context::llama_context(
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+    if (model.embedded_lora) {
+        loras->emplace(model.embedded_lora, 1.0f);
+    }
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -1798,9 +1801,12 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
     }
 
     loras.reset(new llama_adapter_loras());
+    if (model.embedded_lora) {
+        loras->emplace(model.embedded_lora, 1.0f);
+    }
 
     for (size_t i = 0; i < n_adapters; i ++) {
-        if (scales[i] != 0.0f) {
+        if (scales[i] != 0.0f && adapters[i] != model.embedded_lora) {
             loras->insert({adapters[i], scales[i]});
         }
     }
@@ -1812,10 +1818,10 @@ bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
     // Adapters with a zero scale are never added to `loras`, so also ignore them for the comparison.
-    size_t n_non_zero = 0;
+    size_t n_non_zero = model.embedded_lora ? 1 : 0;
 
     for (size_t i = 0; i < n_adapters; i ++) {
-        if (scales[i] == 0.0f) {
+        if (scales[i] == 0.0f || adapters[i] == model.embedded_lora) {
             continue;
         }
         n_non_zero++;
@@ -2997,9 +3003,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         res = std::max<uint32_t>(1024u, 12u*model.n_tensors());
     } else {
         res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
-        for (const auto & lora : model.loras) {
-            res += lora->get_n_nodes();
-        }
+    }
+    for (const auto & lora : model.loras) {
+        res += lora->get_n_nodes();
     }
 
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling

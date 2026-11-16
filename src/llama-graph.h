@@ -1221,6 +1221,9 @@ struct llm_graph_context {
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr) const;
 
+    // Activation-level correction, with no corresponding base matrix.
+    ggml_tensor * build_lora_branch(const ggml_tensor * anchor, ggml_tensor * cur) const;
+
     // do mat_mul_id, while optionally apply lora and per-expert scale
     // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)
     ggml_tensor * build_lora_mm_id(

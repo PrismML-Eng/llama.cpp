@@ -2488,6 +2488,21 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
             }
         }
     }
+    if (embedded_lora) {
+        if (hparams.no_alloc) {
+            for (const auto & ctx : embedded_lora->ctxs) {
+                const auto * t = ggml_get_first_tensor(ctx.get());
+                if (t) {
+                    auto buft = ggml_backend_buffer_get_type(t->buffer);
+                    ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+                }
+            }
+        } else {
+            for (const auto & buf : embedded_lora->bufs) {
+                ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+            }
+        }
+    }
     return ret;
 }
 
