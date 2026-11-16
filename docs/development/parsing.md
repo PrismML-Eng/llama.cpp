@@ -132,6 +132,8 @@ defined as a CFG grammar and therefore does not produce a rule. Its usage
 should be limited and preferably hidden behind a `schema()` parser. In many
 cases, `until(delimiter)` or `until_one_of(delimiters)` is a better choice.
 
+Positive lookahead (`peek(p)`) also does not enforce a consuming delimiter in the generated grammar. In the Qwen3-Coder response-format path, reasoning must consume `</think>` before the JSON body; allowing a tool-call lookahead alternative there would make the closure optional in GBNF. The tool-call lookahead remains available outside response-format mode. `test-grammar-integration` covers valid closures and rejects unterminated reasoning followed by otherwise valid JSON.
+
 Another limitation is that the PEG parser requires an unambiguous grammar. In
 contrast, the `llama-grammar` implementation can support ambiguous grammars,
 though they are difficult to parse.

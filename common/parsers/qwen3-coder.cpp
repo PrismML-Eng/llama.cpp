@@ -76,9 +76,14 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
 
         auto reasoning = p.eps();
         if (supports_reasoning && extract_reasoning) {
+            auto reasoning_end = p.literal("</think>");
+            // JSON cannot follow tool-call lookahead, which GBNF would erase.
+            if (!has_response_format) {
+                reasoning_end = reasoning_end | p.peek(p.literal("<tool_call>"));
+            }
             reasoning = p.optional("<think>" + p.space() +
                                    p.reasoning(p.until_one_of({ "</think>", "<tool_call>" })) +
-                                   (p.literal("</think>") | p.peek(p.literal("<tool_call>"))));
+                                   reasoning_end);
         }
 
         // Response format parser
