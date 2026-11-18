@@ -164,6 +164,21 @@ fa_k_qs_block8 get_k_qs_block8(uint ib, uint a_offset) {
     }
     const bool has_qh = (FaTypeK == GGML_TYPE_Q5_0) || (FaTypeK == GGML_TYPE_Q5_1);
     [[unroll]] for (uint32_t d = 0; d < 4; d++) {
+        if (FaTypeK == GGML_TYPE_PQ2_0M) {
+            // PQ2_0M stores raw 0..3 codes in each byte of the packed K buffer
+            // (one byte per quad of 4 codes), so no nibble unpack is needed.
+            // d covers two bytes: byte d (codes d*4..d*4+3) and byte d+4
+            // (codes d*4+4..d*4+7).
+            const uint bits0 = k_packed_pq2_0m.data[a_offset + ib].qs[d];
+            const uint bits1 = k_packed_pq2_0m.data[a_offset + ib].qs[d + 4];
+            r.qs[d    ] = int32_t(pack32(i8vec4(
+                int8_t(bits0 & 3u), int8_t((bits0 >> 2u) & 3u),
+                int8_t((bits0 >> 4u) & 3u), int8_t(bits0 >> 6u))));
+            r.qs[d + 4] = int32_t(pack32(i8vec4(
+                int8_t(bits1 & 3u), int8_t((bits1 >> 2u) & 3u),
+                int8_t((bits1 >> 4u) & 3u), int8_t(bits1 >> 6u))));
+            continue;
+        }
         uint vui = 0;
         switch (FaTypeK) {
             case GGML_TYPE_Q4_0: { // packed16
