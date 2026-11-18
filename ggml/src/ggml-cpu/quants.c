@@ -33,6 +33,10 @@ void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
 void quantize_row_pq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_pq2_0_ref(x, y, k);
 }
+void quantize_row_pq2_0m(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_pq2_0m_ref(x, y, k);
+}
+
 
 void quantize_row_ptq1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_ptq1_0_ref(x, y, k);
@@ -1494,3 +1498,44 @@ void ggml_vec_dot_pq2_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
     }
     *s = sumf;
 }
+
+// PQ2_0M x Q8_K reference dot: one activation scale per 256 elements.
+// Two PQ2_0M blocks map onto one Q8_K block (halves).
+// Dequant uses min/max (range-scale): y = m + q * d, where m = min, d = (max - min) / 3.
+void ggml_vec_dot_pq2_0m_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_K == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_pq2_0m * GGML_RESTRICT x = vx;
+    const block_q8_K * GGML_RESTRICT y = vy;
+    const int nb = n / QK_PQ2_0;
+
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const block_q8_K * GGML_RESTRICT yb = &y[i >> 1];
+        const int8_t * GGML_RESTRICT q8 = yb->qs + 128 * (i & 1);
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float m0 = GGML_CPU_FP16_TO_FP32(x[i].m);
+
+        int sum_m = 0;
+        int sumi = 0;
+        for (int k = 0; k < 4; k++) {
+            for (int b = 0; b < 8; b++) {
+                const uint8_t byte = x[i].qs[8 * k + b];
+                for (int j = 0; j < 4; j++) {
+                    const int q = (byte >> (2 * j)) & 3;
+                    sum_m += q8[32 * k + 4 * b + j];
+                    sumi += q * q8[32 * k + 4 * b + j];
+                }
+            }
+        }
+
+        sumf += (GGML_CPU_FP16_TO_FP32(yb->d)) * (float)(m0 * (float)sum_m + d0 * (float)sumi);
+    }
+    *s = sumf;
+}
+
