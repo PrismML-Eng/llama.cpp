@@ -2260,6 +2260,21 @@ size_t quantize_pq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     return nrow * row_size;
 }
 
+size_t quantize_pq2_0m(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    if (!quant_weights) {
+        quantize_row_pq2_0m_ref(src, dst, (int64_t)nrow*n_per_row);
+        return nrow * ggml_row_size(GGML_TYPE_PQ2_0M, n_per_row);
+    }
+    size_t row_size = ggml_row_size(GGML_TYPE_PQ2_0M, n_per_row);
+    char * qrow = (char *)dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_pq2_0m_ref(src, (block_pq2_0m*)qrow, n_per_row);
+        src += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
+}
+
 // ====================== PTQ1_0 (Prism ternary, group 128) ======================
 // Base-3 trit packing identical to upstream TQ1_0, but at block 128 so one fp16
 // scale covers 128 weights. qs is 24 bytes, which TQ1_0's fixed 32-then-16 byte
