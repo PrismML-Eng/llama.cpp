@@ -77,7 +77,7 @@ FLOAT_TYPEV2 get_k_scale(uint ib, uint a_offset) {
     }
 }
 
-void k_block_to_shmem(const uint buf_ib, const uint global_ib, const uint iqs, const uint a_offset) {
+void k_block_to_shmem(const uint buf_ib, const uint global_ib, const uint iqs, const uint a_offset, const uint block) {
     // kblocksh[].qs is int32_t for the unified MMQ struct; uint sources need
     // explicit casts. The bit pattern is what we care about here -- the actual
     // signed/unsigned interpretation happens downstream in the dot product.
@@ -116,7 +116,8 @@ void k_block_to_shmem(const uint buf_ib, const uint global_ib, const uint iqs, c
             // SHMEM path: iqs is the vec4 index (0..7) within the sub-block; one
             // byte per vec4 (4 two-bit codes). global_ib indexes the K buffer like
             // the Q4_0 case.
-            const uint bits = k_packed_pq2_0m.data[a_offset + global_ib].qs[iqs];
+            const uint byte = block * 8 + iqs;
+            const uint bits = k_packed_pq2_0m.data[a_offset + global_ib].qs[byte];
             kblocksh[buf_ib].qs[iqs] = pack32(i8vec4(
                 int8_t(bits & 3u),
                 int8_t((bits >> 2u) & 3u),
@@ -147,13 +148,20 @@ void k_block_to_shmem(const uint buf_ib, const uint global_ib, const uint iqs, c
 // Q8_0 takes the generic get_k_qs path because its qs layout (i8 pairs) doesn't
 // share this nibble shape.
 //
+// byte_offset: starting byte within the block (0 for sub-block 0; 8 for sub-block 1;
+// 16 for sub-block 2; 24 for sub-block 3 for PQ2_0M). For Q4_0/Q5_0/Q5_1,
+// byte_offset = 0 (the original code reads bytes 0-7, which is correct for those
+// types because their block layout aligns with the sub-block boundaries).
+// PQ2_0M stores raw 0..3 codes in each byte (one byte per quad of 4 codes),
+// so no nibble unpack is needed.
+//
 // Returned via a struct so the caller's k_quants array (sized from spec
 // constants) doesn't need to match a fixed[8] out-parameter type.
 struct fa_k_qs_block8 {
     int32_t qs[8];
 };
 
-fa_k_qs_block8 get_k_qs_block8(uint ib, uint a_offset) {
+fa_k_qs_block8 get_k_qs_block8(uint ib, uint a_offset, uint byte_offset) {
     fa_k_qs_block8 r;
     uint qh = 0;
     if (FaTypeK == GGML_TYPE_Q5_0) {
@@ -165,12 +173,11 @@ fa_k_qs_block8 get_k_qs_block8(uint ib, uint a_offset) {
     const bool has_qh = (FaTypeK == GGML_TYPE_Q5_0) || (FaTypeK == GGML_TYPE_Q5_1);
     [[unroll]] for (uint32_t d = 0; d < 4; d++) {
         if (FaTypeK == GGML_TYPE_PQ2_0M) {
-            // PQ2_0M stores raw 0..3 codes in each byte of the packed K buffer
-            // (one byte per quad of 4 codes), so no nibble unpack is needed.
-            // d covers two bytes: byte d (codes d*4..d*4+3) and byte d+4
-            // (codes d*4+4..d*4+7).
-            const uint bits0 = k_packed_pq2_0m.data[a_offset + ib].qs[d];
-            const uint bits1 = k_packed_pq2_0m.data[a_offset + ib].qs[d + 4];
+            // PQ2_0M stores raw 0..3 codes in each byte (one byte per quad of 4 codes).
+            // d in 0..3: quad d = byte (byte_offset + d), quad d+4 = byte (byte_offset + d + 4).
+            const uint byte0 = byte_offset + d;
+            const uint bits0 = k_packed_pq2_0m.data[a_offset + ib].qs[byte0];
+            const uint bits1 = k_packed_pq2_0m.data[a_offset + ib].qs[byte0 + 4];
             r.qs[d    ] = int32_t(pack32(i8vec4(
                 int8_t(bits0 & 3u), int8_t((bits0 >> 2u) & 3u),
                 int8_t((bits0 >> 4u) & 3u), int8_t(bits0 >> 6u))));
@@ -182,21 +189,25 @@ fa_k_qs_block8 get_k_qs_block8(uint ib, uint a_offset) {
         uint vui = 0;
         switch (FaTypeK) {
             case GGML_TYPE_Q4_0: { // packed16
-                vui = pack32(u16vec2(k_packed_q4_0.data[a_offset + ib].qs[d * 2 + 0],
-                                     k_packed_q4_0.data[a_offset + ib].qs[d * 2 + 1]));
+                uint bi = d * 2;
+                vui = pack32(u16vec2(k_packed_q4_0.data[a_offset + ib].qs[bi],
+                                     k_packed_q4_0.data[a_offset + ib].qs[bi + 1]));
                 break;
             }
             case GGML_TYPE_Q4_1: { // packed32 alias
-                vui = k_packed_q4_1_p32.data[a_offset + ib].qs[d];
+                uint bi = d;
+                vui = k_packed_q4_1_p32.data[a_offset + ib].qs[bi];
                 break;
             }
             case GGML_TYPE_Q5_0: { // packed16
-                vui = pack32(u16vec2(k_packed_q5_0.data[a_offset + ib].qs[d * 2 + 0],
-                                     k_packed_q5_0.data[a_offset + ib].qs[d * 2 + 1]));
+                uint bi = d * 2;
+                vui = pack32(u16vec2(k_packed_q5_0.data[a_offset + ib].qs[bi],
+                                     k_packed_q5_0.data[a_offset + ib].qs[bi + 1]));
                 break;
             }
             case GGML_TYPE_Q5_1: { // packed32 alias
-                vui = k_packed_q5_1_p32.data[a_offset + ib].qs[d];
+                uint bi = d;
+                vui = k_packed_q5_1_p32.data[a_offset + ib].qs[bi];
                 break;
             }
         }
