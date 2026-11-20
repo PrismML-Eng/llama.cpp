@@ -161,7 +161,7 @@ jobs:
           SLOW_TESTS=1 ./tests.sh
 
   windows:
-    runs-on: windows-2025
+    runs-on: windows-2022
 
     cache-mode: write
     permissions:
@@ -179,15 +179,23 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: server-windows-2025-x64
+          key: server-windows-2022-x64
           evict-old-files: 1d
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
 
       - name: Build
         id: cmake_build
         shell: cmd
         run: |
           cmake -B build -G "Ninja Multi-Config" ^
+            -DLLAMA_BUILD_UI=ON ^
+            -DLLAMA_USE_PREBUILT_UI=OFF ^
             -DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
@@ -224,7 +232,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         with:
-          key: server-windows-2025-x64
+          key: server-windows-2022-x64
           older: 5m
           min: 1
           dry-run: ${{ github.event_name != 'push' || github.ref != 'refs/heads/master' }}
