@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from typing import Iterable, TYPE_CHECKING, cast
 
 import torch
@@ -15,6 +17,52 @@ from .base import LazyTorchTensor, ModelBase, TextModel, gguf
 class MapleModel(TextModel):
     model_arch = gguf.MODEL_ARCH.MAPLE
 
+    def get_vocab_base(self) -> tuple[list[str], list[int], str]:
+        tokens, toktypes, tokpre = super().get_vocab_base()
+        with (self.dir_model / "tokenizer.json").open(encoding="utf-8") as stream:
+            tokenizer = json.load(stream)
+        with (self.dir_model / "tokenizer_config.json").open(encoding="utf-8") as stream:
+            settings = json.load(stream)
+        if tokenizer.get("normalizer") != {"type": "NFC"}:
+            raise ValueError("Maple requires the canonical exact NFC normalizer")
+        if tokenizer.get("model", {}).get("type") != "BPE" or tokpre != "qwen2":
+            raise ValueError("Unsupported Maple tokenizer family")
+        # Keep the existing BPE vocabulary/padding conventions, but do not infer
+        # specialness from spelling: Maple's FIM/tool/think tokens are lexical.
+        for text, token_id in tokenizer["model"]["vocab"].items():
+            if type(token_id) is not int or not 0 <= token_id < len(tokens) or tokens[token_id] != text:
+                raise ValueError(f"Maple canonical vocabulary mismatch at {token_id}")
+            toktypes[token_id] = gguf.TokenType.NORMAL
+        for added in tokenizer["added_tokens"]:
+            token_id = added["id"]
+            if type(token_id) is not int or not 0 <= token_id < len(tokens) or tokens[token_id] != added["content"]:
+                raise ValueError(f"Maple canonical added-token mismatch at {token_id}")
+            if type(added.get("special")) is not bool:
+                raise ValueError(f"Missing Maple added-token special flag at {token_id}")
+            other = settings.get("added_tokens_decoder", {}).get(str(token_id))
+            flags = ("content", "special", "lstrip", "rstrip", "single_word", "normalized")
+            if other is None or any(added.get(key) != other.get(key) for key in flags):
+                raise ValueError(f"Maple added-token configurations disagree at {token_id}")
+            if any(added.get(key) is not False for key in ("lstrip", "rstrip", "single_word", "normalized")):
+                raise ValueError("Unsupported Maple added-token boundary transformation")
+            toktypes[token_id] = gguf.TokenType.CONTROL if added["special"] else gguf.TokenType.USER_DEFINED
+        return tokens, toktypes, tokpre
+
+    def set_vocab(self):
+        self._set_vocab_gpt2()
+        # GenerationConfig overrides model EOS, including an explicit null/empty
+        # policy. The runtime must not append stop-looking lexical tokens.
+        generation_path = self.dir_model / "generation_config.json"
+        generation = {}
+        if generation_path.is_file():
+            with generation_path.open(encoding="utf-8") as stream:
+                generation = json.load(stream)
+        eos = generation.get("eos_token_id", self.hparams.get("eos_token_id"))
+        ids = [] if eos is None else eos if isinstance(eos, list) else [eos]
+        if any(type(token_id) is not int or not 0 <= token_id < self.hparams["vocab_size"] for token_id in ids):
+            raise ValueError("Invalid Maple generation EOS IDs")
+        self.gguf_writer.add_eog_token_ids(list(dict.fromkeys(ids)))
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         hparams = self.hparams
@@ -29,7 +77,12 @@ class MapleModel(TextModel):
 
         self.gguf_writer.add_vocab_size(hparams["vocab_size"])
         self.gguf_writer.add_rope_dimension_count(int(head_dim * partial_rotary_factor))
-        self.gguf_writer.add_sliding_window(hparams["sliding_window"])
+        # FlashAttention's left span is inclusive: 512 past keys + current key.
+        # GGUF STANDARD stores total causal keys; normalize only in the producer.
+        left_span = hparams["sliding_window"]
+        if type(left_span) is not int or not 0 < left_span < 2**32 - 1:
+            raise ValueError("Invalid Maple sliding-window left span")
+        self.gguf_writer.add_sliding_window(left_span + 1)
         self.gguf_writer.add_sliding_window_pattern([layer_type == "sliding_attention" for layer_type in hparams["layer_types"]])
         self.gguf_writer.add_expert_feed_forward_length(hparams["moe_intermediate_size"])
         # the reference clamps the MoE SwiGLU gate/up at 7.0 (modeling_maple.py)

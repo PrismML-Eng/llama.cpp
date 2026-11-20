@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <set>
 
 // pre-tokenization types
 enum llama_vocab_pre_type {
@@ -167,6 +168,7 @@ struct llama_vocab {
     bool get_escape_whitespaces        () const;
     bool get_treat_whitespace_as_suffix() const;
     const normalizer_options & get_normalizer_opts() const;
+    const std::set<llama_token> & get_eog_tokens() const;
 
     const std::vector<llama_token> & get_suppress_tokens() const;
 
