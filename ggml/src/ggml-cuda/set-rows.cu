@@ -317,6 +317,16 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb1, nb2, nb3,
             stream
         );
+    } else if (dst->type == GGML_TYPE_PQ2_0M) {
+        set_rows_cuda_quant<idx_t, block_pq2_0m, QK_PQ2_0, quantize_f32_pq2_0m_block>(
+            src0_d, src1_d, (block_pq2_0m*)dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
     }
