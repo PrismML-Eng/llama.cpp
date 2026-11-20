@@ -5,6 +5,9 @@
 // This effectively selects the generic implementation.
 
 #if defined(GGML_CPU_GENERIC)
+// PQ2_0 4x8 Q8_K repack (Arm NEON implementation only)
+#define ggml_gemv_pq2_0_4x8_q8_K_generic ggml_gemv_pq2_0_4x8_q8_K
+#define ggml_gemm_pq2_0_4x8_q8_K_generic ggml_gemm_pq2_0_4x8_q8_K
 // quants.c
 #define quantize_row_q8_0_generic quantize_row_q8_0
 #define quantize_row_q8_1_generic quantize_row_q8_1
@@ -94,6 +97,9 @@
 #define ggml_gemm_q2_K_8x8_q8_K_generic ggml_gemm_q2_K_8x8_q8_K
 #define ggml_gemm_pq2_0_4x8_q8_0_generic ggml_gemm_pq2_0_4x8_q8_0
 #elif defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+// PQ2_0 4x8 Q8_K repack (Arm NEON implementation only)
+#define ggml_gemv_pq2_0_4x8_q8_K_generic ggml_gemv_pq2_0_4x8_q8_K
+#define ggml_gemm_pq2_0_4x8_q8_K_generic ggml_gemm_pq2_0_4x8_q8_K
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
 #define ggml_quantize_mat_q8_K_4x4_generic ggml_quantize_mat_q8_K_4x4
@@ -122,6 +128,9 @@
 #define ggml_gemm_q8_0_4x4_q8_0_generic ggml_gemm_q8_0_4x4_q8_0
 #define ggml_gemm_q8_0_4x8_q8_0_generic ggml_gemm_q8_0_4x8_q8_0
 #elif defined(__POWERPC__) || defined(__powerpc__)
+// PQ2_0 4x8 Q8_K repack (Arm NEON implementation only)
+#define ggml_gemv_pq2_0_4x8_q8_K_generic ggml_gemv_pq2_0_4x8_q8_K
+#define ggml_gemm_pq2_0_4x8_q8_K_generic ggml_gemm_pq2_0_4x8_q8_K
 // PTQ1_0 currently has only the generic vec_dot; alias it here until a SIMD version lands
 #define ggml_vec_dot_ptq1_0_q8_0_generic ggml_vec_dot_ptq1_0_q8_0
 // ref: https://github.com/ggml-org/llama.cpp/pull/14146#issuecomment-2972561679
@@ -180,6 +189,9 @@
 #define ggml_gemm_q8_0_4x8_q8_0_generic ggml_gemm_q8_0_4x8_q8_0
 #define ggml_gemm_pq2_0_4x8_q8_0_generic ggml_gemm_pq2_0_4x8_q8_0
 #elif defined(__loongarch64)
+// PQ2_0 4x8 Q8_K repack (Arm NEON implementation only)
+#define ggml_gemv_pq2_0_4x8_q8_K_generic ggml_gemv_pq2_0_4x8_q8_K
+#define ggml_gemm_pq2_0_4x8_q8_K_generic ggml_gemm_pq2_0_4x8_q8_K
 // PTQ1_0 currently has only the generic vec_dot; alias it here until a SIMD version lands
 #define ggml_vec_dot_ptq1_0_q8_0_generic ggml_vec_dot_ptq1_0_q8_0
 // quants.c
@@ -238,6 +250,9 @@
 #define ggml_gemm_q8_0_4x8_q8_0_generic ggml_gemm_q8_0_4x8_q8_0
 #define ggml_gemm_pq2_0_4x8_q8_0_generic ggml_gemm_pq2_0_4x8_q8_0
 #elif defined(__riscv)
+// PQ2_0 4x8 Q8_K repack (Arm NEON implementation only)
+#define ggml_gemv_pq2_0_4x8_q8_K_generic ggml_gemv_pq2_0_4x8_q8_K
+#define ggml_gemm_pq2_0_4x8_q8_K_generic ggml_gemm_pq2_0_4x8_q8_K
 // PTQ1_0 currently has only the generic vec_dot; alias it here until a SIMD version lands
 #define ggml_vec_dot_ptq1_0_q8_0_generic ggml_vec_dot_ptq1_0_q8_0
 // quants.c
@@ -289,6 +304,9 @@
 #define ggml_gemm_q8_0_4x8_q8_0_generic ggml_gemm_q8_0_4x8_q8_0
 #define ggml_gemm_pq2_0_4x8_q8_0_generic ggml_gemm_pq2_0_4x8_q8_0
 #elif defined(__s390x__)
+// PQ2_0 4x8 Q8_K repack (Arm NEON implementation only)
+#define ggml_gemv_pq2_0_4x8_q8_K_generic ggml_gemv_pq2_0_4x8_q8_K
+#define ggml_gemm_pq2_0_4x8_q8_K_generic ggml_gemm_pq2_0_4x8_q8_K
 // PTQ1_0 currently has only the generic vec_dot; alias it here until a SIMD version lands
 #define ggml_vec_dot_ptq1_0_q8_0_generic ggml_vec_dot_ptq1_0_q8_0
 // quants.c
@@ -349,6 +367,9 @@
 #define ggml_gemm_q8_0_4x8_q8_0_generic ggml_gemm_q8_0_4x8_q8_0
 #define ggml_gemm_pq2_0_4x8_q8_0_generic ggml_gemm_pq2_0_4x8_q8_0
 #elif defined(__wasm__)
+// PQ2_0 4x8 Q8_K repack (Arm NEON implementation only)
+#define ggml_gemv_pq2_0_4x8_q8_K_generic ggml_gemv_pq2_0_4x8_q8_K
+#define ggml_gemm_pq2_0_4x8_q8_K_generic ggml_gemm_pq2_0_4x8_q8_K
 // PTQ1_0 currently has only the generic vec_dot; alias it here until a SIMD version lands
 #define ggml_vec_dot_ptq1_0_q8_0_generic ggml_vec_dot_ptq1_0_q8_0
 // quants.c

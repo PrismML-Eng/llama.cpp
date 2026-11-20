@@ -2839,6 +2839,87 @@ void ggml_gemm_q1_0_4x8_q8_0_generic(int                        n,
     }
 }
 
+// PQ2_0 rows repacked four at a time (block_pq2_0x4, 8-byte interleave) against Q8_K
+// activations. Row j's packed byte e (weights 4e..4e+3) sits at qs[(e / 8) * 32 + j * 8 + e % 8].
+void ggml_gemv_pq2_0_4x8_q8_K_generic(int                        n,
+                                      float * GGML_RESTRICT      s,
+                                      size_t                     bs,
+                                      const void * GGML_RESTRICT vx,
+                                      const void * GGML_RESTRICT vy,
+                                      int                        nr,
+                                      int                        nc) {
+    const int nb = n / QK_PQ2_0;
+
+    assert(nr == 1);
+    assert(n % QK_K == 0);
+    assert(nc % 4 == 0);
+
+    UNUSED(bs);
+    UNUSED(nr);
+
+    const block_q8_K * a_ptr = (const block_q8_K *) vy;
+    for (int x = 0; x < nc / 4; x++) {
+        const block_pq2_0x4 * b_ptr   = (const block_pq2_0x4 *) vx + (x * nb);
+        float                 sumf[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (int l = 0; l < nb; l++) {
+            const block_q8_K * a  = &a_ptr[l / 2];
+            const int8_t *     q8 = a->qs + QK_PQ2_0 * (l % 2);
+            for (int j = 0; j < 4; j++) {
+                int sumi = 0;
+                for (int i = 0; i < QK_PQ2_0; i++) {
+                    const uint8_t byte = b_ptr[l].qs[(i / 32) * 32 + j * 8 + (i / 4) % 8];
+                    sumi += ((int) ((byte >> (2 * (i % 4))) & 3) - 1) * q8[i];
+                }
+                sumf[j] += GGML_CPU_FP16_TO_FP32(b_ptr[l].d[j]) * a->d * (float) sumi;
+            }
+        }
+        for (int j = 0; j < 4; j++) {
+            s[x * 4 + j] = sumf[j];
+        }
+    }
+}
+
+// Activation row r of a block_q8_Kx4 (4x8 interleave) holds value e at qs[(e / 8) * 32 + r * 8 + e % 8].
+void ggml_gemm_pq2_0_4x8_q8_K_generic(int                        n,
+                                      float * GGML_RESTRICT      s,
+                                      size_t                     bs,
+                                      const void * GGML_RESTRICT vx,
+                                      const void * GGML_RESTRICT vy,
+                                      int                        nr,
+                                      int                        nc) {
+    const int nb   = n / QK_PQ2_0;
+    const int nb_k = n / QK_K;
+
+    assert(n % QK_K == 0);
+    assert(nr % 4 == 0);
+    assert(nc % 4 == 0);
+
+    for (int y = 0; y < nr / 4; y++) {
+        const block_q8_Kx4 * a_ptr = (const block_q8_Kx4 *) vy + (y * nb_k);
+        for (int x = 0; x < nc / 4; x++) {
+            const block_pq2_0x4 * b_ptr = (const block_pq2_0x4 *) vx + (x * nb);
+            for (int r = 0; r < 4; r++) {
+                float sumf[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                for (int l = 0; l < nb; l++) {
+                    const block_q8_Kx4 * a = &a_ptr[l / 2];
+                    for (int j = 0; j < 4; j++) {
+                        int sumi = 0;
+                        for (int i = 0; i < QK_PQ2_0; i++) {
+                            const int     e    = QK_PQ2_0 * (l % 2) + i;
+                            const uint8_t byte = b_ptr[l].qs[(i / 32) * 32 + j * 8 + (i / 4) % 8];
+                            sumi += ((int) ((byte >> (2 * (i % 4))) & 3) - 1) * a->qs[(e / 8) * 32 + r * 8 + e % 8];
+                        }
+                        sumf[j] += GGML_CPU_FP16_TO_FP32(b_ptr[l].d[j]) * a->d[r] * (float) sumi;
+                    }
+                }
+                for (int j = 0; j < 4; j++) {
+                    s[(y * 4 + r) * bs + x * 4 + j] = sumf[j];
+                }
+            }
+        }
+    }
+}
+
 void ggml_gemm_pq2_0_4x8_q8_0_generic(int                        n,
                                      float * GGML_RESTRICT      s,
                                      size_t                     bs,
@@ -4721,6 +4802,10 @@ template <> void gemv<block_pq2_0, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_
     ggml_gemv_pq2_0_4x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 
+template <> void gemv<block_pq2_0, 8, 4, GGML_TYPE_Q8_K>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_pq2_0_4x8_q8_K(n, s, bs, vx, vy, nr, nc);
+}
+
 #if defined __riscv_zvfh
 template <> void gemv<block_q4_0, 1, 16, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemv_q4_0_16x1_q8_0(n, s, bs, vx, vy, nr, nc);
@@ -4828,6 +4913,10 @@ template <> void gemm<block_q8_0, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t
 
 template <> void gemm<block_pq2_0, 8, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemm_pq2_0_4x8_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemm<block_pq2_0, 8, 4, GGML_TYPE_Q8_K>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_pq2_0_4x8_q8_K(n, s, bs, vx, vy, nr, nc);
 }
 
 #if defined __riscv_zvfh
@@ -5269,6 +5358,7 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
 
     // instance for PQ2_0
     static const ggml::cpu::repack::tensor_traits<block_pq2_0, 8, 4, GGML_TYPE_Q8_0> pq2_0_4x8_q8_0;
+    static const ggml::cpu::repack::tensor_traits<block_pq2_0, 8, 4, GGML_TYPE_Q8_K> pq2_0_4x8_q8_K;
 
     // instances for RISC-V
     //
@@ -5463,6 +5553,14 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
                 return &pq2_0_4x8_q8_0;
             }
         }
+#if defined(__aarch64__)
+        // The NEON kernels are AArch64-only; elsewhere the generic version would be slower than vec_dot.
+        if (ggml_cpu_has_neon()) {
+            if (cur->ne[0] % QK_K == 0 && cur->ne[1] % 4 == 0) {
+                return &pq2_0_4x8_q8_K;
+            }
+        }
+#endif
     }
 
     return nullptr;
