@@ -82,10 +82,18 @@ jobs:
           folder: llama.cpp
           hf_bucket: ggml-org/cache
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
       - name: Build
         id: cmake_build
         run: |
           cmake -B build \
+            -DLLAMA_BUILD_UI=ON \
+            -DLLAMA_USE_PREBUILT_UI=OFF \
             -DGGML_NATIVE=OFF \
             -DGGML_BACKEND_DL=OFF \
             -DLLAMA_FATAL_WARNINGS=ON
