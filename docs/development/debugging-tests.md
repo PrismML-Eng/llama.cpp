@@ -102,3 +102,9 @@ Example:
 ```bash
 gdb --args ~/llama.cpp/build-ci-debug/bin/test-tokenizer-0 "~/llama.cpp/tests/../models/ggml-vocab-llama-spm.gguf"
 ```
+
+## Windows mapped-page retirement
+
+On Windows, `test-mmap-win32` checks working-set residency with `QueryWorkingSetEx`. The fixture faults in file-backed pages, retires only complete pages within a fragment, and checks that live boundary pages remain resident and all file bytes remain readable. Windows retains the mapped view; this test checks residency retirement, not partial view unmapping.
+
+With tests enabled, build the `test-mmap-win32` target and run `ctest --test-dir build -R '^test-mmap-win32$' --output-on-failure` (add `-C Release` for a multi-configuration generator).

@@ -476,6 +476,18 @@ static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t li
 #endif
 
 struct llama_mmap::impl {
+    static void align_range(size_t * first, size_t * last, size_t page_size) {
+        size_t offset_in_page = *first & (page_size - 1);
+        size_t offset_to_page = offset_in_page == 0 ? 0 : page_size - offset_in_page;
+        *first += offset_to_page;
+
+        *last = *last & ~(page_size - 1);
+
+        if (*last <= *first) {
+            *last = *first;
+        }
+    }
+
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
 
@@ -526,18 +538,6 @@ struct llama_mmap::impl {
         }
 
         mapped_fragments.emplace_back(0, file->size());
-    }
-
-    static void align_range(size_t * first, size_t * last, size_t page_size) {
-        size_t offset_in_page = *first & (page_size - 1);
-        size_t offset_to_page = offset_in_page == 0 ? 0 : page_size - offset_in_page;
-        *first += offset_to_page;
-
-        *last = *last & ~(page_size - 1);
-
-        if (*last <= *first) {
-            *last = *first;
-        }
     }
 
     void unmap_fragment(size_t first, size_t last) {
@@ -636,8 +636,24 @@ struct llama_mmap::impl {
     }
 
     void unmap_fragment(size_t first, size_t last) {
-        GGML_UNUSED(first);
-        GGML_UNUSED(last);
+        static const size_t page_size = [] {
+            SYSTEM_INFO info;
+            GetSystemInfo(&info);
+            return static_cast<size_t>(info.dwPageSize);
+        }();
+        align_range(&first, &last, page_size);
+        if (first == last) {
+            return;
+        }
+
+        // Windows cannot partially unmap a view. Unlocked pages leave the working set
+        // even when VirtualUnlock reports ERROR_NOT_LOCKED; boundary pages stay live.
+        if (!VirtualUnlock(static_cast<char *>(addr) + first, last - first)) {
+            const DWORD error = GetLastError();
+            if (error != ERROR_NOT_LOCKED) {
+                LLAMA_LOG_WARN("warning: VirtualUnlock failed: %s\n", llama_format_win_err(error).c_str());
+            }
+        }
     }
 
     ~impl() {
