@@ -2,6 +2,12 @@
 
 List of GGML operations and backend support status.
 
+## Flash attention accumulation precision
+
+`GGML_PREC_F32` on `FLASH_ATTN_EXT` requests F32 value accumulation, including the CPU F16-KV fallback and generic CUDA/HIP tile and vector paths. This does not request F32 Q/K storage or F32 softmax intermediates. `GGML_PREC_DEFAULT` retains the existing accumulator choice.
+
+`test-flash-attn-precision` exercises this contract through the public ggml API with exact F16 cancellation inputs and a forward-error bound. Run it with `--backend CPU --threads 1`, `--backend CPU --threads 3`, or the desired GPU name (for example `--backend ROCm0`). For dynamic backends, `--backend-dir` selects the plugin directory; shared-library resolution must also point at that build. The test fails rather than falling back when the requested backend or operation is unavailable.
+
 ## How to add a backend to this table:
 
 1. Run `test-backend-ops support --output csv` with your backend name and redirect output to a csv file in `docs/ops/` (e.g., `docs/ops/CUDA.csv`)
