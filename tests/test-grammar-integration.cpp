@@ -3,6 +3,7 @@
 #endif
 
 #include "json-schema-to-grammar.h"
+#include "parsers/parsers.h"
 
 #include "../src/unicode.h"
 #include "../src/llama-grammar.h"
@@ -232,6 +233,39 @@ static void test_clone() {
 }
 static void test_schema(const std::string & test_desc, const std::string & schema_str, const std::vector<std::string> & passing_strings, const std::vector<std::string> & failing_strings) {
     test(test_desc + ". Schema: " + schema_str, json_schema_to_grammar(json::parse(schema_str), true), passing_strings, failing_strings);
+}
+
+static void test_qwen_reasoning_schema_boundary() {
+    const common_chat_template tmpl(
+        "{% for message in messages %}<|im_start|>{{ message.role }}\n"
+        "{{ message.content }}<|im_end|>\n{% endfor %}"
+        "{% if add_generation_prompt %}<|im_start|>assistant\n<think>\n{% endif %}",
+        "", "<|im_end|>");
+    autoparser::generation_params inputs;
+    inputs.messages = json::parse(R"([{"role":"user","content":"Return the current code."}])");
+    inputs.tools = json::array();
+    inputs.extra_context = json::object();
+    inputs.add_generation_prompt = true;
+    inputs.json_schema = json::parse(R"({
+        "type":"object",
+        "properties":{"code":{"type":["string","null"]}},
+        "required":["code"],
+        "additionalProperties":false
+    })");
+    const auto params = common_chat_params_init_qwen3_coder(tmpl, inputs);
+    const std::string prefix = "<|im_start|>assistant\n";
+    test_grammar("Qwen response schema requires completed reasoning", params.grammar,
+        {
+            prefix + R"({"code":"x"})",
+            prefix + "<think>\n</think>\n" + R"({"code":null})",
+            prefix + "<think>checking</think>" + R"({"code":"<tool_call>"})",
+        },
+        {
+            prefix + "<think>" + R"({"code":"x"})",
+            prefix + "<think>checking<tool_call>" + R"({"code":"x"})",
+            prefix + "<think>checking</think>{}",
+            prefix + "<think>checking</think>",
+        });
 }
 
 static void test_simple_grammar() {
@@ -1665,6 +1699,7 @@ static void test_json_schema() {
 
 int main() {
     fprintf(stdout, "Running grammar integration tests...\n");
+    test_qwen_reasoning_schema_boundary();
     test_simple_grammar();
     test_complex_grammar();
     test_special_chars();
