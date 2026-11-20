@@ -1541,4 +1541,3 @@ void ggml_vec_dot_pq2_0m_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
     }
     *s = sumf;
 }
-
