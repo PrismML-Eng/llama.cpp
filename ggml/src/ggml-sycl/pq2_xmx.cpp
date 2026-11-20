@@ -250,7 +250,7 @@ bool ggml_sycl_pq2_xmx_reorder(ggml_tensor * src0, dpct::queue_ptr stream) {
     const size_t nblk = (size_t) ggml_nelements(src0) / QK_PQ2_0;
     uint8_t *    data = (uint8_t *) src0->data;
 
-    void * tmp = sycl::malloc_device(size, *stream);
+    void * tmp = ggml_sycl_malloc_device(size, *stream);
     if (!tmp) {
         GGML_LOG_WARN("%s: failed to allocate %zu bytes for the PQ2_0 XMX reorder, skipping it\n", __func__, size);
         return false;
@@ -285,7 +285,7 @@ bool ggml_sycl_pq2_xmx_reorder(ggml_tensor * src0, dpct::queue_ptr stream) {
         }).wait();
     }
 
-    sycl::free(tmp, *stream);
+    ggml_sycl_free_device(tmp, *stream);
     return true;
 }
 
