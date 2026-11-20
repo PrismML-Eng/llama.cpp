@@ -129,13 +129,12 @@ static std::vector<llama_token> make_tokens(uint32_t n_tokens, uint32_t n_vocab,
 static std::vector<float> decode_and_get_logits(llama_context * ctx, const std::vector<llama_token> & tokens) {
     const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
 
-    llama_batch batch = llama_batch_init((int32_t) tokens.size(), 0, 1);
+    common_batch batch(ctx);
     for (size_t i = 0; i < tokens.size(); i++) {
-        common_batch_add(batch, tokens[i], (llama_pos) i, { 0 }, true);
+        batch.add(tokens[i], (llama_pos) i, 0, true);
     }
 
-    if (llama_decode(ctx, batch)) {
-        llama_batch_free(batch);
+    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
         throw std::runtime_error("llama_decode failed");
     }
 
@@ -145,8 +144,6 @@ static std::vector<float> decode_and_get_logits(llama_context * ctx, const std::
         const float * li = llama_get_logits_ith(ctx, (int32_t) i);
         logits.insert(logits.end(), li, li + n_vocab);
     }
-
-    llama_batch_free(batch);
 
     return logits;
 }

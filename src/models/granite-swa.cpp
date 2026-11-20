@@ -11,7 +11,7 @@ void llama_model_granite_swa::load_arch_hparams(llama_model_loader & ml) {
 
     // MoE expert configuration
     ml.get_key(LLM_KV_EXPERT_COUNT,                hparams.n_expert, false);
-    ml.get_key(LLM_KV_EXPERT_USED_COUNT,           hparams.n_expert_used, false);
+    ml.get_key_or_arr(LLM_KV_EXPERT_USED_COUNT,    hparams.n_expert_used_arr, hparams.n_layer_all, false);
 
      // iSWA configuration
     ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
@@ -154,6 +154,8 @@ llama_model_granite_swa::graph::graph(
             cb(inpL, "deepstack_in", il);
         }
 
+        res->t_layer_inp[il] = inpL;
+
         ggml_tensor * inpSA = inpL;
 
         // norm
@@ -193,8 +195,6 @@ llama_model_granite_swa::graph::graph(
     cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_logit_scale);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
 }
 
 ggml_tensor * llama_model_granite_swa::graph::build_attention_layer(

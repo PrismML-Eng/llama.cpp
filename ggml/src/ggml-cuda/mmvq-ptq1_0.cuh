@@ -574,3 +574,303 @@ static bool mul_mat_vec_ptq1_0_pt_switch(
     }
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// One-column PTQ1_0 mat-vec on the warp-transposed exact-isum (SoA) activation layout, Hopper.
+//
+// The generic kernel gives every lane one 128-weight K block per row, so each block re-loads
+// its 36 activation words (32 q8 words + 4 (d, isum) words) and a K = 5120 row keeps 40 of 64
+// lane slots busy. Here thread (g, kb) of a CTA loads the activations of K block kb into
+// registers once and walks rows g, g + G, g + 2G, ... of the CTA, two rows per step, so the
+// activation traffic is paid once per CTA instead of once per row and every thread is busy.
+// The digit decode also drops the remainder masks: with F_t = floor(q * 3^t / 256), the high
+// bytes of the 16-bit-lane product q * 3^t, the base-3 digit is F_{t+1} - 3 F_t, and that
+// difference taken on the packed 32-bit word leaves every byte in 0..2 (no borrows). The
+// integer sums are the same as the multiply-and-mask walk of vec_dot_ptq1_0_q8_1_multi.
+//
+// Bit-exact with the generic kernel: each (row, K block) partial is the same float expression
+// (d and the sub-block fold are kept apart until the epilogue), and the epilogue replays the
+// generic kernel's K partition and order: lane l sums blocks l, l + S, l + 2S, ... with an FMA
+// per block (the generic loop contracts acc += d * acc_block the same way), the S / 32 lane
+// groups are added in warp order, then the same butterfly. S = 32 for K < 128 blocks (the
+// warp-per-row small-K geometry), S = 128 otherwise (four warps per row). Bias and GLU fusion
+// follow the respective path.
+// ---------------------------------------------------------------------------
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+// five base-3 digits of each byte of P, digit t of all four bytes packed into D[t]
+static __device__ __forceinline__ void ptq1_0_ks_trits5(const uint32_t P, uint32_t (&D)[5]) {
+    const uint32_t vlo = __byte_perm(P, 0, 0x4140);
+    const uint32_t vhi = __byte_perm(P, 0, 0x4342);
+    uint32_t Fp = 0;
+#pragma unroll
+    for (int t = 0; t < 5; ++t) {
+        constexpr uint32_t pow3[5] = {3, 9, 27, 81, 243};
+        const uint32_t Fn = __byte_perm(vlo * pow3[t], vhi * pow3[t], 0x7531);
+        D[t] = Fn - 3*Fp;
+        Fp = Fn;
+    }
+}
+
+// ROWS weight blocks (7 words each: qs[0..23], then qh[0..1] | d << 16) against one activation
+// block held in registers (ua[0..31] = q8 words sub*8 + m, ua[32..35] = (d8, isum) words).
+// dd = weight scale, aa = sum_k d8_k * (sumi_k - isum_k), the operands of the generic kernel's d * acc.
+template <int ROWS>
+static __device__ __forceinline__ void ptq1_0_ks_block_dot(
+        const uint32_t (&w)[ROWS][7], const int (&ua)[36], float (&dd)[ROWS], float (&aa)[ROWS]) {
+    int sumi[ROWS][4];
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            sumi[i][k] = 0;
+        }
+    }
+#pragma unroll
+    for (int g = 0; g < 6; ++g) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            uint32_t D[5];
+            ptq1_0_ks_trits5(w[i][g], D);
+#pragma unroll
+            for (int t = 0; t < 5; ++t) {
+                // qs[0..15]: element 16 t + 4 g + b; qs[16..23]: element 80 + 8 t + 4 (g - 4) + b
+                const int e = g < 4 ? 16*t + 4*g : 80 + 8*t + 4*(g - 4);
+                sumi[i][e >> 5] = ggml_cuda_dp4a((int) D[t], ua[(e >> 5)*8 + ((e & 31) >> 2)], sumi[i][e >> 5]);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+        // qh: two bytes, four trits each, interleaved: element 120 + 2 t + h
+        uint32_t v = __byte_perm(w[i][6], 0, 0x4140);
+#pragma unroll
+        for (int t = 0; t < 4; t += 2) {
+            const uint32_t w0 = v * 3;
+            v                 = w0 & 0x00FF00FF;
+            const uint32_t w1 = v * 3;
+            v                 = w1 & 0x00FF00FF;
+            const int q = __byte_perm(w0, w1, 0x7531);
+            sumi[i][3] = ggml_cuda_dp4a(q, ua[3*8 + 6 + t/2], sumi[i][3]);
+        }
+        float acc = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int   ds_bits = ua[32 + k];
+            const half2 ds      = *reinterpret_cast<const half2 *>(&ds_bits);
+            const int   isum    = (int) __half_as_short(__high2half(ds));
+            acc += __low2float(ds) * (float) (sumi[i][k] - isum);
+        }
+        dd[i] = __half2float(__ushort_as_half((unsigned short) (w[i][6] >> 16)));
+        aa[i] = acc;
+    }
+}
+
+static __device__ __forceinline__ float ptq1_0_ks_glu(const ggml_glu_op op, float result, const float gate_value) {
+    switch (op) {
+        case GGML_GLU_OP_SWIGLU:
+            result *= ggml_cuda_op_silu_single(gate_value);
+            break;
+        case GGML_GLU_OP_GEGLU:
+            result *= ggml_cuda_op_gelu_single(gate_value);
+            break;
+        case GGML_GLU_OP_SWIGLU_OAI:
+            result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+            break;
+        default:
+            result = result * gate_value;
+            break;
+    }
+    return result;
+}
+
+// G row groups of RPT rows per CTA (R = G * RPT rows), ROWS rows per step. Launch with
+// round_up(G * blocks_per_row, 32) threads; threads past G * blocks_per_row only join the epilogue.
+template <int G, int RPT, int ROWS, int LB, int MINB, bool has_fusion, bool has_gate>
+__launch_bounds__(LB, MINB)
+static __global__ void mul_mat_vec_ptq1_0_ks(
+        const void * vx_, const void * vy_, const ggml_cuda_mm_fusion_args_device fusion, float * dst_,
+        const int ncols_x, const int nrows_x, const int stride_row_x, const uint3 bpr_fd, const bool small_k_order) {
+    static_assert(RPT % ROWS == 0, "RPT must be a multiple of ROWS");
+    constexpr int R  = G * RPT;
+    constexpr int NM = has_gate ? 2 : 1;
+    const void * GGML_CUDA_RESTRICT vx  = vx_;
+    const void * GGML_CUDA_RESTRICT vy  = vy_;
+    float      * GGML_CUDA_RESTRICT dst = dst_;
+
+    extern __shared__ float2 ptq1_0_ks_part[]; // [NM][R][bpr]: (d, acc) of every (row, K block)
+
+    const int bpr  = ncols_x / QK_PTQ1_0;
+    const int row0 = R * blockIdx.x;
+    const int nr   = min(R, nrows_x - row0);
+    const int g    = fastdiv((uint32_t) threadIdx.x, bpr_fd);
+    const int kb   = threadIdx.x - g*bpr;
+
+    // the activations are written by the preceding quantize kernel
+    ggml_cuda_pdl_sync();
+
+    if (g < G) {
+        int ua[36];
+        const int * yw = (const int *) vy + (kb / GGML_CUDA_PTQ1_Q8_GROUP_KB) * GGML_CUDA_PTQ1_Q8_GROUP_WORDS
+                                          + kb % GGML_CUDA_PTQ1_Q8_GROUP_KB;
+#pragma unroll
+        for (int k = 0; k < 36; ++k) {
+            ua[k] = yw[k * GGML_CUDA_PTQ1_Q8_GROUP_KB];
+        }
+#pragma unroll
+        for (int j = 0; j < RPT; j += ROWS) {
+            uint32_t w[ROWS*NM][7];
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+                const int r = min(g + G*(j + i), nr - 1); // clamp the tail, that result is not stored
+#pragma unroll
+                for (int m = 0; m < NM; ++m) {
+                    const uint32_t * p = (const uint32_t *) ((const block_ptq1_0 *) (m == 0 ? vx : fusion.gate) +
+                                                             (int64_t) (row0 + r)*stride_row_x + kb);
+#pragma unroll
+                    for (int k = 0; k < 7; ++k) {
+                        w[i*NM + m][k] = p[k];
+                    }
+                }
+            }
+            float dd[ROWS*NM];
+            float aa[ROWS*NM];
+            ptq1_0_ks_block_dot<ROWS*NM>(w, ua, dd, aa);
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+                const int r = g + G*(j + i);
+                if (r < nr) {
+#pragma unroll
+                    for (int m = 0; m < NM; ++m) {
+                        ptq1_0_ks_part[(m*R + r)*bpr + kb] = make_float2(dd[i*NM + m], aa[i*NM + m]);
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    const int S    = small_k_order ? WARP_SIZE : 4*WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    for (int r = warp; r < nr; r += blockDim.x / WARP_SIZE) {
+        float sum[NM];
+#pragma unroll
+        for (int m = 0; m < NM; ++m) {
+            const float2 * p = ptq1_0_ks_part + (m*R + r)*bpr;
+            float tot = 0.0f;
+            for (int w0 = 0; w0 < S; w0 += WARP_SIZE) {
+                float a = 0.0f;
+                for (int k = w0 + lane; k < bpr; k += S) {
+                    const float2 v = p[k];
+                    a += v.x * v.y;
+                }
+                tot = w0 == 0 ? a : tot + a;
+            }
+            sum[m] = warp_reduce_sum<WARP_SIZE>(tot);
+        }
+        const int row = row0 + r;
+        if (lane == 0) {
+            float result = sum[0];
+            if constexpr (has_fusion) {
+                const float * x_bias    = (const float *) fusion.x_bias;
+                const float * gate_bias = (const float *) fusion.gate_bias;
+                if (small_k_order) {
+                    // warp-per-row small-K path: biases are added only when present
+                    if (x_bias) {
+                        result += x_bias[row];
+                    }
+                    if constexpr (has_gate) {
+                        float gate_value = sum[NM - 1];
+                        if (gate_bias) {
+                            gate_value += gate_bias[row];
+                        }
+                        result = ptq1_0_ks_glu(fusion.glu_op, result, gate_value);
+                    }
+                } else {
+                    // four-warp path: the bias registers default to 0.0f and are always added
+                    result += x_bias ? x_bias[row] : 0.0f;
+                    if constexpr (has_gate) {
+                        const float gate_value = sum[NM - 1] + (gate_bias ? gate_bias[row] : 0.0f);
+                        result = ptq1_0_ks_glu(fusion.glu_op, result, gate_value);
+                    }
+                }
+            }
+            dst[row] = result;
+        }
+    }
+}
+
+// GATE selects the gate-fused instantiation; the others cover the plain and bias-fused calls
+template <int G, int RPT, int ROWS, int LB, int MINB, bool GATE>
+static void mul_mat_vec_ptq1_0_ks_launch(
+        const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const int ncols_x, const int nrows_x, const int stride_row_x, const bool small_k_order, cudaStream_t stream) {
+    constexpr int R = G * RPT;
+    const int bpr = ncols_x / QK_PTQ1_0;
+    const int nthreads = (G*bpr + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE;
+    GGML_ASSERT(nthreads <= LB);
+    GGML_ASSERT(GATE == (fusion.gate != nullptr));
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const size_t smem = (size_t) (GATE ? 2 : 1) * R * bpr * sizeof(float2);
+    const dim3 block_nums((nrows_x + R - 1) / R, 1, 1);
+    const dim3 block_dims(nthreads, 1, 1);
+    const uint3 bpr_fd = init_fastdiv_values((uint32_t) bpr);
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, smem, stream);
+    if constexpr (GATE) {
+        ggml_cuda_kernel_launch(mul_mat_vec_ptq1_0_ks<G, RPT, ROWS, LB, MINB, true, true>, lp,
+            vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, bpr_fd, small_k_order);
+    } else if (has_fusion) {
+        ggml_cuda_kernel_launch(mul_mat_vec_ptq1_0_ks<G, RPT, ROWS, LB, MINB, true, false>, lp,
+            vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, bpr_fd, small_k_order);
+    } else {
+        ggml_cuda_kernel_launch(mul_mat_vec_ptq1_0_ks<G, RPT, ROWS, LB, MINB, false, false>, lp,
+            vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, bpr_fd, small_k_order);
+    }
+}
+
+static bool ggml_cuda_ptq1_0_ks_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_PTQ1_KS");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// true when the K-block-stationary kernel handled a plain 2D one-column call on the SoA layout.
+// It pays where the generic kernel leaves lanes idle in its last K pass: K = 33-63 blocks (one
+// warp per row) and K = 129-160 blocks (four warps per row). H200, Bonsai 2 27B decode, in-graph
+// kernel time: K = 5120 projections -21..-29%, LM head -38%, K = 6144 -14%, K = 17408 down -16%.
+// At K = 32 or 64 blocks every lane is already busy and this kernel was 5-10% slower in isolation
+// (9B, K = 4096), so those, other K, matrices under 4096 rows, gate fusion past 64 blocks and
+// non-Hopper devices keep the generic kernel. GGML_CUDA_PTQ1_KS=0 turns it off.
+static bool mul_mat_vec_ptq1_0_ks_switch(
+        const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const int ncols_x, const int nrows_x, const int stride_row_x, cudaStream_t stream) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_HOPPER || cc >= GGML_CUDA_CC_BLACKWELL ||
+        !ggml_cuda_ptq1_0_ks_enabled()) {
+        return false;
+    }
+    if (nrows_x < 4096 || ncols_x % QK_PTQ1_0 != 0 || fusion.x_scale != nullptr || fusion.gate_scale != nullptr ||
+        (uintptr_t) vx % 4 != 0 || (uintptr_t) fusion.gate % 4 != 0) {
+        return false;
+    }
+    const int  bpr      = ncols_x / QK_PTQ1_0;
+    const bool has_gate = fusion.gate != nullptr;
+    if (bpr > 32 && bpr < 64) {
+        if (has_gate) {
+            mul_mat_vec_ptq1_0_ks_launch<4, 1, 1, 256, 4, true>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, true, stream);
+        } else {
+            mul_mat_vec_ptq1_0_ks_launch<4, 2, 2, 256, 4, false>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, true, stream);
+        }
+        return true;
+    }
+    if (bpr > 128 && bpr <= 160 && !has_gate) {
+        mul_mat_vec_ptq1_0_ks_launch<1, 8, 2, 160, 6, false>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, false, stream);
+        return true;
+    }
+    return false;
+}
+
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

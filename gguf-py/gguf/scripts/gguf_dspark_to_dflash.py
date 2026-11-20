@@ -36,6 +36,7 @@ two largest tensors (11x total with a Q4_0 repack) at unchanged acceptance. Keep
 them only for reduced-vocab drafts or for running the draft on devices the
 target does not use.
 """
+import logging
 import os
 import shutil
 import struct
@@ -106,6 +107,9 @@ class Reader:
         return struct.unpack(fmt, self.f.read(struct.calcsize(fmt)))[0]
 
 
+logger = logging.getLogger("gguf_dspark_to_dflash")
+
+
 def enc_str(s):
     b = s.encode("utf-8")
     return struct.pack("<Q", len(b)) + b
@@ -130,7 +134,9 @@ def transform_kv(src_kv, donor_kv):
 
     for k, t, v in src_kv:
         if k == "general.architecture":
-            out.append((k, STR, "dflash")); seen.add(k); continue
+            out.append((k, STR, "dflash"))
+            seen.add(k)
+            continue
         if k.startswith("dspark.dspark."):
             rest = k[len("dspark.dspark."):]
             if rest == "mask_token_id":
@@ -148,12 +154,14 @@ def transform_kv(src_kv, donor_kv):
         if nk.endswith(".target_layers") and t == ARR:
             et, items = v
             v = (et, [int(x) + 1 for x in items])
-        out.append((nk, t, v)); seen.add(nk)
+        out.append((nk, t, v))
+        seen.add(nk)
 
     # tokenizer comes from the donor; legacy drafters carry no vocab at all
     for k, t, v in donor_kv:
         if k.startswith("tokenizer.") and k not in seen:
-            out.append((k, t, v)); seen.add(k)
+            out.append((k, t, v))
+            seen.add(k)
 
     if mask_token_id is not None and "tokenizer.ggml.mask_token_id" not in seen:
         t, v = mask_token_id
@@ -236,12 +244,13 @@ def main():
                     o.write(chunk)
                     left -= len(chunk)
 
-    print(f"  {os.path.basename(src_path)}")
-    print(f"    -> {os.path.basename(out_path)}")
+    logger.info(f"  {os.path.basename(src_path)}")
+    logger.info(f"    -> {os.path.basename(out_path)}")
     note = f", dropped shared: {', '.join(dropped)}" if dropped else ""
-    print(f"    kv {len(src.kv)} -> {len(new_kv)}, tensors {len(new_tensors)}, "
-          f"data {data_bytes} bytes copied verbatim{note}")
+    logger.info(f"    kv {len(src.kv)} -> {len(new_kv)}, tensors {len(new_tensors)}, "
+                f"data {data_bytes} bytes copied verbatim{note}")
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     main()

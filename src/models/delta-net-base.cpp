@@ -205,9 +205,6 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
             ggml_row_size(g_cs->type, g_cs->ne[0] - 1));
     cb(g_last, "g_last", il);
 
-    // TODO: remove this cont when CUDA supports non-cont unary ops
-    g_last = ggml_cont(ctx0, g_last);
-
     // [1, 1, n_chunks, H_v * n_seqs] KDA: [S_k, 1, n_chunks, H_v * n_seqs]
     ggml_tensor * g_last_exp_t = ggml_transpose(ctx0, ggml_exp(ctx0, g_last));
     cb(g_last_exp_t, "g_last_exp_t", il);
@@ -553,9 +550,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const bool keep = cparams.n_rs_seq > 0;
 
-    GGML_ASSERT(state_rows == nullptr || keep); // rows mode is a ring-path optimization
-
-    if (!keep) {
+    if (!keep && state_rows == nullptr) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
         ggml_tensor * output    = attn_out.first;
         ggml_tensor * new_state = attn_out.second;
