@@ -104,6 +104,7 @@ class ServerProcess:
     spec_draft_n_ubatch: int | None = None
     spec_synth_len: float | None = None
     spec_synth_rates: List[float] | None = None
+    spec_draft_window: int | None = None
     no_ui: bool | None = None
     jinja: bool | None = None
     reasoning_format: Literal['deepseek', 'none', 'nothink'] | None = None
@@ -264,6 +265,8 @@ class ServerProcess:
         if self.spec_synth_rates is not None:
             rates = ",".join(str(rate) for rate in self.spec_synth_rates)
             server_args.extend(["--spec-synth-rates", rates])
+        if self.spec_draft_window:
+            server_args.extend(["--spec-draft-window", self.spec_draft_window])
         if self.no_ui:
             server_args.append("--no-ui")
         if self.no_models_autoload:
