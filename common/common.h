@@ -613,6 +613,9 @@ struct common_params {
     std::string kv_mean_center_path = "";
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
 
+    // tiered KV cache: cells past this many live in pinned host memory (0 = all in device memory)
+    int32_t n_kv_vram_cells = 0;
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

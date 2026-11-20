@@ -1801,6 +1801,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     // at least as long as it takes to call llama_init_from_model() with the returned cparams
     cparams.path_kv_mean_center = params.kv_mean_center_path.empty() ? nullptr : params.kv_mean_center_path.c_str();
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.n_kv_vram_cells     = (uint32_t) std::max(0, params.n_kv_vram_cells);
 
     return cparams;
 }
