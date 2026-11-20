@@ -716,7 +716,7 @@ static __global__ void mul_mat_q_pq2_j128(
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 }
 
-// C74: mul_mat_q_stream_k_fixup<type, 128, false> (no ids, one channel and one sample) for the ADD variant. The
+// C74: mul_mat_q_stream_k_fixup<type, 128, false, GGML_PREC_Q8> (no ids, one channel and one sample) for the ADD variant. The
 // partial sums of the preceding blocks are combined in the same order into the same `sum`, the completed value is
 // dst + sum (what the plain fixup stores to dst), and dst_add receives that value plus the residual.
 template <ggml_type type>
@@ -727,10 +727,10 @@ static __global__ void mul_mat_q_pq2_j128_fixup_add(
     constexpr int  J               = 128;
     constexpr bool fallback        = false;
     constexpr int  warp_size       = ggml_cuda_get_physical_warp_size();
-    constexpr int  nwarps          = (ggml_cuda_mmq_get_nthreads(type, J, fallback) / 2) / warp_size;
-    constexpr int  I               = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int  nwarps          = (ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / 2) / warp_size;
+    constexpr int  I               = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8);
     constexpr int  qk              = ggml_cuda_type_traits<type>::qk;
-    constexpr int  ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback);
+    constexpr int  ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback, GGML_PREC_Q8);
     constexpr int  blocks_per_iter = ITER_K / qk;
 
     float sum[J / nwarps] = {0.0f};
@@ -901,7 +901,7 @@ static void ggml_cuda_mmq_pq2_j128_launch(const mmq_args & args, const int grid,
         const uint3 blocks_per_ne00_fd = init_fastdiv_values(nkb);
         const uint3 one_fd             = init_fastdiv_values(1);
         const uint3 ntx_fd             = init_fastdiv_values(ntx);
-        mul_mat_q_stream_k_fixup<type, 128, false><<<dim3(grid, 128/32, 1), dim3(32, 4, 1), 0, stream>>>(nullptr, nullptr, args.dst, tmp_fixup, blocks_per_ne00_fd, (int) args.nrows_x, (int) args.ncols_dst,
+        mul_mat_q_stream_k_fixup<type, 128, false, GGML_PREC_Q8><<<dim3(grid, 128/32, 1), dim3(32, 4, 1), 0, stream>>>(nullptr, nullptr, args.dst, tmp_fixup, blocks_per_ne00_fd, (int) args.nrows_x, (int) args.ncols_dst,
             (int) args.nrows_dst, one_fd, (int) args.stride_channel_dst, one_fd, (int) args.stride_sample_dst, ntx_fd);
     CUDA_CHECK(cudaGetLastError());
     }

@@ -40,6 +40,7 @@ enum handcrafted_file_type {
     HANDCRAFTED_TENSORS_ZERO_DIM           =  35 + offset_has_tensors,
     HANDCRAFTED_TENSORS_NE_TOO_BIG         =  40 + offset_has_tensors,
     HANDCRAFTED_TENSORS_NBYTES_TOO_BIG     =  45 + offset_has_tensors,
+    HANDCRAFTED_TENSORS_NBYTES_PAD_WRAP    =  46 + offset_has_tensors,
     HANDCRAFTED_TENSORS_BAD_TYPE           =  50 + offset_has_tensors,
     HANDCRAFTED_TENSORS_BAD_OFFSET         =  60 + offset_has_tensors,
     HANDCRAFTED_TENSORS_DUPLICATE_NAME     =  70 + offset_has_tensors,
@@ -81,6 +82,7 @@ static std::string handcrafted_file_type_name(const enum handcrafted_file_type h
         case HANDCRAFTED_TENSORS_ZERO_DIM:           return "TENSORS_ZERO_DIM";
         case HANDCRAFTED_TENSORS_NE_TOO_BIG:         return "TENSORS_NE_TOO_BIG";
         case HANDCRAFTED_TENSORS_NBYTES_TOO_BIG:     return "TENSORS_NBYTES_TOO_BIG";
+        case HANDCRAFTED_TENSORS_NBYTES_PAD_WRAP:    return "TENSORS_NBYTES_PAD_WRAP";
         case HANDCRAFTED_TENSORS_BAD_TYPE:           return "TENSORS_BAD_TYPE";
         case HANDCRAFTED_TENSORS_BAD_OFFSET:         return "TENSORS_BAD_OFFSET";
         case HANDCRAFTED_TENSORS_DUPLICATE_NAME:     return "TENSORS_DUPLICATE_NAME";
@@ -256,6 +258,13 @@ static FILE * get_handcrafted_file(const unsigned int seed, const enum handcraft
 
         tensor_configs[0] = { GGML_TYPE_I8, { 0x7FFFFFFFFFFFFFC0, 1, 1, 1 } };
         tensor_configs[1] = { GGML_TYPE_I8, { 0x7FFFFFFFFFFFFFC0, 1, 1, 1 } };
+    }
+
+    if (hft == HANDCRAFTED_TENSORS_NBYTES_PAD_WRAP) {
+        tensor_configs.resize(1);
+        // F32 with ne = [4, 2^30-1, 2^30+1, 1] so ggml_nbytes = 2^64 - 16.
+        // this hits the GGML_PAD wrap window: pad wraps to 0.
+        tensor_configs[0] = { GGML_TYPE_F32, { 4, INT64_C(1073741823), INT64_C(1073741825), 1 } };
     }
 
     if (hft == HANDCRAFTED_HEADER_BAD_N_TENSORS) {
@@ -782,6 +791,7 @@ static std::pair<int, int> test_handcrafted_file(const unsigned int seed) {
         HANDCRAFTED_TENSORS_ZERO_DIM,
         HANDCRAFTED_TENSORS_NE_TOO_BIG,
         HANDCRAFTED_TENSORS_NBYTES_TOO_BIG,
+        HANDCRAFTED_TENSORS_NBYTES_PAD_WRAP,
         HANDCRAFTED_TENSORS_BAD_TYPE,
         HANDCRAFTED_TENSORS_BAD_OFFSET,
         HANDCRAFTED_TENSORS_DUPLICATE_NAME,
@@ -1176,15 +1186,17 @@ static bool same_tensor_data(const struct ggml_context * orig, const struct ggml
 
 enum roundtrip_read_mode {
     ROUNDTRIP_READ_MODE_FILE,
+    ROUNDTRIP_READ_MODE_FILE_OFFSET, // GGUF embedded after some bytes of a bigger file
     ROUNDTRIP_READ_MODE_BUFFER,
     ROUNDTRIP_READ_MODE_CALLBACK,
 };
 
 static const char * roundtrip_read_mode_name(const roundtrip_read_mode mode) {
     switch (mode) {
-        case ROUNDTRIP_READ_MODE_FILE:     return "file";
-        case ROUNDTRIP_READ_MODE_BUFFER:   return "buffer";
-        case ROUNDTRIP_READ_MODE_CALLBACK: return "callback";
+        case ROUNDTRIP_READ_MODE_FILE:        return "file";
+        case ROUNDTRIP_READ_MODE_FILE_OFFSET: return "file_offset";
+        case ROUNDTRIP_READ_MODE_BUFFER:      return "buffer";
+        case ROUNDTRIP_READ_MODE_CALLBACK:    return "callback";
     }
 
     GGML_ABORT("fatal error");
@@ -1223,6 +1235,12 @@ static std::pair<int, int> test_roundtrip(
     GGML_ASSERT(file);
 #endif // _WIN32
 
+    // not a multiple of any alignment, so the data section padding must be relative to the GGUF start
+    const long prefix = read_mode == ROUNDTRIP_READ_MODE_FILE_OFFSET ? 7 : 0;
+    for (long i = 0; i < prefix; ++i) {
+        fputc(0xAB, file);
+    }
+
     gguf_write_to_file_ptr(gguf_ctx_0, file, only_meta);
     rewind(file);
 
@@ -1245,6 +1263,7 @@ static std::pair<int, int> test_roundtrip(
         };
         gguf_ctx_1 = gguf_init_from_callback(read_buffer_callback, &reader, 4096, 4ull << 30 /* 4GB */, gguf_params);
     } else {
+        GGML_ASSERT(fseek(file, prefix, SEEK_SET) == 0);
         gguf_ctx_1 = gguf_init_from_file_ptr(file, gguf_params);
     }
 
@@ -1457,6 +1476,11 @@ int main(int argc, char ** argv) {
 
         for (bool only_meta : {true, false}) {
             std::pair<int, int> result = test_roundtrip(dev, seed, only_meta, ROUNDTRIP_READ_MODE_FILE);
+            npass += result.first;
+            ntest += result.second;
+        }
+        {
+            std::pair<int, int> result = test_roundtrip(dev, seed, /*only_meta=*/false, ROUNDTRIP_READ_MODE_FILE_OFFSET);
             npass += result.first;
             ntest += result.second;
         }

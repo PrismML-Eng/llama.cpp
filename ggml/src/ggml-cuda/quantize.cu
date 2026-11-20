@@ -147,6 +147,26 @@ static __global__ void quantize_q8_1(
         *ds = make_half2(__float2half(d), __short_as_half((short) isum));
         return;
     }
+    if constexpr (layout == GGML_CUDA_Q8_1_Q1B) {
+        const int64_t row_cont = (i3*ne2.z + i2) * ne1 + i1;
+        char * ycol = (char *) vy + row_cont * (ne0 * 9 / 8); // same row stride as block_q8_1
+        const int64_t kb = i0 / QK8_1;
+        const int     e  = i0 % QK8_1;
+        // word j of the 32-block holds elements j, 8+j, 16+j, 24+j (byte i = element 8*i + j)
+        ((int8_t *) ycol)[kb*QK8_1 + 4*(e % 8) + e / 8] = q;
+
+        int isum = q;
+        isum = warp_reduce_sum<QK8_1>(isum);
+
+        if (iqs > 0) {
+            return;
+        }
+
+        // |isum| <= 32*127 fits int16; keep the raw bits in the half slot.
+        half2 * ds = (half2 *) (ycol + ne0) + kb;
+        *ds = make_half2(__float2half(d), __short_as_half((short) isum));
+        return;
+    }
     if constexpr (layout == GGML_CUDA_Q8_1_SOA_ISUM) {
         // Warp-transposed layout (see ggml_cuda_ptq1_q8_word); ne0 is padded to GGML_CUDA_PTQ1_K_PAD.
         int isum = q;
@@ -255,6 +275,17 @@ static __global__ void fwht_quantize_q8_1(
                 half2 * ds = (half2 *) (ycol + 8*nblk*16) + kb*4 + e / QK8_1;
                 *ds = make_half2(__float2half(d), __short_as_half((short) isum));
             }
+        } else if constexpr (layout == GGML_CUDA_Q8_1_PQ2) {
+            char * ycol = (char *) vy + row * (ne0 * 9 / 8);
+            const int64_t kb = i0 / QK8_1;
+            const int     e  = iqs;
+            ((int8_t *) ycol)[kb*QK8_1 + (e / 16)*16 + (e % 4)*4 + (e % 16)/4] = q;
+
+            int isum = q;
+            isum = warp_reduce_sum<QK8_1>(isum);
+            if (iqs == 0) {
+                ((half2 *) (ycol + ne0))[kb] = make_half2(__float2half(d), __short_as_half((short) isum));
+            }
         } else if constexpr (layout == GGML_CUDA_Q8_1_SOA_ISUM) {
             int isum = q;
             isum = warp_reduce_sum<QK8_1>(isum);
@@ -277,12 +308,11 @@ static __global__ void fwht_quantize_q8_1(
     }
 }
 
-template <int N, typename T>
-static void fwht_quantize_launch_layout(
+template <int N, int NT, typename T>
+static void fwht_quantize_launch_nt(
         const T * x, const float * signs, void * vy, const ggml_cuda_q8_1_layout layout,
         const int64_t ne00, const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
         const float scale, cudaStream_t stream) {
-    constexpr int NT = N < 256 ? N : 256;
     const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
     const dim3 num_blocks((unsigned) (ne0 / N), (unsigned) ne1, (unsigned) (ne2*ne3));
     const dim3 block_size(NT, 1, 1);
@@ -296,9 +326,32 @@ static void fwht_quantize_launch_layout(
     switch (layout) {
         case GGML_CUDA_Q8_1_PT:       FWHT_Q_LAUNCH(GGML_CUDA_Q8_1_PT);       break;
         case GGML_CUDA_Q8_1_SOA_ISUM: FWHT_Q_LAUNCH(GGML_CUDA_Q8_1_SOA_ISUM); break;
+        case GGML_CUDA_Q8_1_PQ2:      FWHT_Q_LAUNCH(GGML_CUDA_Q8_1_PQ2);      break;
         default:                      FWHT_Q_LAUNCH(GGML_CUDA_Q8_1_AOS);      break;
     }
 #undef FWHT_Q_LAUNCH
+}
+
+template <int N, typename T>
+static void fwht_quantize_launch_layout(
+        const T * x, const float * signs, void * vy, const ggml_cuda_q8_1_layout layout,
+        const int64_t ne00, const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
+        const float scale, cudaStream_t stream) {
+    // wider blocks for few rows (decode / verify), same choice as fwht_cuda_block
+    const int nt = ggml_cuda_fwht_block_threads(N, ne1*ne2*ne3);
+    if constexpr (N >= 1024) {
+        if (nt == 1024) {
+            fwht_quantize_launch_nt<N, 1024, T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, stream);
+            return;
+        }
+    }
+    if constexpr (N >= 512) {
+        if (nt == 512) {
+            fwht_quantize_launch_nt<N, 512, T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, stream);
+            return;
+        }
+    }
+    fwht_quantize_launch_nt<N, (N < 256 ? N : 256), T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, stream);
 }
 
 template <typename T>
@@ -375,8 +428,6 @@ static __global__ void quantize_mmq_nvfp4(
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int n_expert_used) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
-
-    const int64_t blocks_per_col = (ne0 + QK_FP4_MMQ - 1) / QK_FP4_MMQ;
 
     int64_t base_idx;
     if constexpr (scatter) {
@@ -562,7 +613,8 @@ static __global__ void quantize_mmq_nvfp4(
                 reinterpret_cast<uint8_t *>(yb->d4)[sub] = fp8_code;
             }
         } else {
-            block_fp4_mmq * yb = y + (blockIdx.y * ((int64_t) blocks_per_col * ne1) + k_block * ne1 + blockIdx.x);
+            const int64_t blocks_per_col = (ne0 + QK_FP4_MMQ - 1) / QK_FP4_MMQ;
+            block_fp4_mmq * yb = y + (blockIdx.y * (blocks_per_col * ne1) + k_block * ne1 + blockIdx.x);
             uint32_t * yqs = reinterpret_cast<uint32_t *>(yb->qs);
             yqs[2 * sub + 0] = q0;
             yqs[2 * sub + 1] = q1;
@@ -904,6 +956,9 @@ void quantize_row_q8_1_cuda(
         case GGML_CUDA_Q8_1_PQ2:
             ggml_cuda_kernel_launch(quantize_q8_1<GGML_CUDA_Q8_1_PQ2>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
             break;
+        case GGML_CUDA_Q8_1_Q1B:
+            ggml_cuda_kernel_launch(quantize_q8_1<GGML_CUDA_Q8_1_Q1B>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+            break;
         default:
             ggml_cuda_kernel_launch(quantize_q8_1<GGML_CUDA_Q8_1_AOS>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
             break;
@@ -936,7 +991,6 @@ void quantize_mmq_q8_1_cuda(
             break;
         default:
             GGML_ABORT("fatal error");
-            break;
     }
 }
 
@@ -966,7 +1020,6 @@ void quantize_scatter_mmq_q8_1_cuda(
             break;
         default:
             GGML_ABORT("fatal error");
-            break;
     }
 }
 

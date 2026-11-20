@@ -1,7 +1,7 @@
 <script lang="ts">
 	import '../app.css';
 	import { browser } from '$app/environment';
-	import { goto } from '$app/navigation';
+	import { afterNavigate, goto } from '$app/navigation';
 	import { base } from '$app/paths';
 	import { page } from '$app/state';
 	import { SidebarNavigation } from '$lib/components/app';
@@ -11,6 +11,7 @@
 		FAVICON_PATHS,
 		FAVICON_SELECTORS,
 		HEADERS,
+		MODELS_ROUTE_ID,
 		NEW_CHAT_TAB_ID,
 		ROUTES,
 		SETTINGS_KEYS,
@@ -28,6 +29,7 @@
 		serverStore,
 		settingsStore,
 		tabsStore,
+		uiStore,
 		versionStore
 	} from '$lib/stores';
 	import { initStores } from '$lib/stores/init';
@@ -137,6 +139,9 @@
 			untrack(() => tabsStore.removeTabs([NEW_CHAT_TAB_ID]));
 		}
 	});
+	// the models page returns to wherever it was reached from, by any kind of navigation
+	afterNavigate(() => uiStore.rememberModelsReturnRoute());
+
 	// Global keyboard shortcuts
 	const { handleKeydown } = useKeyboardShortcuts({
 		editActiveConversation: () => chatSidebar?.editActiveConversation?.(),
@@ -158,7 +163,9 @@
 
 		untrack(() => {
 			if (
-				(page.route.id === '/(chat)' || page.route.id === '/(chat)/chat/[id]') &&
+				(page.route.id === '/(chat)' ||
+					page.route.id === '/(chat)/chat/[id]' ||
+					page.route.id === MODELS_ROUTE_ID) &&
 				page.status !== 401 &&
 				page.status !== 403
 			) {
@@ -296,7 +303,7 @@
 
 <svelte:head>
 	{#if pwaAssetsHead.themeColor}
-		<meta name="theme-color" content={pwaAssetsHead.themeColor.content} />
+		<meta content={pwaAssetsHead.themeColor.content} name="theme-color" />
 	{/if}
 
 	{#if settingsStore.config.customCss}
@@ -310,7 +317,7 @@
 	<PwaMetaTags />
 </svelte:head>
 
-<svelte:window onkeydown={handleKeydown} bind:innerHeight bind:innerWidth />
+<svelte:window bind:innerHeight bind:innerWidth onkeydown={handleKeydown} />
 <svelte:document onvisibilitychange={handleVisibilityChange} />
 
 <Tooltip.Provider delayDuration={TOOLTIP_DELAY_DURATION}>
@@ -325,14 +332,17 @@
 			}}
 		/>
 
-		<div class="flex-1">
+		<!-- min-w-0 lets the chat column shrink below its content width, so wide
+		     code blocks and tables scroll inside their own containers instead of
+		     stretching the page into a horizontal scrollbar -->
+		<div class="min-w-0 flex-1">
 			{@render children?.()}
 		</div>
 	</div>
 
 	<ModeWatcher />
 
-	<Toaster richColors />
+	<Toaster closeButton richColors />
 </Tooltip.Provider>
 
 <!-- PWA update prompt + version -->
@@ -342,8 +352,8 @@
 	{/if}
 
 	<PwaRefreshAlert
-		needRefresh={$needRefresh || pwa.needRefreshByStorage}
 		forceReload={pwa.needRefreshByStorage}
+		needRefresh={$needRefresh || pwa.needRefreshByStorage}
 		{updateServiceWorker}
 	/>
 </div>
