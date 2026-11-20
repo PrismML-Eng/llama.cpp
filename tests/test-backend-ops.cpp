@@ -13564,6 +13564,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    for (int64_t d : {128, 256}) {
+        test_cases.emplace_back(new test_flash_attn_ext(d, d, 4, {1, 1}, 256, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_PQ2_0M));
+        test_cases.emplace_back(new test_flash_attn_ext(d, d, 4, {1, 1}, 256, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_PQ2_0M, GGML_TYPE_F16));
+    }
     // ARC-LAB: pq2_0m-cache decode kernel (SYCL fattn-dec): Bonsai 27B shape (D 256, 4 KV heads x GQA 6), 1-4 query tokens
     for (int64_t kv : {256, 512, 4096, 16384}) {
         for (int64_t nb : {1, 2, 3, 4, 5, 8}) {

@@ -283,7 +283,7 @@ void main() {
                     uint32_t kcol;
                     if (fa_kv_index(j * Bc + c, kcol)) {
                         const uint global_ib = kcol * k_stride + block;
-                        k_block_to_shmem(buf_ib, global_ib, iqs, k_offset, block);
+                        k_block_to_shmem(buf_ib, global_ib, iqs, k_offset);
                     } else {
                         k_block_to_shmem_zero(buf_ib, iqs);
                     }
@@ -379,25 +379,16 @@ void main() {
                     k_dm = ACC_TYPEV2(kblocksh[buf_ib].dm);
 
                     if (block8_fast) {
-                        if (FaTypeK == GGML_TYPE_PQ2_0M) {
-                            // PQ2_0M stores raw 0..3 codes in each byte of
-                            // kblocksh[buf_ib].qs[0..7] (one byte per quad of 4 codes).
-                            // No nibble unpack.
-                            [[unroll]] for (uint32_t d = 0; d < 8; d++) {
-                                k_quants[d] = kblocksh[buf_ib].qs[d];
-                            }
-                        } else {
-                            const bool has_qh = (FaTypeK == GGML_TYPE_Q5_0) || (FaTypeK == GGML_TYPE_Q5_1);
-                            [[unroll]] for (uint32_t d = 0; d < 4; d++) {
-                                uint vui = kblocksh[buf_ib].qs[d];
-                                k_quants[d    ] = int32_t( vui       & 0x0F0F0F0F);
-                                k_quants[d + 4] = int32_t((vui >> 4) & 0x0F0F0F0F);
-                                if (has_qh) {
-                                    uint qh_lo = (kblocksh[buf_ib].qh >> (d * 4)) & 0xF;
-                                    uint qh_hi = (kblocksh[buf_ib].qh >> (d * 4 + 16)) & 0xF;
-                                    k_quants[d    ] |= int32_t((qh_lo * 0x02040810u) & 0x10101010u);
-                                    k_quants[d + 4] |= int32_t((qh_hi * 0x02040810u) & 0x10101010u);
-                                }
+                        const bool has_qh = (FaTypeK == GGML_TYPE_Q5_0) || (FaTypeK == GGML_TYPE_Q5_1);
+                        [[unroll]] for (uint32_t d = 0; d < 4; d++) {
+                            uint vui = kblocksh[buf_ib].qs[d];
+                            k_quants[d    ] = int32_t( vui       & 0x0F0F0F0F);
+                            k_quants[d + 4] = int32_t((vui >> 4) & 0x0F0F0F0F);
+                            if (has_qh) {
+                                uint qh_lo = (kblocksh[buf_ib].qh >> (d * 4)) & 0xF;
+                                uint qh_hi = (kblocksh[buf_ib].qh >> (d * 4 + 16)) & 0xF;
+                                k_quants[d    ] |= int32_t((qh_lo * 0x02040810u) & 0x10101010u);
+                                k_quants[d + 4] |= int32_t((qh_hi * 0x02040810u) & 0x10101010u);
                             }
                         }
                     } else {
@@ -413,7 +404,7 @@ void main() {
                     k_dm = ACC_TYPEV2(get_k_scale(ib, k_offset));
 
                     if (block8_fast) {
-                        fa_k_qs_block8 blk = get_k_qs_block8(ib, k_offset, iqs / 4);
+                        fa_k_qs_block8 blk = get_k_qs_block8(ib, k_offset);
                         [[unroll]] for (uint32_t d = 0; d < 8; d++) {
                             k_quants[d] = blk.qs[d];
                         }

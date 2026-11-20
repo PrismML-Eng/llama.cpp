@@ -32,7 +32,6 @@ uint fa_quant_r_mmq(uint ty) {
         case GGML_TYPE_Q5_0: return uint(QUANT_R_Q5_0);
         case GGML_TYPE_Q5_1: return uint(QUANT_R_Q5_1);
         case GGML_TYPE_Q8_0: return uint(QUANT_R_Q8_0);
-        case GGML_TYPE_PQ2_0M: return uint(QUANT_R_PQ2_0M);
         default:           return 1u;
     }
 }
