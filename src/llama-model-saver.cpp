@@ -4,6 +4,7 @@
 #include "gguf.h"
 
 #include "llama-arch.h"
+#include "llama-adapter.h"
 #include "llama.h"
 #include "llama-hparams.h"
 #include "llama-model.h"
@@ -150,6 +151,11 @@ void llama_model_saver::add_tensor(const struct ggml_tensor * tensor) {
 void llama_model_saver::add_kv_from_model() {
     const llama_hparams & hparams = model->hparams;
     const llama_vocab   & vocab   = model->vocab;
+
+    if (model->embedded_lora) {
+        gguf_set_val_str(gguf_ctx, "general.type", "model");
+        gguf_set_kv(gguf_ctx, model->embedded_lora->embedded_metadata.get());
+    }
 
     const int32_t n_vocab = vocab.n_tokens();
     std::vector<std::string> tokens(n_vocab);
@@ -463,12 +469,7 @@ void llama_model_saver::add_kv_from_model() {
     if (vocab.token_fim_rep() != LLAMA_TOKEN_NULL) { add_kv(LLM_KV_TOKENIZER_FIM_REP_ID, uint32_t(vocab.token_fim_rep())); }
     if (vocab.token_fim_sep() != LLAMA_TOKEN_NULL) { add_kv(LLM_KV_TOKENIZER_FIM_SEP_ID, uint32_t(vocab.token_fim_sep())); }
 
-    // TODO: implement LoRA support
-    // add_kv(LLM_KV_ADAPTER_TYPE,                      ???);
-    // add_kv(LLM_KV_ADAPTER_LORA_ALPHA,                ???);
-    // add_kv(LLM_KV_ADAPTER_LORA_TASK_NAME,            ???);
-    // add_kv(LLM_KV_ADAPTER_LORA_PROMPT_PREFIX,        ???);
-    // add_kv(LLM_KV_ADAPTER_ALORA_INVOCATION_TOKENS,   ???);
+    // External adapters stay separate; embedded adapter metadata is copied above.
 
     add_kv(LLM_KV_POSNET_EMBEDDING_LENGTH,           hparams.posnet.n_embd);
     add_kv(LLM_KV_POSNET_BLOCK_COUNT,                hparams.posnet.n_layer);
@@ -544,6 +545,12 @@ void llama_model_saver::add_tensors_from_model() {
                 continue;
             }
             add_tensor(tensor);
+        }
+    }
+    if (model->embedded_lora) {
+        for (const auto & entry : model->embedded_lora->ab_map) {
+            add_tensor(entry.second.a);
+            add_tensor(entry.second.b);
         }
     }
 }

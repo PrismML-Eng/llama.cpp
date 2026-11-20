@@ -4,6 +4,7 @@
 #include "llama-version.h"
 
 #include "llama-chat.h"
+#include "llama-adapter.h"
 #include "llama-context.h"
 #include "llama-mmap.h"
 #include "llama-vocab.h"
@@ -368,6 +369,10 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
+        }
+
+        if (ml.n_embedded_tensors != 0) {
+            model->embedded_lora = llama_adapter_lora_init_embedded(*model, ml);
         }
 
         return {0, model_ptr.release()};

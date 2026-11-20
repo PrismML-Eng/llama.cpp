@@ -44,6 +44,12 @@ using llama_adapter_cvec_ptr = std::shared_ptr<llama_adapter_cvec>;
 //
 // llama_adapter_lora
 //
+struct llama_model_loader;
+
+bool llama_adapter_lora_is_tensor(const char * name);
+// Throws on malformed or unsupported embedded corrections; registered with the model on success.
+llama_adapter_lora * llama_adapter_lora_init_embedded(llama_model & model, llama_model_loader & ml);
+
 
 struct llama_adapter_lora_weight {
     ggml_tensor * a = nullptr;
@@ -65,14 +71,19 @@ struct llama_adapter_lora {
 
     // map tensor name to lora_a_b
     std::unordered_map<std::string, llama_adapter_lora_weight> ab_map;
+    // Resolve virtual branches once at load time; graph builds avoid formatting names.
+    // unordered_map rehash preserves references to ab_map's stored weights.
+    std::unordered_map<const ggml_tensor *, llama_adapter_lora_weight *> virtual_ab_map;
 
     std::vector<ggml_context_ptr> ctxs;
     std::vector<ggml_backend_buffer_ptr> bufs;
 
-    float alpha;
+    float alpha = 0.0f;
 
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
+    // Typed adapter.* metadata, retained for lossless embedded-adapter serialization.
+    gguf_context_ptr embedded_metadata;
 
     // activated lora (aLoRA)
     std::vector<llama_token> alora_invocation_tokens;
@@ -81,6 +92,11 @@ struct llama_adapter_lora {
     ~llama_adapter_lora() = default;
 
     llama_adapter_lora_weight * get_weight(ggml_tensor * w);
+    llama_adapter_lora_weight * get_weight_named(const std::string & name);
+    const llama_adapter_lora_weight * get_weight_for_anchor(const ggml_tensor * anchor) const {
+        const auto pos = virtual_ab_map.find(anchor);
+        return pos == virtual_ab_map.end() ? nullptr : pos->second;
+    }
 
     uint32_t get_n_nodes() const {
         return ab_map.size() * 6u; // a, b, scale, add, 2 x mul_mat

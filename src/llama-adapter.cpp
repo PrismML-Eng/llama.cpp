@@ -3,11 +3,13 @@
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-model-loader.h"
 
 #include <map>
 #include <cassert>
 #include <cerrno>
 #include <cstring>
+#include <cmath>
 #include <sstream>
 #include <stdexcept>
 
@@ -137,9 +139,20 @@ bool llama_adapter_cvec::apply(
 
 // lora
 
-llama_adapter_lora_weight * llama_adapter_lora::get_weight(ggml_tensor * w) {
-    const std::string name(w->name);
+static bool lora_ends_with(const std::string & name, const std::string & suffix) {
+    return name.size() >= suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
 
+bool llama_adapter_lora_is_tensor(const char * name) {
+    const size_t len = strlen(name);
+    return len >= 7 && (strcmp(name + len - 7, ".lora_a") == 0 || strcmp(name + len - 7, ".lora_b") == 0);
+}
+
+llama_adapter_lora_weight * llama_adapter_lora::get_weight(ggml_tensor * w) {
+    return get_weight_named(w->name);
+}
+
+llama_adapter_lora_weight * llama_adapter_lora::get_weight_named(const std::string & name) {
     const auto pos = ab_map.find(name);
     if (pos != ab_map.end()) {
         return &pos->second;
@@ -148,26 +161,73 @@ llama_adapter_lora_weight * llama_adapter_lora::get_weight(ggml_tensor * w) {
     return nullptr;
 }
 
-static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama_adapter_lora & adapter) {
-    ggml_context * ctx_init;
-    gguf_init_params meta_gguf_params = {
-        /* .no_alloc = */ true,
-        /* .ctx      = */ &ctx_init,
-    };
-
-    gguf_context_ptr ctx_gguf { gguf_init_from_file_ptr(file, meta_gguf_params) };
-    if (!ctx_gguf) {
-        throw std::runtime_error("failed to load lora adapter from file");
+static gguf_context_ptr copy_embedded_adapter_metadata(const gguf_context * src) {
+    gguf_context_ptr dst(gguf_init_empty());
+    for (int64_t i = 0; i < gguf_get_n_kv(src); ++i) {
+        const char * key = gguf_get_key(src, i);
+        if (strncmp(key, "adapter.", 8) != 0) {
+            continue;
+        }
+        switch (gguf_get_kv_type(src, i)) {
+            case GGUF_TYPE_UINT8:   gguf_set_val_u8  (dst.get(), key, gguf_get_val_u8  (src, i)); break;
+            case GGUF_TYPE_INT8:    gguf_set_val_i8  (dst.get(), key, gguf_get_val_i8  (src, i)); break;
+            case GGUF_TYPE_UINT16:  gguf_set_val_u16 (dst.get(), key, gguf_get_val_u16 (src, i)); break;
+            case GGUF_TYPE_INT16:   gguf_set_val_i16 (dst.get(), key, gguf_get_val_i16 (src, i)); break;
+            case GGUF_TYPE_UINT32:  gguf_set_val_u32 (dst.get(), key, gguf_get_val_u32 (src, i)); break;
+            case GGUF_TYPE_INT32:   gguf_set_val_i32 (dst.get(), key, gguf_get_val_i32 (src, i)); break;
+            case GGUF_TYPE_FLOAT32: gguf_set_val_f32 (dst.get(), key, gguf_get_val_f32 (src, i)); break;
+            case GGUF_TYPE_UINT64:  gguf_set_val_u64 (dst.get(), key, gguf_get_val_u64 (src, i)); break;
+            case GGUF_TYPE_INT64:   gguf_set_val_i64 (dst.get(), key, gguf_get_val_i64 (src, i)); break;
+            case GGUF_TYPE_FLOAT64: gguf_set_val_f64 (dst.get(), key, gguf_get_val_f64 (src, i)); break;
+            case GGUF_TYPE_BOOL:    gguf_set_val_bool(dst.get(), key, gguf_get_val_bool(src, i)); break;
+            case GGUF_TYPE_STRING:  gguf_set_val_str (dst.get(), key, gguf_get_val_str (src, i)); break;
+            case GGUF_TYPE_ARRAY: {
+                const size_t n = gguf_get_arr_n(src, i);
+                const auto type = gguf_get_arr_type(src, i);
+                if (type == GGUF_TYPE_STRING) {
+                    std::vector<const char *> strings(n);
+                    for (size_t j = 0; j < n; ++j) {
+                        strings[j] = gguf_get_arr_str(src, i, j);
+                    }
+                    gguf_set_arr_str(dst.get(), key, strings.data(), n);
+                } else {
+                    gguf_set_arr_data(dst.get(), key, type, gguf_get_arr_data(src, i), n);
+                }
+                break;
+            }
+            default: throw std::runtime_error("invalid embedded adapter metadata type");
+        }
     }
+    return dst;
+}
 
-    ggml_context_ptr ctx { ctx_init };
-
-    // must come after gguf_init_from_file_ptr, the llama_file constructor moves the file position
-    llama_file gguf_file(file);
+// Embedded loading reuses the model loader's catalog, including split files and FILE* offsets.
+// The virtual MoE target follows sky-is-green/prism-ml-llama.cpp at 3a25590406e8.
+static void llama_adapter_lora_init_impl(
+        llama_model & model, FILE * file, llama_adapter_lora & adapter, llama_model_loader * ml = nullptr) {
+    gguf_context_ptr owned_gguf;
+    ggml_context_ptr ctx;
+    std::unique_ptr<llama_file> gguf_file;
+    gguf_context * metadata;
+    if (ml) {
+        metadata = ml->metadata;
+        adapter.embedded_metadata = copy_embedded_adapter_metadata(metadata);
+    } else {
+        ggml_context * ctx_init = nullptr;
+        gguf_init_params params = { true, &ctx_init };
+        owned_gguf.reset(gguf_init_from_file_ptr(file, params));
+        ctx.reset(ctx_init);
+        if (!owned_gguf) {
+            throw std::runtime_error("failed to load lora adapter from file");
+        }
+        metadata = owned_gguf.get();
+        // Must follow GGUF parsing, since llama_file moves the file position.
+        gguf_file.reset(new llama_file(file));
+    }
 
     // check metadata
     {
-        const gguf_context * gguf_ctx = ctx_gguf.get();
+        const gguf_context * gguf_ctx = metadata;
 
         LLAMA_LOG_INFO("%s: Dumping metadata keys/values.\n", __func__);
 
@@ -194,17 +254,24 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
 
         auto get_kv_str = [&](const std::string & key) -> std::string {
             int id = gguf_find_key(gguf_ctx, key.c_str());
+            if (id >= 0 && gguf_get_kv_type(gguf_ctx, id) != GGUF_TYPE_STRING) {
+                throw std::runtime_error("invalid gguf type for " + key);
+            }
             return id < 0 ? "" : std::string(gguf_get_val_str(gguf_ctx, id));
         };
         auto get_kv_f32 = [&](const std::string & key) -> float {
             int id = gguf_find_key(gguf_ctx, key.c_str());
+            if (id >= 0 && gguf_get_kv_type(gguf_ctx, id) != GGUF_TYPE_FLOAT32) {
+                throw std::runtime_error("invalid gguf type for " + key);
+            }
             return id < 0 ? 0.0f : gguf_get_val_f32(gguf_ctx, id);
         };
         LLM_KV llm_kv = LLM_KV(LLM_ARCH_UNKNOWN);
 
         auto general_type = get_kv_str(llm_kv(LLM_KV_GENERAL_TYPE));
-        if (general_type != "adapter") {
-            throw std::runtime_error("expect general.type to be 'adapter', but got: " + general_type);
+        const char * expected_type = ml ? "model" : "adapter";
+        if (general_type != expected_type) {
+            throw std::runtime_error(std::string("expect general.type to be '") + expected_type + "', but got: " + general_type);
         }
 
         auto general_arch_str = get_kv_str(llm_kv(LLM_KV_GENERAL_ARCHITECTURE));
@@ -219,20 +286,26 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
         }
 
         adapter.alpha = get_kv_f32(llm_kv(LLM_KV_ADAPTER_LORA_ALPHA));
+        if (!std::isfinite(adapter.alpha)) {
+            throw std::runtime_error("adapter.lora.alpha must be finite");
+        }
 
         // parse alora invocation sequence vector
         const auto & key = llm_kv(LLM_KV_ADAPTER_ALORA_INVOCATION_TOKENS);
-        const int kid = gguf_find_key(ctx_gguf.get(), key.c_str());
+        const int kid = gguf_find_key(metadata, key.c_str());
         if (kid >= 0) {
-            if (gguf_get_kv_type(ctx_gguf.get(), kid) != GGUF_TYPE_ARRAY) {
+            if (gguf_get_kv_type(metadata, kid) != GGUF_TYPE_ARRAY) {
                 throw std::runtime_error("invalid gguf type for " + key);
             }
-            const auto arr_type = gguf_get_arr_type(ctx_gguf.get(), kid);
+            const auto arr_type = gguf_get_arr_type(metadata, kid);
             if (arr_type != GGUF_TYPE_UINT32) {
                 throw std::runtime_error("invalid gguf element type for " + key);
             }
-            const size_t seq_len = gguf_get_arr_n(ctx_gguf.get(), kid);
-            const void * data = gguf_get_arr_data(ctx_gguf.get(), kid);
+            const size_t seq_len = gguf_get_arr_n(metadata, kid);
+            if (ml && seq_len != 0) {
+                throw std::runtime_error("embedded corrections cannot be conditional aLoRA adapters");
+            }
+            const void * data = gguf_get_arr_data(metadata, kid);
             adapter.alora_invocation_tokens.resize(seq_len);
             std::copy(
                 (const llama_token *)data,
@@ -241,7 +314,7 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
         }
     }
 
-    int n_tensors = gguf_get_n_tensors(ctx_gguf.get());
+    const int n_tensors = ml ? ml->n_embedded_tensors : gguf_get_n_tensors(metadata);
 
     // contexts for each buffer type
     std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
@@ -267,32 +340,54 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
 
     // bundle lora_a and lora_b into pairs
     std::map<std::string, llama_adapter_lora_weight> ab_map;
-    auto str_endswith = [](const std::string & str, const std::string & suffix) {
-        return str.size() >= suffix.size() && str.compare(str.size()-suffix.size(), suffix.size(), suffix) == 0;
-    };
-
-    for (ggml_tensor * cur = ggml_get_first_tensor(ctx.get()); cur; cur = ggml_get_next_tensor(ctx.get(), cur)) {
+    auto add_tensor = [&](ggml_tensor * cur) {
         std::string name(cur->name);
-        if (str_endswith(name, ".lora_a")) {
-            replace_all(name, ".lora_a", "");
+        if (lora_ends_with(name, ".lora_a")) {
+            name.resize(name.size() - 7);
             if (ab_map.find(name) == ab_map.end()) {
                 ab_map[name] = llama_adapter_lora_weight(cur, nullptr);
             } else {
                 ab_map[name].a = cur;
             }
-        } else if (str_endswith(name, ".lora_b")) {
-            replace_all(name, ".lora_b", "");
+        } else if (lora_ends_with(name, ".lora_b")) {
+            name.resize(name.size() - 7);
             if (ab_map.find(name) == ab_map.end()) {
                 ab_map[name] = llama_adapter_lora_weight(nullptr, cur);
             } else {
                 ab_map[name].b = cur;
             }
-        } else if (str_endswith(name, "_norm.weight")) {
+        } else if (lora_ends_with(name, "_norm.weight")) {
             // TODO: add support for norm vector
             // for now, we don't really care because most adapters still work fine without it
-            continue;
+            return;
         } else {
             throw std::runtime_error("LoRA tensor '" + name + "' has unexpected suffix");
+        }
+    };
+    if (ml && ml->files.empty()) {
+        // Metadata/callback model loading has no source GGML context.
+        ctx.reset(ggml_init({ n_tensors * ggml_tensor_overhead(), nullptr, true }));
+        if (!ctx) {
+            throw std::runtime_error("failed to allocate embedded adapter metadata");
+        }
+        for (int64_t i = 0; i < gguf_get_n_tensors(metadata); ++i) {
+            const char * name = gguf_get_tensor_name(metadata, i);
+            if (llama_adapter_lora_is_tensor(name)) {
+                auto * t = ggml_new_tensor(ctx.get(), gguf_get_tensor_type(metadata, i), GGML_MAX_DIMS,
+                                          gguf_get_tensor_ne(metadata, i));
+                ggml_set_name(t, name);
+                add_tensor(t);
+            }
+        }
+    } else if (ml) {
+        for (const auto & it : ml->weights_map) {
+            if (llama_adapter_lora_is_tensor(it.first.c_str())) {
+                add_tensor(it.second.tensor);
+            }
+        }
+    } else {
+        for (auto * cur = ggml_get_first_tensor(ctx.get()); cur; cur = ggml_get_next_tensor(ctx.get(), cur)) {
+            add_tensor(cur);
         }
     }
 
@@ -323,14 +418,20 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
     for (auto & it : ab_map) {
         const std::string & name = it.first;
         llama_adapter_lora_weight & w = it.second;
-        bool is_token_embd = str_endswith(name, "token_embd.weight");
+        bool is_token_embd = lora_ends_with(name, "token_embd.weight");
 
         if (!w.a || !w.b) {
             throw std::runtime_error("LoRA tensor pair for '" + name + "' is missing one component");
         }
 
         // device buft and device ctx
-        const auto * model_tensor = model.get_tensor(name.c_str());
+        const bool is_moe_corr = lora_ends_with(name, ".ffn_moe_out.weight");
+        if (is_moe_corr && model.arch != LLM_ARCH_QWEN35MOE) {
+            throw std::runtime_error("MoE output correction is only implemented for qwen35moe");
+        }
+        const std::string anchor = is_moe_corr ?
+            name.substr(0, name.size() - strlen("ffn_moe_out.weight")) + "ffn_gate_inp.weight" : name;
+        const auto * model_tensor = model.get_tensor(anchor.c_str());
         if (!model_tensor) {
             throw std::runtime_error("LoRA tensor '" + name + "' does not exist in base model (hint: maybe wrong base model?)");
         }
@@ -361,13 +462,25 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
 
         ggml_context * dev_ctx = ctx_for_buft(buft);
         // validate tensor shape
-        if (is_token_embd) {
+        if (!dev_ctx) {
+            throw std::runtime_error("failed to allocate LoRA tensor context");
+        }
+        if (is_moe_corr) {
+            // A=[n_embd,rank], B=[rank,n_embd]; no batched/expert dimensions.
+            if (w.a->ne[0] != model.hparams.n_embd || w.b->ne[1] != model.hparams.n_embd ||
+                w.a->ne[1] != w.b->ne[0] || w.a->ne[1] <= 0 ||
+                w.a->ne[2] != 1 || w.a->ne[3] != 1 || w.b->ne[2] != 1 || w.b->ne[3] != 1) {
+                throw std::runtime_error("MoE output correction '" + name + "' expects A=[n_embd,rank], B=[rank,n_embd]");
+            }
+        } else if (is_token_embd) {
             // expect B to be non-transposed, A and B are flipped; see llm_build_inp_embd()
             if (model_tensor->ne[0] != w.b->ne[1] || model_tensor->ne[1] != w.a->ne[1]) {
                 throw std::runtime_error("tensor '" + name + "' has incorrect shape (hint: maybe wrong base model?)");
             }
         } else {
-            if (model_tensor->ne[0] != w.a->ne[0] || model_tensor->ne[1] != w.b->ne[1]) {
+            if (model_tensor->ne[0] != w.a->ne[0] || model_tensor->ne[1] != w.b->ne[1] ||
+                (ml && (model_tensor->ne[2] != w.a->ne[2] || model_tensor->ne[2] != w.b->ne[2] ||
+                        model_tensor->ne[3] != w.a->ne[3] || model_tensor->ne[3] != w.b->ne[3]))) {
                 throw std::runtime_error("tensor '" + name + "' has incorrect shape (hint: maybe wrong base model?)");
             }
             if (w.a->ne[1] != w.b->ne[0]) {
@@ -380,8 +493,12 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
         ggml_tensor * tensor_b = ggml_dup_tensor(dev_ctx, w.b);
         ggml_set_name(tensor_a, w.a->name);
         ggml_set_name(tensor_b, w.b->name);
-        adapter.ab_map[name] = llama_adapter_lora_weight(tensor_a, tensor_b);
+        auto & registered = adapter.ab_map.emplace(name, llama_adapter_lora_weight(tensor_a, tensor_b)).first->second;
+        if (is_moe_corr) {
+            adapter.virtual_ab_map.emplace(model_tensor, &registered);
+        }
     }
+
 
     // allocate tensors / buffers and zero
     {
@@ -390,28 +507,56 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
         for (auto & it : ctx_map) {
             ggml_backend_buffer_type_t buft = it.first;
             ggml_context * ctx_dev = it.second;
-            ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev, buft) };
+            ggml_backend_buffer_ptr buf { ml && ml->no_alloc ?
+                ggml_backend_buft_alloc_buffer(buft, 0) : ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev, buft) };
             if (!buf) {
                 throw std::runtime_error("failed to allocate buffer for lora adapter\n");
             }
+            if (ml && ml->no_alloc) {
+                for (auto * t = ggml_get_first_tensor(ctx_dev); t; t = ggml_get_next_tensor(ctx_dev, t)) {
+                    t->buffer = buf.get();
+                }
+            }
             LLAMA_LOG_INFO("%s: %10s LoRA buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get())/1024.0/1024.0);
+            ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             adapter.bufs.emplace_back(std::move(buf));
         }
+    }
+
+    if (ml && ml->no_alloc) {
+        model.loras.insert(&adapter);
+        return;
     }
 
     // set tensor data
     {
         std::vector<uint8_t> read_buf;
         auto set_tensor = [&](ggml_tensor * orig, ggml_tensor * dev) {
-            const size_t offs = gguf_get_data_offset(ctx_gguf.get()) + gguf_get_tensor_offset(ctx_gguf.get(), gguf_find_tensor(ctx_gguf.get(), orig->name));
+            if (ml && ml->files.empty()) {
+                ml->set_tensor_data(dev, ml->set_tensor_data_ud);
+                return;
+            }
+            const auto * weight = ml ? &ml->require_weight(orig->name) : nullptr;
+            const size_t offs = weight ? weight->offs :
+                gguf_get_data_offset(metadata) + gguf_get_tensor_offset(metadata, gguf_find_tensor(metadata, orig->name));
+            llama_file * source = weight ? ml->files.at(weight->idx).get() : gguf_file.get();
             const size_t size = ggml_nbytes(orig);
-            if (offs + size < offs || offs + size > gguf_file.size()) {
+            if (offs + size < offs || offs + size > source->size()) {
                 throw std::runtime_error(format("LoRA tensor '%s' data is not within the file bounds, file is corrupted or incomplete", orig->name));
             }
-            read_buf.resize(size);
-            gguf_file.seek(offs, SEEK_SET);
-            gguf_file.read_raw(read_buf.data(), size);
-            ggml_backend_tensor_set(dev, read_buf.data(), 0, size);
+            const bool host = ggml_backend_buffer_is_host(dev->buffer);
+            if (!host) {
+                read_buf.resize(size);
+            }
+            void * data = host ? dev->data : read_buf.data();
+            source->seek(offs, SEEK_SET);
+            source->read_raw(data, size);
+            if (ml && ml->check_tensors && !ggml_validate_row_data(orig->type, data, size)) {
+                throw std::runtime_error(format("embedded LoRA tensor '%s' has invalid data", orig->name));
+            }
+            if (!host) {
+                ggml_backend_tensor_set(dev, data, 0, size);
+            }
         };
         for (auto & it : adapter.ab_map) {
             auto orig = ab_map[it.first];
@@ -425,6 +570,12 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
     model.loras.insert(&adapter);
 
     LLAMA_LOG_INFO("%s: loaded %zu tensors from lora file\n", __func__, adapter.ab_map.size()*2);
+}
+
+llama_adapter_lora * llama_adapter_lora_init_embedded(llama_model & model, llama_model_loader & ml) {
+    auto adapter = std::make_unique<llama_adapter_lora>(&model);
+    llama_adapter_lora_init_impl(model, nullptr, *adapter, &ml);
+    return adapter.release();
 }
 
 llama_adapter_lora * llama_adapter_lora_init(llama_model * model, const char * path_lora) {
@@ -506,6 +657,11 @@ void llama_adapter_lora_free(llama_adapter_lora * adapter) {
         return;
     }
 
+    // The model owns this mandatory correction; external adapter APIs must not detach it.
+    if (adapter->model && adapter->model->embedded_lora == adapter) {
+        LLAMA_LOG_ERROR("%s: cannot free the model's embedded adapter\n", __func__);
+        return;
+    }
     if (adapter->model != nullptr) {
         adapter->model->loras.erase(adapter);
         adapter->model = nullptr;
