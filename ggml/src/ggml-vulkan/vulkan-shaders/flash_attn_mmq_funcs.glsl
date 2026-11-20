@@ -175,9 +175,14 @@ fa_k_qs_block8 get_k_qs_block8(uint ib, uint a_offset, uint byte_offset) {
         if (FaTypeK == GGML_TYPE_PQ2_0M) {
             // PQ2_0M stores raw 0..3 codes in each byte (one byte per quad of 4 codes).
             // d in 0..3: quad d = byte (byte_offset + d), quad d+4 = byte (byte_offset + d + 4).
+            // Each byte may cross into the next block; read from ib + byte/32 at byte%32,
+            // matching the generic get_k_qs path's ib + elem/128 indexing.
             const uint byte0 = byte_offset + d;
-            const uint bits0 = k_packed_pq2_0m.data[a_offset + ib].qs[byte0];
-            const uint bits1 = k_packed_pq2_0m.data[a_offset + ib].qs[byte0 + 4];
+            const uint block0 = ib + byte0 / 32;
+            const uint bits0 = k_packed_pq2_0m.data[a_offset + block0].qs[byte0 % 32];
+            const uint byte1 = byte0 + 4;
+            const uint block1 = ib + byte1 / 32;
+            const uint bits1 = k_packed_pq2_0m.data[a_offset + block1].qs[byte1 % 32];
             r.qs[d    ] = int32_t(pack32(i8vec4(
                 int8_t(bits0 & 3u), int8_t((bits0 >> 2u) & 3u),
                 int8_t((bits0 >> 4u) & 3u), int8_t(bits0 >> 6u))));
