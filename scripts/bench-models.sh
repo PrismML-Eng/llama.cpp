@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+set -euo pipefail
+
 RESULTS="bench-models-results.txt"
 : > "$RESULTS"
 
