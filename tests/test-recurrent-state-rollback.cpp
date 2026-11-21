@@ -9,7 +9,7 @@
 #include <vector>
 
 static llama_context * make_ctx(const common_params & params, llama_model * model) {
-    auto cparams = common_context_params_to_llama(params);
+    auto cparams       = common_context_params_to_llama(params);
     cparams.n_seq_max = 1;
     cparams.n_rs_seq  = 8;
     cparams.n_batch   = std::max(cparams.n_batch,  (uint32_t) (cparams.n_rs_seq + 1));
@@ -207,6 +207,72 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     return true;
 }
 
+// Fork a sequence with seq_cp while its partial rollback is pending, then decode one token on the fork.
+// The reference rolls back seq 1 directly. The fork must match it bitwise.
+// The tiny test weights make the recurrent part too small to show in the logits, so compare the state bytes.
+static bool test_seq_cp_pending_rollback(const common_params & params, llama_model * model, const int n_vocab) {
+    constexpr uint32_t  n_prompt   = 12;
+    constexpr uint32_t  n_rollback = 3;
+    constexpr llama_pos p0         = n_prompt - n_rollback;
+
+    auto cparams       = common_context_params_to_llama(params);
+    cparams.n_seq_max  = 2;
+    cparams.n_rs_seq   = 8;
+    cparams.n_ctx      = 256;
+    cparams.n_batch    = 256;
+    cparams.n_ubatch   = 256;
+    cparams.kv_unified = false;
+
+    // fork: seq 0 -> rollback -> seq_cp to seq 1, ref: seq 1 -> rollback
+    std::vector<uint8_t> state[2];
+    for (int fork : { 1, 0 }) {
+        llama_context * ctx = llama_init_from_model(model, cparams);
+        if (ctx == nullptr) {
+            fprintf(stderr, "%s : failed to init context\n", __func__);
+            return false;
+        }
+
+        llama_memory_t     mem = llama_get_memory(ctx);
+        const llama_seq_id src = fork ? 0 : 1;
+
+        llama_batch batch = llama_batch_init(n_prompt, 0, 1);
+        for (llama_pos pos = 0; pos < (llama_pos) n_prompt; ++pos) {
+            common_batch_add(batch, (llama_token) ((5 * pos + 3) % n_vocab), pos, { src }, false);
+        }
+        bool ok = llama_decode(ctx, batch) == 0;
+
+        ok = ok && llama_memory_seq_rm(mem, src, p0, -1);
+        if (fork) {
+            llama_memory_seq_cp(mem, 0, 1, -1, -1);
+        }
+
+        common_batch_clear(batch);
+        common_batch_add(batch, (llama_token) (p0 % n_vocab), p0, { 1 }, true);
+        ok = ok && llama_decode(ctx, batch) == 0;
+        llama_batch_free(batch);
+
+        if (ok) {
+            state[fork].resize(llama_state_seq_get_size_ext(ctx, 1, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+            llama_state_seq_get_data_ext(ctx, state[fork].data(), state[fork].size(), 1, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
+        llama_free(ctx);
+
+        if (!ok) {
+            fprintf(stderr, "%s : decode/rollback failed (fork = %d)\n", __func__, fork);
+            return false;
+        }
+    }
+
+    if (state[0].empty() || state[0] != state[1]) {
+        fprintf(stderr, "%s : forked seq did not continue from the rolled-back state (%zu vs %zu bytes)\n",
+                __func__, state[1].size(), state[0].size());
+        return false;
+    }
+
+    fprintf(stderr, "%s : forked seq matched the rolled-back state (%zu bytes)\n", __func__, state[0].size());
+    return true;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -394,6 +460,10 @@ int main(int argc, char ** argv) {
     llama_free(ctx_dirty);
 
     if (!test_multi_seq_split_replay(params, model, n_vocab)) {
+        return 1;
+    }
+
+    if (!test_seq_cp_pending_rollback(params, model, n_vocab)) {
         return 1;
     }
 

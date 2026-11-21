@@ -91,6 +91,13 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
+// the backend buffers that a state write of this memory would touch - empty caches report none
+LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
+
+// Turn the KV cache attention rotation on or off for the contexts created from this model.
+// Useful for testing purposes.
+LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
@@ -100,6 +107,32 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
+
+// ARC-LAB: chained MTP drafts (single NextN head, qwen35). llama_mtp_chain_support: 0 = not available on this context,
+// bit 0 = available, bit 1 = the head has a trimmed draft vocabulary (in-graph token lookups can stay on the device).
+// llama_set_mtp_chain(ctx, n): the next llama_decode on this MTP context drafts n tokens in one graph. Its batch must be
+// one ubatch: catch-up rows (no output), the anchor row (id_last at n_past, output), then n-1 rows at n_past+1.. whose
+// token and embd are placeholders (the graph writes their K/V). Reset with n = 0 after the decode.
+// llama_get_mtp_chain_ids: after that decode, the n greedy draft tokens (synchronizes), or nullptr.
+LLAMA_API int32_t             llama_mtp_chain_support(const struct llama_context * ctx);
+LLAMA_API void                llama_set_mtp_chain    (struct llama_context * ctx, int32_t n_steps);
+LLAMA_API const llama_token * llama_get_mtp_chain_ids(struct llama_context * ctx);
+// Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
+// See https://github.com/ggml-org/llama.cpp/pull/29831 for details
+// A run of entries with the same value is one span, spans must be separated by entries with value 0
+// An option belongs to the last question before it
+enum llama_decision_order {
+    LLAMA_DECISION_ORDER_NONE            = 0, // not read by the head
+    LLAMA_DECISION_ORDER_QUESTION_NOUL   = 1, // text of a question
+    LLAMA_DECISION_ORDER_QUESTION_CHOICE = 2,
+    LLAMA_DECISION_ORDER_QUESTION_SCORE  = 3,
+    LLAMA_DECISION_ORDER_OPTION          = 4, // text of an option
+};
+// The embeddings output has one value per entry: row i is the score of option i
+LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch, int32_t idx, enum llama_decision_order order);
+
+// Label of option i of a decision model ("<arch>.decision.labels"), nullptr past the last one
+LLAMA_API const char * llama_model_decision_label(const struct llama_model * model, uint32_t i);
 
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
@@ -223,3 +256,9 @@ LLAMA_API bool llama_model_dspark_get_meta(const struct llama_model * model, lla
 LLAMA_API bool llama_model_dspark_get_markov(const struct llama_model * model,
                                              std::vector<float> &       w1,
                                              std::vector<float> &       w2);
+// same as above, but only the rows of the given tokens, in order (n_tokens * n_embd elements)
+// returns the number of elements written or 0 on error
+LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const llama_token * tokens, uint32_t n_tokens, float * out);
+
+// realtime models: number of tokens the output lags behind the audio input, used by mtmd; 0 if not applicable
+LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);

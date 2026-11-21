@@ -188,6 +188,48 @@ static void test(const std::string & test_desc, const std::string & grammar_str,
 static void test_grammar(const std::string & test_desc, const std::string & grammar_str, const std::vector<std::string> & passing_strings, const std::vector<std::string> & failing_strings) {
     test(test_desc + ". Grammar: " + grammar_str, grammar_str, passing_strings, failing_strings);
 }
+
+static bool stacks_point_into_rules(llama_grammar * grammar) {
+    const auto & rules = llama_grammar_get_rules(grammar);
+    for (const auto & stack : llama_grammar_get_stacks(grammar)) {
+        for (const llama_grammar_element * pe : stack) {
+            bool found = false;
+            for (const auto & rule : rules) {
+                found = found || (!rule.empty() && pe >= rule.data() && pe < rule.data() + rule.size());
+            }
+            if (!found) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static void test_clone() {
+    fprintf(stderr, "⚫ Testing grammar clone at each position of an input\n");
+    const std::string grammar_str = json_schema_to_grammar(json::parse(R"""({
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "n": {"type": "integer"}
+        },
+        "required": ["name", "n"]
+    })"""), true);
+    const std::string input = R"""({"name": "a", "n": 42, "tags": ["x", "y"]})""";
+    for (size_t k = 0; k <= input.size(); k++) {
+        auto * grammar = build_grammar(grammar_str);
+        for (const auto & in : parse_tokens(input.substr(0, k))) {
+            llama_grammar_accept_token(*grammar, in.token, in.piece);
+        }
+        auto * clone = llama_grammar_clone_impl(*grammar);
+        llama_grammar_free_impl(grammar);
+        assert(stacks_point_into_rules(clone));
+        assert(match_string(input.substr(k), clone));
+        llama_grammar_free_impl(clone);
+    }
+    fprintf(stdout, "  ✅︎\n");
+}
 static void test_schema(const std::string & test_desc, const std::string & schema_str, const std::vector<std::string> & passing_strings, const std::vector<std::string> & failing_strings) {
     test(test_desc + ". Schema: " + schema_str, json_schema_to_grammar(json::parse(schema_str), true), passing_strings, failing_strings);
 }
@@ -879,6 +921,18 @@ static void test_failure_left_recursion() {
         empty ::= "blah" | )""";
     assert(test_build_grammar_fails(hardest_str));
 
+    const auto chain = [](int n) {
+        std::string s = "root ::= r0\n";
+        for (int i = 0; i < n; i++) {
+            s += "r" + std::to_string(i) + " ::= r" + std::to_string(i + 1) + "\n";
+        }
+        return s + "r" + std::to_string(n) + " ::= \"a\"\n";
+    };
+    llama_grammar * grammar = build_grammar(chain(100));
+    assert(grammar != nullptr);
+    llama_grammar_free_impl(grammar);
+    assert(test_build_grammar_fails(chain(1000)));
+
     fprintf(stderr, "  ✅︎ Passed\n");
 }
 
@@ -918,7 +972,7 @@ static void test_json_schema() {
     // Otherwise, this test structure is the same.
 
     test_schema(
-        "empty schema (object)",
+        "empty schema (any value)",
         // Schema
         R"""(
             {}
@@ -927,14 +981,16 @@ static void test_json_schema() {
         {
             R"""({})""",
             R"""({"foo": "bar"})""",
-        },
-        // Failing strings
-        {
-            "",
             "[]",
             "null",
             R"""("")""",
             "true",
+        },
+        // Failing strings
+        {
+            "",
+            R"""({"foo"})""",
+            "foo",
         }
     );
 
@@ -1402,6 +1458,118 @@ static void test_json_schema() {
         }
     );
 
+    test_schema(
+        "optional props declared before a required one: declared order and required-first both accepted",
+        // Schema
+        R"""({
+            "properties": {
+                "name": {"type": "string"},
+                "nickname": {"type": "string"},
+                "age": {"type": "integer"},
+                "city": {"type": "string"}
+            },
+            "required": ["name", "city"],
+            "additionalProperties": false
+        })""",
+        // Passing strings
+        {
+            // both optional fields skipped
+            R"""({"name": "Ana", "city": "Lima"})""",
+            // only the first optional field
+            R"""({"name": "Ana", "nickname": "An", "city": "Lima"})""",
+            // only the second optional field
+            R"""({"name": "Ana", "age": 30, "city": "Lima"})""",
+            // both optional fields
+            R"""({"name": "Ana", "nickname": "An", "age": 30, "city": "Lima"})""",
+            // required-first order (what stock llama.cpp produced) is still accepted
+            R"""({"name": "Ana", "city": "Lima", "nickname": "An"})""",
+            R"""({"name": "Ana", "city": "Lima", "nickname": "An", "age": 30})""",
+            R"""({"name": "Ana", "city": "Lima", "age": 30})""",
+        },
+        // Failing strings
+        {
+            // the same optional field twice
+            R"""({"name": "Ana", "nickname": "An", "city": "Lima", "nickname": "An"})""",
+            // optional fields out of order
+            R"""({"name": "Ana", "age": 30, "nickname": "An", "city": "Lima"})""",
+            // missing a required field
+            R"""({"name": "Ana", "nickname": "An"})""",
+            // first required field not first
+            R"""({"nickname": "An", "name": "Ana", "city": "Lima"})""",
+        }
+    );
+
+    test_schema(
+        "optional props before a required one, additionalProperties not set",
+        // Schema
+        R"""({
+            "properties": {
+                "name": {"type": "string"},
+                "nickname": {"type": "string"},
+                "city": {"type": "string"}
+            },
+            "required": ["name", "city"]
+        })""",
+        // Passing strings
+        {
+            R"""({"name": "Ana", "city": "Lima"})""",
+            R"""({"name": "Ana", "nickname": "An", "city": "Lima"})""",
+            R"""({"name": "Ana", "city": "Lima", "nickname": "An"})""",
+        },
+        // Failing strings
+        {
+            R"""({"name": "Ana", "nickname": "An", "city": "Lima", "nickname": "An"})""",
+            R"""({"name": "Ana", "nickname": "An"})""",
+        }
+    );
+
+    test_schema(
+        "optional first property keeps required-first order (unchanged)",
+        // Schema
+        R"""({
+            "properties": {
+                "nickname": {"type": "string"},
+                "name": {"type": "string"},
+                "city": {"type": "string"}
+            },
+            "required": ["name", "city"],
+            "additionalProperties": false
+        })""",
+        // Passing strings
+        {
+            R"""({"name": "Ana", "city": "Lima"})""",
+            R"""({"name": "Ana", "city": "Lima", "nickname": "An"})""",
+        },
+        // Failing strings
+        {
+            R"""({"nickname": "An", "name": "Ana", "city": "Lima"})""",
+        }
+    );
+
+    test_schema(
+        "optional before required with additional properties keeps required-first order (unchanged)",
+        // Schema
+        R"""({
+            "properties": {
+                "name": {"type": "string"},
+                "nickname": {"type": "string"},
+                "city": {"type": "string"}
+            },
+            "required": ["name", "city"],
+            "additionalProperties": true
+        })""",
+        // Passing strings
+        {
+            R"""({"name": "Ana", "city": "Lima"})""",
+            R"""({"name": "Ana", "city": "Lima", "nickname": "An"})""",
+            R"""({"name": "Ana", "city": "Lima", "extra": 1})""",
+        },
+        // Failing strings
+        {
+            R"""({"name": "Ana", "nickname": "An", "city": "Lima"})""",
+        }
+    );
+
     // NOTE: Example from https://json-schema.org/learn/getting-started-step-by-step#define-required-properties
     test_schema(
         "required props",
@@ -1474,6 +1642,25 @@ static void test_json_schema() {
             // R"""({"productId": 1, "productName": "A green door", "price": 12.50, "tags": ["home", "green", "home"]})""",
         }
     );
+
+    // the deepest schema of json_schema_to_grammar must give a valid grammar
+    std::string deep_schema;
+    for (int i = 0; i < 127; i++) {
+        deep_schema += R"({"type": "array", "items": )";
+    }
+    deep_schema += R"({"type": "string"})" + std::string(127, '}');
+    test_schema(
+        "127 nested arrays",
+        deep_schema,
+        // Passing strings
+        {
+            std::string(127, '[') + R"("a")" + std::string(127, ']'),
+        },
+        // Failing strings
+        {
+            std::string(126, '[') + R"("a")" + std::string(126, ']'),
+        }
+    );
 }
 
 int main() {
@@ -1488,6 +1675,7 @@ int main() {
     test_failure_missing_root_symbol();
     test_custom_root_symbol_check();
     test_json_schema();
+    test_clone();
     fprintf(stdout, "All tests passed.\n");
     return 0;
 }

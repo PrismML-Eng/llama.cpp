@@ -431,16 +431,28 @@ extern "C" {
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
         // Prism-private Q2_0 at group size 128 (upstream Q2_0 is group 64). High id so it
-        // slots above upstream types; type_traits is sized to COUNT (143) with 43..141 unused.
+        // slots above upstream types; type_traits is sized to COUNT (146) with 43..141 unused.
         GGML_TYPE_PQ2_0 = 142,
         GGML_TYPE_PTQ1_0 = 143, // Prism-private ternary, group 128
-        GGML_TYPE_COUNT   = 144,
+        GGML_TYPE_PQ2_0M = 145, // Prism min/max (range-scale) Q2_0, group 128, KV-only
+        GGML_TYPE_COUNT   = 146,
     };
 
-    // precision
+    // [TAG_GGML_PREC]
+    // this enum is used to declare the allowed numerical precision/data-types types that can be used during the compute of an op
+    // the declared types can be:
+    //  - result accumulation type
+    //  - source tensor data representation type
+    //  - etc.
+    // the precision parameters are stored as ggml_tensor.op_params to the respective ops
     enum ggml_prec {
-        GGML_PREC_DEFAULT =  0, // stored as ggml_tensor.op_params, 0 by default
-        GGML_PREC_F32     = 10,
+        GGML_PREC_UNDEFINED = 0,
+        GGML_PREC_DEFAULT   = 0,  // note: deprecated, use GGML_PREC_UNDEFINED
+        GGML_PREC_F32       = 10,
+        GGML_PREC_BF16      = 15,
+        GGML_PREC_F16       = 20,
+        GGML_PREC_Q8        = 30,
+        GGML_PREC_Q4        = 40,
     };
 
     // op hint
@@ -580,6 +592,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_TOP_K_MASK,
 
         GGML_OP_UNARY,
 
@@ -595,6 +608,8 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+
+        GGML_OP_GATED_DELTA_NET_REPLAY, // ARC-LAB: appended last so the existing op numbers do not move
 
         GGML_OP_COUNT,
     };
@@ -633,6 +648,7 @@ extern "C" {
         GGML_GLU_OP_SWIGLU_OAI,
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
+        GGML_GLU_OP_SWIGLU_CLAMP,
 
         GGML_GLU_OP_COUNT,
     };
@@ -919,6 +935,7 @@ extern "C" {
             enum   ggml_type      type);
 
     // dst[i0, i1, i2] = a[i0, i1, i2] + b[i0, ids[i1, i2]]
+    // an id of -1 adds nothing: dst[i0, i1, i2] = a[i0, i1, i2]
     GGML_API struct ggml_tensor * ggml_add_id(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -1373,6 +1390,12 @@ extern "C" {
             float                 alpha,
             float                 limit);
 
+    GGML_API struct ggml_tensor * ggml_swiglu_clamp(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 limit);
+
     // normalize along rows
     GGML_API struct ggml_tensor * ggml_norm(
             struct ggml_context * ctx,
@@ -1428,6 +1451,52 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 eps);
 
+    // [TAG_GGML_PREC]
+    // set the minimum required accumulator type for the implementation to use during the compute
+    // for example:
+    //  - GGML_PREC_F32  - requires accumulation of the results in F32
+    //  - GGML_PREC_BF16 - can accumulate the results in BF16, F32
+    //  - GGML_PREC_F16  - can accumulate the results in F16, F32
+    //  - GGML_PREC_Q8   - not allowed
+    //  - GGML_PREC_Q4   - not allowed
+    //
+    // return false on faliure
+    GGML_API bool ggml_prec_set_acc(
+            struct ggml_tensor * a,
+            enum ggml_prec       prec);
+
+    // [TAG_GGML_PREC]
+    // set the smallest rank that the implementation can use to internally convert the src[idx] data to
+    // ranks in decreasing order:
+    //  - GGML_PREC_F32  - GGML_TYPE_F32
+    //  - GGML_PREC_BF16 - GGML_TYPE_BF16
+    //  - GGML_PREC_F16  - GGML_TYPE_F16,
+    //  - GGML_PREC_Q8   - GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, GGML_TYPE_Q8_K, etc.
+    //  - GGML_PREC_Q4   - GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_NVFP4, GGML_TYPE_MXFP4, etc.
+    //
+    // for example:
+    //   - ggml_prec_set_src(a, GGML_PREC_Q8, 1):
+    //     - allows the implementation to quantize F32, BF16, F16 data of src[1] down to GGML_TYPE_Q8_0
+    //     - cannot quantize it down to GGML_TYPE_Q4_0 or GGML_TYPE_NVFP4
+    //   - ggml_prec_set_src(a, GGML_PREC_Q4, 1):
+    //     - allows the implementation to quantize F32, BF16, F16 data of src[1] down to 4-bit datatypes such as GGML_TYPE_Q4_K, GGML_TYPE_NVFP4 etc.
+    //
+    // return false on faliure
+    GGML_API bool ggml_prec_set_src(
+            struct ggml_tensor * a,
+            enum ggml_prec       prec,
+            int                  idx);
+
+    // [TAG_GGML_PREC]
+    // get the accumulator / src[idx] precision set by the functions above
+    // return GGML_PREC_UNDEFINED when the op does not carry the requested precision
+    GGML_API enum ggml_prec ggml_prec_get_acc(
+            const struct ggml_tensor * a);
+
+    GGML_API enum ggml_prec ggml_prec_get_src(
+            const struct ggml_tensor * a,
+            int                        idx);
+
     // A: k columns, n rows => [ne03, ne02, n, k]
     // B: k columns, m rows  (i.e. we transpose it internally) => [ne03 * x, ne02 * y, m, k]
     // result is n columns, m rows => [ne03 * x, ne02 * y, m, n]
@@ -1438,9 +1507,10 @@ extern "C" {
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
-    GGML_API void ggml_mul_mat_set_prec(
+    GGML_DEPRECATED(GGML_API void ggml_mul_mat_set_prec(
             struct ggml_tensor * a,
-            enum ggml_prec       prec);
+            enum ggml_prec       prec),
+        "use ggml_prec_set_acc() instead");
 
     // change the hint of a matrix multiplication
     GGML_API void ggml_mul_mat_set_hint(
@@ -1448,6 +1518,12 @@ extern "C" {
             enum ggml_op_hint    hint);
 
     // indirect matrix multiplication
+    // an id of -1 skips the slot and zeroes the matching row of the result
+    //
+    // [TAG_MUL_MAT_ID_DUPLICATE_ID]
+    // note: this op has undefined behaviour if a given `a` is referenced more than once for a given `b`
+    //       (i.e. duplicate experts per token are not guaranteed to be supported in all backends)
+    // TODO: add backend support: https://github.com/ggml-org/llama.cpp/pull/29998#issuecomment-6153742533
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
             struct ggml_context * ctx,
             struct ggml_tensor  * as,
@@ -2445,12 +2521,19 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
-    GGML_API void ggml_flash_attn_ext_set_prec(
+    GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
-            enum ggml_prec       prec);
+            enum ggml_prec       prec),
+        "use ggml_prec_set_acc() instead");
 
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
+
+    // Use finite mask entries as a sparse K/V set. Set 0 to disable.
+    // n_kv_max must bound the number of finite entries in every mask row.
+    GGML_API void ggml_flash_attn_ext_set_n_kv_max(
+            struct ggml_tensor * a,
+            int32_t              n_kv_max);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
@@ -2593,6 +2676,7 @@ extern "C" {
     // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K state
     // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
     // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
+    // when n_tokens > K only slot 0 is guaranteed; backends may leave slots 1..K-1 unwritten.
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2627,6 +2711,34 @@ extern "C" {
             struct ggml_tensor  * gdn,
             struct ggml_tensor  * dt_bias,
             struct ggml_tensor  * a);
+
+    // ARC-LAB: gated delta net with rollback by replay (independent implementation of the technique described by
+    // llamADALL). Same recurrence as ggml_gated_delta_net (scalar gate only), but instead of K state snapshots the op
+    // keeps ONE base state plus, for each later token, its update record: the per-token update is
+    // S <- g * S + k (x) delta, so a record is (delta [S_v], k [S_v], g [1]) per head, R = H*(2*S_v + 1) floats:
+    //   record = [ delta: S_v*H | k: S_v*H (head h holds k of head h % H_k) | g: H ]   (g = the decay factor exp(gate))
+    //
+    //   q, k, v, g, beta : as ggml_gated_delta_net (g: [1, H, n_tokens, n_seqs])
+    //   state : [S_v, S_v, H, n_seqs] stored base state
+    //   rec   : F32 [R*(K-1), 2, n_seqs] stored records, two banks per seq (a pass reads one bank, the caller
+    //           stores the new records in the other one)
+    //   ctrl  : I32 [2, n_seqs] = {n_rec, bank}: records 0..n_rec-1 of `bank` are first re-applied to state
+    //
+    // output, packed: [ attn scores S_v*H*n_tokens*n_seqs | base D*n_seqs | records (K-1)*R*n_seqs ], D = S_v*S_v*H
+    //   with m = min(n_tokens - 1, K - 1): base = state after token n_tokens-1-m (the oldest state a rollback of up
+    //   to m tokens can need), record j = token n_tokens-m+j for j < m; records m..K-2 are left unwritten.
+    //   Rolling back r <= m tokens = re-applying m - r records to base on the next call.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_replay(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * rec,
+            struct ggml_tensor  * ctrl,
+            int                   K);
 
     // DSA lightning indexer
     //
@@ -2672,11 +2784,21 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * weights);
 
+    // hc_pre with a per-element gate (Qwen3.8-Flash-Next): gate [n_embd, hc, n_tokens]
+    //   result[i, t] = scale*sum_h x[i, h, t]*sigmoid(gate[i, h, t])
+    //
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_pre_gated(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gate,
+            float                 scale);
+
     // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens],
     //          post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]
     //          -> [n_embd, hc, n_tokens]
     //   result[i, dst, t] = x[i, t]*post[dst, t]
     //                       + sum_src residual[i, src, t]*comb[dst, src, t]
+    //   comb == NULL uses the identity: result[i, dst, t] = x[i, t]*post[dst, t] + residual[i, dst, t]
     //
     GGML_API struct ggml_tensor * ggml_dsv4_hc_post(
             struct ggml_context * ctx,
@@ -2684,6 +2806,26 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // top-k sparse attention mask: keep the mask cells of the live picks and the extra cells, set the rest to -inf
+    //
+    // mask:   [n_kv,    m1,  m2,  m3]  f16 or f32, broadcast to the rows of top_k
+    // top_k:  [n_top,   ne1, ne2, ne3] i32, picks of each row
+    // score:  [n_pick,  ne1, ne2, ne3] f32, can be NULL: a pick is live when its score is above -inf, else every pick is live
+    // blocks: [n_blk,   n_pick]        i32, can be NULL: the member cells of each pick, else a pick is a cell
+    // extra:  [n_extra, ne1, ne2, ne3] i32, can be NULL: cells of each row kept without a pick
+    // res:    [n_kv,    ne1, ne2, ne3] same type as mask
+    //
+    // res[c, i] = mask[c, i % m] when c is a cell of a live pick of row i or an extra cell of row i, else -inf
+    // picks and cells out of range are skipped
+    //
+    GGML_API struct ggml_tensor * ggml_top_k_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * top_k,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * blocks,
+            struct ggml_tensor  * extra);
 
     // custom operators
 

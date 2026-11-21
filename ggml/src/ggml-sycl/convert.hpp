@@ -21,6 +21,11 @@ typedef to_t_sycl_t<float>      to_fp32_sycl_t;
 typedef to_t_sycl_t<sycl::half> to_fp16_sycl_t;
 
 to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst);
+
+// PQ2_0 / PTQ1_0 rows -> packed s4 (low nibble = even element) + f32 scales laid out [group][row].
+// All their values (-1..2) are exact in s4.
+void ggml_sycl_quant_to_s4(ggml_type type, bool reordered, const void * vx, uint8_t * w4, float * scales,
+                           int64_t nrows, int64_t ncols, dpct::queue_ptr stream);
 to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor * dst);
 
 #ifdef GGML_SYCL_HAS_BF16

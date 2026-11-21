@@ -2,6 +2,7 @@
 #include "common.cuh"
 #include "unary.cuh"
 #include "mmvf.cuh"
+#include "mmf.cuh"
 #include "convert.cuh"
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
@@ -56,6 +57,7 @@ static __global__ void mul_mat_vec_f(
     bool use_bias = false;
     bool use_gate_bias = false;
     ggml_glu_op glu_op = ggml_glu_op::GGML_GLU_OP_SWIGLU;
+    float glu_limit = 0.0f;
     const T * gate_x = nullptr;
     const float * x_bias = nullptr;
     const float * gate_bias = nullptr;
@@ -65,6 +67,7 @@ static __global__ void mul_mat_vec_f(
         use_bias = fusion.x_bias != nullptr;
         use_gate_bias = fusion.gate_bias != nullptr;
         glu_op = fusion.glu_op;
+        glu_limit = fusion.glu_limit;
 
         if (use_gate) {
             gate_x = static_cast<const T *>(fusion.gate);
@@ -365,6 +368,9 @@ static __global__ void mul_mat_vec_f(
                     value = ggml_cuda_op_swiglu_oai_single(gate_value, value);
                     break;
                 }
+                case GGML_GLU_OP_SWIGLU_CLAMP:
+                    value = ggml_cuda_op_swiglu_clamp_single(gate_value, value, glu_limit);
+                    break;
                 default:
                     break;
             }
@@ -374,7 +380,7 @@ static __global__ void mul_mat_vec_f(
     dst[tid*stride_col_dst + row] = value;
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, gate_x, x_bias, gate_bias, sumf_gate);
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, glu_limit, gate_x, x_bias, gate_bias, sumf_gate);
     }
 }
 
@@ -498,9 +504,8 @@ void launch_mul_mat_vec_f_cuda(
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
         } break;
-        default: {
+        default:
             GGML_ABORT("fatal error");
-        } break;
     }
 }
 
@@ -597,7 +602,6 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
             break;
         default:
             GGML_ABORT("fatal error");
-            break;
     }
 }
 
@@ -675,6 +679,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             fusion_local.gate_bias = fusion->gate_bias->data;
         }
         fusion_local.glu_op = fusion->glu_op;
+        fusion_local.glu_limit = fusion->glu_limit;
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -783,7 +788,7 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
-bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
+bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
     if (src0_ne[0] % 2 != 0) {
         return false;
     }
@@ -804,6 +809,11 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
         case GGML_TYPE_F32:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 if (ampere_mma_available(cc)) {
+                    // A thin src0 (e.g. the 32-row GDN ssm_alpha/ssm_beta projections) gives the tiled mul_mat_f
+                    // only a block or two; the vector kernel is several times faster up to its batch limit.
+                    if (src0_ne[1] <= 512 && ne11 <= MMVF_MAX_BATCH_SIZE) {
+                        return true;
+                    }
                     return ne11 <= 3;
                 }
                 if (cc >= GGML_CUDA_CC_TURING) {
@@ -814,12 +824,16 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 if (fp32_mma_hardware_available(cc)) {
                     return ne11 <= 3;
                 }
-                return ne11 <= 8;
+                return ne11 <= MMVF_MAX_BATCH_SIZE;
             }
-            return ne11 <= 8;
+            return ne11 <= MMVF_MAX_BATCH_SIZE;
         case GGML_TYPE_F16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                // MMF needs full row tiles, for other row counts MMVF still beats cuBLAS at small batch size
+                if (src0_small && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
+                    return ne11 <= MMVF_MAX_BATCH_SIZE;
+                }
                 if (ampere_mma_available(cc)) {
                     if (ggml_cuda_batch_invariant()) {
                         return src0_small && ne11 <= MMVF_MAX_BATCH_SIZE;
@@ -832,8 +846,11 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 if (fp16_mma_hardware_available(cc)) {
                     return src0_small && ne11 <= 3;
                 }
-                return ne11 <= 8;
+                return ne11 <= MMVF_MAX_BATCH_SIZE;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+                if (GGML_CUDA_CC_IS_RDNA(cc) && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
+                    return ne11 <= MMVF_MAX_BATCH_SIZE;
+                }
                 if (fp16_mma_hardware_available(cc)) {
                     if (GGML_CUDA_CC_IS_RDNA3(cc)) {
                         return ne11 <= 3;
@@ -843,12 +860,16 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                     }
                     return ne11 <= 2;
                 }
-                return ne11 <= 8;
+                return ne11 <= MMVF_MAX_BATCH_SIZE;
             }
-            return ne11 <= 8;
+            return ne11 <= MMVF_MAX_BATCH_SIZE;
         case GGML_TYPE_BF16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                // MMF needs full row tiles, for other row counts MMVF still beats cuBLAS at small batch size
+                if (src0_small && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
+                    return ne11 <= MMVF_MAX_BATCH_SIZE;
+                }
                 if (ampere_mma_available(cc)) {
                     // a few dozen rows (the qwen35 gated-delta-net gate projections) run faster as a
                     // mat-vec than through the tensor-core path at 2 to 8 columns: 3.4 vs 10.5 us on an RTX 3060
@@ -863,15 +884,87 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 if (bf16_mma_hardware_available(cc)) {
                     return src0_small && ne11 <= 3;
                 }
-                return ne11 <= 8;
+                return ne11 <= MMVF_MAX_BATCH_SIZE;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+                if (GGML_CUDA_CC_IS_RDNA(cc) && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
+                    return ne11 <= MMVF_MAX_BATCH_SIZE;
+                }
                 if (bf16_mma_hardware_available(cc)) {
                     return ne11 <= 3;
                 }
-                return ne11 <= 8;
+                return ne11 <= MMVF_MAX_BATCH_SIZE;
             }
-            return ne11 <= 8;
+            return ne11 <= MMVF_MAX_BATCH_SIZE;
         default:
             return false;
     }
+}
+
+// Two independent mat-vecs that share src1 and the weight type, shape and strides, as one launch of the same kernel:
+// the second weight becomes channel 1 (its offset from the first is the channel stride, src1 is broadcast with channel
+// stride 0). With 1..MMVF_MAX_BATCH_SIZE src1 columns (decode and speculative verify widths) every row and column runs
+// the same template instance (ncols_dst = the column count) with the same block size as ggml_cuda_mul_mat_vec_f would
+// for either product alone, so the results are bit-identical. Returns false (nothing launched) when the pair does not
+// qualify.
+bool ggml_cuda_mul_mat_vec_f_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst0, ggml_tensor * dst1) {
+    const ggml_tensor * a    = dst0->src[0];
+    const ggml_tensor * b    = dst1->src[0];
+    const ggml_tensor * src1 = dst0->src[1];
+    if (dst1->src[1] != src1 || a->type != b->type || !ggml_are_same_shape(a, b) || !ggml_are_same_stride(a, b) ||
+            (a->type != GGML_TYPE_F32 && a->type != GGML_TYPE_F16 && a->type != GGML_TYPE_BF16) ||
+            src1->type != GGML_TYPE_F32 || dst0->type != GGML_TYPE_F32 || dst1->type != GGML_TYPE_F32 ||
+            a->ne[2] != 1 || a->ne[3] != 1 || src1->ne[1] < 1 || src1->ne[1] > MMVF_MAX_BATCH_SIZE ||
+            src1->ne[2] != 1 || src1->ne[3] != 1 || src1->nb[0] != sizeof(float) ||
+            src1->nb[1] % (2*sizeof(float)) != 0 ||
+            !ggml_are_same_shape(dst0, dst1) || !ggml_is_contiguous(dst0) || !ggml_is_contiguous(dst1) ||
+            dst0->ne[1] != src1->ne[1] || dst0->ne[2] != 1 || dst0->ne[3] != 1 ||
+            a->nb[0] != ggml_type_size(a->type)) {
+        return false;
+    }
+    const size_t  ts = ggml_type_size(a->type);
+    const int64_t dx = (const char *) b->data - (const char *) a->data;
+    const int64_t dd = (const char *) dst1->data - (const char *) dst0->data;
+    if (dx % (int64_t) ts != 0 || dd % (int64_t) sizeof(float) != 0 || dx == 0 || dd == 0 ||
+            std::abs(dx / (int64_t) ts) > INT_MAX || std::abs(dd / (int64_t) sizeof(float)) > INT_MAX) {
+        return false;
+    }
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const enum ggml_prec prec = fast_fp16_available(cc) ? ggml_prec(dst0->op_params[0]) : GGML_PREC_F32;
+    if (prec != (fast_fp16_available(cc) ? ggml_prec(dst1->op_params[0]) : GGML_PREC_F32)) {
+        return false;
+    }
+
+    const int64_t ne00 = a->ne[0];
+    const int64_t ne01 = a->ne[1];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t s01  = a->nb[1] / ts;
+    const int64_t s11  = src1->nb[1] / sizeof(float);
+    const int64_t s1   = dst0->nb[1] / sizeof(float);
+    const int64_t s03  = a->nb[3] / ts;
+    const int64_t s13  = src1->nb[3] / sizeof(float);
+    const int64_t s3   = dst0->nb[3] / sizeof(float);
+
+    const float * src1_d = (const float *) src1->data;
+    float       * dst_d  = (float *) dst0->data;
+    ggml_cuda_mm_fusion_args_device fusion{};
+
+    switch (a->type) {
+        case GGML_TYPE_F32:
+            mul_mat_vec_f_cuda((const float *) a->data, src1_d, nullptr, fusion, dst_d, ne00, ne01, ne11, s01, s11, s1,
+                2, 2, 2, dx / (int64_t) ts, 0, dd / (int64_t) sizeof(float), 1, 1, s03, s13, s3, 0, prec, ctx.stream());
+            break;
+        case GGML_TYPE_F16:
+            mul_mat_vec_f_cuda((const half *) a->data, src1_d, nullptr, fusion, dst_d, ne00, ne01, ne11, s01, s11, s1,
+                2, 2, 2, dx / (int64_t) ts, 0, dd / (int64_t) sizeof(float), 1, 1, s03, s13, s3, 0, prec, ctx.stream());
+            break;
+        case GGML_TYPE_BF16:
+            mul_mat_vec_f_cuda((const nv_bfloat16 *) a->data, src1_d, nullptr, fusion, dst_d, ne00, ne01, ne11, s01,
+                s11, s1, 2, 2, 2, dx / (int64_t) ts, 0, dd / (int64_t) sizeof(float), 1, 1, s03, s13, s3, 0, prec,
+                ctx.stream());
+            break;
+        default:
+            return false;
+    }
+    return true;
 }

@@ -2,8 +2,9 @@
 
 #include "llama.h"
 
-#include <unordered_map>
+#include <algorithm>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #define LLAMA_NGRAM_MIN    1
@@ -99,3 +100,62 @@ common_ngram_cache common_ngram_cache_load(const std::string & filename);
 // ngram_cache_target: the ngram cache to which to add the information from ngram_cache_add.
 // ngram_cache_add:    the ngram cache to add to ngram_cache_target.
 void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ngram_cache & ngram_cache_add);
+
+// Prompt-copy proposals only; the target must verify every returned token.
+inline std::vector<llama_token> common_prompt_lookup_draft(const std::vector<llama_token> & prompt,
+                                                           const std::vector<llama_token> & history,
+                                                           llama_token                      anchor,
+                                                           int                              depth) {
+    if (depth <= 0 || (size_t) depth >= prompt.size() || history.size() < prompt.size() ||
+        !std::equal(prompt.begin(), prompt.end(), history.begin())) {
+        return {};
+    }
+    const size_t n      = (size_t) depth;
+    size_t       chosen = prompt.size();
+    if (history.size() == prompt.size()) {
+        for (size_t c = 1; c < prompt.size() - n; ++c) {
+            if (prompt[c - 1] == prompt.back() && prompt[c] == anchor) {
+                if (chosen != prompt.size()) {
+                    return {};
+                }
+                chosen = c + 1;
+            }
+        }
+    } else {
+        auto committed = history;
+        committed.push_back(anchor);
+        const size_t longest = std::min({ size_t(64), committed.size() - n, prompt.size() - n });
+        if (longest < 16) {
+            return {};
+        }
+        size_t best      = 15;
+        bool   ambiguous = false;
+        for (size_t end = 16; end <= prompt.size() - n; ++end) {
+            if (prompt[end - 1] != anchor) {
+                continue;
+            }
+            size_t length = 1;
+            while (length < std::min(longest, end) &&
+                   prompt[end - length - 1] == committed[committed.size() - length - 1]) {
+                ++length;
+            }
+            if (length < 16 || length < best) {
+                continue;
+            }
+            if (length > best) {
+                best      = length;
+                chosen    = end;
+                ambiguous = false;
+            } else if (!std::equal(prompt.begin() + chosen, prompt.begin() + chosen + n, prompt.begin() + end)) {
+                ambiguous = true;
+            }
+        }
+        if (ambiguous) {
+            return {};
+        }
+    }
+    if (chosen == prompt.size()) {
+        return {};
+    }
+    return { prompt.begin() + chosen, prompt.begin() + chosen + n };
+}

@@ -83,10 +83,10 @@ void llama_model_dspark::load_arch_tensors(llama_model_loader & ml) {
         // Account for the local tensor without allocating or reading its weights.
         create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab_dspark }, TENSOR_NOT_REQUIRED | TENSOR_SKIP);
         output = source.output;
-        hadamard_weight_blocks.erase("output.weight");
-        const auto rotation = source.hadamard_rotations.find(output);
-        if (rotation != source.hadamard_rotations.end()) {
-            hadamard_rotations.emplace(output, rotation->second);
+        hdmd.weight_blocks.erase("output.weight");
+        const auto rotation = source.hdmd.rot.find(output);
+        if (rotation != source.hdmd.rot.end()) {
+            hdmd.rot.emplace(output, rotation->second);
         }
     } else {
         output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab_dspark }, TENSOR_NOT_REQUIRED);
@@ -436,7 +436,7 @@ llama_model_dspark::graph::graph(const llama_model & model, const llm_graph_para
         if ((top_k_env && (top_k_end == top_k_env || *top_k_end != '\0')) || top_k < 0 || top_k > model.output->ne[1]) {
             throw std::runtime_error("DSPARK_HEAD_TOP_K is outside the vocabulary");
         }
-        if (top_k > 0 && model.hadamard_rotations.count(model.output)) {
+        if (top_k > 0 && model.hdmd.rot.count(model.output)) {
             throw std::runtime_error("DSpark restricted head does not support folded output weights");
         }
         if (top_k > 0 && (model.output_s || (loras && !loras->empty()))) {

@@ -40,6 +40,7 @@ enum handcrafted_file_type {
     HANDCRAFTED_TENSORS_ZERO_DIM           =  35 + offset_has_tensors,
     HANDCRAFTED_TENSORS_NE_TOO_BIG         =  40 + offset_has_tensors,
     HANDCRAFTED_TENSORS_NBYTES_TOO_BIG     =  45 + offset_has_tensors,
+    HANDCRAFTED_TENSORS_NBYTES_PAD_WRAP    =  46 + offset_has_tensors,
     HANDCRAFTED_TENSORS_BAD_TYPE           =  50 + offset_has_tensors,
     HANDCRAFTED_TENSORS_BAD_OFFSET         =  60 + offset_has_tensors,
     HANDCRAFTED_TENSORS_DUPLICATE_NAME     =  70 + offset_has_tensors,
@@ -47,6 +48,7 @@ enum handcrafted_file_type {
     HANDCRAFTED_TENSORS_INCONSISTENT_ALIGN =  80 + offset_has_tensors,
     HANDCRAFTED_TENSORS_SUCCESS            = 800 + offset_has_tensors,
     HANDCRAFTED_TENSORS_CUSTOM_ALIGN       = 810 + offset_has_tensors,
+    HANDCRAFTED_TENSORS_Q2_0_ODD_BLOCK     = 820 + offset_has_tensors,
 
     HANDCRAFTED_DATA_NOT_ENOUGH_DATA       =  10 + offset_has_data,
     HANDCRAFTED_DATA_BAD_ALIGN             =  15 + offset_has_data,
@@ -80,6 +82,7 @@ static std::string handcrafted_file_type_name(const enum handcrafted_file_type h
         case HANDCRAFTED_TENSORS_ZERO_DIM:           return "TENSORS_ZERO_DIM";
         case HANDCRAFTED_TENSORS_NE_TOO_BIG:         return "TENSORS_NE_TOO_BIG";
         case HANDCRAFTED_TENSORS_NBYTES_TOO_BIG:     return "TENSORS_NBYTES_TOO_BIG";
+        case HANDCRAFTED_TENSORS_NBYTES_PAD_WRAP:    return "TENSORS_NBYTES_PAD_WRAP";
         case HANDCRAFTED_TENSORS_BAD_TYPE:           return "TENSORS_BAD_TYPE";
         case HANDCRAFTED_TENSORS_BAD_OFFSET:         return "TENSORS_BAD_OFFSET";
         case HANDCRAFTED_TENSORS_DUPLICATE_NAME:     return "TENSORS_DUPLICATE_NAME";
@@ -87,6 +90,7 @@ static std::string handcrafted_file_type_name(const enum handcrafted_file_type h
         case HANDCRAFTED_TENSORS_INCONSISTENT_ALIGN: return "TENSORS_INCONSISTENT_ALIGN";
         case HANDCRAFTED_TENSORS_SUCCESS:            return "TENSORS_SUCCESS";
         case HANDCRAFTED_TENSORS_CUSTOM_ALIGN:       return "TENSORS_CUSTOM_ALIGN";
+        case HANDCRAFTED_TENSORS_Q2_0_ODD_BLOCK:     return "TENSORS_Q2_0_ODD_BLOCK";
 
         case HANDCRAFTED_DATA_NOT_ENOUGH_DATA:       return "DATA_NOT_ENOUGH_DATA";
         case HANDCRAFTED_DATA_BAD_ALIGN:             return "DATA_BAD_ALIGN";
@@ -116,7 +120,7 @@ static bool expect_context_not_null(const enum handcrafted_file_type hft) {
 
 typedef std::pair<enum ggml_type, std::array<int64_t, GGML_MAX_DIMS>> tensor_config_t;
 
-static std::vector<tensor_config_t> get_tensor_configs(std::mt19937 & rng) {
+static std::vector<tensor_config_t> get_tensor_configs(std::mt19937 & rng, const enum handcrafted_file_type hft) {
     std::vector<tensor_config_t> tensor_configs;
     tensor_configs.reserve(100);
 
@@ -134,6 +138,12 @@ static std::vector<tensor_config_t> get_tensor_configs(std::mt19937 & rng) {
         }
 
         tensor_configs.push_back(std::make_pair(type, shape));
+    }
+
+    // deterministic case for the legacy Q2_0 layout hint: a group-64 row that is not
+    // PQ2_0-divisible must parse without depending on ggml_row_size asserts
+    if (hft == HANDCRAFTED_TENSORS_Q2_0_ODD_BLOCK && !tensor_configs.empty()) {
+        tensor_configs[0] = std::make_pair(GGML_TYPE_Q2_0, std::array<int64_t, GGML_MAX_DIMS>{64, 1, 1, 1});
     }
 
     return tensor_configs;
@@ -240,7 +250,7 @@ static FILE * get_handcrafted_file(const unsigned int seed, const enum handcraft
 
     std::vector<tensor_config_t> tensor_configs;
     if (hft >= offset_has_tensors) {
-        tensor_configs = get_tensor_configs(rng);
+        tensor_configs = get_tensor_configs(rng, hft);
     }
 
     if (hft == HANDCRAFTED_DATA_MEM_SIZE_OVERFLOW) {
@@ -248,6 +258,13 @@ static FILE * get_handcrafted_file(const unsigned int seed, const enum handcraft
 
         tensor_configs[0] = { GGML_TYPE_I8, { 0x7FFFFFFFFFFFFFC0, 1, 1, 1 } };
         tensor_configs[1] = { GGML_TYPE_I8, { 0x7FFFFFFFFFFFFFC0, 1, 1, 1 } };
+    }
+
+    if (hft == HANDCRAFTED_TENSORS_NBYTES_PAD_WRAP) {
+        tensor_configs.resize(1);
+        // F32 with ne = [4, 2^30-1, 2^30+1, 1] so ggml_nbytes = 2^64 - 16.
+        // this hits the GGML_PAD wrap window: pad wraps to 0.
+        tensor_configs[0] = { GGML_TYPE_F32, { 4, INT64_C(1073741823), INT64_C(1073741825), 1 } };
     }
 
     if (hft == HANDCRAFTED_HEADER_BAD_N_TENSORS) {
@@ -496,7 +513,7 @@ static FILE * get_handcrafted_file(const unsigned int seed, const enum handcraft
     return file;
 }
 
-static bool handcrafted_check_header(const gguf_context * gguf_ctx, const unsigned int seed, const bool has_kv, const bool has_tensors, const bool alignment_defined) {
+static bool handcrafted_check_header(const gguf_context * gguf_ctx, const unsigned int seed, const enum handcrafted_file_type hft, const bool has_kv, const bool has_tensors, const bool alignment_defined) {
     if (!gguf_ctx) {
         return false;
     }
@@ -505,7 +522,7 @@ static bool handcrafted_check_header(const gguf_context * gguf_ctx, const unsign
 
     std::vector<tensor_config_t> tensor_configs;
     if (has_tensors) {
-        tensor_configs = get_tensor_configs(rng);
+        tensor_configs = get_tensor_configs(rng, hft);
     }
     std::vector<std::pair<enum gguf_type, enum gguf_type>> kv_types;
     if (has_kv) {
@@ -527,7 +544,7 @@ static bool handcrafted_check_header(const gguf_context * gguf_ctx, const unsign
     return ok;
 }
 
-static bool handcrafted_check_kv(const gguf_context * gguf_ctx, const unsigned int seed, const bool has_tensors, const bool alignment_defined) {
+static bool handcrafted_check_kv(const gguf_context * gguf_ctx, const unsigned int seed, const enum handcrafted_file_type hft, const bool has_tensors, const bool alignment_defined) {
     if (!gguf_ctx) {
         return false;
     }
@@ -536,7 +553,7 @@ static bool handcrafted_check_kv(const gguf_context * gguf_ctx, const unsigned i
 
     std::vector<tensor_config_t> tensor_configs;
     if (has_tensors) {
-        tensor_configs = get_tensor_configs(rng);
+        tensor_configs = get_tensor_configs(rng, hft);
     }
 
     std::vector<std::pair<enum gguf_type, enum gguf_type>> kv_types = get_kv_types(rng);
@@ -647,14 +664,14 @@ static bool handcrafted_check_kv(const gguf_context * gguf_ctx, const unsigned i
     return ok;
 }
 
-static bool handcrafted_check_tensors(const gguf_context * gguf_ctx, const unsigned int seed) {
+static bool handcrafted_check_tensors(const gguf_context * gguf_ctx, const unsigned int seed, const enum handcrafted_file_type hft) {
     if (!gguf_ctx) {
         return false;
     }
 
     std::mt19937 rng(seed);
 
-    std::vector<tensor_config_t> tensor_configs = get_tensor_configs(rng);
+    std::vector<tensor_config_t> tensor_configs = get_tensor_configs(rng, hft);
 
     // Call get_kv_types to get the same RNG state:
     get_kv_types(rng);
@@ -708,14 +725,14 @@ static bool handcrafted_check_tensors(const gguf_context * gguf_ctx, const unsig
     return ok;
 }
 
-static bool handcrafted_check_tensor_data(const gguf_context * gguf_ctx, const unsigned int seed, FILE * file) {
+static bool handcrafted_check_tensor_data(const gguf_context * gguf_ctx, const unsigned int seed, const enum handcrafted_file_type hft, FILE * file) {
     if (!gguf_ctx) {
         return false;
     }
 
     std::mt19937 rng(seed);
 
-    std::vector<tensor_config_t> tensor_configs = get_tensor_configs(rng);
+    std::vector<tensor_config_t> tensor_configs = get_tensor_configs(rng, hft);
 
     bool ok = true;
 
@@ -774,6 +791,7 @@ static std::pair<int, int> test_handcrafted_file(const unsigned int seed) {
         HANDCRAFTED_TENSORS_ZERO_DIM,
         HANDCRAFTED_TENSORS_NE_TOO_BIG,
         HANDCRAFTED_TENSORS_NBYTES_TOO_BIG,
+        HANDCRAFTED_TENSORS_NBYTES_PAD_WRAP,
         HANDCRAFTED_TENSORS_BAD_TYPE,
         HANDCRAFTED_TENSORS_BAD_OFFSET,
         HANDCRAFTED_TENSORS_DUPLICATE_NAME,
@@ -781,6 +799,7 @@ static std::pair<int, int> test_handcrafted_file(const unsigned int seed) {
         HANDCRAFTED_TENSORS_INCONSISTENT_ALIGN,
         HANDCRAFTED_TENSORS_SUCCESS,
         HANDCRAFTED_TENSORS_CUSTOM_ALIGN,
+        HANDCRAFTED_TENSORS_Q2_0_ODD_BLOCK,
 
         HANDCRAFTED_DATA_NOT_ENOUGH_DATA,
         HANDCRAFTED_DATA_BAD_ALIGN,
@@ -840,7 +859,7 @@ static std::pair<int, int> test_handcrafted_file(const unsigned int seed) {
 
         if (expect_context_not_null(hft)) {
             printf("%s:   - check_header: ", __func__);
-            if (handcrafted_check_header(gguf_ctx, seed, hft >= offset_has_kv, hft >= offset_has_tensors, alignment_defined)) {
+            if (handcrafted_check_header(gguf_ctx, seed, hft, hft >= offset_has_kv, hft >= offset_has_tensors, alignment_defined)) {
                 printf("\033[1;32mOK\033[0m\n");
                 npass++;
             } else {
@@ -851,7 +870,7 @@ static std::pair<int, int> test_handcrafted_file(const unsigned int seed) {
 
         if (expect_context_not_null(hft) && hft >= offset_has_kv) {
             printf("%s:   - check_kv: ", __func__);
-            if (handcrafted_check_kv(gguf_ctx, seed, hft >= offset_has_tensors, alignment_defined)) {
+            if (handcrafted_check_kv(gguf_ctx, seed, hft, hft >= offset_has_tensors, alignment_defined)) {
                 printf("\033[1;32mOK\033[0m\n");
                 npass++;
             } else {
@@ -864,7 +883,7 @@ static std::pair<int, int> test_handcrafted_file(const unsigned int seed) {
         // so only assert that it loads without crashing; skip the exact-geometry comparison.
         if (expect_context_not_null(hft) && hft >= offset_has_tensors && hft != HANDCRAFTED_TENSORS_ZERO_DIM) {
             printf("%s:   - check_tensors: ", __func__);
-            if (handcrafted_check_tensors(gguf_ctx, seed)) {
+            if (handcrafted_check_tensors(gguf_ctx, seed, hft)) {
                 printf("\033[1;32mOK\033[0m\n");
                 npass++;
             } else {
@@ -875,7 +894,7 @@ static std::pair<int, int> test_handcrafted_file(const unsigned int seed) {
 
         if (expect_context_not_null(hft) && hft >= offset_has_data) {
             printf("%s:   - check_tensor_data: ", __func__);
-            if (handcrafted_check_tensor_data(gguf_ctx, seed, file)) {
+            if (handcrafted_check_tensor_data(gguf_ctx, seed, hft, file)) {
                 printf("\033[1;32mOK\033[0m\n");
                 npass++;
             } else {
@@ -1167,15 +1186,17 @@ static bool same_tensor_data(const struct ggml_context * orig, const struct ggml
 
 enum roundtrip_read_mode {
     ROUNDTRIP_READ_MODE_FILE,
+    ROUNDTRIP_READ_MODE_FILE_OFFSET, // GGUF embedded after some bytes of a bigger file
     ROUNDTRIP_READ_MODE_BUFFER,
     ROUNDTRIP_READ_MODE_CALLBACK,
 };
 
 static const char * roundtrip_read_mode_name(const roundtrip_read_mode mode) {
     switch (mode) {
-        case ROUNDTRIP_READ_MODE_FILE:     return "file";
-        case ROUNDTRIP_READ_MODE_BUFFER:   return "buffer";
-        case ROUNDTRIP_READ_MODE_CALLBACK: return "callback";
+        case ROUNDTRIP_READ_MODE_FILE:        return "file";
+        case ROUNDTRIP_READ_MODE_FILE_OFFSET: return "file_offset";
+        case ROUNDTRIP_READ_MODE_BUFFER:      return "buffer";
+        case ROUNDTRIP_READ_MODE_CALLBACK:    return "callback";
     }
 
     GGML_ABORT("fatal error");
@@ -1214,6 +1235,12 @@ static std::pair<int, int> test_roundtrip(
     GGML_ASSERT(file);
 #endif // _WIN32
 
+    // not a multiple of any alignment, so the data section padding must be relative to the GGUF start
+    const long prefix = read_mode == ROUNDTRIP_READ_MODE_FILE_OFFSET ? 7 : 0;
+    for (long i = 0; i < prefix; ++i) {
+        fputc(0xAB, file);
+    }
+
     gguf_write_to_file_ptr(gguf_ctx_0, file, only_meta);
     rewind(file);
 
@@ -1236,6 +1263,7 @@ static std::pair<int, int> test_roundtrip(
         };
         gguf_ctx_1 = gguf_init_from_callback(read_buffer_callback, &reader, 4096, 4ull << 30 /* 4GB */, gguf_params);
     } else {
+        GGML_ASSERT(fseek(file, prefix, SEEK_SET) == 0);
         gguf_ctx_1 = gguf_init_from_file_ptr(file, gguf_params);
     }
 
@@ -1448,6 +1476,11 @@ int main(int argc, char ** argv) {
 
         for (bool only_meta : {true, false}) {
             std::pair<int, int> result = test_roundtrip(dev, seed, only_meta, ROUNDTRIP_READ_MODE_FILE);
+            npass += result.first;
+            ntest += result.second;
+        }
+        {
+            std::pair<int, int> result = test_roundtrip(dev, seed, /*only_meta=*/false, ROUNDTRIP_READ_MODE_FILE_OFFSET);
             npass += result.first;
             ntest += result.second;
         }

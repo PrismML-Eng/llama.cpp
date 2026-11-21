@@ -12,8 +12,10 @@
 // Several columns (batched decode, ALU bound): passes of CG columns; per block decode all rows once per level, pack the trits and dot them with every column of the pass.
 
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
-#extension GL_EXT_integer_dot_product : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+// Enable integer dot product optionally: allows compilation on GPUs without hardware DP4A (e.g. AMD Polaris / Vega)
+#extension GL_EXT_integer_dot_product : enable
 
 #define B_TYPE block_q8_1_x4
 
@@ -38,18 +40,27 @@ layout (constant_id = 3) const uint CG = 3;
 
 uint a_offset, b_offset, d_offset;
 
-#if defined(PTQ1_0_MUL3_SHIFT)
-#define MUL3(v) (((v) << 1u) + (v))
-#elif defined(PTQ1_0_MUL3_PK16)
+#if defined(PTQ1_0_MUL3_PK16)
 #define MUL3(v) pack32(unpack16(v) * u16vec2(3us, 3us))
 #else
-#define MUL3(v) ((v) * 3u)
+// (v << 1u) + (v) maps to a single-cycle shift-add (v_lshl_add_u32) on AMD GCN/RDNA
+#define MUL3(v) (((v) << 1u) + (v))
 #endif
 
-#ifdef PTQ1_0_DOT_NOSAT
+#if defined(GL_EXT_integer_dot_product)
+// Hardware DP4A: saturation is mathematically impossible (max sum in 32 trits is 8128 << 2^31-1),
+// so non-saturating dotPacked4x8EXT maps directly to single-cycle native instructions (v_dot4_i32_i8).
 #define DOT4(a, b, acc) ((acc) + dotPacked4x8EXT((a), (b)))
 #else
-#define DOT4(a, b, acc) dotPacked4x8AccSatEXT((a), (b), (acc))
+// Universal fallback for GPUs without hardware DP4A (AMD Polaris RX 400/500, Vega, older Intel/Nvidia):
+// bitfieldExtract maps directly to AMD GCN's v_bfe_i32 instruction.
+int32_t dot4_emulated(const int32_t a, const int32_t b, const int32_t acc) {
+    return acc + bitfieldExtract(a, 0, 8)  * bitfieldExtract(b, 0, 8)
+               + bitfieldExtract(a, 8, 8)  * bitfieldExtract(b, 8, 8)
+               + bitfieldExtract(a, 16, 8) * bitfieldExtract(b, 16, 8)
+               + bitfieldExtract(a, 24, 8) * bitfieldExtract(b, 24, 8);
+}
+#define DOT4(a, b, acc) dot4_emulated((a), (b), (acc))
 #endif
 
 // One trit level from the 16-bit lanes vl (bytes 0,2) and vh (bytes 1,3): after w = v*3 the trit is in byte 1/3 and the residue in byte 0/2.

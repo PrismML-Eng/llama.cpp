@@ -19,6 +19,10 @@ layout(push_constant) uniform parameter
 {
     uint n_rows;
     uint src_offset;
+#ifdef FWHT_SIGNED
+    uint signs_offset;
+    uint signs_ne;
+#endif
     uint dst_offset;
     float scale;
 };
@@ -31,6 +35,9 @@ layout(binding = 0, std430) readonly buffer A {
 #endif
 };
 layout(binding = 1, std430) writeonly buffer D { float data_d[]; };
+#ifdef FWHT_SIGNED
+layout(binding = 2, std430) readonly buffer S { float data_s[]; };
+#endif
 
 const uint EL_W = N / BLOCK_SIZE;
 
@@ -64,7 +71,11 @@ void main() {
 
         [[unroll]]
         for (uint i = 0; i < EL_W; ++i) {
+#ifdef FWHT_SIGNED
+            reg[i] = row < n_rows ? float(data_a[src_offset + row_offset + i * BLOCK_SIZE + tid]) * data_s[signs_offset + (row_offset % signs_ne) + i * BLOCK_SIZE + tid] * scale : 0.0;
+#else
             reg[i] = row < n_rows ? float(data_a[src_offset + row_offset + i * BLOCK_SIZE + tid]) * scale : 0.0;
+#endif
         }
 
 #ifdef FWHT_SHMEM

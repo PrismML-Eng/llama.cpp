@@ -151,9 +151,10 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
         case 3:  launch_kernel(std::integral_constant<int, 3 >{}); break;
         case 4:  launch_kernel(std::integral_constant<int, 4 >{}); break;
         case 5:  launch_kernel(std::integral_constant<int, 5 >{}); break;
+        case 7:  launch_kernel(std::integral_constant<int, 7 >{}); break;
         case 9:  launch_kernel(std::integral_constant<int, 9 >{}); break;
         case 15: launch_kernel(std::integral_constant<int, 15>{}); break;
-        default: GGML_ABORT("Only support kernel sizes 3, 4, 5, 9, 15 right now.");
+        default: GGML_ABORT("Only support kernel sizes 3, 4, 5, 7, 9, 15 right now.");
     }
 }
 
@@ -202,5 +203,131 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     } else {
         ssm_conv_f32_cuda<false>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
                           out->nb[2], nc, nr, n_t, n_s, stream);
+    }
+}
+
+// GDN conv chain in one launch (see ggml_cuda_gdn_conv_match in ggml-cuda.cu): the conv-state row gather, the concat
+// with the n_t new tokens, the conv-state write-backs (one per rollback snapshot), the depthwise conv + SiLU and the L2
+// norm of the q/k heads of every token. One thread per channel, one block per L2 row (head). Every value is computed
+// with the same expression, in the same order, as the unfused kernels: the conv sum as ssm_conv_f32 (no bias), the L2
+// norm as l2_norm_f32 with WARP_SIZE threads (per-lane strided partial sums, then the warp butterfly; one warp per
+// token here), so the outputs are bit-identical.
+struct ggml_cuda_gdn_conv_snaps {
+    int64_t offs[GGML_CUDA_GDN_CONV_MAX_SNAP];
+    int     pos [GGML_CUDA_GDN_CONV_MAX_SNAP];
+};
+
+template <int d_conv>
+static __global__ void ssm_conv_gdn_fused_f32(
+        const float * cache, const int32_t * __restrict__ ids, const int64_t row_stride,
+        const float * x, const int64_t x_stride, const int64_t x_tok_stride,
+        const float * __restrict__ w, const int w_stride,
+        float * cache_dst, const ggml_cuda_gdn_conv_snaps snaps, const int n_snap,
+        float * y, float * __restrict__ l2, const int n_l2, const int n_channels, const int n_t, const float eps) {
+    ggml_cuda_pdl_lc();
+    // per thread (strided by blockDim.x): the d_conv - 1 + n_t conv inputs of its channel, then its n_t silu outputs;
+    // then the n_t row scales of the block
+    extern __shared__ float smem[];
+
+    const int tid = threadIdx.x;
+    const int bd  = blockDim.x;
+    const int c   = blockIdx.x*bd + tid;
+
+    float * win = smem;
+    float * yv  = win + (d_conv - 1 + n_t)*bd;
+    float * sc  = yv + n_t*bd;
+
+    ggml_cuda_pdl_sync();
+
+    // every read of this channel's state and tokens comes first: a conv-state row written below may be the row read
+    // here, and y may be x itself (element for element); both only at this thread's own channel
+    const float * s = cache + ids[0]*row_stride + (int64_t) c*(d_conv - 1);
+#pragma unroll
+    for (int j = 0; j < d_conv - 1; ++j) {
+        win[j*bd + tid] = s[j];
+    }
+    for (int t = 0; t < n_t; ++t) {
+        win[(d_conv - 1 + t)*bd + tid] = x[t*x_tok_stride + c*x_stride];
+    }
+    float ww[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        ww[j] = w[c*w_stride + j];
+    }
+
+    // conv-state write-backs: d_conv - 1 consecutive conv inputs per row
+    for (int k = 0; k < n_snap; ++k) {
+        float * dk = cache_dst + snaps.offs[k] + (int64_t) c*(d_conv - 1);
+        const int p = snaps.pos[k];
+#pragma unroll
+        for (int j = 0; j < d_conv - 1; ++j) {
+            dk[j] = win[(p + j)*bd + tid];
+        }
+    }
+
+    const float b = 0.0f; // ssm_conv_f32 adds its (absent) bias as 0.0f
+    for (int t = 0; t < n_t; ++t) {
+        float sumf = 0.0f;
+#pragma unroll
+        for (int j = 0; j < d_conv; ++j) {
+            sumf += win[(t + j)*bd + tid] * ww[j];
+        }
+        sumf += b;
+        const float v = ggml_cuda_op_silu_single(sumf);
+        y[(int64_t) t*n_channels + c] = v;
+        yv[t*bd + tid] = v;
+    }
+
+    if (blockIdx.x*bd >= n_l2) {
+        return; // a v channel block: no L2 norm (block-uniform)
+    }
+
+    __syncthreads();
+    const int lane    = tid % WARP_SIZE;
+    const int n_warps = bd / WARP_SIZE;
+    for (int t = tid / WARP_SIZE; t < n_t; t += n_warps) {
+        float tmp = 0.0f;
+        for (int col = lane; col < bd; col += WARP_SIZE) {
+            const float xi = yv[t*bd + col];
+            tmp += xi * xi;
+        }
+        tmp = warp_reduce_sum(tmp);
+        if (lane == 0) {
+            sc[t] = rsqrtf(fmaxf(tmp, eps * eps));
+        }
+    }
+    __syncthreads();
+    for (int t = 0; t < n_t; ++t) {
+        l2[(int64_t) t*n_l2 + c] = sc[t] * yv[t*bd + tid];
+    }
+}
+
+void ggml_cuda_ssm_conv_gdn_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_ssm_conv_gdn_fused_args & a) {
+    GGML_ASSERT(a.row_len % WARP_SIZE == 0 && a.row_len < 1024 && a.n_channels % a.row_len == 0 && a.n_l2 % a.row_len == 0);
+    GGML_ASSERT(a.n_t >= 1 && a.n_t <= GGML_CUDA_GDN_CONV_MAX_TOKENS);
+    GGML_ASSERT(a.n_snap >= 1 && a.n_snap <= GGML_CUDA_GDN_CONV_MAX_SNAP);
+    const dim3 blocks(a.n_channels / a.row_len, 1, 1);
+    const dim3 threads(a.row_len, 1, 1);
+    const size_t smem = ((size_t) (a.d_conv - 1 + 2*a.n_t)*a.row_len + a.n_t) * sizeof(float);
+    GGML_ASSERT(smem <= 48*1024);
+    const ggml_cuda_kernel_launch_params launch_params(blocks, threads, smem, ctx.stream());
+
+    ggml_cuda_gdn_conv_snaps snaps;
+    for (int k = 0; k < GGML_CUDA_GDN_CONV_MAX_SNAP; ++k) {
+        snaps.offs[k] = k < a.n_snap ? a.snap_offs[k] : 0;
+        snaps.pos[k]  = k < a.n_snap ? a.snap_pos[k]  : 0;
+    }
+
+    auto launch = [&](auto NC) {
+        constexpr int kNC = decltype(NC)::value;
+        ggml_cuda_kernel_launch(ssm_conv_gdn_fused_f32<kNC>, launch_params, a.cache, a.ids, a.row_stride, a.x, a.x_stride,
+                                a.x_tok_stride, a.w, a.w_stride, a.cache_dst, snaps, a.n_snap, a.y, a.l2, a.n_l2,
+                                a.n_channels, a.n_t, a.eps);
+    };
+    switch (a.d_conv) {
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+        case 5: launch(std::integral_constant<int, 5>{}); break;
+        default: GGML_ABORT("unsupported d_conv %d", a.d_conv);
     }
 }

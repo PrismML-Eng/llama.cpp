@@ -566,6 +566,11 @@ class SchemaConverter:
         return self._format_literal(json.dumps(value))
 
     def visit(self, schema, name):
+        # An empty union ("anyOf": [], "oneOf": [] or "type": []) has no alternatives to build a rule from; drop the
+        # keyword and convert the rest of the schema (same as the C++ converter).
+        for key in ('oneOf', 'anyOf', 'type'):
+            if isinstance(schema, dict) and isinstance(schema.get(key), list) and not schema[key]:
+                return self.visit({k: v for k, v in schema.items() if k != key}, name)
         schema_type = schema.get('type')
         schema_format = schema.get('format')
         rule_name = name + '-' if name in RESERVED_NAMES else name or 'root'
@@ -734,6 +739,17 @@ class SchemaConverter:
             )
             optional_props.append("*")
 
+        # Also allow declared order while preserving required-first order (mirrors the C++ converter).
+        first_required = [k in required for k in sorted_props]
+        optional_before_required = any(not a and b for i, a in enumerate(first_required) for b in first_required[i + 1:])
+        declared_order_rule = None
+        if optional_before_required and first_required[0] and "*" not in prop_kv_rule_names:
+            declared_order_rule = '"{" space ' + prop_kv_rule_names[sorted_props[0]]
+            for k in sorted_props[1:]:
+                kv = f' "," space {prop_kv_rule_names[k]}'
+                declared_order_rule += kv if k in required else f' ({kv} )?'
+            declared_order_rule += ' space "}"'
+
         rule = '"{" space '
         rule += ' "," space '.join(prop_kv_rule_names[k] for k in required_props)
 
@@ -767,6 +783,8 @@ class SchemaConverter:
 
         rule += ' space "}"'
 
+        if declared_order_rule:
+            return declared_order_rule + ' | ' + rule
         return rule
 
     def format_grammar(self):
@@ -791,8 +809,10 @@ def main(args_in = None):
         help='''
             comma-separated property names defining the order of precedence for object properties;
             properties not specified here are given lower precedence than those that are, and
-            are kept in their original order from the schema. Required properties are always
-            given precedence over optional properties.
+            are kept in their original order from the schema. Required properties are given
+            precedence over optional properties. When (in this ordering) an optional property comes
+            before a required one, the first property is required and additional properties are not
+            allowed, this ordering is also accepted, with optional properties skippable in place.
         '''
     )
     parser.add_argument(

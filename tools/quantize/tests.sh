@@ -61,5 +61,11 @@ $MAIN -no-cnv --model $WORK_PATH/ggml-model-requant-merge.gguf -p "I believe the
 echo PASS
 echo
 
+# 5. Refuse Prism types for a model without prism.hadamard.* metadata
+$QUANTIZE --allow-requantize $WORK_PATH/Qwen3-0.6B-Q8_0.gguf $WORK_PATH/ggml-model-requant-pq2.gguf PQ2_0 2>&1 | grep "prism.hadamard"
+test ! -e $WORK_PATH/ggml-model-requant-pq2.gguf
+echo PASS
+echo
+
 # Clean up
 rm -f $WORK_PATH/ggml-model-split*.gguf $WORK_PATH/ggml-model-requant*.gguf

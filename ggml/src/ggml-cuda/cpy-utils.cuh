@@ -186,6 +186,33 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
     y->d = sumq2 > 0 ? sumqx/sumq2 : d;
 }
 
+// PQ2_0M: min/max (range-scale) KV-cache quantize. Inverse of dequantize_row_pq2_0m.
+// d = (max - min) / 3, m = min, dequant y = m + q*d, q in {0, 1, 2, 3}.
+static __device__ void quantize_f32_pq2_0m_block(const float * __restrict__ x, block_pq2_0m * __restrict__ y) {
+    float vmin = x[0];
+    float vmax = x[0];
+    for (int j = 1; j < QK_PQ2_0; ++j) {
+        const float v = x[j];
+        if (v < vmin) vmin = v;
+        if (v > vmax) vmax = v;
+    }
+    const float d  = (vmax - vmin) / 3.0f;
+    const float id = d ? 1.0f/d : 0.0f;
+    y->d = d;
+    y->m = vmin;
+    for (int j = 0; j < QK_PQ2_0/4; ++j) {
+        uint8_t byte = 0;
+        for (int k = 0; k < 4; ++k) {
+            const float xv = (x[j*4 + k] - vmin)*id;
+            int q = (int)(xv + 0.5f);
+            if (q < 0) q = 0;
+            if (q > 3) q = 3;
+            byte |= (uint8_t)q << (k*2);
+        }
+        y->qs[j] = byte;
+    }
+}
+
 // Wrapper functions for cpy.cu compatibility
 static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
     quantize_f32_q4_0_block((const float *)cxi, (block_q4_0 *)cdsti);

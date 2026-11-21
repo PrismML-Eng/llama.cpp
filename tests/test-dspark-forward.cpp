@@ -788,7 +788,7 @@ static int run_runtime_ab(const std::string & model_path, const char * backend =
                         auto & dp   = common_speculative_get_draft_params(spec, 0);
                         dp.drafting = true;
                         dp.n_max    = -1;
-                        dp.n_past   = 6;
+                        dp.pos0     = 6;
                         dp.id_last  = tokens[0];
                         dp.result   = &ids;
                         common_speculative_draft(spec);
@@ -1046,7 +1046,7 @@ static int run_prefix_ab(const std::string & model_path, const char * backend = 
                         auto & dp   = common_speculative_get_draft_params(spec, 0);
                         dp.drafting = true;
                         dp.n_max    = keep;
-                        dp.n_past   = 6;
+                        dp.pos0     = 6;
                         dp.id_last  = tokens[0];
                         dp.result   = &ids;
                         common_speculative_draft(spec);
@@ -1140,7 +1140,7 @@ static int run_prefix_ab(const std::string & model_path, const char * backend = 
         auto &                   dp = common_speculative_get_draft_params(spec, 0);
         dp.drafting                 = true;
         dp.n_max                    = keep;
-        dp.n_past                   = 6;
+        dp.pos0                     = 6;
         dp.id_last                  = tokens[0];
         dp.result                   = &ids;
         if (mode == "changed-after-init") {

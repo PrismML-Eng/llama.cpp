@@ -8,13 +8,13 @@
 
 #include "common.hpp"
 #include "fattn-common.hpp"
-#include "fattn-buffers.hpp"
 #include "convert.hpp"
 #include "fattn.hpp"
 
 #include <oneapi/mkl.hpp>
 #include <cstdio>
 #include <chrono>
+#include <vector>
 
 #define MKL_FA_CHUNK_SIZE_KV 8192
 
@@ -110,8 +110,15 @@ static void mkl_fa_init_softmax_state(
 // The tile spans absolute rows [q0, q0 + q_rows). Score buffers
 // (KQ_f32/S_f16) are indexed RELATIVE to the tile; the persistent state
 // (VKQ_accum/KQ_max/KQ_sum) and mask are indexed by ABSOLUTE row.
-// For each row: find local max → rescale previous VKQ_accum →
-// compute exp(s - max) → write S_f16 → update running max/sum.
+// One WORK-GROUP per query row (local size = wg_size): work-items stride
+// over the chunk so adjacent items touch adjacent elements (coalesced),
+// the row max/sum come from group reductions, and the DV-long VKQ
+// rescale is spread across the items. Item 0 is the sole writer of
+// KQ_max/KQ_sum; its writes are ordered after every other item's reads
+// by the second group reduction (a collective). Per-element math is
+// identical to the original one-item-per-row kernel: softcap before
+// mask, native::exp, -1e30 sentinel, half-precision S. Only the float
+// summation order differs (tree vs serial), i.e. last-ulp level.
 static void mkl_fa_online_softmax_chunk(
     dpct::queue_ptr stream,
     float * __restrict KQ_f32,
@@ -124,81 +131,70 @@ static void mkl_fa_online_softmax_chunk(
     int kvh_head,
     const sycl::half * mask_data, int64_t mask_head_stride,
     int64_t mask_row_stride, int mask_n_heads,
-    float logit_softcap, int64_t wg_size) {
+    float logit_softcap, int64_t wg_size,
+    const sycl::event & dep_event) {
 
-    const int64_t wg = ((q_rows + wg_size - 1) / wg_size) * wg_size;
-
+    // ARC-LAB: one work-group per query row (was one work-item per row walking the whole chunk: neighbouring
+    // work-items read addresses chunk_size floats apart, 72% of generation time at 115K context). Same math.
+    GGML_UNUSED(wg_size);
+    constexpr int SWG = 256;
     stream->submit([&](sycl::handler & cgh) {
-        cgh.parallel_for(sycl::nd_range<1>(wg, wg_size),
+        cgh.depends_on(dep_event);
+        cgh.parallel_for(sycl::nd_range<1>((size_t) q_rows * SWG, SWG),
             [=](sycl::nd_item<1> item) {
-                int jc_rel = item.get_global_id(0);
-                if (jc_rel >= q_rows) return;
-                int jc_abs = q0 + jc_rel;
+                const int jc_rel = item.get_group(0);
+                const int tid    = item.get_local_id(0);
+                const int jc_abs = q0 + jc_rel;
+                auto      grp    = item.get_group();
 
                 const int gqa_group = jc_abs / n_queries;
                 const int q_row     = jc_abs % n_queries;
 
-                // Score buffers are tile-local (relative index).
-                const float * __restrict KQ_row = KQ_f32
-                    + jc_rel * (int64_t)chunk_size;
-                // Persistent accumulator is full-sized (absolute index).
-                float * __restrict vkq = VKQ_accum
-                    + jc_abs * (int64_t)DV;
+                const float * __restrict KQ_row = KQ_f32 + jc_rel * (int64_t)chunk_size;
+                float * __restrict vkq = VKQ_accum + jc_abs * (int64_t)DV;
 
                 const sycl::half * mask_h = nullptr;
-                int64_t m_stride = 0;
                 if (mask_data) {
-                    int m_head = (mask_n_heads > 1)
-                        ? (kvh_head + gqa_group) : 0;
-                    mask_h   = mask_data + (int64_t)m_head * mask_head_stride;
-                    m_stride = mask_row_stride;
+                    const int m_head = (mask_n_heads > 1) ? (kvh_head + gqa_group) : 0;
+                    mask_h = mask_data + (int64_t)m_head * mask_head_stride + (int64_t)q_row * mask_row_stride + chunk_start;
                 }
-
-                // Row-wise local maximum (softcap before mask)
-                float local_max = -1e30f;
-                for (int i = 0; i < chunk_size; i++) {
+                // Score at chunk offset i — original per-element math.
+                auto score = [&](int i) {
                     float s = KQ_row[i];
                     if (logit_softcap != 0.0f) {
                         s = logit_softcap * sycl::tanh(s);
                     }
                     if (mask_h) {
-                        s += (float)mask_h[q_row * m_stride
-                            + (chunk_start + i)];
+                        s += (float)mask_h[i];
                     }
-                    if (s > local_max) local_max = s;
+                    return s;
+                };
+
+                const float old_max = KQ_max[jc_abs];  // read by every item before item 0 updates it below
+                float local_max = -1e30f;
+                for (int i = tid; i < chunk_size; i += SWG) {
+                    local_max = sycl::fmax(local_max, score(i));
                 }
+                local_max = sycl::reduce_over_group(grp, local_max, sycl::maximum<float>());
 
-                // Rescale previous accumulator by exp(old_max - new_max)
-                float old_max = KQ_max[jc_abs];
-                float new_max = (old_max > local_max) ? old_max : local_max;
-                float rescale = (old_max < -1e29f) ? 1.0f
-                    : sycl::native::exp(old_max - new_max);
-
-                for (int v = 0; v < DV; v++) {
+                const float new_max = (old_max > local_max) ? old_max : local_max;
+                const float rescale = (old_max < -1e29f) ? 1.0f : sycl::native::exp(old_max - new_max);
+                for (int v = tid; v < DV; v += SWG) {
                     vkq[v] *= rescale;
                 }
 
-                // Softmax and write S_f16 (tile-local index)
+                sycl::half * __restrict S_row = S_f16 + jc_rel * (int64_t)chunk_size;
                 float local_sum = 0.0f;
-                sycl::half * __restrict S_row = S_f16
-                    + jc_rel * (int64_t)chunk_size;
-
-                for (int i = 0; i < chunk_size; i++) {
-                    float s = KQ_row[i];
-                    if (logit_softcap != 0.0f) {
-                        s = logit_softcap * sycl::tanh(s);
-                    }
-                    if (mask_h) {
-                        s += (float)mask_h[q_row * m_stride
-                            + (chunk_start + i)];
-                    }
-                    float val = sycl::native::exp(s - new_max);
+                for (int i = tid; i < chunk_size; i += SWG) {
+                    const float val = sycl::native::exp(score(i) - new_max);
                     S_row[i] = sycl::half(val);
                     local_sum += val;
                 }
-
-                KQ_sum[jc_abs] = KQ_sum[jc_abs] * rescale + local_sum;
-                KQ_max[jc_abs] = new_max;
+                local_sum = sycl::reduce_over_group(grp, local_sum, sycl::plus<float>());
+                if (tid == 0) {
+                    KQ_sum[jc_abs] = KQ_sum[jc_abs] * rescale + local_sum;
+                    KQ_max[jc_abs] = new_max;
+                }
             });
     });
 }
@@ -278,8 +274,10 @@ static mkl_fa_kv_desc mkl_fa_make_desc(const ggml_tensor * T, bool interleaved, 
     d.ts   = (int64_t)ggml_type_size(T->type);
 
     if (T->type == GGML_TYPE_F16) {
-        d.mode = interleaved ? MKL_FA_KV_MODE_F16_INTERLEAVED
-                             : MKL_FA_KV_MODE_F16_DENSE;
+        // MLA's V cache is a 512-wide view of 576-wide K rows. Treat any
+        // padded row stride as strided even when there is only one KV head.
+        d.mode = interleaved || d.nb1 != d.D * (int64_t)sizeof(sycl::half)
+            ? MKL_FA_KV_MODE_F16_INTERLEAVED : MKL_FA_KV_MODE_F16_DENSE;
     } else if (ggml_is_contiguously_allocated(T) && !interleaved) {
         d.mode = MKL_FA_KV_MODE_QUANT_CONTIG;
     } else {
@@ -408,7 +406,9 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     const int64_t q_row_stride  = Q->nb[1] / sizeof(float);
     const int64_t q_head_stride = Q->nb[2] / sizeof(float);
 
-    const bool V_is_K_view = V->view_src
+    // Alias the dequantized buffers only when K and V expose the same values.
+    // MLA V is a narrower view of K and needs its own strided dequantization.
+    const bool V_is_K_view = V->ne[0] == K->ne[0] && V->view_src
         && (V->view_src == K || (V->view_src == K->view_src
             && V->view_offs == K->view_offs));
 
@@ -555,9 +555,6 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                 KQ_max_ptr, KQ_sum_ptr, VKQ_accum_ptr,
                 n_query_rows, DV, wg_size);
 
-            // Sync before MKL GEMM (MKL may use an internal queue)
-            stream->wait();
-
             // 3. KV chunk loop (OUTER): dequant each chunk once, then tile queries.
             for (int chunk_start = 0; chunk_start < n_kv; chunk_start += chunk_size) {
                 int this_chunk = std::min(chunk_size, n_kv - chunk_start);
@@ -571,29 +568,26 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                         mkl_fa_dequant_chunk(stream, V_desc, KQV,
                             V_chunk_f16_ptr, ikvh, chunk_start, this_chunk);
                     }
-                    stream->wait();  // dequant must be ready before MKL GEMM
                     MKL_ACCUM(dequant_time_us, t0);
                 }
 
                 // 3b. Query tile loop (INNER) — bounds KQ_f32/S_f16 footprint.
                 for (int q0 = 0; q0 < n_query_rows; q0 += q_tile_rows) {
                     int q_rows = std::min(q_tile_rows, n_query_rows - q0);
+                    sycl::event kq_done, vkq_done;
 
                     // GEMM: KQ = Q_tile × K_chunk^T
                     {
                         MKL_TAKE_TIME(t0);
-                        sycl::event ev = gemm(*stream,
+                        kq_done = gemm(*stream,
                             transpose::trans, transpose::nontrans,
                             this_chunk, q_rows, DKQ,
                             alpha,
                             K_chunk_f16_ptr, DKQ,
                             Q_head_f16_ptr + (int64_t)q0 * DKQ, DKQ,
                             beta,
-                            KQ_f32_ptr, this_chunk);
-                        try { ev.wait_and_throw(); } catch (sycl::exception & e) {
-                            GGML_LOG_INFO("[MKL-FA] GEMM KQ: %s\n", e.what());
-                            GGML_ABORT("MKL GEMM KQ failed");
-                        }
+                            KQ_f32_ptr, this_chunk,
+                            std::vector<sycl::event>{*stream->ext_oneapi_get_last_event()});
                         MKL_ACCUM(gemm_kq_time_us, t0);
                     }
                     // Online softmax over this chunk for this query tile
@@ -607,26 +601,22 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                             kvh_base_head,
                             mask_batch, mask_head_stride,
                             mask_row_stride, mask_n_heads,
-                            logit_softcap, wg_size);
-                        stream->wait();  // S_f16 must be ready for GEMM
+                            logit_softcap, wg_size, kq_done);
                         MKL_ACCUM(softmax_time_us, t0);
                     }
 
                     // GEMM: VKQ_chunk = S × V_chunk
                     {
                         MKL_TAKE_TIME(t0);
-                        sycl::event ev = gemm(*stream,
+                        vkq_done = gemm(*stream,
                             transpose::nontrans, transpose::nontrans,
                             DV, q_rows, this_chunk,
                             alpha,
                             V_chunk_f16_ptr, DV,
                             S_f16_ptr, this_chunk,
                             beta,
-                            VKQ_chunk_ptr, DV);
-                        try { ev.wait_and_throw(); } catch (sycl::exception & e) {
-                            GGML_LOG_INFO("[MKL-FA] GEMM VKQ: %s\n", e.what());
-                            GGML_ABORT("MKL GEMM VKQ failed");
-                        }
+                            VKQ_chunk_ptr, DV,
+                            std::vector<sycl::event>{*stream->ext_oneapi_get_last_event()});
                         MKL_ACCUM(gemm_vkq_time_us, t0);
                     }
                     // VKQ_accum[q0..] += VKQ_chunk
@@ -636,6 +626,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                             * wg_size;
                         float * accum = VKQ_accum_ptr + (int64_t)q0 * DV;
                         stream->submit([&](sycl::handler & cgh) {
+                            cgh.depends_on(vkq_done);
                             cgh.parallel_for(sycl::nd_range<1>(wg, wg_size),
                                 [=](sycl::nd_item<1> item) {
                                     int64_t i = item.get_global_id(0);

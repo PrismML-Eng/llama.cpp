@@ -14,6 +14,7 @@
 #include <cassert>
 #include <cstdlib> // for qsort
 #include <cstdio>  // for GGML_ASSERT
+#include <vector>
 
 #define GGML_CPU_CLANG_WORKAROUND
 #include "../../repack.h"
@@ -45,6 +46,24 @@ static inline void decode_q_Kx8_6bit_scales(const uint8_t * scales_in, int16x8_t
     scales_u32[0] = sm[0] & kmask1;
     scales_u32[1] = (sm[2] & kmask2) | (((sm[0] >> 6) & kmask3) << 4);
     memcpy(out_scales, scales_u32, 8);
+}
+#endif
+
+#if defined(__aarch64__) && defined(__ARM_NEON) && (defined(__ARM_FEATURE_DOTPROD) || defined(__ARM_FEATURE_MATMUL_INT8))
+#define B1(c,s,n)  0x ## n ## c ,  0x ## n ## s
+#define B2(c,s,n) B1(c,s,n ## c), B1(c,s,n ## s)
+#define B3(c,s,n) B2(c,s,n ## c), B2(c,s,n ## s)
+#define B4(c,s,n) B3(c,s,n ## c), B3(c,s,n ## s)
+#define B5(c,s,n) B4(c,s,n ## c), B4(c,s,n ## s)
+#define B6(c,s,n) B5(c,s,n ## c), B5(c,s,n ## s)
+#define B7(c,s,n) B6(c,s,n ## c), B6(c,s,n ## s)
+#define B8(c,s  ) B7(c,s,     c), B7(c,s,     s)
+
+static const uint64_t table_q1_signs[256] = { B8(ff, 01) };
+
+static inline int8x16_t ggml_q1_0_unpack_pair(uint8_t bits0, uint8_t bits1) {
+    return vreinterpretq_s8_u8(vcombine_u8(vcreate_u8(table_q1_signs[bits0]),
+                                           vcreate_u8(table_q1_signs[bits1])));
 }
 #endif
 
@@ -1823,24 +1842,6 @@ void ggml_gemv_q8_0_4x8_q8_0(int                        n,
     ggml_gemv_q8_0_4x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
-#if defined(__aarch64__) && defined(__ARM_NEON) && (defined(__ARM_FEATURE_DOTPROD) || defined(__ARM_FEATURE_MATMUL_INT8))
-#define B1(c,s,n)  0x ## n ## c ,  0x ## n ## s
-#define B2(c,s,n) B1(c,s,n ## c), B1(c,s,n ## s)
-#define B3(c,s,n) B2(c,s,n ## c), B2(c,s,n ## s)
-#define B4(c,s,n) B3(c,s,n ## c), B3(c,s,n ## s)
-#define B5(c,s,n) B4(c,s,n ## c), B4(c,s,n ## s)
-#define B6(c,s,n) B5(c,s,n ## c), B5(c,s,n ## s)
-#define B7(c,s,n) B6(c,s,n ## c), B6(c,s,n ## s)
-#define B8(c,s  ) B7(c,s,     c), B7(c,s,     s)
-
-static const uint64_t table_q1_signs[256] = { B8(ff, 01) };
-
-static inline int8x16_t ggml_q1_0_unpack_pair(uint8_t bits0, uint8_t bits1) {
-    return vreinterpretq_s8_u8(vcombine_u8(vcreate_u8(table_q1_signs[bits0]),
-                                           vcreate_u8(table_q1_signs[bits1])));
-}
-#endif
-
 void ggml_gemv_q1_0_4x4_q8_0(int                        n,
                              float * GGML_RESTRICT      s,
                              size_t                     bs,
@@ -1966,7 +1967,6 @@ void ggml_gemv_q1_0_4x8_q8_0(int                        n,
 
     ggml_gemv_q1_0_4x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
-
 
 void ggml_gemm_q4_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     const int qk = QK8_0;
@@ -5465,3 +5465,283 @@ void ggml_gemm_q1_0_4x8_q8_0(int                        n,
     ggml_gemm_q1_0_4x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+// PQ2_0 x4 (8-byte interleave) against Q8_K activations, for decode and prefill.
+//
+// A 16-byte code vector holds 8 bytes of two rows, so each activation group is stored twice
+// (dup_half below) and a dot product leaves lanes (row a, row a, row b, row b). Codes stay
+// unsigned (0..2); the per-128 activation sum removes the "code - 1" offset once per block.
+// A pairwise add of the two row pairs gives exact integer dots for four rows, then one
+// convert and one fused multiply-add per block covers all four rows.
+
+namespace {
+
+struct pq2_q8k_prepared {
+    std::vector<int8_t>  dup;   // 256 bytes per 128-value block
+    std::vector<int32_t> sums;  // sum of each 128-value block
+    std::vector<float>   scales;
+};
+
+// Store one 128-value activation block as 16 vectors: vector (k, f) repeats, in both halves,
+// the 8 values that pair with field f of packed bytes 8k..8k+7. Also return the block sum.
+inline void pq2_q8k_prepare_block(const int8_t * vals, int8_t * dup, int32_t * sum) {
+    int16x8_t acc = vdupq_n_s16(0);
+    for (int g = 0; g < 2; ++g) {
+        // val[f] lane i = value 64g + 4i + f
+        const int8x16x4_t v = vld4q_s8(vals + 64 * g);
+        for (int f = 0; f < 4; ++f) {
+            acc               = vpadalq_s8(acc, v.val[f]);
+            const int64x2_t w = vreinterpretq_s64_s8(v.val[f]);
+            vst1q_s8(dup + ((2 * g + 0) * 4 + f) * 16, vreinterpretq_s8_s64(vdupq_laneq_s64(w, 0)));
+            vst1q_s8(dup + ((2 * g + 1) * 4 + f) * 16, vreinterpretq_s8_s64(vdupq_laneq_s64(w, 1)));
+        }
+    }
+    *sum = vaddlvq_s16(acc);
+}
+
+inline void pq2_q8k_gemv_rows(int nb, int nc, const block_pq2_0x4 * vx, const pq2_q8k_prepared & a, float * out) {
+    for (int x = 0; x < nc / 4; ++x) {
+        const block_pq2_0x4 * b   = vx + x * nb;
+        float32x4_t           acc = vdupq_n_f32(0.0f);
+        for (int l = 0; l < nb; ++l) {
+            const uint8_t * q = (const uint8_t *) b[l].qs;
+            const int8_t *  d = a.dup.data() + 256 * l;
+#    if defined(__ARM_FEATURE_DOTPROD)
+            const int32x4_t zero  = vdupq_n_s32(0);
+            int32x4_t       one01 = zero, four01 = zero, sixt01 = zero;
+            int32x4_t       one23 = zero, four23 = zero, sixt23 = zero;
+            for (int k = 0; k < 4; ++k) {
+                const uint8x16_t c01 = vld1q_u8(q + 32 * k);
+                const uint8x16_t c23 = vld1q_u8(q + 32 * k + 16);
+                const int8x16_t  d0  = vld1q_s8(d + (4 * k + 0) * 16);
+                const int8x16_t  d1  = vld1q_s8(d + (4 * k + 1) * 16);
+                const int8x16_t  d2  = vld1q_s8(d + (4 * k + 2) * 16);
+                const int8x16_t  d3  = vld1q_s8(d + (4 * k + 3) * 16);
+                // Fields 1 and 2 are masked in place, so they carry weights 4 and 16.
+                one01                = vdotq_s32(one01, vreinterpretq_s8_u8(vandq_u8(c01, vdupq_n_u8(0x03))), d0);
+                four01               = vdotq_s32(four01, vreinterpretq_s8_u8(vandq_u8(c01, vdupq_n_u8(0x0c))), d1);
+                sixt01               = vdotq_s32(sixt01, vreinterpretq_s8_u8(vandq_u8(c01, vdupq_n_u8(0x30))), d2);
+                one01                = vdotq_s32(one01, vreinterpretq_s8_u8(vshrq_n_u8(c01, 6)), d3);
+                one23                = vdotq_s32(one23, vreinterpretq_s8_u8(vandq_u8(c23, vdupq_n_u8(0x03))), d0);
+                four23               = vdotq_s32(four23, vreinterpretq_s8_u8(vandq_u8(c23, vdupq_n_u8(0x0c))), d1);
+                sixt23               = vdotq_s32(sixt23, vreinterpretq_s8_u8(vandq_u8(c23, vdupq_n_u8(0x30))), d2);
+                one23                = vdotq_s32(one23, vreinterpretq_s8_u8(vshrq_n_u8(c23, 6)), d3);
+            }
+            const int32x4_t t01 = vaddq_s32(one01, vaddq_s32(vshrq_n_s32(four01, 2), vshrq_n_s32(sixt01, 4)));
+            const int32x4_t t23 = vaddq_s32(one23, vaddq_s32(vshrq_n_s32(four23, 2), vshrq_n_s32(sixt23, 4)));
+            const int32x4_t dot = vsubq_s32(vpaddq_s32(t01, t23), vdupq_n_s32(a.sums[l]));
+#    else
+            // Without dot product, one block's products fit in int16 lanes (16 products of at most 256).
+            int16x8_t        r0 = vdupq_n_s16(0), r1 = r0, r2 = r0, r3 = r0;
+            const uint8x16_t m = vdupq_n_u8(3);
+            for (int k = 0; k < 4; ++k) {
+                const uint8x16_t c01 = vld1q_u8(q + 32 * k);
+                const uint8x16_t c23 = vld1q_u8(q + 32 * k + 16);
+                for (int f = 0; f < 4; ++f) {
+                    const int8x16_t  dv  = vld1q_s8(d + (4 * k + f) * 16);
+                    const uint8x16_t s01 = f == 0 ? c01 : vshlq_u8(c01, vdupq_n_s8((int8_t) (-2 * f)));
+                    const uint8x16_t s23 = f == 0 ? c23 : vshlq_u8(c23, vdupq_n_s8((int8_t) (-2 * f)));
+                    const int8x16_t  x01 = vreinterpretq_s8_u8(vandq_u8(s01, m));
+                    const int8x16_t  x23 = vreinterpretq_s8_u8(vandq_u8(s23, m));
+                    r0                   = vmlal_s8(r0, vget_low_s8(x01), vget_low_s8(dv));
+                    r1                   = vmlal_high_s8(r1, x01, dv);
+                    r2                   = vmlal_s8(r2, vget_low_s8(x23), vget_low_s8(dv));
+                    r3                   = vmlal_high_s8(r3, x23, dv);
+                }
+            }
+            const int32x4_t dot = vsubq_s32(
+                vpaddq_s32(vpaddq_s32(vpaddlq_s16(r0), vpaddlq_s16(r1)), vpaddq_s32(vpaddlq_s16(r2), vpaddlq_s16(r3))),
+                vdupq_n_s32(a.sums[l]));
+#    endif
+            const float32x4_t ws = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16((const uint16_t *) b[l].d)));
+            acc                  = vfmaq_f32(acc, vcvtq_f32_s32(dot), vmulq_n_f32(ws, a.scales[l]));
+        }
+        vst1q_f32(out + 4 * x, acc);
+    }
+}
+
+pq2_q8k_prepared & pq2_q8k_scratch(int nb) {
+    static thread_local pq2_q8k_prepared p;
+    if ((int) p.sums.size() < nb) {
+        p.dup.resize((size_t) nb * 256);
+        p.sums.resize(nb);
+        p.scales.resize(nb);
+    }
+    return p;
+}
+
+}  // namespace
+#endif
+
+void ggml_gemv_pq2_0_4x8_q8_K(int                        n,
+                              float * GGML_RESTRICT      s,
+                              size_t                     bs,
+                              const void * GGML_RESTRICT vx,
+                              const void * GGML_RESTRICT vy,
+                              int                        nr,
+                              int                        nc) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    assert(nr == 1);
+    assert(n % QK_K == 0);
+    assert(nc % 4 == 0);
+    UNUSED(bs);
+    UNUSED(nr);
+    const int          nb = n / QK_PQ2_0;
+    const block_q8_K * a  = (const block_q8_K *) vy;
+    pq2_q8k_prepared & p  = pq2_q8k_scratch(nb);
+    for (int l = 0; l < nb; ++l) {
+        pq2_q8k_prepare_block(a[l / 2].qs + QK_PQ2_0 * (l % 2), p.dup.data() + 256 * l, &p.sums[l]);
+        p.scales[l] = a[l / 2].d;
+    }
+    pq2_q8k_gemv_rows(nb, nc, (const block_pq2_0x4 *) vx, p, s);
+    return;
+#endif
+    ggml_gemv_pq2_0_4x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+namespace {
+
+// Four activation rows against four weight rows. Each packed code vector is unpacked once and
+// reused for all four activation rows, so weights are read once per group of four tokens.
+inline void pq2_q8k_gemm_rows(int                      nb,
+                              int                      nc,
+                              const block_pq2_0x4 *    vx,
+                              const pq2_q8k_prepared * a,
+                              float *                  s,
+                              size_t                   bs) {
+    const uint8x16_t m = vdupq_n_u8(3);
+    for (int x = 0; x < nc / 4; ++x) {
+        const block_pq2_0x4 * b = vx + x * nb;
+        float32x4_t           f[4];
+        for (int r = 0; r < 4; ++r) {
+            f[r] = vdupq_n_f32(0.0f);
+        }
+        for (int l = 0; l < nb; ++l) {
+            const uint8_t * q = (const uint8_t *) b[l].qs;
+#    if defined(__ARM_FEATURE_DOTPROD)
+            int32x4_t acc01[4], acc23[4];
+            for (int r = 0; r < 4; ++r) {
+                acc01[r] = vdupq_n_s32(0);
+                acc23[r] = vdupq_n_s32(0);
+            }
+            for (int k = 0; k < 4; ++k) {
+                const uint8x16_t c01    = vld1q_u8(q + 32 * k);
+                const uint8x16_t c23    = vld1q_u8(q + 32 * k + 16);
+                const int8x16_t  x01[4] = { vreinterpretq_s8_u8(vandq_u8(c01, m)),
+                                            vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(c01, 2), m)),
+                                            vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(c01, 4), m)),
+                                            vreinterpretq_s8_u8(vshrq_n_u8(c01, 6)) };
+                const int8x16_t  x23[4] = { vreinterpretq_s8_u8(vandq_u8(c23, m)),
+                                            vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(c23, 2), m)),
+                                            vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(c23, 4), m)),
+                                            vreinterpretq_s8_u8(vshrq_n_u8(c23, 6)) };
+                for (int r = 0; r < 4; ++r) {
+                    const int8_t * d = a[r].dup.data() + 256 * l + 64 * k;
+                    for (int fi = 0; fi < 4; ++fi) {
+                        const int8x16_t dv = vld1q_s8(d + 16 * fi);
+                        acc01[r]           = vdotq_s32(acc01[r], x01[fi], dv);
+                        acc23[r]           = vdotq_s32(acc23[r], x23[fi], dv);
+                    }
+                }
+            }
+            const float32x4_t ws = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16((const uint16_t *) b[l].d)));
+            for (int r = 0; r < 4; ++r) {
+                const int32x4_t dot = vsubq_s32(vpaddq_s32(acc01[r], acc23[r]), vdupq_n_s32(a[r].sums[l]));
+                f[r]                = vfmaq_f32(f[r], vcvtq_f32_s32(dot), vmulq_n_f32(ws, a[r].scales[l]));
+            }
+#    else
+            int16x8_t acc[4][4];
+            for (int r = 0; r < 4; ++r) {
+                for (int j = 0; j < 4; ++j) {
+                    acc[r][j] = vdupq_n_s16(0);
+                }
+            }
+            for (int k = 0; k < 4; ++k) {
+                const uint8x16_t c01    = vld1q_u8(q + 32 * k);
+                const uint8x16_t c23    = vld1q_u8(q + 32 * k + 16);
+                const int8x16_t  x01[4] = { vreinterpretq_s8_u8(vandq_u8(c01, m)),
+                                            vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(c01, 2), m)),
+                                            vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(c01, 4), m)),
+                                            vreinterpretq_s8_u8(vshrq_n_u8(c01, 6)) };
+                const int8x16_t  x23[4] = { vreinterpretq_s8_u8(vandq_u8(c23, m)),
+                                            vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(c23, 2), m)),
+                                            vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(c23, 4), m)),
+                                            vreinterpretq_s8_u8(vshrq_n_u8(c23, 6)) };
+                for (int r = 0; r < 4; ++r) {
+                    const int8_t * d = a[r].dup.data() + 256 * l + 64 * k;
+                    for (int fi = 0; fi < 4; ++fi) {
+                        const int8x16_t dv = vld1q_s8(d + 16 * fi);
+                        acc[r][0]          = vmlal_s8(acc[r][0], vget_low_s8(x01[fi]), vget_low_s8(dv));
+                        acc[r][1]          = vmlal_high_s8(acc[r][1], x01[fi], dv);
+                        acc[r][2]          = vmlal_s8(acc[r][2], vget_low_s8(x23[fi]), vget_low_s8(dv));
+                        acc[r][3]          = vmlal_high_s8(acc[r][3], x23[fi], dv);
+                    }
+                }
+            }
+            const float32x4_t ws = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16((const uint16_t *) b[l].d)));
+            for (int r = 0; r < 4; ++r) {
+                const int32x4_t t   = vpaddq_s32(vpaddq_s32(vpaddlq_s16(acc[r][0]), vpaddlq_s16(acc[r][1])),
+                                                 vpaddq_s32(vpaddlq_s16(acc[r][2]), vpaddlq_s16(acc[r][3])));
+                const int32x4_t dot = vsubq_s32(t, vdupq_n_s32(a[r].sums[l]));
+                f[r]                = vfmaq_f32(f[r], vcvtq_f32_s32(dot), vmulq_n_f32(ws, a[r].scales[l]));
+            }
+#    endif
+        }
+        for (int r = 0; r < 4; ++r) {
+            vst1q_f32(s + (size_t) r * bs + 4 * x, f[r]);
+        }
+    }
+}
+
+pq2_q8k_prepared * pq2_q8k_scratch4(int nb) {
+    static thread_local pq2_q8k_prepared p[4];
+    for (int r = 0; r < 4; ++r) {
+        if ((int) p[r].sums.size() < nb) {
+            p[r].dup.resize((size_t) nb * 256);
+            p[r].sums.resize(nb);
+            p[r].scales.resize(nb);
+        }
+    }
+    return p;
+}
+
+}  // namespace
+#endif
+
+void ggml_gemm_pq2_0_4x8_q8_K(int                        n,
+                              float * GGML_RESTRICT      s,
+                              size_t                     bs,
+                              const void * GGML_RESTRICT vx,
+                              const void * GGML_RESTRICT vy,
+                              int                        nr,
+                              int                        nc) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    assert(n % QK_K == 0);
+    assert(nr % 4 == 0);
+    assert(nc % 4 == 0);
+    const int          nb   = n / QK_PQ2_0;
+    const int          nb_k = n / QK_K;
+    pq2_q8k_prepared * p    = pq2_q8k_scratch4(nb);
+    int8_t             row[QK_K];
+    for (int y = 0; y < nr / 4; ++y) {
+        const block_q8_Kx4 * a = (const block_q8_Kx4 *) vy + y * nb_k;
+        for (int r = 0; r < 4; ++r) {
+            for (int i = 0; i < nb_k; ++i) {
+                // Undo the 4x8 interleave: row r's values e..e+7 sit at qs[(e / 8) * 32 + r * 8].
+                for (int e = 0; e < QK_K; e += 8) {
+                    vst1_s8(row + e, vld1_s8(a[i].qs + (e / 8) * 32 + r * 8));
+                }
+                for (int h = 0; h < 2; ++h) {
+                    pq2_q8k_prepare_block(row + QK_PQ2_0 * h, p[r].dup.data() + 256 * (2 * i + h),
+                                          &p[r].sums[2 * i + h]);
+                    p[r].scales[2 * i + h] = a[i].d[r];
+                }
+            }
+        }
+        pq2_q8k_gemm_rows(nb, nc, (const block_pq2_0x4 *) vx, p, s + (size_t) (y * 4) * bs, bs);
+    }
+    return;
+#endif
+    ggml_gemm_pq2_0_4x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
+}

@@ -71,12 +71,26 @@ public:
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
 
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
+    // (ARC-LAB: with rpl on, S has 2 groups only - base and record banks; r keeps 1 + n_rs_seq)
     uint32_t n_rs_seq = 0;
 
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+
+    // ARC-LAB: rollback by replay for the gated delta net state (LLAMA_GDN_REPLAY, default on where it applies;
+    // independent implementation of the technique described by llamADALL). The S rows of plane 0 hold the base
+    // state; plane 1 of each cell holds two banks of per-token update records (ggml_gated_delta_net_replay). S is
+    // allocated with these 2 planes only (the snapshot path allocates 1 + n_rs_seq).
+    // Rolling back r tokens drops the last r pending records instead of selecting a snapshot plane. The conv
+    // state (r_l) keeps its snapshot planes and rs_idx.
+    bool     rpl   = false;
+    uint32_t rpl_R = 0;              // floats per record: n_v_heads * (2 * head_dim + 1)
+    std::vector<uint32_t> rpl_n;     // per seq: records still to be re-applied onto the base state
+    std::vector<uint8_t>  rpl_bank;  // per seq: bank holding them
+
+    void rpl_reset(llama_seq_id seq_id); // seq_id < 0: all
 
     // computed before each graph build
     uint32_t n = 0;
@@ -111,6 +125,8 @@ public:
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
+    // a second conv history that must stay replicated across devices, so it cannot share the r row
+    std::vector<ggml_tensor *> p_l;
 
 private:
     //const llama_model & model;
@@ -121,16 +137,23 @@ private:
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
+    // true if no layers - can happen if the layer filter removes all layers
+    bool is_empty() const;
+
     size_t total_size() const;
 
     size_t size_r_bytes() const;
     size_t size_s_bytes() const;
+    size_t size_p_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+            const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges_s, uint32_t rpl_pending, uint32_t rpl_bank_cur) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
+
+    void state_clear(llama_seq_id seq_id, uint32_t cell_head, uint32_t cell_count);
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {
@@ -170,8 +193,16 @@ public:
 
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
+    ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // ARC-LAB GDN replay (see llama_memory_recurrent::rpl)
+    bool    get_rpl() const;
+    int32_t rpl_row(int i) const; // plane-0 S row the state of rs i is read from
+    // records to re-apply for seq set i of the ubatch and their bank; also books this ubatch's records (call once
+    // per ubatch, when setting the inputs - like s_copy() consumes rs_idx)
+    void    rpl_take(int i, uint32_t n_seq_tokens, int32_t & n_rec, int32_t & bank) const;
 
 private:
     const llama_memory_status status;

@@ -9,4 +9,9 @@
 // ordinary mat-mul dispatch.
 bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src, ggml_tensor * dst);
 
+// Same, with the Hadamard sign flip (dst = H * (src * signs)) done during the load.
+// signs: F32, ne[0] a multiple of the block width, repeating per block row.
+bool ggml_sycl_op_fwht_signed(ggml_backend_sycl_context & ctx, const ggml_tensor * src, const ggml_tensor * signs,
+                              ggml_tensor * dst);
+
 #endif  // GGML_SYCL_FWHT_HPP

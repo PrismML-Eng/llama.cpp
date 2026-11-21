@@ -59,13 +59,14 @@ static inline ggml_tensor * llama_mul_mat_hadamard(
         ggml_tensor * cur,
         ggml_tensor * rot) {
     const auto n = rot->ne[0];
+    GGML_ASSERT(cur->ne[0] % n == 0);
 
     ggml_tensor * res;
 
     if (!ggml_is_contiguous(cur)) {
-        res = ggml_cont_2d(ctx, cur, n, ggml_nelements(cur)/n);
+        res = ggml_cont_4d(ctx, cur, n, cur->ne[0]/n, cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
-        res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur)/n);
+        res = ggml_reshape_4d(ctx, cur, n, cur->ne[0]/n, cur->ne[1], cur->ne[2]*cur->ne[3]);
     }
     res = ggml_mul_mat(ctx, rot, res);
     ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
@@ -73,6 +74,14 @@ static inline ggml_tensor * llama_mul_mat_hadamard(
 
     return res;
 }
+
+// ARC-LAB: LLAMA_SYNC_TRIM bit mask, see llama-context.cpp
+int llama_sync_trim();
+
+// true when a SYCL device is registered; the ARC-LAB defaults below were only measured there
+bool llama_sycl_present();
+// Prefetch the host pages needed to gather these rows.
+void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows);
 
 struct time_meas {
     time_meas(int64_t & t_acc, bool disable = false);
@@ -93,6 +102,8 @@ struct buffer_view {
     }
 };
 
+void llama_clear_tensor_data(ggml_tensor * t, size_t offset, size_t size);
+
 void replace_all(std::string & s, const std::string & search, const std::string & replace);
 
 // TODO: rename to llama_format ?
@@ -102,4 +113,5 @@ std::string format(const char * fmt, ...);
 std::string llama_format_tensor_shape(const std::vector<int64_t> & ne);
 std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 
-std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);
+// arrays are rendered only until the result is longer than max_len
+std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i, size_t max_len = SIZE_MAX);

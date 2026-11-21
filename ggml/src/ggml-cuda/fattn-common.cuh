@@ -50,6 +50,20 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t end;
 };
 
+// GGML_CUDA_FA_PREFILL_F16=N: prefill-sized batches (more than 8 queries) over a quantized K/V cache of at most N cells
+// convert K/V to f16 in pool memory sized by the actual KV length and run the f16 MMA kernel; decode keeps the in-place
+// quantized read. Nothing is reserved at load (the reserved f16 copy would be n_ctx cells).
+static inline bool ggml_cuda_fattn_prefill_f16(const ggml_tensor * dst) {
+    static const int64_t max_kv = [] {
+        const char * e = getenv("GGML_CUDA_FA_PREFILL_F16");
+        return e ? (int64_t) atoll(e) : (int64_t) 0;
+    }();
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    return max_kv > 0 && Q->ne[1] > 8 && K->ne[1] <= max_kv && K->type == V->type && ggml_is_quantized(K->type);
+}
+
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
         const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
@@ -301,6 +315,48 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q5_1(
 }
 
 template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_pq2_0m(
+        const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_pq2_0m * K_pq2_0m = (const block_pq2_0m *) K_c;
+    float sum = 0.0f;
+
+    // PQ2_0M: same 2-bit codec as PQ2_0 (2 bits per element, 4 elements per byte),
+    // dequant y = m + q * d, q in {0, 1, 2, 3}. The block layout is block_pq2_0m
+    // (d, m, qs[QK_PQ2_0/4]) -- the M variant adds an offset m per block.
+    const int n_bytes = D / 4; // D elements / 4 elements per byte
+
+    for (int k_KQ_0 = 0; k_KQ_0 < n_bytes; k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int ib  = k_KQ / (QK_PQ2_0 / 4); // which PQ2_0M block (32 bytes per block)
+        const int iqs = k_KQ % (QK_PQ2_0 / 4); // which byte within the block
+
+        const float d = K_pq2_0m[ib].d;
+        const float m = K_pq2_0m[ib].m;
+        const uint8_t byte = K_pq2_0m[ib].qs[iqs];
+
+        // Extract 4 two-bit codes from the byte (2 bits per element, 4 elements per byte)
+        const int c0 = byte & 0x03;
+        const int c1 = (byte >> 2) & 0x03;
+        const int c2 = (byte >> 4) & 0x03;
+        const int c3 = (byte >> 6) & 0x03;
+
+        // Dequantize each K code (m + c * d) and dot with the corresponding Q q8_1 element.
+        // sum = d_Q * (m * sum(c0..c3) + d * sum(cK * qQ))
+        const int c_byte = (c0 << 0) | (c1 << 8) | (c2 << 16) | (c3 << 24);
+        const int u = Q_q8[k_KQ_0/nthreads];
+        const float d_Q = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads].x;
+
+        const int sum_c_u = ggml_cuda_dp4a(c_byte, u, 0);
+        const int sum_u   = ggml_cuda_dp4a(0x01010101, u, 0);
+
+        sum += d_Q * (m * (float)sum_u + d * (float)sum_c_u);
+    }
+
+    return sum;
+}
+
+template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
@@ -416,9 +472,14 @@ static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict
     int q;
     static_assert(ne == 2 || ne == 4, "bad ne");
     ggml_cuda_memcpy_1<ne, 2>(&q, x[ib].qs + iqs);
+#if defined(GGML_USE_HIP)
+    // Keep this VMEM read close to its packed-byte dequantization. Hoisting it too far
+    // increases VGPR pressure substantially in some FlashAttention vector kernels.
+    __builtin_amdgcn_sched_group_barrier(0x20, 1, 0);
+#endif // defined(GGML_USE_HIP)
     q >>= 4*shift;
     q &= 0x0F0F0F0F;
-    q = __vsubss4(q, 0x08080808);
+    q = __vsub4(q, 0x08080808);
 
     const int8_t * q8 = (const int8_t *) &q;
 
@@ -508,7 +569,7 @@ static __device__ __forceinline__ void dequantize_V_q5_0(const void * __restrict
         }
     }
 
-    q = __vsubss4(q, 0x10101010);
+    q = __vsub4(q, 0x10101010);
 
     const int8_t * q8 = (const int8_t *) &q;
 
@@ -585,6 +646,39 @@ static __device__ __forceinline__ void dequantize_V_q5_1(const void * __restrict
 }
 
 template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_pq2_0m(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_pq2_0m * x = (const block_pq2_0m *) vx;
+
+    const int64_t ib  = i0 / QK_PQ2_0;
+    const int     iqs = i0 % QK_PQ2_0 / 4;
+
+    static_assert(ne == 4, "bad ne");
+    const float d = x[ib].d;
+    const float m = x[ib].m;
+
+    const uint8_t byte = x[ib].qs[iqs];
+    const int c0 = byte & 0x03;
+    const int c1 = (byte >> 2) & 0x03;
+    const int c2 = (byte >> 4) & 0x03;
+    const int c3 = (byte >> 6) & 0x03;
+
+    #ifdef FP16_AVAILABLE
+    if constexpr (std::is_same<T, half>::value) {
+        ((half2 *) dst)[0] = make_half2((__half)(m + c0 * d), (__half)(m + c1 * d));
+        ((half2 *) dst)[1] = make_half2((__half)(m + c2 * d), (__half)(m + c3 * d));
+    } else
+    #endif // FP16_AVAILABLE
+    if constexpr (std::is_same<T, float>::value) {
+        ((float *) dst)[0] = m + c0 * d;
+        ((float *) dst)[1] = m + c1 * d;
+        ((float *) dst)[2] = m + c2 * d;
+        ((float *) dst)[3] = m + c3 * d;
+    } else {
+        static_assert(std::is_same_v<T, void>, "bad type");
+    }
+}
+
+template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_q8_0 * x = (const block_q8_0 *) vx;
 
@@ -631,6 +725,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q5_1<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q8_0) {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_PQ2_0M) {
+        return vec_dot_fattn_vec_KQ_pq2_0m<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
     } else {
@@ -653,6 +749,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q5_1<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q8_0) {
         return dequantize_V_q8_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_PQ2_0M) {
+        return dequantize_V_pq2_0m<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
     } else {
@@ -717,6 +815,9 @@ static __global__ void flash_attn_mask_to_KV_max(
 
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
+
+void ggml_cuda_flash_attn_ext_compact_mask(
+        const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
@@ -972,7 +1073,8 @@ static __global__ void flash_attn_combine_results(
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
+    const int warp_size = WARP_SIZE, const bool async_kv_preload = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1002,8 +1104,12 @@ void launch_fattn(
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
+    // GGML_CUDA_FA_PREFILL_F16: the f16 copies come from the pool, not from the space reserved behind dst
+    const bool prefill_f16 = ggml_cuda_fattn_prefill_f16(dst);
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K && !prefill_f16, need_f16_V && !prefill_f16);
+    ggml_cuda_pool_alloc<half> K_f16_pool(pool);
+    ggml_cuda_pool_alloc<half> V_f16_pool(pool);
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
@@ -1023,8 +1129,8 @@ void launch_fattn(
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
-        GGML_ASSERT(f16_extra.K != 0);
-        half * K_f16 = (half *) f16_extra.K;
+        half * K_f16 = prefill_f16 ? K_f16_pool.alloc(ggml_nelements(K)) : (half *) f16_extra.K;
+        GGML_ASSERT(K_f16 != nullptr);
         if (ggml_is_contiguously_allocated(K)) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
             to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
@@ -1057,8 +1163,8 @@ void launch_fattn(
             const size_t bs = ggml_blck_size(V->type);
             const size_t ts = ggml_type_size(V->type);
 
-            GGML_ASSERT(f16_extra.V != 0);
-            half * V_f16 = (half *) f16_extra.V;
+            half * V_f16 = prefill_f16 ? V_f16_pool.alloc(ggml_nelements(V)) : (half *) f16_extra.V;
+            GGML_ASSERT(V_f16 != nullptr);
             if (ggml_is_contiguously_allocated(V)) {
                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                 to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
@@ -1088,10 +1194,25 @@ void launch_fattn(
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
 
+    // sparse: a query tile of ncols1 queries shares one index list, the union of the queries' visible columns
+    int32_t n_kv_max = 0;
+    if (use_sparse) {
+        GGML_ASSERT(mask != nullptr);
+        const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
+        GGML_ASSERT(n_kv_max_query > 0);
+        n_kv_max = std::min<int64_t>(K->ne[1], int64_t(ncols1)*n_kv_max_query);
+
+        const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
+
+        KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
+        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+    }
+
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+    if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1114,16 +1235,32 @@ void launch_fattn(
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
-    const int ntiles_KV = (K->ne[1] + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
+    const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1];
+    const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
     dim3 blocks_num;
     if (stream_k) {
-        // For short contexts it can be faster to have the SMs work on whole tiles because this lets us skip the fixup.
-        const int max_blocks = max_blocks_per_sm*nsm;
-        const int tiles_nwaves = (ntiles_dst + max_blocks - 1) / max_blocks;
-        const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
+        // Stream-K splits the work before the mask scan is applied, so skipped KV tiles make the blocks uneven.
+        const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK && async_kv_preload && scan_mask;
 
-        const bool use_stream_k = cc >= GGML_CUDA_CC_ADA_LOVELACE || amd_wmma_available(cc) || tiles_efficiency_percent < 75;
+        auto should_use_stream_k = [prefer_whole_tiles](const int cc, const int ntiles_dst, const int max_blocks, const int DKQ) {
+            const int tiles_nwaves             = (ntiles_dst + max_blocks - 1) / max_blocks;
+            const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
+
+            if (prefer_whole_tiles && tiles_efficiency_percent >= 75) {
+                return false;
+            }
+            if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+                return true;
+            }
+            if (amd_wmma_available(cc) && DKQ == 64) {
+                return true; // TODO better configuration
+            }
+            return tiles_efficiency_percent < 75;
+        };
+
+        const int  max_blocks   = max_blocks_per_sm*nsm;
+        const bool use_stream_k = should_use_stream_k(cc, ntiles_dst, max_blocks, Q->ne[0]);
 
         blocks_num.x = ntiles_dst;
         blocks_num.y = 1;
@@ -1210,8 +1347,8 @@ void launch_fattn(
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
-        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
-        ggml_cuda_kernel_launch(fattn_kernel, launch_params,
+    ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
+    ggml_cuda_kernel_launch(fattn_kernel, launch_params,
         (const char *) Q->data,
         K_data,
         V_data,
@@ -1221,7 +1358,7 @@ void launch_fattn(
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
-        K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
+        K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
