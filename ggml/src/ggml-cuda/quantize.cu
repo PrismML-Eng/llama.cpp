@@ -965,6 +965,104 @@ void quantize_row_q8_1_cuda(
     }
 }
 
+// SwiGLU + sign flip + Hadamard transform + MMQ activation quantization in one launch: the FFN down input of a Hadamard-folded
+// model when the mat-mul is a PTQ1_0 MMQ (prompt batches). Same arithmetic as unary_gated_op_kernel<op_silu>, the signed
+// fwht_cuda_block and quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4> in sequence (note the MMQ quantizer's d_inv = 127/amax form,
+// not the amax/127 of fwht_quantize_q8_1), so the rows are bit-identical to the three-launch version.
+// One CUDA block per transform r = token*n_blk + blk of width N; the 32-wide scale groups lie inside one warp.
+template <int N, int NT>
+__launch_bounds__(NT, 1)
+static __global__ void swiglu_fwht_quantize_mmq(
+        const float * gate, const float * up, const float * signs, block_q8_1_mmq * y,
+        const int n_blk, const int64_t ntok, const float scale) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int NE        = N / NT;
+    static_assert(NE >= 1 && N % NT == 0 && NT % warp_size == 0 && NT % QK8_1 == 0, "bad fused FWHT shape");
+    static_assert(warp_size % QK8_1 == 0, "a 32-block must not span two warps");
+
+    __shared__ float s[N];
+
+    const int64_t r   = blockIdx.x;
+    const int64_t t   = r / n_blk;                  // token (row of the mat-mul's src1)
+    const int     blk = (int) (r - t * n_blk);      // transform block within the row
+    const int     tid  = threadIdx.x;
+    const int     lane = tid % warp_size;
+
+    ggml_cuda_pdl_sync();
+    const float * signs_row = signs + (int64_t) blk * N;
+    const float * g = gate + r * N;
+    const float * u = up   + r * N;
+
+    float reg[NE];
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        const float v = ggml_cuda_op_silu_single(g[i * NT + tid]) * u[i * NT + tid];
+        reg[i] = v * scale;
+        reg[i] *= signs_row[i * NT + tid];
+    }
+    ggml_cuda_fwht_block_butterfly<N, NT>(reg, s, tid, lane);
+
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        const float   xi  = reg[i];
+        const int64_t col = (int64_t) blk * N + i * NT + tid;      // column within the row of K = n_blk*N values
+        float amax = fabsf(xi);
+        amax = warp_reduce_max<QK8_1>(amax);
+
+        const float d_inv = 127.0f / amax;
+        const int8_t q    = roundf(xi * d_inv);
+        const float d     = 1.0f / d_inv;
+
+        const int64_t k_block = col / QK8_1_MMQ;
+        const int     iqs     = (int) (col % QK8_1_MMQ);
+        block_q8_1_mmq * yb = y + (k_block * ntok + t);
+        yb->qs[iqs] = q;
+        if (iqs % QK8_1 == 0) {
+            yb->d4[iqs / QK8_1] = d;
+        }
+    }
+}
+
+bool ggml_cuda_swiglu_fwht_quantize_mmq(
+        const float * gate, const float * up, const float * signs, void * vy,
+        const int n, const int n_blk, const int64_t ntok, cudaStream_t stream) {
+    const int64_t rows = ntok * n_blk;
+    if (rows == 0 || ((int64_t) n * n_blk) % MATRIX_ROW_PADDING != 0) {
+        return false;
+    }
+    const float scale = 1 / sqrtf(n);
+    const int   nt    = ggml_cuda_fwht_block_threads(n, rows);
+#define SWQ_LAUNCH(NN, NTT) { \
+        const dim3 g((unsigned) rows, 1, 1), b(NTT, 1, 1); \
+        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(g, b, 0, stream); \
+        ggml_cuda_kernel_launch(swiglu_fwht_quantize_mmq<NN, NTT>, lp, gate, up, signs, (block_q8_1_mmq *) vy, n_blk, ntok, scale); \
+        return true; \
+    }
+#define SWQ_CASE(NN) \
+    case NN: { \
+        if constexpr (NN >= 1024) { \
+            if (nt == 1024) SWQ_LAUNCH(NN, 1024) \
+        } \
+        if constexpr (NN >= 512) { \
+            if (nt == 512) SWQ_LAUNCH(NN, 512) \
+        } \
+        SWQ_LAUNCH(NN, 256) \
+    }
+    switch (n) {
+        SWQ_CASE(512)
+        SWQ_CASE(1024)
+        SWQ_CASE(2048)
+        SWQ_CASE(4096)
+#if !defined(GGML_USE_MUSA)
+        SWQ_CASE(8192)
+#endif // !defined(GGML_USE_MUSA)
+        default:
+            return false;
+    }
+#undef SWQ_CASE
+#undef SWQ_LAUNCH
+}
+
 void quantize_mmq_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,

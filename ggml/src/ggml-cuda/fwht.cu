@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fwht.cuh"
+#include "unary.cuh"
 
 #include <cstdlib>
 
@@ -310,6 +311,106 @@ bool ggml_cuda_op_mul_mat_use_fwht(const struct ggml_tensor * op) {
            a->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
            (b->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F16) && ggml_is_contiguous(b) && ggml_is_contiguous(op) &&
            ggml_are_same_shape(b, op);
+}
+
+// silu(gate) * up folded into the load of fwht_cuda_block (always with the sign flip): v = silu(a)*b is the GLU node's value
+// (unary_gated_op_kernel<op_silu, float>), then the same "* scale", "* sign" and butterfly as fwht_cuda_block.
+template <int N, int NT>
+__launch_bounds__(NT, 1)
+__global__ void fwht_cuda_block_swiglu(const float * gate, const float * up, float * dst, const int64_t n_rows,
+                                       const float scale, const float * signs, const int n_blk) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int NE        = N / NT;
+    static_assert(NE >= 1 && N % NT == 0 && NT % warp_size == 0, "bad FWHT block shape");
+
+    __shared__ float s[N];
+
+    const int64_t r = blockIdx.x;
+    if (r >= n_rows) {
+        return;
+    }
+
+    gate += r * N;
+    up   += r * N;
+    dst  += r * N;
+
+    const int tid  = threadIdx.x;
+    const int lane = tid % warp_size;
+
+    ggml_cuda_pdl_sync();
+    const float * signs_row = signs + (r % n_blk) * N;
+
+    float reg[NE];
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        const float v = ggml_cuda_op_silu_single(gate[i * NT + tid]) * up[i * NT + tid];
+        reg[i] = v * scale;
+        reg[i] *= signs_row[i * NT + tid];
+    }
+
+    ggml_cuda_fwht_block_butterfly<N, NT>(reg, s, tid, lane);
+
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        dst[i * NT + tid] = reg[i];
+    }
+}
+
+bool ggml_cuda_op_swiglu_fwht_signed(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up,
+                                     const ggml_tensor * signs_t, ggml_tensor * dst) {
+    static const bool off = getenv("GGML_CUDA_GLU_FWHT_FUSION") != nullptr && atoi(getenv("GGML_CUDA_GLU_FWHT_FUSION")) == 0;
+    static const bool legacy = getenv("GGML_CUDA_FWHT_LEGACY") != nullptr;
+    if (off || legacy) {
+        return false;
+    }
+    if (gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || signs_t->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(gate) || !ggml_is_contiguous(up) || !ggml_is_contiguous(dst) || !ggml_is_contiguous(signs_t) ||
+            !ggml_are_same_shape(gate, up) || ggml_nelements(gate) != ggml_nelements(dst)) {
+        return false;
+    }
+    const int     n    = dst->ne[0];
+    const int64_t rows = ggml_nelements(dst) / n;
+    if (signs_t->ne[0] % n != 0 || rows == 0) {
+        return false;
+    }
+    const int     n_blk = signs_t->ne[0] / n;
+    const float * signs = (const float *) signs_t->data;
+    const float   scale = 1 / sqrtf(n);
+    cudaStream_t  stream = ctx.stream();
+    const float * g_d = (const float *) gate->data;
+    const float * u_d = (const float *) up->data;
+    float *       d_d = (float *) dst->data;
+    const int nt = ggml_cuda_fwht_block_threads(n, rows);
+
+#define FWHT_GLU_LAUNCH(NN, NTT) { \
+        const dim3 g((unsigned) rows, 1, 1), b(NTT, 1, 1); \
+        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(g, b, 0, stream); \
+        ggml_cuda_kernel_launch(fwht_cuda_block_swiglu<NN, NTT>, lp, g_d, u_d, d_d, rows, scale, signs, n_blk); \
+        return true; \
+    }
+#define FWHT_GLU_CASE(NN) \
+    case NN: { \
+        if constexpr (NN >= 1024) { \
+            if (nt == 1024) FWHT_GLU_LAUNCH(NN, 1024) \
+        } \
+        if constexpr (NN >= 512) { \
+            if (nt == 512) FWHT_GLU_LAUNCH(NN, 512) \
+        } \
+        FWHT_GLU_LAUNCH(NN, FWHT_BLOCK_THREADS) \
+    }
+    switch (n) {
+        FWHT_GLU_CASE(512)
+        FWHT_GLU_CASE(1024)
+        FWHT_GLU_CASE(2048)
+        FWHT_GLU_CASE(4096)
+#if !defined(GGML_USE_MUSA)
+        FWHT_GLU_CASE(8192)
+#endif // !defined(GGML_USE_MUSA)
+        default:
+            return false;
+    }
+#undef FWHT_GLU_CASE
+#undef FWHT_GLU_LAUNCH
 }
 
 bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {

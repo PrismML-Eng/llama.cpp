@@ -88,3 +88,9 @@ void quantize_scatter_mmq_q8_1_cuda(const float *   x,
                                     int64_t         nrows_dst,
                                     int             n_expert_used,
                                     cudaStream_t    stream);
+
+// SwiGLU(gate, up) * signs -> block-wise Hadamard transform (width n, n_blk blocks per row) -> MMQ q8_1 quantization (D4 layout, as
+// quantize_mmq_q8_1 writes for PTQ1_0), ntok rows of K = n*n_blk values. Returns false when the width is not covered.
+bool ggml_cuda_swiglu_fwht_quantize_mmq(
+    const float * gate, const float * up, const float * signs, void * vy,
+    int n, int n_blk, int64_t ntok, cudaStream_t stream);
