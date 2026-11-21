@@ -1541,6 +1541,8 @@ struct mmq_args {
     int64_t ncols_max;
     int J_best; // Tile width in ne11(dense)/ne12(MoE) direction to use for optimal performance.
     ggml_cuda_mm_fusion_args_device fusion = {}; // gate != nullptr selects the fused gate/up/GLU path
+    // PQ2_0 prefill: y was quantized with one scale per 128 values (GGML_CUDA_PQ2_D1), all four D4 fields equal
+    bool d1_y = false;
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
