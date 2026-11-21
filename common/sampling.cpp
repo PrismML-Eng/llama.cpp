@@ -180,6 +180,38 @@ static void topk_from_logits(const float * logits, int32_t n_vocab, int32_t k, s
     std::sort_heap(out.begin(), out.end(), comp);
 }
 
+bool common_topk_shortlist_exact(struct llama_sampler * penalties, const llama_token_data * shortlist, size_t n, int32_t k) {
+    if (k <= 0 || n < (size_t) k + 1) {
+        return false;
+    }
+
+    std::vector<llama_token_data> tmp(shortlist, shortlist + n);
+    llama_token_data_array tmp_p = { tmp.data(), tmp.size(), -1, false };
+    llama_sampler_apply(penalties, &tmp_p);
+
+    // the k + 1 largest penalized values, descending
+    std::partial_sort(tmp.begin(), tmp.begin() + k + 1, tmp.end(), [](const llama_token_data & a, const llama_token_data & b) {
+        return a.logit > b.logit;
+    });
+
+    // equal values among them: which token is selected, or in which order the top k comes, would depend on the order in
+    // which the tokens are given, and this differs from the full array
+    for (int32_t i = 0; i < k; i++) {
+        if (!(tmp[i].logit > tmp[i + 1].logit)) {
+            return false;
+        }
+    }
+
+    // a token outside the shortlist has a raw logit <= the smallest one in it, and is lowered further or not at all: it
+    // can only reach the k + 1 largest values by being equal to the (k + 1)-th. Penalties only lower logits, so the
+    // (k + 1)-th is >= that smallest raw logit when at least k + 1 shortlist tokens are not lowered.
+    float raw_min = shortlist[0].logit;
+    for (size_t i = 1; i < n; i++) {
+        raw_min = std::min(raw_min, shortlist[i].logit);
+    }
+    return tmp[k].logit > raw_min;
+}
+
 struct common_sampler {
     common_params_sampling params;
 
@@ -303,18 +335,26 @@ std::string common_params_sampling::print() const {
 }
 
 // k > 0 if the sampler chain starts with top-k (every sampler before it does nothing with these settings)
+// penalties that only lower logits add penalty_last_n + 1 to k: at most penalty_last_n distinct tokens are lowered, so the
+// top k + 1 after the penalties is inside the top k + penalty_last_n + 1 of the raw logits (unless a tie at the border,
+// see common_topk_shortlist_exact: then the full array is used)
 static int32_t common_sampler_fast_topk(const common_params_sampling & params, bool has_logit_bias) {
     if (has_logit_bias || params.mirostat != 0 || params.backend_sampling || params.top_k <= 0 || params.top_k > 128) {
         return 0;
     }
 
+    int32_t margin = 0;
     for (const auto cnstr : params.samplers) {
         switch (cnstr) {
             case COMMON_SAMPLER_TYPE_TOP_K:
-                return params.top_k;
+                return params.top_k + margin;
             case COMMON_SAMPLER_TYPE_PENALTIES:
                 if (params.penalty_last_n != 0 && (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) {
-                    return 0;
+                    const bool lowers_only = params.penalty_repeat >= 1.0f && params.penalty_freq >= 0.0f && params.penalty_present >= 0.0f;
+                    if (!lowers_only || params.penalty_last_n < 0 || params.penalty_last_n > 128) {
+                        return 0;
+                    }
+                    margin = params.penalty_last_n + 1;
                 }
                 break;
             case COMMON_SAMPLER_TYPE_DRY:
@@ -795,10 +835,25 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
     // top-k directly from the logits when nothing before the top-k sampler reads the full array
-    const bool fast = gsmpl->fast_topk > 0 &&
+    bool fast = gsmpl->fast_topk > 0 &&
         !(grammar_first && grammar_should_apply(gsmpl)) &&
         !(rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING) &&
         gsmpl->set_logits_topk(ctx, idx, gsmpl->fast_topk);
+
+    // a shortlist that was widened for penalties must give the same top k as the full array, including ties
+    if (fast && gsmpl->fast_topk > gsmpl->params.top_k) {
+        llama_sampler * penalties = nullptr;
+        for (int32_t i = 0; i < llama_sampler_chain_n(chain); i++) {
+            llama_sampler * smpl = llama_sampler_chain_get(chain, i);
+            if (strcmp(llama_sampler_name(smpl), "penalties") == 0) {
+                penalties = smpl;
+                break;
+            }
+        }
+        if (!penalties || !common_topk_shortlist_exact(penalties, cur_p.data, cur_p.size, gsmpl->params.top_k)) {
+            fast = false;
+        }
+    }
 
     if (!fast) {
         gsmpl->set_logits(ctx, idx);
