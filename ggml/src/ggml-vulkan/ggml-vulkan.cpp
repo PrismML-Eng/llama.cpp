@@ -1335,6 +1335,11 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
     FaCodePath path = device->coopmat2 ? FA_COOPMAT2 :
                       device->coopmat1_fa_support ? FA_COOPMAT1 : FA_SCALAR;
 
+    // coopmat2 decoders have no PQ2_0M case; use coopmat1 (dequantize4 is correct)
+    if (path == FA_COOPMAT2 && (k_type == GGML_TYPE_PQ2_0M || v_type == GGML_TYPE_PQ2_0M)) {
+        path = FA_COOPMAT1;
+    }
+
     if (path == FA_COOPMAT2 && k_type == GGML_TYPE_BF16 && !device->coopmat2_bf16_support) {
         path = FA_COOPMAT1;
     }
