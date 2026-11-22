@@ -1,5 +1,6 @@
 #include "gated_delta_net.cuh"
 #include "gated_delta_net_l8.cuh"
+#include "gated_delta_net_l8p.cuh"
 #include "gated-delta-net-mma.cuh"
 #include "ggml-cuda/common.cuh"
 
@@ -246,6 +247,37 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// GGML_CUDA_GDN_L8P: 0/unset = off, 1 = auto, else a config from the table in launch_gated_delta_net (T tokens per
+// stage, NW warps per block, CPL columns per lane). GGML_CUDA_GDN_L8P_SAB=1 breaks the reduction order (gate test).
+static int gdn_l8p_cfg() {
+    static const int cfg = getenv("GGML_CUDA_GDN_L8P") ? atoi(getenv("GGML_CUDA_GDN_L8P")) : 0;
+    return cfg;
+}
+template <int T, int NW, int CPL, int U, bool keep_rs_t, bool RAW>
+static void launch_gdn_l8p(const float * q_d, const float * k_d, const float * v_d, const float * g_d, const float * b_d,
+        const float * rb_d, const float * ra_d, const float * s_d, float * dst_d, float * state_d,
+        int64_t H, int64_t n_tokens, int64_t n_seqs, int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2,
+        int64_t sv3, int64_t sb1, int64_t sb2, int64_t sb3, uint3 neqk1_magic, uint3 rq3_magic, float scale,
+        int64_t state_slot_stride, int K, const int32_t * s_ids, int64_t s_row_stride, cudaStream_t stream) {
+    constexpr size_t smem = gdn_l8p_smem<T, NW, CPL>::BYTES;
+    static bool attr_set[GGML_CUDA_MAX_DEVICES] = {false};
+    const int dev = ggml_cuda_get_device();
+    if (!attr_set[dev]) {
+        CUDA_CHECK(cudaFuncSetAttribute(gated_delta_net_l8p_cuda<T, NW, CPL, U, keep_rs_t, RAW>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        attr_set[dev] = true;
+    }
+    static const int sab = getenv("GGML_CUDA_GDN_L8P_SAB") ? atoi(getenv("GGML_CUDA_GDN_L8P_SAB")) : 0;
+    const dim3 grid_dims(H, n_seqs, 128 / gdn_l8p_smem<T, NW, CPL>::NCOL);
+    const dim3 block_dims(32, NW, 1);
+    ggml_cuda_kernel_launch(gated_delta_net_l8p_cuda<T, NW, CPL, U, keep_rs_t, RAW>,
+        ggml_cuda_kernel_launch_params(grid_dims, block_dims, smem, stream),
+        q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, sab);
+}
+#endif
+
 template <bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -257,7 +289,7 @@ static void launch_gated_delta_net(
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
         float scale, int64_t state_slot_stride, int K,
-        const int32_t * s_ids, int64_t s_row_stride, cudaStream_t stream) {
+        const int32_t * s_ids, int64_t s_row_stride, cudaStream_t stream, bool allow_l8p = true) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -296,6 +328,48 @@ static void launch_gated_delta_net(
             // Opt in until end-to-end measurements establish defaults for each device family.
             static const bool l8_enabled =
                 getenv("GGML_CUDA_GDN_L8") != nullptr && atoi(getenv("GGML_CUDA_GDN_L8")) != 0;
+            if constexpr (!KDA && !G_PRECOMPUTED) {
+                const int l8p = gdn_l8p_cfg();
+                if (allow_l8p && l8p > 0 && GGML_CUDA_CC_IS_NVIDIA(cc) &&
+                    ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE && warp_size == 32 &&
+                    cols_per_warp == 4 && n_tokens >= GDN_L8P_MIN_TOKENS) {
+                    int c = l8p;
+                    if (c == 1) {
+                        // auto: every block must be resident at once (each block walks all tokens), so pick the
+                        // largest stage T whose shared memory fits ceil(blocks / SMs) blocks per SM
+                        static int smpsm[GGML_CUDA_MAX_DEVICES] = {0};
+                        const int dev = ggml_cuda_get_device();
+                        if (smpsm[dev] == 0) {
+                            CUDA_CHECK(cudaDeviceGetAttribute(&smpsm[dev], cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
+                        }
+                        const int    nsm    = ggml_cuda_info().devices[dev].nsm;
+                        const int64_t per_sm = (H * n_seqs * 8 + nsm - 1) / nsm;
+                        const size_t  smpbo  = ggml_cuda_info().devices[dev].smpbo;
+                        auto fits = [&](size_t b) { return b <= smpbo && per_sm * (int64_t) (b + 1024) <= smpsm[dev]; };
+                        c = fits(gdn_l8p_smem<32, 4, 1>::BYTES) ? 12 : fits(gdn_l8p_smem<16, 4, 1>::BYTES) ? 16 :
+                            fits(gdn_l8p_smem<8, 4, 1>::BYTES) ? 17 : 0;
+                    }
+#define GDN_L8P_LAUNCH(T_, NW_, CPL_, U_) launch_gdn_l8p<T_, NW_, CPL_, U_, keep_rs_t, RAW>(q_d, k_d, v_d, g_d, b_d, rb_d, ra_d,         s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic,          scale, state_slot_stride, K, s_ids, s_row_stride, stream)
+                    if (c > 0) {
+                    switch (c) {
+                        case 3:  GDN_L8P_LAUNCH(32, 4, 1, 1); break;
+                        case 4:  GDN_L8P_LAUNCH(32, 8, 1, 1); break;
+                        case 6:  GDN_L8P_LAUNCH(32, 4, 2, 1); break;
+                        case 10: GDN_L8P_LAUNCH(32, 4, 1, 2); break;
+                        case 11: GDN_L8P_LAUNCH(32, 4, 1, 4); break;
+                        case 12: GDN_L8P_LAUNCH(32, 4, 1, 8); break;
+                        case 13: GDN_L8P_LAUNCH(16, 4, 1, 4); break;
+                        case 14: GDN_L8P_LAUNCH(32, 8, 1, 4); break;
+                        case 15: GDN_L8P_LAUNCH(32, 4, 2, 4); break;
+                        case 16: GDN_L8P_LAUNCH(16, 4, 1, 8); break;
+                        case 17: GDN_L8P_LAUNCH(8, 4, 1, 8); break;
+                        default: GDN_L8P_LAUNCH(16, 4, 1, 1); break;
+                    }
+                    break;
+                    }
+#undef GDN_L8P_LAUNCH
+                }
+            }
             if constexpr (keep_rs_t && !KDA) {
                 if (l8_enabled && GGML_CUDA_CC_IS_NVIDIA(cc) &&
                     ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE && warp_size == 32 &&
@@ -316,6 +390,17 @@ static void launch_gated_delta_net(
         }
         default:
             GGML_ABORT("fatal error");
+    }
+}
+
+static __global__ void gdn_xcheck_cmp(const float * a, const float * b, int64_t n, int64_t sa, int64_t sb, int nslots,
+        unsigned long long * cnt) {
+    for (int sl = 0; sl < nslots; ++sl) {
+        for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (int64_t) blockDim.x*gridDim.x) {
+            if (__float_as_uint(a[sl*sa + i]) != __float_as_uint(b[sl*sb + i])) {
+                atomicAdd(cnt, 1ull);
+            }
+        }
     }
 }
 
@@ -551,10 +636,35 @@ static void ggml_cuda_op_gated_delta_net_impl(
         g_precomputed = true;
     }
 
-#define GDN_LAUNCH(KDA_, KEEP_, RAW_, PRE_)                                                       \
-    launch_gated_delta_net<KDA_, KEEP_, RAW_, PRE_>(q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, \
+#define GDN_LAUNCH_X(KDA_, KEEP_, RAW_, PRE_, DST_, STATE_, SSTRIDE_, ALLOW_)                      \
+    launch_gated_delta_net<KDA_, KEEP_, RAW_, PRE_>(q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, DST_, STATE_, \
         S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                                    \
-        sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_ids, s_row_stride, stream)
+        sb1, sb2, sb3, neqk1, rq3, scale, SSTRIDE_, K, s_ids, s_row_stride, stream, ALLOW_)
+#define GDN_LAUNCH(KDA_, KEEP_, RAW_, PRE_) GDN_LAUNCH_X(KDA_, KEEP_, RAW_, PRE_, dst_d, state_d, state_slot_stride, true)
+
+    // GGML_CUDA_GDN_XCHECK=1 (needs GGML_CUDA_DISABLE_GRAPHS=1): run the stock kernel into temporaries, then the selected
+    // kernel, and count bitwise differences in the attention output and the written state slots.
+    static const bool xcheck = getenv("GGML_CUDA_GDN_XCHECK") && atoi(getenv("GGML_CUDA_GDN_XCHECK")) != 0;
+    ggml_cuda_pool_alloc<float> x_out(ctx.pool());
+    ggml_cuda_pool_alloc<float> x_state(ctx.pool());
+    const int64_t x_D      = S_v * S_v * H * n_seqs;
+    const int     x_slots  = keep_rs ? (int) std::min<int64_t>(K, n_tokens) : 1;
+    cudaStreamCaptureStatus x_cap = cudaStreamCaptureStatusNone;
+    if (xcheck) {
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &x_cap));
+    }
+    const bool do_x = xcheck && x_cap == cudaStreamCaptureStatusNone && !kda && !g_precomputed && S_v == 128;
+    if (do_x) {
+        x_out.alloc(S_v * H * n_tokens * n_seqs);
+        x_state.alloc(x_D * (keep_rs ? K : 1));
+        if (raw) {
+            if (keep_rs) { GDN_LAUNCH_X(false, true,  true,  false, x_out.ptr, x_state.ptr, x_D, false); }
+            else         { GDN_LAUNCH_X(false, false, true,  false, x_out.ptr, x_state.ptr, x_D, false); }
+        } else {
+            if (keep_rs) { GDN_LAUNCH_X(false, true,  false, false, x_out.ptr, x_state.ptr, x_D, false); }
+            else         { GDN_LAUNCH_X(false, false, false, false, x_out.ptr, x_state.ptr, x_D, false); }
+        }
+    }
 
     if (kda) {
         if (keep_rs) { GDN_LAUNCH(true,  true,  false, false); } else { GDN_LAUNCH(true,  false, false, false); }
@@ -567,7 +677,24 @@ static void ggml_cuda_op_gated_delta_net_impl(
             if (keep_rs) { GDN_LAUNCH(false, true,  false, false); } else { GDN_LAUNCH(false, false, false, false); }
         }
     }
+    if (do_x) {
+        ggml_cuda_pool_alloc<unsigned long long> cnt(ctx.pool(), 2);
+        CUDA_CHECK(cudaMemsetAsync(cnt.ptr, 0, 2*sizeof(unsigned long long), stream));
+        gdn_xcheck_cmp<<<512, 256, 0, stream>>>(x_out.ptr, dst_d, S_v * H * n_tokens * n_seqs, 0, 0, 1, cnt.ptr);
+        gdn_xcheck_cmp<<<512, 256, 0, stream>>>(x_state.ptr, state_d, x_D, x_D, state_slot_stride, x_slots, cnt.ptr + 1);
+        unsigned long long h[2];
+        CUDA_CHECK(cudaMemcpyAsync(h, cnt.ptr, sizeof(h), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        static unsigned long long calls = 0, toks = 0, bad_out = 0, bad_state = 0, eng = 0;
+        calls++; toks += n_tokens; bad_out += h[0]; bad_state += h[1];
+        eng += (gdn_l8p_cfg() > 0 && n_tokens >= GDN_L8P_MIN_TOKENS) ? 1 : 0;
+        if (h[0] || h[1] || calls % 200 == 0 || calls == 1 || getenv("GGML_CUDA_GDN_XCHECK")[0] == '2') {
+            GGML_LOG_WARN("gdn xcheck: calls %llu (l8p %llu) tokens %llu | this call n %lld K %d raw %d: out diff %llu, state diff %llu | total out %llu state %llu\n",
+                calls, eng, toks, (long long) n_tokens, K, (int) raw, h[0], h[1], bad_out, bad_state);
+        }
+    }
 #undef GDN_LAUNCH
+#undef GDN_LAUNCH_X
 }
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
