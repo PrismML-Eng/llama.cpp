@@ -12464,6 +12464,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 4, 2, false, 70, n, 2048));
     }
 
+    // GGML_CUDA_PTQ1_J128 (Hopper) and GGML_CUDA_J128_ADA (Ada): the J=128 MMQ kernel needs a row count that is a
+    // multiple of 128, K a multiple of 256, no batch dims and an MMQ-sized column count. None of the PTQ1_0 cases above
+    // has 128-aligned rows, so they never reach it. Bonsai 2 projection widths, full and partial 128-column tiles.
+    for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0}) {
+        for (int64_t n : {64, 200, 512}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 256,  n, 1024, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 1024, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
+
     // PQ2_0 at speculative verify widths (Metal few-row tensor tile): every n up to 32 plus
     // the mul_mm sizes past it, row counts with a partial 32-row block, and two K lengths
     for (int64_t n = 1; n <= 32; ++n) {
