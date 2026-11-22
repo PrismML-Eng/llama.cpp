@@ -11,6 +11,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -104,6 +105,38 @@ static double log_softmax(int n_vocab, const float * logits, uint16_t * log_prob
         std::memset(log_prob, 0, n_vocab*sizeof(uint16_t));
     }
     return max_logit + log_sum_exp - logits[tok];
+}
+
+// Worker threads for the per-token log-softmax / KL work. Default: every hardware thread, as before. On a shared
+// node those threads queue behind one mutex per token and stall on any busy core; LLAMA_PERPLEXITY_THREADS=<n>
+// caps them. The per-token math is unchanged; only which thread does which token changes.
+static int perplexity_workers(int dflt) {
+    const char * e = getenv("LLAMA_PERPLEXITY_THREADS");
+    if (e && atoi(e) > 0) {
+        return std::max(0, atoi(e) - 1);
+    }
+    return dflt;
+}
+
+// Chunk-range shards (LLAMA_PERPLEXITY_SHARD=k/K, opt-in): shard k of K evaluates only its contiguous run of chunks,
+// cut on whole n_seq batches so every decode batch is the one the unsharded run builds (same logits).
+//  - with --kl-divergence-base, every shard writes its chunks at their own offset of ONE logits file (no truncation):
+//    after all K shards the file is byte-for-byte the unsharded one (delete a stale file first);
+//  - with --kl-divergence, a shard reads only its part and LLAMA_KLD_DUMP=<file> saves its sums and per-token values;
+//    LLAMA_KLD_MERGE=<dump0>,<dump1>,... (no model needed) prints the summary of the whole run from the dumps.
+static void perplexity_shard_range(int n_chunk, int n_seq, int & first_chunk, int & end_chunk) {
+    first_chunk = 0; end_chunk = n_chunk;
+    const char * e = getenv("LLAMA_PERPLEXITY_SHARD");
+    int k = 0, n = 1;
+    if (!e || sscanf(e, "%d/%d", &k, &n) != 2 || n <= 1) {
+        return;
+    }
+    GGML_ASSERT(k >= 0 && k < n);
+    const int passes    = (n_chunk + n_seq - 1) / n_seq;
+    const int per_shard = (passes + n - 1) / n;
+    first_chunk = std::min(n_chunk, k * per_shard * n_seq);
+    end_chunk   = std::min(n_chunk, (k + 1) * per_shard * n_seq);
+    LOG_INF("%s: shard %d/%d: chunks [%d, %d) of %d\n", __func__, k, n, first_chunk, end_chunk, n_chunk);
 }
 
 static void process_logits(
@@ -456,8 +489,15 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     GGML_ASSERT(!llama_vocab_get_add_eos(vocab));
 
     std::ofstream logits_stream;
+    const char * shard_env = getenv("LLAMA_PERPLEXITY_SHARD");
+    const bool sharded = shard_env && strchr(shard_env, '/') && atoi(strchr(shard_env, '/') + 1) > 1;
     if (!params.logits_file.empty()) {
-        logits_stream.open(params.logits_file.c_str(), std::ios::binary);
+        if (sharded) {   // every shard writes into the same file: create it if needed, never truncate
+            { std::ofstream touch(params.logits_file.c_str(), std::ios::binary | std::ios::app); }
+            logits_stream.open(params.logits_file.c_str(), std::ios::binary | std::ios::in | std::ios::out);
+        } else {
+            logits_stream.open(params.logits_file.c_str(), std::ios::binary);
+        }
         if (!logits_stream.is_open()) {
             LOG_ERR("%s: failed to open %s for writing\n", __func__, params.logits_file.c_str());
             return {};
@@ -505,6 +545,9 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     GGML_ASSERT(n_batch < n_ctx || n_batch % n_ctx == 0);
     GGML_ASSERT(params.n_ctx == n_seq * n_ctx);
 
+    int chunk_begin = 0, chunk_end = n_chunk;
+    perplexity_shard_range(n_chunk, n_seq, chunk_begin, chunk_end);
+
     common_batch batch(ctx);
 
     std::vector<float> logits;
@@ -514,7 +557,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
     LOG_INF("%s: calculating perplexity over %d chunks, n_ctx=%d, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
 
-    std::vector<std::thread> workers(std::thread::hardware_concurrency() - 1);
+    std::vector<std::thread> workers(perplexity_workers(std::thread::hardware_concurrency() - 1));
 
     std::vector<uint16_t> log_probs;
     if (!params.logits_file.empty()) {
@@ -523,6 +566,9 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
         logits_stream.write((const char *)tokens.data(), n_chunk*n_ctx*sizeof(tokens[0]));
         const int nv = 2*((n_vocab + 1)/2) + 4;
         log_probs.resize(size_t(n_ctx) * nv);
+        // header = magic + n_ctx + n_vocab + n_chunk + tokens; then n_ctx-1-n_ctx/2 rows of nv uint16 per chunk
+        logits_stream.seekp(20 + std::streamoff(n_chunk)*n_ctx*sizeof(tokens[0])
+                            + std::streamoff(chunk_begin)*(n_ctx - 1 - n_ctx/2)*nv*sizeof(uint16_t));
     }
 
     // We get the logits for all the tokens in the context window (params.n_ctx)
@@ -539,11 +585,11 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     // process the entire prompt.
     const int first = n_ctx/2;
 
-    for (int i = 0; i < n_chunk; i += n_seq) {
+    for (int i = chunk_begin; i < chunk_end; i += n_seq) {
         const int start =     i * n_ctx;
         const int end   = start + n_ctx;
 
-        const int n_seq_batch = std::min(n_seq, n_chunk - i);
+        const int n_seq_batch = std::min(n_seq, chunk_end - i);
 
         const auto t_start = std::chrono::high_resolution_clock::now();
 
@@ -591,12 +637,12 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
         }
 
 
-        if (i == 0) {
+        if (i == chunk_begin) {
             llama_synchronize(ctx);
             const auto t_end = std::chrono::high_resolution_clock::now();
             const float t_total = std::chrono::duration<float>(t_end - t_start).count();
             LOG_INF("%s: %.2f seconds per pass - ETA ", __func__, t_total);
-            int total_seconds = (int)(t_total*n_chunk/n_seq);
+            int total_seconds = (int)(t_total*(chunk_end - chunk_begin)/n_seq);
             if (total_seconds >= 60*60) {
                 LOG("%d hours ", total_seconds / (60*60));
                 total_seconds = total_seconds % (60*60);
@@ -1672,6 +1718,58 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
     LOG_INF("\n");
 }
 
+static std::pair<double, double> kld_mean_and_uncertainty(double sum, double sum2, size_t count) {
+    if (count < 1) {
+        return std::make_pair(0., 0.);
+    }
+    double f = sum/count;
+    double df = sum2/count - f*f;
+    df = df > 0 && count > 10 ? sqrt(df/(count-1)) : 0.;
+    return std::make_pair(f, df);
+}
+
+static double kld_covariance(double suma, double sumb, double sumab, size_t count) {
+    if (count < 10) {
+        return 0.0;
+    }
+    double var = sumab/count - (suma/count)*(sumb/count);
+    var /= count - 1;
+    return var;
+}
+
+static void kld_summary(const kl_divergence_result & kld, std::vector<float> & kld_values, std::vector<float> & p_diff_values);
+
+static void kld_print_row(int chunk, const kl_divergence_result & kld) {
+    auto mean_and_uncertainty = kld_mean_and_uncertainty;
+    auto covariance = kld_covariance;
+    LOG("%4d", chunk);
+
+    auto log_ppl = mean_and_uncertainty(kld.sum_nll, kld.sum_nll2, kld.count);
+    const double ppl_val = exp(log_ppl.first);
+    const double ppl_unc = ppl_val * log_ppl.second;
+    LOG("    %9.4lf ± %9.4lf", ppl_val, ppl_unc);
+
+    auto log_ppl_base = mean_and_uncertainty(kld.sum_nll_base, kld.sum_nll_base2, kld.count);
+    const double log_ppl_cov = covariance(kld.sum_nll, kld.sum_nll_base, kld.sum_nll_nll_base, kld.count);
+    const double log_ppl_ratio_val = log_ppl.first - log_ppl_base.first;
+    const double log_ppl_ratio_unc = sqrt(log_ppl.second*log_ppl.second + log_ppl_base.second*log_ppl_base.second - 2.0*log_ppl_cov);
+    LOG("    %10.5lf ± %10.5lf", log_ppl_ratio_val, log_ppl_ratio_unc);
+
+    auto kl_div = mean_and_uncertainty(kld.sum_kld, kld.sum_kld2, kld.count);
+    LOG("    %10.5lf ± %10.5lf", kl_div.first, kl_div.second);
+
+    auto p_diff_mse   = mean_and_uncertainty(kld.sum_p_diff2, kld.sum_p_diff4, kld.count);
+    const double p_diff_rms_val = sqrt(p_diff_mse.first);
+    const double p_diff_rms_unc = 0.5/p_diff_rms_val * p_diff_mse.second;
+    LOG("    %6.3lf ± %6.3lf %%", 100.0*p_diff_rms_val, 100.0*p_diff_rms_unc);
+
+    double p_top_val = 1.*kld.n_same_top/kld.count;
+    double p_top_unc = sqrt(p_top_val*(1 - p_top_val)/(kld.count - 1));
+    LOG("    %6.3lf ± %6.3lf %%", 100.0*p_top_val, 100.0*p_top_unc);
+
+    LOG("\n");
+}
+
 static void kl_divergence(llama_context * ctx, const common_params & params) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -1735,9 +1833,15 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     common_batch batch(ctx);
 
+    int chunk_begin = 0, chunk_end = n_chunk;
+    perplexity_shard_range(n_chunk, n_seq, chunk_begin, chunk_end);
+    if (chunk_begin > 0) {   // skip the earlier shards' log-probs (header and tokens are already read)
+        in.seekg(std::streamoff(chunk_begin)*(n_ctx - 1 - n_ctx/2)*nv*sizeof(uint16_t), std::ios::cur);
+    }
+
     std::vector<uint16_t> log_probs_uint16(size_t(n_ctx - 1 - n_ctx/2) * nv);
-    std::vector<float>    kld_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
-    std::vector<float> p_diff_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
+    std::vector<float>    kld_values(size_t(n_ctx - 1 - n_ctx/2)*(chunk_end - chunk_begin));
+    std::vector<float> p_diff_values(size_t(n_ctx - 1 - n_ctx/2)*(chunk_end - chunk_begin));
     std::vector<float> logits;
     if (num_batches > 1) {
         logits.reserve(size_t(n_ctx) * n_vocab);
@@ -1745,25 +1849,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     LOG_INF("%s: computing over %d chunks, n_ctx=%u, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
 
-    std::vector<std::thread> workers(std::thread::hardware_concurrency() - 1);
-
-    auto mean_and_uncertainty = [] (double sum, double sum2, size_t count) {
-        if (count < 1) {
-            return std::make_pair(0., 0.);
-        }
-        double f = sum/count;
-        double df = sum2/count - f*f;
-        df = df > 0 && count > 10 ? sqrt(df/(count-1)) : 0.;
-        return std::make_pair(f, df);
-    };
-    auto covariance = [] (double suma, double sumb, double sumab, size_t count) {
-        if (count < 10) {
-            return 0.0;
-        }
-        double var = sumab/count - (suma/count)*(sumb/count);
-        var /= count - 1;
-        return var;
-    };
+    std::vector<std::thread> workers(perplexity_workers(std::thread::hardware_concurrency() - 1));
 
     kl_divergence_result kld;
     auto    kld_ptr =    kld_values.data();
@@ -1771,11 +1857,11 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     const int first = n_ctx/2;
 
-    for (int i = 0; i < n_chunk; i += n_seq) {
+    for (int i = chunk_begin; i < chunk_end; i += n_seq) {
         const int start =     i * n_ctx;
         const int end   = start + n_ctx;
 
-        const int n_seq_batch = std::min(n_seq, n_chunk - i);
+        const int n_seq_batch = std::min(n_seq, chunk_end - i);
 
         const auto t_start = std::chrono::high_resolution_clock::now();
 
@@ -1822,12 +1908,12 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
             }
         }
 
-        if (i == 0) {
+        if (i == chunk_begin) {
             llama_synchronize(ctx);
             const auto t_end = std::chrono::high_resolution_clock::now();
             const float t_total = std::chrono::duration<float>(t_end - t_start).count();
             LOG_INF("%s: %.2f seconds per pass - ETA ", __func__, t_total);
-            int total_seconds = (int)(t_total * n_chunk / n_seq);
+            int total_seconds = (int)(t_total * (chunk_end - chunk_begin) / n_seq);
             if (total_seconds >= 60*60) {
                 LOG("%d hours ", total_seconds / (60*60));
                 total_seconds = total_seconds % (60*60);
@@ -1851,38 +1937,35 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
             p_diff_ptr += n_ctx - 1 - first;
             kld_ptr    += n_ctx - 1 - first;
 
-            LOG("%4d", i + seq + 1);
-
-            auto log_ppl = mean_and_uncertainty(kld.sum_nll, kld.sum_nll2, kld.count);
-            const double ppl_val = exp(log_ppl.first);
-            const double ppl_unc = ppl_val * log_ppl.second;
-            LOG("    %9.4lf ± %9.4lf", ppl_val, ppl_unc);
-
-            auto log_ppl_base = mean_and_uncertainty(kld.sum_nll_base, kld.sum_nll_base2, kld.count);
-            const double log_ppl_cov = covariance(kld.sum_nll, kld.sum_nll_base, kld.sum_nll_nll_base, kld.count);
-            const double log_ppl_ratio_val = log_ppl.first - log_ppl_base.first;
-            const double log_ppl_ratio_unc = sqrt(log_ppl.second*log_ppl.second + log_ppl_base.second*log_ppl_base.second - 2.0*log_ppl_cov);
-            LOG("    %10.5lf ± %10.5lf", log_ppl_ratio_val, log_ppl_ratio_unc);
-
-            auto kl_div = mean_and_uncertainty(kld.sum_kld, kld.sum_kld2, kld.count);
-            LOG("    %10.5lf ± %10.5lf", kl_div.first, kl_div.second);
-
-            auto p_diff_mse   = mean_and_uncertainty(kld.sum_p_diff2, kld.sum_p_diff4, kld.count);
-            const double p_diff_rms_val = sqrt(p_diff_mse.first);
-            const double p_diff_rms_unc = 0.5/p_diff_rms_val * p_diff_mse.second;
-            LOG("    %6.3lf ± %6.3lf %%", 100.0*p_diff_rms_val, 100.0*p_diff_rms_unc);
-
-            double p_top_val = 1.*kld.n_same_top/kld.count;
-            double p_top_unc = sqrt(p_top_val*(1 - p_top_val)/(kld.count - 1));
-            LOG("    %6.3lf ± %6.3lf %%", 100.0*p_top_val, 100.0*p_top_unc);
-
-            LOG("\n");
+            kld_print_row(i + seq + 1, kld);
         }
 
         logits.clear();
     }
 
     LOG("\n");
+
+    const char * dump = getenv("LLAMA_KLD_DUMP");
+    if (dump && *dump) {   // this shard's sums and per-token values, for LLAMA_KLD_MERGE
+        std::ofstream o(dump, std::ios::binary);
+        const uint64_t n = kld_values.size();
+        o.write("KLDDUMP1", 8);
+        o.write((const char *)&kld, sizeof(kld));
+        o.write((const char *)&n, sizeof(n));
+        o.write((const char *)kld_values.data(), n*sizeof(float));
+        o.write((const char *)p_diff_values.data(), n*sizeof(float));
+        if (!o) {
+            LOG_ERR("%s: failed writing %s\n", __func__, dump);
+            exit(1);
+        }
+    }
+
+    kld_summary(kld, kld_values, p_diff_values);
+}
+
+static void kld_summary(const kl_divergence_result & kld, std::vector<float> & kld_values, std::vector<float> & p_diff_values) {
+    auto mean_and_uncertainty = kld_mean_and_uncertainty;
+    auto covariance = kld_covariance;
 
     if (kld.count < 100) return; // we do not wish to do statistics on so few values
 
@@ -1982,11 +2065,61 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     LOG("Same top p: %6.3lf ± %5.3lf %%\n", 100.0*same_top_p, 100.0*sqrt(same_top_p*(1.0 - same_top_p)/(kld.count - 1)));
 }
 
+// LLAMA_KLD_MERGE=<dump0>,<dump1>,...: the whole run's per-chunk total row and summary from the shards' dumps,
+// in shard order (sums add in that order; the per-token values, so the median and percentiles, are the same set).
+static int kld_merge(const char * list) {
+    kl_divergence_result kld;
+    std::vector<float> kld_values, p_diff_values;
+    int n_dumps = 0;
+    std::string all(list);
+    size_t pos = 0;
+    while (pos <= all.size()) {
+        size_t comma = all.find(',', pos);
+        std::string f = all.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        pos = comma == std::string::npos ? all.size() + 1 : comma + 1;
+        if (f.empty()) continue;
+        std::ifstream in(f, std::ios::binary);
+        char magic[8]; kl_divergence_result r; uint64_t n = 0;
+        in.read(magic, 8); in.read((char *)&r, sizeof(r)); in.read((char *)&n, sizeof(n));
+        if (!in || strncmp(magic, "KLDDUMP1", 8) != 0) {
+            LOG_ERR("%s: %s is not a KLD dump\n", __func__, f.c_str());
+            return 1;
+        }
+        const size_t off = kld_values.size();
+        kld_values.resize(off + n); p_diff_values.resize(off + n);
+        in.read((char *)(kld_values.data() + off), n*sizeof(float));
+        in.read((char *)(p_diff_values.data() + off), n*sizeof(float));
+        if (!in) {
+            LOG_ERR("%s: %s is truncated\n", __func__, f.c_str());
+            return 1;
+        }
+        kld.sum_nll += r.sum_nll; kld.sum_nll2 += r.sum_nll2;
+        kld.sum_nll_base += r.sum_nll_base; kld.sum_nll_base2 += r.sum_nll_base2;
+        kld.sum_nll_nll_base += r.sum_nll_nll_base;
+        kld.sum_kld += r.sum_kld; kld.sum_kld2 += r.sum_kld2;
+        kld.sum_p_diff += r.sum_p_diff; kld.sum_p_diff2 += r.sum_p_diff2; kld.sum_p_diff4 += r.sum_p_diff4;
+        kld.max_p_diff = std::max(kld.max_p_diff, r.max_p_diff);
+        kld.n_same_top += r.n_same_top; kld.count += r.count;
+        n_dumps++;
+    }
+    LOG_INF("%s: merged %d shard dumps, %zu tokens\n", __func__, n_dumps, (size_t) kld.count);
+    LOG("chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p\n");
+    kld_print_row((int) (kld.count / 255), kld);   // the total row (chunk label = tokens / 255 at -c 512)
+    LOG("\n");
+    kld_summary(kld, kld_values, p_diff_values);
+    return 0;
+}
+
 // satisfies -Wmissing-declarations
 int llama_perplexity(int argc, char ** argv);
 
 int llama_perplexity(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
+
+    if (const char * merge = getenv("LLAMA_KLD_MERGE"); merge && *merge) {
+        common_init();
+        return kld_merge(merge);
+    }
 
     common_params params;
 
