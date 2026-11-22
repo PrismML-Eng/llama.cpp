@@ -775,7 +775,8 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     // token, so they keep the full graph.
     static const bool kv_only_on = [] {
         const char * e = getenv("LLAMA_MTP_KV_ONLY");
-        return e ? atoi(e) != 0 : llama_sycl_present();
+        const char * l = getenv("LLAMA_MTP_PREFILL_LEAN");  // the lean prefill implies the K/V-only head pass
+        return e ? atoi(e) != 0 : (llama_sycl_present() || (l && atoi(l) != 0));
     }();
     const bool kv_only = kv_only_on && n_outputs == 0 && cparams.embeddings_nextn_masked;
 

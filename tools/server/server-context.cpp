@@ -4634,8 +4634,13 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        static const bool prefill_lean = [] { const char * e = getenv("LLAMA_MTP_PREFILL_LEAN"); return e && atoi(e) != 0; }();
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            // the MTP head's held prompt batch runs while this target batch computes (before the wait for outputs)
+            if (ret == 0 && spec && prefill_lean && !common_speculative_flush_lean(spec.get(), batch.view)) {
+                SRV_ERR("%s", "failed to process speculative batch (lean flush)\n");
+            }
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
