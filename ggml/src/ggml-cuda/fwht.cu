@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fwht.cuh"
+#include "unary.cuh"
 
 #include <cstdlib>
 
@@ -320,4 +321,162 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
 bool ggml_cuda_op_fwht_signed(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
                               const ggml_tensor * signs, ggml_tensor * dst) {
     return fwht_dispatch(ctx, src, dst, signs);
+}
+
+
+// block_q8_1_mmq with D4 scales (mmq.cuh), restated to keep this file free of the MMQ headers
+struct fwht_q8_1_mmq_d4 {
+    float  d4[4];
+    int8_t qs[128];
+};
+static_assert(sizeof(fwht_q8_1_mmq_d4) == 144, "block_q8_1_mmq size");
+
+// GGML_CUDA_FWHT_MMQ: fwht_cuda_block (has_signs as there) followed by quantize_mmq_q8_1<D4> of its output, in one
+// launch. Row r of the [rows, N] view is column col = r*N / K, values k = (r*N) % K + i*NT + tid. A 32-value
+// quantization group is one warp at one i (N, NT and r*N are multiples of 32), so the group's amax is a warp max.
+template <int N, int NT, typename T, bool has_signs, bool glu = false>
+__launch_bounds__(NT, 1)
+__global__ void fwht_quantize_mmq_d4_block(const T * src, fwht_q8_1_mmq_d4 * y, const int64_t n_rows, const float scale,
+                                           const float * signs, const int n_blk, const int64_t K, const int64_t ncols,
+                                           const float * glu_up = nullptr) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int NE        = N / NT;
+    static_assert(NE >= 1 && N % NT == 0 && NT % warp_size == 0, "bad FWHT block shape");
+
+    __shared__ float s[N];
+
+    const int64_t r = blockIdx.x;
+    if (r >= n_rows) {
+        return;
+    }
+
+    src += r * N;
+    if (glu) {
+        glu_up += r * N;
+    }
+
+    const int tid  = threadIdx.x;
+    const int lane = tid % warp_size;
+
+    ggml_cuda_pdl_lc(); // as unary_gated_op_kernel: the next launch may start its prologue (it waits in pdl_sync)
+    ggml_cuda_pdl_sync();
+    const float * signs_row = has_signs ? signs + (r % n_blk) * N : nullptr;
+
+    float reg[NE];
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        if (glu) {
+            // the GLU value as unary_gated_op_kernel<op_silu, float> stores it
+            const float v = ggml_cuda_op_silu_single(fwht_load(src[i * NT + tid])) * glu_up[i * NT + tid];
+            reg[i] = v * scale;
+        } else {
+            reg[i] = fwht_load(src[i * NT + tid]) * scale;
+        }
+        if (has_signs) {
+            reg[i] *= signs_row[i * NT + tid];
+        }
+    }
+
+    ggml_cuda_fwht_block_butterfly<N, NT>(reg, s, tid, lane);
+
+    // through shared memory to 4 consecutive values per thread, then quantize_mmq_q8_1<D4> as written there:
+    // amax over the 4 values and 8 threads (xor 4, 2, 1), char4 stores, one d per 32 values
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        s[i * NT + tid] = reg[i];
+    }
+    __syncthreads();
+    const int64_t e0  = r * N;
+    const int64_t col = e0 / K;
+    const int64_t k0  = e0 % K;
+    for (int e = tid; e < N/4; e += NT) {
+        const float4 xi = ((const float4 *) s)[e];
+        float amax = fabsf(xi.x);
+        amax = fmaxf(amax, fabsf(xi.y));
+        amax = fmaxf(amax, fabsf(xi.z));
+        amax = fmaxf(amax, fabsf(xi.w));
+#pragma unroll
+        for (int offset = 32/8; offset > 0; offset >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, warp_size));
+        }
+        const float d_inv = 127.0f / amax;
+        char4 q;
+        q.x = roundf(xi.x*d_inv);
+        q.y = roundf(xi.y*d_inv);
+        q.z = roundf(xi.z*d_inv);
+        q.w = roundf(xi.w*d_inv);
+        const float d = 1.0f / d_inv;
+        const int64_t k   = k0 + 4*e;
+        const int64_t ib  = (k / 128) * ncols + col;
+        const int     iqs = (int) (k % 128);
+        ((char4 *) y[ib].qs)[iqs/4] = q;
+        if (iqs % 32 == 0) {
+            y[ib].d4[iqs/32] = d;
+        }
+    }
+}
+
+bool ggml_cuda_fwht_quantize_mmq_d4(const void * x, ggml_type xt, const float * signs, int n, void * out,
+                                    int64_t K, int64_t ncols, cudaStream_t stream, const float * glu_up) {
+    if (K % n != 0 || K % 128 != 0 || (xt != GGML_TYPE_F32 && xt != GGML_TYPE_F16)) {
+        return false;
+    }
+    const int64_t rows  = K / n * ncols;
+    const float   scale = 1 / sqrtf(n);
+    const int     n_blk = (int) (K / n);
+    if (ggml_cuda_fwht_block_threads(n, rows) != FWHT_BLOCK_THREADS) {
+        return false;
+    }
+    const dim3 g((unsigned) rows, 1, 1), b(FWHT_BLOCK_THREADS, 1, 1);
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(g, b, 0, stream);
+    fwht_q8_1_mmq_d4 * y = (fwht_q8_1_mmq_d4 *) out;
+#define FQM_CASE(NN) \
+    case NN: \
+        if (xt == GGML_TYPE_F32) { \
+            if (signs) ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, float, true>,  lp, (const float *) x, y, rows, scale, signs, n_blk, K, ncols); \
+            else       ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, float, false>, lp, (const float *) x, y, rows, scale, nullptr, 1, K, ncols); \
+        } else { \
+            if (signs) ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, half, true>,   lp, (const half *) x, y, rows, scale, signs, n_blk, K, ncols); \
+            else       ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, half, false>,  lp, (const half *) x, y, rows, scale, nullptr, 1, K, ncols); \
+        } \
+        return true;
+    if (!glu_up) {
+        // the non-GLU instantiations take glu_up = nullptr explicitly (the launch helper does not apply defaults)
+        switch (n) {
+#define FQN_CASE(NN) case NN: \
+            if (xt == GGML_TYPE_F32) { \
+                if (signs) ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, float, true>,  lp, (const float *) x, y, rows, scale, signs, n_blk, K, ncols, (const float *) nullptr); \
+                else       ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, float, false>, lp, (const float *) x, y, rows, scale, (const float *) nullptr, 1, K, ncols, (const float *) nullptr); \
+            } else { \
+                if (signs) ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, half, true>,   lp, (const half *) x, y, rows, scale, signs, n_blk, K, ncols, (const float *) nullptr); \
+                else       ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, half, false>,  lp, (const half *) x, y, rows, scale, (const float *) nullptr, 1, K, ncols, (const float *) nullptr); \
+            } \
+            return true;
+            FQN_CASE(512)
+            FQN_CASE(1024)
+            FQN_CASE(2048)
+            FQN_CASE(4096)
+#undef FQN_CASE
+            default:
+                return false;
+        }
+    }
+    {
+        if (xt != GGML_TYPE_F32 || !signs) {
+            return false;
+        }
+        switch (n) {
+#define FQG_CASE(NN) case NN: ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_block<NN, FWHT_BLOCK_THREADS, float, true, true>, lp, \
+                (const float *) x, y, rows, scale, signs, n_blk, K, ncols, glu_up); return true;
+            FQG_CASE(512)
+            FQG_CASE(1024)
+            FQG_CASE(2048)
+            FQG_CASE(4096)
+#undef FQG_CASE
+            default:
+                return false;
+        }
+    }
+    return false;
+#undef FQM_CASE
 }

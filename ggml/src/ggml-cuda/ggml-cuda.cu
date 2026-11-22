@@ -3198,6 +3198,136 @@ static bool ggml_cuda_fwht_q8_find_uses(const ggml_cgraph * cgraph, const int i_
     return true;
 }
 
+// GGML_CUDA_FWHT_MMQ: like ggml_cuda_fwht_q8_find_uses, but every use must be an MMQ mat-mul (prefill widths) of
+// PTQ1_0/PQ2_0 weights (q8_1 D4 layout), so the rotation can write their shared block_q8_1_mmq rows.
+static bool ggml_cuda_fwht_mmq_find_uses(const ggml_cgraph * cgraph, const int i_mm, const int cc, ggml_cuda_fwht_q8_uses & u) {
+    const ggml_tensor * mm = cgraph->nodes[i_mm];
+    u = ggml_cuda_fwht_q8_uses();
+    u.aliases[0] = mm;
+    u.n_aliases  = 1;
+    int uses_expected = ggml_node_get_use_count(cgraph, i_mm);
+    int uses_found    = 0;
+    for (int j = i_mm + 1; j < cgraph->n_nodes; ++j) {
+        ggml_tensor * t = cgraph->nodes[j];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = t->src[s];
+            if (!src) {
+                continue;
+            }
+            bool is_alias = false;
+            for (int a = 0; a < u.n_aliases; ++a) {
+                if (src == u.aliases[a]) {
+                    is_alias = true;
+                    break;
+                }
+            }
+            if (!is_alias) {
+                continue;
+            }
+            uses_found++;
+            if (t->op == GGML_OP_RESHAPE && t->view_src == mm && t->data == mm->data &&
+                    ggml_nelements(t) == ggml_nelements(mm) && ggml_is_contiguous(t)) {
+                if (u.n_aliases == 8 || (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                    return false; // an output view of the transform must stay F32 (as in ggml_cuda_fwht_q8_find_uses)
+                }
+                u.aliases[u.n_aliases++] = t;
+                uses_expected += ggml_node_get_use_count(cgraph, j);
+                continue;
+            }
+            const ggml_type ct = t->src[0] ? t->src[0]->type : GGML_TYPE_COUNT;
+            if (t->op != GGML_OP_MUL_MAT || s != 1 || (ct != GGML_TYPE_PTQ1_0 && ct != GGML_TYPE_PQ2_0) ||
+                    ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
+                    t->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) ||
+                    src->ne[2] != 1 || src->ne[3] != 1 || t->src[0]->ne[2] != 1 || t->src[0]->ne[3] != 1 ||
+                    (u.K != 0 && (src->ne[0] != u.K || src->ne[1] != u.ncols)) ||
+                    src->ne[0] % 512 != 0 ||  // no padding blocks (ne10_padded == K)
+                    ggml_cuda_should_use_mmvq(ct, cc, src->ne[1]) || !ggml_cuda_should_use_mmq(ct, cc, src->ne[1], 0)) {
+                return false;
+            }
+            const ggml_tensor * w = t->src[0];
+            if (ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+                return false;
+            }
+            u.K     = src->ne[0];
+            u.ncols = src->ne[1];
+            u.wtype = ct;
+        }
+        if (uses_found == uses_expected) {
+            break; // every use seen (host time: the uses sit a few nodes after the rotation)
+        }
+    }
+    return uses_found > 0 && uses_found == uses_expected && u.K != 0;
+}
+
+// GGML_CUDA_FWHT_MMQ_GLU: GLU(swiglu, split gate/up, not swapped) -> MUL(signs) -> RESHAPE -> MUL_MAT(Hadamard) whose
+// uses are all MMQ mat-muls: one launch computes silu(gate)*up, rotates and quantizes. Returns nodes consumed (4) or 0.
+static int ggml_cuda_try_glu_fwht_mmq(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+    static const bool on = getenv("GGML_CUDA_FWHT_MMQ") != nullptr && atoi(getenv("GGML_CUDA_FWHT_MMQ")) != 0 &&
+                           getenv("GGML_CUDA_FWHT_MMQ_GLU") != nullptr && atoi(getenv("GGML_CUDA_FWHT_MMQ_GLU")) != 0;
+    if (!on || !ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_GLU, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { node_idx + 3 })) {
+        return 0;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_TURING) {
+        return 0;
+    }
+    const ggml_tensor * glu     = cgraph->nodes[node_idx];
+    const ggml_tensor * mul     = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * reshape = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * mm      = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * g0      = glu->src[0];
+    const ggml_tensor * g1      = glu->src[1];
+    const ggml_tensor * signs   = mul->src[1];
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || g1 == nullptr || ggml_get_op_params_i32(glu, 1) != 0 ||
+            glu->type != GGML_TYPE_F32 || g0->type != GGML_TYPE_F32 || g1->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(glu) || !ggml_is_contiguous(g0) || !ggml_is_contiguous(g1) ||
+            !ggml_are_same_shape(g0, glu) || !ggml_are_same_shape(g1, glu) ||
+            mul->src[0] != glu || mul->type != GGML_TYPE_F32 ||
+            ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD || mm->src[1] != reshape || reshape->src[0] != mul ||
+            signs->type != GGML_TYPE_F32 || !ggml_is_contiguous(signs) || signs->ne[1] != 1 || signs->ne[2] != 1 ||
+            signs->ne[3] != 1 || signs->ne[0] != glu->ne[0] ||
+            mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm) || (mm->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            ggml_nelements(mm) != ggml_nelements(glu)) {
+        return 0;
+    }
+    const int n = (int) mm->src[0]->ne[0];
+    ggml_cuda_fwht_q8_uses u;
+    if (signs->ne[0] % n != 0 || !ggml_cuda_fwht_mmq_find_uses(cgraph, node_idx + 3, cc, u) || u.K % n != 0 ||
+            signs->ne[0] != u.K) {
+        return 0;
+    }
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * a1 = a0 + ggml_nbytes(a);
+        const char * b0 = (const char *) b->data;
+        const char * b1 = b0 + ggml_nbytes(b);
+        return a0 < b1 && b0 < a1;
+    };
+    const size_t q8_bytes = (size_t) (u.ncols * u.K) / 128 * 144 + 256*1024;
+    std::unique_ptr<ggml_cuda_pool_alloc<char>> blk;
+    void * out = mm->data; // stable address (CUDA graphs) unless it overlaps an input
+    if (overlaps(g0, mm) || overlaps(g1, mm) || overlaps(signs, mm) || q8_bytes > ggml_nbytes(mm)) {
+        blk = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_bytes);
+        out = blk->get();
+    }
+    if (!ggml_cuda_fwht_quantize_mmq_d4(g0->data, g0->type, (const float *) signs->data, n, out, u.K, u.ncols, ctx.stream(),
+                                        (const float *) g1->data)) {
+        return 0;
+    }
+    if (blk) {
+        ctx.fwht_q8().held.push_back(std::move(blk));
+    }
+    ggml_cuda_fwht_q8 e;
+    e.layout = GGML_CUDA_Q8_1_MMQ_D4;
+    e.ne0    = u.K;
+    e.ncols  = u.ncols;
+    e.data   = out;
+    for (int a = 0; a < u.n_aliases; ++a) {
+        ctx.fwht_q8().set(u.aliases[a], e);
+    }
+    return 4;
+}
+
 // A Hadamard rotation of an activation ([MUL signs, RESHAPE,] MUL_MAT with GGML_HINT_SRC0_IS_HADAMARD)
 // whose every use is a PTQ1_0 mat-vec on the mmvq path does not need to exist in F32: each of those
 // mat-vecs quantizes it to q8_1 straight away, so the transform kernel quantizes as it goes and writes
@@ -3286,7 +3416,37 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
     // in the unsigned pattern it is the [n, rows] reshape
     ggml_cuda_fwht_q8_uses u;
     if (!ggml_cuda_fwht_q8_find_uses(cgraph, i_mm, cc, pq2_enabled, u)) {
-        return 0;
+        static const bool fwht_mmq = getenv("GGML_CUDA_FWHT_MMQ") != nullptr && atoi(getenv("GGML_CUDA_FWHT_MMQ")) != 0;
+        if (!fwht_mmq || !ggml_cuda_fwht_mmq_find_uses(cgraph, i_mm, cc, u) || u.K % n != 0 ||
+                (signs && signs->ne[0] != u.K)) {
+            return 0;
+        }
+        // rows in the rotation's own F32 output (4 bytes per value vs 1.125: room for the MMQ tile reads past the
+        // last column; a stable address, so CUDA graphs stay valid), or in a pool block held for this graph when
+        // that buffer overlaps the input (see out_aliases_in above)
+        const size_t q8_bytes = (size_t) (u.ncols * u.K) / 128 * 144 + 256*1024;
+        std::unique_ptr<ggml_cuda_pool_alloc<char>> blk;
+        void * out = mm->data;
+        if (out_aliases_in || q8_bytes > ggml_nbytes(mm)) {
+            blk = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_bytes);
+            out = blk->get();
+        }
+        if (!ggml_cuda_fwht_quantize_mmq_d4(x->data, x->type, signs ? (const float *) signs->data : nullptr, n, out,
+                                            u.K, u.ncols, ctx.stream())) {
+            return 0;
+        }
+        if (blk) {
+            ctx.fwht_q8().held.push_back(std::move(blk));
+        }
+        ggml_cuda_fwht_q8 e;
+        e.layout = GGML_CUDA_Q8_1_MMQ_D4;
+        e.ne0    = u.K;
+        e.ncols  = u.ncols;
+        e.data   = out;
+        for (int a = 0; a < u.n_aliases; ++a) {
+            ctx.fwht_q8().set(u.aliases[a], e);
+        }
+        return consumed;
     }
     const int64_t K     = u.K;
     const int64_t ncols = u.ncols;
@@ -6580,6 +6740,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                if (node->op == GGML_OP_GLU && !is_concurrent_event_active) {
+                    const int consumed = ggml_cuda_try_glu_fwht_mmq(*cuda_ctx, cgraph, i);
+                    if (consumed > 0) {
+                        i += consumed - 1;
+                        continue;
+                    }
+                }
                 // Hadamard rotation that quantizes its own output; its PTQ1_0 mat-vecs skip quantize
                 if ((node->op == GGML_OP_MUL || node->op == GGML_OP_MUL_MAT) && !is_concurrent_event_active) {
                     const int consumed = ggml_cuda_try_fwht_q8(*cuda_ctx, cgraph, i);

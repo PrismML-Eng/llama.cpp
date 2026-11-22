@@ -1070,6 +1070,7 @@ enum ggml_cuda_q8_1_layout : int {
     GGML_CUDA_Q8_1_PT       = 2, // PTQ1_0, 2-8 columns or MoE ids: planar-transposed (mmvq-ptq1_0.cuh)
     GGML_CUDA_Q8_1_PQ2      = 3, // PQ2_0, 3-8 columns, plain 2D, Ada: permuted qs plus half2 (d, int sum) per block (mmvq-pq2_0.cuh)
     GGML_CUDA_Q8_1_Q1B      = 4, // Q1_0, one column: per 32-block, word j = elements j, 8+j, 16+j, 24+j (bit-serial dot), then half2 (d, exact int sum) per block
+    GGML_CUDA_Q8_1_MMQ_D4   = 5, // MMQ src1 (block_q8_1_mmq, d4 scales), written by the fused prefill rotation (GGML_CUDA_FWHT_MMQ)
 };
 
 // Column-count helper, not the layout decision. 2-8 columns and MoE (ids) take the planar

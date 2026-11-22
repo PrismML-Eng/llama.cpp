@@ -62,6 +62,9 @@ __device__ __forceinline__ void ggml_cuda_fwht_block_butterfly(float * reg, floa
 
 // Returns whether the Fast Walsh-Hadamard transform could be used.
 bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst);
+// GGML_CUDA_FWHT_MMQ: rotation + q8_1 MMQ (D4) quantization of x [K, ncols] in one launch; false if the width is unsupported
+bool ggml_cuda_fwht_quantize_mmq_d4(const void * x, ggml_type xt, const float * signs, int n, void * out,
+                                    int64_t K, int64_t ncols, cudaStream_t stream, const float * glu_up = nullptr);
 bool ggml_cuda_op_fwht_signed(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
                               const ggml_tensor * signs, ggml_tensor * dst);
 
