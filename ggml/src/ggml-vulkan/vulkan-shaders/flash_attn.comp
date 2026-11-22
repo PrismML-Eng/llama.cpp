@@ -404,7 +404,11 @@ void main() {
                     k_dm = ACC_TYPEV2(get_k_scale(ib, k_offset));
 
                     if (block8_fast) {
-                        fa_k_qs_block8 blk = get_k_qs_block8(ib, k_offset);
+                        // byte_off is the thread's raw byte offset within the block.
+                        // 0 for block-32 types (each thread reads a distinct block at
+                        // offset 0); non-zero for block-128 types (PQ2_0M) where 4
+                        // threads share one block at element offsets 0/32/64/96.
+                        fa_k_qs_block8 blk = get_k_qs_block8(ib, k_offset, iqs / 4);
                         [[unroll]] for (uint32_t d = 0; d < 8; d++) {
                             k_quants[d] = blk.qs[d];
                         }
