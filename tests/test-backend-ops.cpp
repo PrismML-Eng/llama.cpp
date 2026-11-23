@@ -12512,6 +12512,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 4, 2, false, 70, n, 2048));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 4, 2, false, 70, n, 2048));
     }
+    // PTQ1_0 1..8-row batches on shapes the SYCL T2 path takes (N % 16 == 0, K % 128 == 0): with GGML_SYCL_PTQ1_T2=all
+    // they run on the GEMV, and with GGML_SYCL_T2_VGEMM_MIN=k the k..8-row ones on GemmMT in the GEMV's K-slice order
+    // (N <= 8192: 4 slices, N > 8192: 2)
+    for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 1024,  n, 5120,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 5120,  n, 17408, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 10240, n, 5120,  {1, 1}, {1, 1}));
+    }
 
     // GGML_CUDA_PTQ1_J128 (Hopper) and GGML_CUDA_J128_ADA (Ada): the J=128 MMQ kernel needs a row count that is a
     // multiple of 128, K a multiple of 256, no batch dims and an MMQ-sized column count. None of the PTQ1_0 cases above

@@ -290,7 +290,10 @@ struct Gemv {
 // zero-fills out-of-range reads and clips writes, so any M works. 256 GRF.
 // The epilogue is a template parameter here (as in the OpenCL -D build): a
 // runtime-selected one costs ~3% in this kernel.
-template <bool BF16, int QMODE, int MT_M, int MT_N, int WG_M, int WG_N, int POSTOP, bool F32>
+// llama.cpp vendored copy: KSPLIT = sum K in ks consecutive slices, each from zero, then add the slices in
+// order, exactly as Gemv<.., LS = ks, ..> reduces its K-slices through SLM. With ks = the LS the GEMV would use, a 1..8-row
+// batch through this kernel gives the GEMV's floats bit for bit (same per-step products, same summation order).
+template <bool BF16, int QMODE, int MT_M, int MT_N, int WG_M, int WG_N, int POSTOP, bool F32, bool KSPLIT = false>
 struct GemmMT {
     const unsigned short *A;
     const signed char *Aq;
@@ -300,6 +303,7 @@ struct GemmMT {
     void *C;
     Epi epi;
     int M, N, K;
+    int ks = 1;
 
     using D = dt<BF16>;
     static constexpr int MB = MT_M / 8, NB = MT_N / 16, WG = 16 * WG_M * WG_N;
@@ -314,10 +318,14 @@ struct GemmMT {
         const surf ssa(SA, ldsa(M) * 2, K / GS, ldsa(M) * 2);
 
         float8 acc[MB][NB];
+        [[maybe_unused]] float8 tot[MB][NB];
 #pragma unroll
         for (int i = 0; i < MB; ++i)
 #pragma unroll
             for (int j = 0; j < NB; ++j) acc[i][j] = 0.0f;
+        const int nsteps = K / GS;
+        const int nks = KSPLIT ? ks : 1;
+        const int per = (nsteps + nks - 1) / nks;
 
         // 2D payloads built once; each K step only moves y (B, SB, SA) or x (A)
         unsigned pb = pl2d<b32_16x8>(sbs, n0, 0), psb2 = pl2d<b16_32x1>(ssb, n0, 0),
@@ -325,7 +333,15 @@ struct GemmMT {
         if constexpr (QMODE == 0) pq = pl2d<b16_2x16x8>(surf(Aq, K, M, K), 0, m0);
         else pq = pl2d<b32_16x8>(surf(A, K * 2, M, K * 2), 0, m0);
 
-        for (int s = 0; s < K / GS; ++s) {
+        for (int sl = 0; sl < nks; ++sl) {
+        if constexpr (KSPLIT) {
+#pragma unroll
+            for (int i = 0; i < MB; ++i)
+#pragma unroll
+                for (int j = 0; j < NB; ++j) acc[i][j] = 0.0f;
+        }
+        const int s_end = KSPLIT ? sycl::min(nsteps, (sl + 1) * per) : nsteps;
+        for (int s = KSPLIT ? sl * per : 0; s < s_end; ++s) {
             // A (and SA) loads first: they feed the quantization / unpacking that the
             // first dpas waits on (the asm reads are issued in source order). Row
             // block 0 before B and SB, block I + 1 at the start of block I.
@@ -393,6 +409,19 @@ struct GemmMT {
                     for (int r = 0; r < 8; ++r) acc[I][j][r] += fi[r] * (sb[j] * inv[r]);
                 }
             });
+        }
+        if constexpr (KSPLIT) {
+#pragma unroll
+            for (int i = 0; i < MB; ++i)
+#pragma unroll
+                for (int j = 0; j < NB; ++j) tot[i][j] = sl == 0 ? acc[i][j] : tot[i][j] + acc[i][j];
+        }
+        }
+        if constexpr (KSPLIT) {
+#pragma unroll
+            for (int i = 0; i < MB; ++i)
+#pragma unroll
+                for (int j = 0; j < NB; ++j) acc[i][j] = tot[i][j];
         }
 
 #pragma unroll
