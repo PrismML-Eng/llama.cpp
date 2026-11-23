@@ -1790,6 +1790,22 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
 
     const ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(n_fuse > 1 ? ctx->node(idx + n_fuse - 1) : op);
 
+    // GGML_METAL_SSM_CONV_ROWS=1: one thread per row (256-row threadgroups) for 1..8 tokens (decode and verify)
+    static const bool rows_env = getenv("GGML_METAL_SSM_CONV_ROWS") && atoi(getenv("GGML_METAL_SSM_CONV_ROWS")) == 1;
+    if (rows_env && ne1 <= 8 && ne10 % 4 == 0) {
+        auto pipeline = ggml_metal_library_get_pipeline_ssm_conv_rows(lib, (int32_t) ne10, use_silu);
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer(enc, bid_dst, 3);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + 255)/256, ne1, ne02, 256, 1, 1);
+
+        return n_fuse;
+    }
+
     // Use batched kernel for prefill (ne1 > 1) to reduce threadgroup dispatch overhead
     const bool use_batched = (ne1 > 1);
 
