@@ -12530,6 +12530,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // PTQ1_0 at 1-8 rows (Metal GGML_METAL_PTQ1_COEF / _MULTICOL=2 at 2-8): 132 rows leave a partial row tile,
+    // K = 17408 is the longest 27B row
+    for (int64_t n = 1; n <= 8; ++n) {
+        for (int64_t k : {1024, 5120, 17408}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 132, n, k, {1, 1}, {1, 1}));
+        }
+    }
+
     // PQ2_0 at speculative verify widths (Metal few-row tensor tile): every n up to 32 plus
     // the mul_mm sizes past it, row counts with a partial 32-row block, and two K lengths
     for (int64_t n = 1; n <= 32; ++n) {

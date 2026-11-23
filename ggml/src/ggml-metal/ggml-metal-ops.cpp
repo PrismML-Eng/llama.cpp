@@ -2798,6 +2798,11 @@ static int ggml_metal_ptq1_multicol_mode() {
     return mode;
 }
 
+static int ggml_metal_ptq1_coef_mode() {
+    static const int mode = getenv("GGML_METAL_PTQ1_COEF") ? atoi(getenv("GGML_METAL_PTQ1_COEF")) : 0;
+    return mode;
+}
+
 // Q1_0 word-parallel verify path (opt-in): quantize the activation columns into
 // int8 bit-planes once, then consume 32 weights per AND+popcount instead of one
 // select per weight. See the kernel comment in mul_mv.metal.
@@ -3022,7 +3027,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     static const bool pq2_0_ext_enable = getenv("GGML_METAL_PQ2_0_NR1") && atoi(getenv("GGML_METAL_PQ2_0_NR1")) == 1;
 
 
-    if (ggml_metal_ptq1_multicol_mode() == 2 && ggml_metal_op_mul_mat_ptq1_extc_supported(op)) {
+    if ((ggml_metal_ptq1_multicol_mode() == 2 || ggml_metal_ptq1_coef_mode() != 0) &&
+        ggml_metal_op_mul_mat_ptq1_extc_supported(op)) {
         return ggml_metal_op_mul_mat_ptq1_extc(ctx, idx);
     }
 
