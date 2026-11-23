@@ -2097,7 +2097,9 @@ PTQ1_EXTC(8, 4, 2)  PTQ1_EXTC(8, 4, 4)  PTQ1_EXTC(8, 4, 8)
 PTQ1_EXTC(8, 5, 2)  PTQ1_EXTC(8, 5, 4)
 #undef PTQ1_EXTC
 
-// GGML_METAL_PQ2_COEF at 4..8 src1 rows: the stock path there is mul_mv_ext (nxpsg = 8, chunks of 4 weights), which
+// 2-bit formats (PQ2_0, Q2_0) where the stock path is mul_mv_ext. Written for GGML_METAL_PQ2_COEF at 4..8 src1 rows
+// (nxpsg = 8 there) and below for NX = 8; the template takes NX (mul_mv_ext's nxpsg: 4, 8 or 16) for Q2_0.
+// The stock path there is mul_mv_ext (chunks of 4 weights), which
 // re-reads every weight once per group of r1ptg <= 5 columns. This kernel keeps that arithmetic exactly, so the result
 // is bit-identical: for each output, lane tx of an 8-lane group sums dot(w4, y4) over the chunks tx, tx+8, tx+16, ...
 // in ascending order, w4 decoded as in dequantize_pq2_0_t4, and the 8 lane sums are combined by the same
@@ -2105,8 +2107,8 @@ PTQ1_EXTC(8, 5, 2)  PTQ1_EXTC(8, 5, 4)
 // so each weight is read once; half of them at 6..8, where more columns per lane spill registers), each lane owns NR rows (each activation chunk is loaded once for NR rows), and the per-lane walk goes
 // block by block instead of carrying a chunk cursor. Each row's 4 weights are decoded once per chunk and reused for all
 // R columns, one activation chunk in registers at a time.
-template<short R, short NR>
-kernel void kernel_mul_mv_pq2_0_f32_extc(
+template<typename block_t, short QK, void (*deq_t4)(device const block_t *, short, thread float4 &), short NX, short R, short NR>
+kernel void kernel_mul_mv_q2x_extc(
         constant ggml_metal_kargs_mul_mv_ext & args,
         device const char * src0,
         device const char * src1,
@@ -2115,20 +2117,19 @@ kernel void kernel_mul_mv_pq2_0_f32_extc(
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
     const short NSG = FC_mul_mv_nsg;
-    constexpr short NX = 8;            // lanes per row, as mul_mv_ext's nxpsg for ne00 % 128 == 0 and ne11 >= 3
     constexpr short NY = N_SIMDWIDTH/NX;
-    constexpr short CHPB = QK_PQ2_0/4; // float4 chunks per block
+    constexpr short CHPB = QK/4;       // float4 chunks per block
 
     const short tx = tiisg%NX;
     const short ty = tiisg/NX;
 
     const int i0  = (tgpig.x*NSG + sgitg)*(NY*NR) + ty; // rows i0 + NY*r
     const int i11 = tgpig.y*R;
-    const int nb  = args.ne00/QK_PQ2_0;
+    const int nb  = args.ne00/QK;
 
-    device const block_pq2_0 * xq[NR];
+    device const block_t * xq[NR];
     FOR_UNROLL (short r = 0; r < NR; ++r) {
-        xq[r] = (device const block_pq2_0 *) (src0 + (uint64_t) min(i0 + NY*r, args.ne01 - 1)*args.nb01);
+        xq[r] = (device const block_t *) (src0 + (uint64_t) min(i0 + NY*r, args.ne01 - 1)*args.nb01);
     }
 
     device const float4 * y4[R];
@@ -2147,7 +2148,7 @@ kernel void kernel_mul_mv_pq2_0_f32_extc(
         FOR_UNROLL (short ch = 0; ch < CHPB/NX; ++ch) {
             float4 lx[NR];
             FOR_UNROLL (short r = 0; r < NR; ++r) {
-                dequantize_pq2_0_t4(xq[r] + ib, tx + ch*NX, lx[r]);
+                deq_t4(xq[r] + ib, tx + ch*NX, lx[r]);
             }
             FOR_UNROLL (short c = 0; c < R; ++c) {
                 const float4 yv = y4[c][ib*CHPB + ch*NX];
@@ -2160,7 +2161,12 @@ kernel void kernel_mul_mv_pq2_0_f32_extc(
 
     FOR_UNROLL (short r = 0; r < NR; ++r) {
         FOR_UNROLL (short c = 0; c < R; ++c) {
-            sumf[r][c] += simd_shuffle_down(sumf[r][c], 4);
+            if (NX >= 16) {
+                sumf[r][c] += simd_shuffle_down(sumf[r][c], 8);
+            }
+            if (NX >= 8) {
+                sumf[r][c] += simd_shuffle_down(sumf[r][c], 4);
+            }
             sumf[r][c] += simd_shuffle_down(sumf[r][c], 2);
             sumf[r][c] += simd_shuffle_down(sumf[r][c], 1);
         }
@@ -2178,13 +2184,22 @@ kernel void kernel_mul_mv_pq2_0_f32_extc(
     }
 }
 
-typedef decltype(kernel_mul_mv_pq2_0_f32_extc<4, 1>) mul_mv_pq2_0_extc_t;
-#define PQ2_EXTC(C, N) template [[host_name("kernel_mul_mv_pq2_0_f32_extc_c" #C "_r" #N)]] kernel mul_mv_pq2_0_extc_t kernel_mul_mv_pq2_0_f32_extc<C, N>;
+typedef decltype(kernel_mul_mv_q2x_extc<block_pq2_0, QK_PQ2_0, dequantize_pq2_0_t4, 8, 4, 4>) mul_mv_q2x_extc_t;
+// PQ2_0 at 4..8 rows: mul_mv_ext's nxpsg is 8 there (ne00 % 128 == 0, ne11 >= 3)
+#define PQ2_EXTC(C, N) template [[host_name("kernel_mul_mv_pq2_0_f32_extc_c" #C "_r" #N)]] kernel mul_mv_q2x_extc_t kernel_mul_mv_q2x_extc<block_pq2_0, QK_PQ2_0, dequantize_pq2_0_t4, 8, C, N>;
 PQ2_EXTC(2, 4) PQ2_EXTC(3, 4)
 PQ2_EXTC(4, 2) PQ2_EXTC(5, 2) PQ2_EXTC(6, 2) PQ2_EXTC(7, 2) PQ2_EXTC(8, 2)
 PQ2_EXTC(4, 4) PQ2_EXTC(5, 4) PQ2_EXTC(6, 4) PQ2_EXTC(7, 4) PQ2_EXTC(8, 4)
 PQ2_EXTC(4, 8) PQ2_EXTC(5, 8) PQ2_EXTC(6, 8) PQ2_EXTC(7, 8) PQ2_EXTC(8, 8)
 #undef PQ2_EXTC
+
+// Q2_0 (GGML_METAL_Q2_COEF) where the stock path is mul_mv_ext: 2 rows, or 2..8 rows on GPUs without the few-row MMA
+// kernels. NX = mul_mv_ext's nxpsg: 16 at 2 rows when ne00 % 256 == 0, 8 when ne00 % 128 == 0, else 4.
+#define Q2_EXTC(X, C, N) template [[host_name("kernel_mul_mv_q2_0_f32_extc_x" #X "_c" #C "_r" #N)]] kernel mul_mv_q2x_extc_t kernel_mul_mv_q2x_extc<block_q2_0, QK2_0, dequantize_q2_0_t4, X, C, N>;
+Q2_EXTC(16, 2, 2) Q2_EXTC(16, 2, 4) Q2_EXTC(16, 2, 8)
+Q2_EXTC(8, 2, 2)  Q2_EXTC(8, 2, 4)  Q2_EXTC(8, 2, 8)  Q2_EXTC(8, 3, 4)  Q2_EXTC(8, 4, 4)  Q2_EXTC(8, 5, 4)
+Q2_EXTC(4, 2, 2)  Q2_EXTC(4, 2, 4)  Q2_EXTC(4, 2, 8)  Q2_EXTC(4, 3, 4)  Q2_EXTC(4, 4, 4)  Q2_EXTC(4, 5, 4)
+#undef Q2_EXTC
 
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_2")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_q4_0,   32, dequantize_q4_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_3")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_q4_0,   32, dequantize_q4_0_t4>;

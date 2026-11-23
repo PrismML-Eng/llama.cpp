@@ -12544,6 +12544,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 132, n, k, {1, 1}, {1, 1}));
         }
     }
+    // and for mainline Q2_0 at verify widths (Metal GGML_METAL_Q2_COEF): a K that is a multiple of the 64-wide
+    // block but not of 128, and the 27B row lengths (5120, 6144, 17408)
+    for (int64_t n = 1; n <= 8; ++n) {
+        for (int64_t k : {576, 2560, 9728, 5120, 6144, 17408}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_0, GGML_TYPE_F32, 132, n, k, {1, 1}, {1, 1}));
+        }
+    }
 
     // PQ2_0 at speculative verify widths (Metal few-row tensor tile): every n up to 32 plus
     // the mul_mm sizes past it, row counts with a partial 32-row block, and two K lengths

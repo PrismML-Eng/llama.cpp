@@ -3050,6 +3050,46 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     static const bool pq2_0_ext_enable = getenv("GGML_METAL_PQ2_0_NR1") && atoi(getenv("GGML_METAL_PQ2_0_NR1")) == 1;
 
 
+    // GGML_METAL_Q2_COEF=1/2: Q2_0 where the stock path is mul_mv_ext (2 rows; 2..8 rows on GPUs without the few-row
+    // MMA kernels), on kernel_mul_mv_q2x_extc: mul_mv_ext's arithmetic, bit-identical, with 4 rows and up to 5 columns
+    // per lane. 1 row (the decode kernel's bit-select dot) and the MMA widths stay on the stock kernels, which no
+    // other arithmetic matches bit for bit. GGML_METAL_Q2_COEF_ENR = rows per lane (2, 4, 8).
+    {
+        static const int q2_on = getenv("GGML_METAL_Q2_COEF") ? atoi(getenv("GGML_METAL_Q2_COEF")) : 0;
+        if (q2_on && op->src[0]->type == GGML_TYPE_Q2_0 && op->src[1]->type == GGML_TYPE_F32 &&
+            ne11 >= 2 && ne11 <= 8 && ne00 % 64 == 0 && nb01 % 4 == 0 &&
+            nb10 == sizeof(float) && nb11 % 16 == 0 && ggml_is_contiguous(op) &&
+            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            !(props_dev->has_simdgroup_mm && ggml_metal_op_mul_mat_use_mma(op))) {
+            static const int enr_env = getenv("GGML_METAL_Q2_COEF_ENR") ? atoi(getenv("GGML_METAL_Q2_COEF_ENR")) : 4;
+            const int nx  = (ne00 % 256 == 0 && ne11 < 3) ? 16 : ne00 % 128 == 0 ? 8 : 4; // mul_mv_ext's nxpsg
+            const int nr1 = ne11 <= 5 ? ne11 : (ne11 + 1)/2;
+            const int nrl = (enr_env == 2 || enr_env == 8) && (nr1 == 2) ? enr_env : 4;
+            const int nsg = 2;
+
+            auto pipeline = ggml_metal_library_get_pipeline_mul_mv_q2_extc(lib, nx, nr1, nrl, nsg);
+
+            ggml_metal_kargs_mul_mv_ext args = {
+                /*.ne00  =*/ ne00, /*.ne01  =*/ ne01, /*.ne02  =*/ ne02,
+                /*.nb00  =*/ nb00, /*.nb01  =*/ nb01, /*.nb02  =*/ nb02, /*.nb03  =*/ nb03,
+                /*.ne10  =*/ ne10, /*.ne11  =*/ ne11, /*.ne12  =*/ ne12,
+                /*.nb10  =*/ nb10, /*.nb11  =*/ nb11, /*.nb12  =*/ nb12, /*.nb13  =*/ nb13,
+                /*.ne0   =*/ ne0,  /*.ne1   =*/ ne1,  /*.r2    =*/ r2,   /*.r3    =*/ r3,
+            };
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+            const int rows_tg = pipeline.nr0*nsg;
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + rows_tg - 1)/rows_tg, (ne11 + nr1 - 1)/nr1, 1, 32, nsg, 1);
+
+            return 1;
+        }
+    }
+
     if ((ggml_metal_ptq1_multicol_mode() == 2 || ggml_metal_ptq1_coef_mode() != 0) &&
         ggml_metal_op_mul_mat_ptq1_extc_supported(op)) {
         return ggml_metal_op_mul_mat_ptq1_extc(ctx, idx);
