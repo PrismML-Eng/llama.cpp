@@ -129,6 +129,9 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_pq
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_q1_0_planes         (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_q1_0_pc      (ggml_metal_library_t lib, const struct ggml_tensor * op, int nr1);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ptq1_extc    (ggml_metal_library_t lib, int nx, int nr1, int nrl, int nsg);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_coef_prepass        (ggml_metal_library_t lib, enum ggml_type t);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_pq2_coef     (ggml_metal_library_t lib, int nr0, int nr1, int nsg);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_pq2_extc     (ggml_metal_library_t lib, int nr1, int nrl, int nsg);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cumsum_add        (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_tri               (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max          (ggml_metal_library_t lib, const struct ggml_tensor * op);

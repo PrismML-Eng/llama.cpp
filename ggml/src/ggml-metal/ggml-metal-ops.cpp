@@ -2803,6 +2803,29 @@ static int ggml_metal_ptq1_coef_mode() {
     return mode;
 }
 
+// GGML_METAL_PQ2_COEF=1: PQ2_0 mat-vec at 1..GGML_METAL_PQ2_COEF_MAX (default 8) rows, bit-identical to the stock
+// path at each width; =2 keeps 1 row (decode) on the stock kernel. 1..3 rows: a coefficient pre-pass (kernel_pq2_0_coef)
+// and the mat-vec that reads it (kernel_mul_mv_pq2_0_f32_coef_*); 4..8 rows: kernel_mul_mv_pq2_0_f32_extc. Like the
+// Q1_0 planes below, the coefficient scratch is carved out of the padding the allocator adds behind dst, so the
+// encoder and the allocator both call this predicate.
+static bool ggml_metal_op_mul_mat_pq2_coef_supported(const ggml_tensor * op) {
+    static const int on   = getenv("GGML_METAL_PQ2_COEF") ? atoi(getenv("GGML_METAL_PQ2_COEF")) : 0;
+    static const int maxc = getenv("GGML_METAL_PQ2_COEF_MAX") ? atoi(getenv("GGML_METAL_PQ2_COEF_MAX")) : 8;
+    if (!on || !op->src[0] || !op->src[1] || op->src[0]->type != GGML_TYPE_PQ2_0 || op->src[1]->type != GGML_TYPE_F32) return false;
+    const int64_t ne11 = op->src[1]->ne[1];
+    const int min1 = on == 2 ? 2 : 1; // 2: verify widths only, decode stays on the stock kernel
+    if (ne11 < min1 || ne11 > maxc || maxc > 8) return false;
+    if (op->src[0]->ne[0] % 128 != 0 || op->src[1]->nb[0] != sizeof(float) || op->ne[0] % 4 != 0) return false;
+    return op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 && op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+           op->src[1]->nb[1] % 16 == 0;
+}
+
+size_t ggml_metal_op_mul_mat_extra_pq2_coef(const ggml_tensor * op) {
+    if (!ggml_metal_op_mul_mat_pq2_coef_supported(op)) return 0;
+    if (op->src[1]->ne[1] >= 4) return 0; // extc: no pre-pass
+    return (size_t) (op->src[0]->ne[0]/128) * op->src[1]->ne[1] * (128 + 128/16) * sizeof(float);
+}
+
 // Q1_0 word-parallel verify path (opt-in): quantize the activation columns into
 // int8 bit-planes once, then consume 32 weights per AND+popcount instead of one
 // select per weight. See the kernel comment in mul_mv.metal.
@@ -3030,6 +3053,130 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     if ((ggml_metal_ptq1_multicol_mode() == 2 || ggml_metal_ptq1_coef_mode() != 0) &&
         ggml_metal_op_mul_mat_ptq1_extc_supported(op)) {
         return ggml_metal_op_mul_mat_ptq1_extc(ctx, idx);
+    }
+
+    if (ggml_metal_op_mul_mat_pq2_coef_supported(op) && ne11 >= 4) {
+        // PQ2_0 at 4..8 rows: the stock path is mul_mv_ext (r1ptg <= 5 columns per weight pass). Keep its arithmetic
+        // (bit-identical) but give each lane 4 rows and up to 5 columns (kernel_mul_mv_pq2_0_f32_extc), so each
+        // weight is read once at 4..5 rows and twice at 6..8. The coefficient pre-pass is not used here: it is a
+        // different float evaluation of the same dot product and would not match mul_mv_ext bit for bit. GGML_METAL_PQ2_COEF_ENR = rows per lane
+        // (2, 4, 8), GGML_METAL_PQ2_COEF_ENSG = simdgroups per threadgroup.
+        static const int enr_env  = getenv("GGML_METAL_PQ2_COEF_ENR")  ? atoi(getenv("GGML_METAL_PQ2_COEF_ENR"))  : 4;
+        static const int ensg_env = getenv("GGML_METAL_PQ2_COEF_ENSG") ? atoi(getenv("GGML_METAL_PQ2_COEF_ENSG")) : 2;
+        // GGML_METAL_PQ2_COEF_EMAX = most columns per threadgroup (default 5; beyond it the columns are split in
+        // equal tiles). Measured on M4 Pro: 4 rows x 4..5 columns per lane is the register budget.
+        static const int emax_env = getenv("GGML_METAL_PQ2_COEF_EMAX") ? atoi(getenv("GGML_METAL_PQ2_COEF_EMAX")) : 5;
+        const int nrl  = (enr_env == 2 || enr_env == 8) ? enr_env : 4;
+        const int nsg  = ensg_env >= 1 && ensg_env <= 8 ? ensg_env : 2;
+        const int emax = std::max(4, std::min(8, emax_env));
+        const int ntile = (ne11 + emax - 1)/emax;
+        const int nr1   = std::max(nrl == 4 ? 2 : 4, (int) (ne11 + ntile - 1)/ntile); // instantiated: c2, c3 at r4
+
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_pq2_extc(lib, nr1, nrl, nsg);
+
+        ggml_metal_kargs_mul_mv_ext args = {
+            /*.ne00  =*/ ne00, /*.ne01  =*/ ne01, /*.ne02  =*/ ne02,
+            /*.nb00  =*/ nb00, /*.nb01  =*/ nb01, /*.nb02  =*/ nb02, /*.nb03  =*/ nb03,
+            /*.ne10  =*/ ne10, /*.ne11  =*/ ne11, /*.ne12  =*/ ne12,
+            /*.nb10  =*/ nb10, /*.nb11  =*/ nb11, /*.nb12  =*/ nb12, /*.nb13  =*/ nb13,
+            /*.ne0   =*/ ne0,  /*.ne1   =*/ ne1,  /*.r2    =*/ r2,   /*.r3    =*/ r3,
+        };
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+        const int rows_tg = pipeline.nr0*nsg;
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + rows_tg - 1)/rows_tg, (ne11 + nr1 - 1)/nr1, 1, 32, nsg, 1);
+
+        return 1;
+    }
+
+    if (ggml_metal_op_mul_mat_pq2_coef_supported(op)) {
+        const int32_t nblk = ne00/128;
+
+        ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
+        ggml_metal_buffer_id bid_src1 = ggml_metal_get_buffer_id(op->src[1]);
+        ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
+        ggml_metal_buffer_id bid_coef = bid_dst;
+        bid_coef.offs += ggml_nbytes(op);
+
+        // pre-pass: each src1 column's coefficients, once
+        {
+            auto pipeline = ggml_metal_library_get_pipeline_coef_prepass(lib, GGML_TYPE_PQ2_0);
+            ggml_metal_kargs_q1_0_planes args = { nblk, (int32_t) ne11, nb11 };
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_src1, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_coef, 2);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (nblk*(128/16) + 31)/32, ne11, 1, 32, 1, 1);
+        }
+
+        // the mat-vec reads what the pre-pass just wrote
+        ggml_metal_op_concurrency_reset(ctx);
+
+        {
+            // column tiles: GGML_METAL_PQ2_COEF_NR1=2..4 -> uniform tiles (the last one partial); =0 -> mixed tiles,
+            // 3 columns while 3 or 5+ remain, 2+2 for 4, then 2 or 1; rows longer than GGML_METAL_PQ2_COEF_KMAX
+            // (default 8192) take uniform 2-column tiles. GGML_METAL_PQ2_COEF_NR0 (2, 4, 8) rows per simdgroup,
+            // GGML_METAL_PQ2_COEF_NSG simdgroups (GGML_METAL_PQ2_COEF_NSG1 at 1 row).
+            static const int nr1_env  = getenv("GGML_METAL_PQ2_COEF_NR1")  ? atoi(getenv("GGML_METAL_PQ2_COEF_NR1"))  : 2;
+            static const int nr0_env  = getenv("GGML_METAL_PQ2_COEF_NR0")  ? atoi(getenv("GGML_METAL_PQ2_COEF_NR0"))  : 4;
+            static const int nsg_env  = getenv("GGML_METAL_PQ2_COEF_NSG")  ? atoi(getenv("GGML_METAL_PQ2_COEF_NSG"))  : 1;
+            static const int nsg1_env = getenv("GGML_METAL_PQ2_COEF_NSG1") ? atoi(getenv("GGML_METAL_PQ2_COEF_NSG1")) : 2;
+            static const int kmax     = getenv("GGML_METAL_PQ2_COEF_KMAX") ? atoi(getenv("GGML_METAL_PQ2_COEF_KMAX")) : 8192;
+            const int nsg = nsg_env >= 1 && nsg_env <= 4 ? nsg_env : 1;
+
+            const int tile_mode = (nr1_env == 0 && ne00 > kmax) ? 2 : nr1_env;
+            int tiles[16]; int ntiles = 0;
+            if (tile_mode == 0) {
+                int rem = ne11;
+                while (rem > 0) {
+                    const int t = rem == 4 ? 2 : rem >= 3 ? 3 : rem;
+                    tiles[ntiles++] = t; rem -= t;
+                }
+            } else {
+                tiles[ntiles++] = ne11 == 1 ? 1 : std::min<int>(std::max(2, std::min(4, tile_mode)), ne11);
+            }
+
+            int c0 = 0;
+            for (int ti = 0; ti < ntiles; ++ti) {
+                const int nr1   = tiles[ti];
+                const int width = tile_mode == 0 ? nr1 : ne11; // uniform: one dispatch over all columns
+                const int nr0   = nr1 == 1 ? 8 : (nr1 == 2 && nr0_env == 8) ? 8 : (nr0_env == 2 ? 2 : 4);
+                const int nsg_t = nr1 == 1 ? nsg1_env : nsg;
+
+                auto pipeline = ggml_metal_library_get_pipeline_mul_mv_pq2_coef(lib, nr0, nr1, nsg_t);
+
+                ggml_metal_kargs_mul_mv args = {
+                    /*.ne00 =*/ ne00, /*.ne01 =*/ ne01, /*.ne02 =*/ ne02,
+                    /*.nb00 =*/ nb00, /*.nb01 =*/ nb01, /*.nb02 =*/ nb02, /*.nb03 =*/ nb03,
+                    /*.ne10 =*/ ne10, /*.ne11 =*/ width, /*.ne12 =*/ ne12,
+                    /*.nb10 =*/ nb10, /*.nb11 =*/ nb11, /*.nb12 =*/ nb12, /*.nb13 =*/ nb13,
+                    /*.ne0  =*/ ne0,  /*.ne1  =*/ ne1,  /*.nr0  =*/ nr0,
+                    /*.r2   =*/ r2,   /*.r3   =*/ r3,
+                };
+
+                ggml_metal_buffer_id bid_dst_t  = bid_dst;
+                ggml_metal_buffer_id bid_coef_t = bid_coef;
+                bid_dst_t.offs  += (size_t) c0*nb1;
+                bid_coef_t.offs += (size_t) c0*nblk*(128 + 128/16)*sizeof(float);
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline);
+                ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_src0,   1);
+                ggml_metal_encoder_set_buffer  (enc, bid_src1,   2);
+                ggml_metal_encoder_set_buffer  (enc, bid_dst_t,  3);
+                ggml_metal_encoder_set_buffer  (enc, bid_coef_t, 4);
+
+                ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0*nsg_t - 1)/(nr0*nsg_t), (width + nr1 - 1)/nr1, 1, 32, nsg_t, 1);
+                c0 += width;
+            }
+        }
+
+        return 1;
     }
 
     if (ggml_metal_op_mul_mat_q1_0_pc_supported(op)) {

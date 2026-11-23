@@ -472,6 +472,61 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ptq1_extc
     return res;
 }
 
+// GGML_METAL_PQ2_COEF at 4..8 rows: mul_mv_ext's arithmetic over all columns at once (kernel_mul_mv_pq2_0_f32_extc)
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_pq2_extc(ggml_metal_library_t lib, int nr1, int nrl, int nsg) {
+    char base[256];
+    char name[256];
+    snprintf(base, 256, "kernel_mul_mv_pq2_0_f32_extc_c%d_r%d", nr1, nrl);
+    snprintf(name, 256, "%s_nsg=%d", base, nsg);
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_int16(cv, nsg,         FC_MUL_MV + 0);
+        ggml_metal_cv_set_int16(cv, (int16_t) 8, FC_MUL_MV + 1);
+        ggml_metal_cv_set_int16(cv, (int16_t) 1, FC_MUL_MV + 2);
+        ggml_metal_cv_set_int16(cv, (int16_t) 1, FC_MUL_MV + 3);
+        ggml_metal_cv_set_int16(cv, (int16_t) 1, FC_MUL_MV + 4);
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+        ggml_metal_cv_free(cv);
+    }
+    res.nr0 = 4*nrl;
+    res.nr1 = nr1;
+    res.nsg = nsg;
+    return res;
+}
+
+// coefficient pre-pass (GGML_METAL_PQ2_COEF, 1..3 rows) and the mat-vec that reads it
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_coef_prepass(ggml_metal_library_t lib, ggml_type t) {
+    GGML_ASSERT(t == GGML_TYPE_PQ2_0);
+    const char * base = "kernel_pq2_0_coef";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, base);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_pq2_coef(ggml_metal_library_t lib, int nr0, int nr1, int nsg) {
+    char base[256];
+    char name[256];
+    snprintf(base, 256, "kernel_mul_mv_pq2_0_f32_coef_c%d_r%d", nr1, nr0);
+    snprintf(name, 256, "%s_nsg=%d", base, nsg);
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_int16(cv, nsg,         FC_MUL_MV + 0);
+        ggml_metal_cv_set_int16(cv, (int16_t) 1, FC_MUL_MV + 2);
+        ggml_metal_cv_set_int16(cv, (int16_t) 1, FC_MUL_MV + 3);
+        ggml_metal_cv_set_int16(cv, (int16_t) 1, FC_MUL_MV + 4);
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+        ggml_metal_cv_free(cv);
+    }
+    res.nr0 = nr0;
+    res.nr1 = nr1;
+    res.nsg = nsg;
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_q1_0_pc(ggml_metal_library_t lib, const ggml_tensor * op, int nr1) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
