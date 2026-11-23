@@ -2739,6 +2739,65 @@ int ggml_metal_op_pool_2d(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// PTQ1_0 at 2..8 rows for GGML_METAL_PTQ1_MULTICOL=2 and GGML_METAL_PTQ1_COEF. The stock path there is
+// mul_mv_ext (ptq1_0_elem decode, dot() per float4, nxpsg lanes per row, shuffle-down reduction); a base-3 collapse
+// evaluation of the same dot product (the multi-column kernel of GGML_METAL_PTQ1_MULTICOL=1) is not bit-identical. kernel_mul_mv_ptq1_0_f32_extc keeps mul_mv_ext's arithmetic and changes only the scheduling: 4 rows and up
+// to 5 columns per lane (6..8 rows: two tiles of 3-4), so each weight is read once at 2..5 rows and twice at 6..8.
+// GGML_METAL_PTQ1_EXTC_NR = rows per lane (2, 4, 8), GGML_METAL_PTQ1_EXTC_NSG = simdgroups per threadgroup.
+static bool ggml_metal_op_mul_mat_ptq1_extc_supported(const ggml_tensor * op) {
+    if (!op->src[0] || !op->src[1] || op->src[0]->type != GGML_TYPE_PTQ1_0 || op->src[1]->type != GGML_TYPE_F32) return false;
+    const int64_t ne11 = op->src[1]->ne[1];
+    return ne11 >= 2 && ne11 <= 8 && op->src[0]->ne[0] % 128 == 0 && op->src[0]->nb[1] % 4 == 0 &&
+           op->src[1]->nb[0] == sizeof(float) && op->src[1]->nb[1] % 16 == 0 && ggml_is_contiguous(op) &&
+           op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 && op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1;
+}
+
+static int ggml_metal_op_mul_mat_ptq1_extc(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
+
+    static const int nr_env  = getenv("GGML_METAL_PTQ1_EXTC_NR")  ? atoi(getenv("GGML_METAL_PTQ1_EXTC_NR"))  : 4;
+    static const int nsg_env = getenv("GGML_METAL_PTQ1_EXTC_NSG") ? atoi(getenv("GGML_METAL_PTQ1_EXTC_NSG")) : 2;
+
+    const int nx    = (ne00 % 256 == 0 && ne11 < 3) ? 16 : 8; // mul_mv_ext's nxpsg for these shapes
+    const int nr1   = ne11 <= 5 ? ne11 : (ne11 + 1)/2;
+    const int nrl   = (nr_env == 2 || (nr_env == 8 && nr1 <= 4)) ? nr_env : 4;
+    const int nsg   = nsg_env >= 1 && nsg_env <= 8 ? nsg_env : 2;
+
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ptq1_extc(lib, nx, nr1, nrl, nsg);
+
+    ggml_metal_kargs_mul_mv_ext args = {
+        /*.ne00  =*/ ne00, /*.ne01  =*/ ne01, /*.ne02  =*/ ne02,
+        /*.nb00  =*/ nb00, /*.nb01  =*/ nb01, /*.nb02  =*/ nb02, /*.nb03  =*/ nb03,
+        /*.ne10  =*/ ne10, /*.ne11  =*/ ne11, /*.ne12  =*/ ne12,
+        /*.nb10  =*/ nb10, /*.nb11  =*/ nb11, /*.nb12  =*/ nb12, /*.nb13  =*/ nb13,
+        /*.ne0   =*/ ne0,  /*.ne1   =*/ ne1,  /*.r2    =*/ 1,    /*.r3    =*/ 1,
+    };
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+    const int rows_tg = pipeline.nr0*nsg;
+    ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + rows_tg - 1)/rows_tg, (ne11 + nr1 - 1)/nr1, 1, 32, nsg, 1);
+
+    return 1;
+}
+
+static int ggml_metal_ptq1_multicol_mode() {
+    static const int mode = getenv("GGML_METAL_PTQ1_MULTICOL") ? atoi(getenv("GGML_METAL_PTQ1_MULTICOL")) : 0;
+    return mode;
+}
+
 // Q1_0 word-parallel verify path (opt-in): quantize the activation columns into
 // int8 bit-planes once, then consume 32 weights per AND+popcount instead of one
 // select per weight. See the kernel comment in mul_mv.metal.
@@ -2962,6 +3021,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     // 4-8 stay on mul_mv_ext. GGML_METAL_PQ2_0_NR1=1 restores mul_mv_ext for 2-3 as well.
     static const bool pq2_0_ext_enable = getenv("GGML_METAL_PQ2_0_NR1") && atoi(getenv("GGML_METAL_PQ2_0_NR1")) == 1;
 
+
+    if (ggml_metal_ptq1_multicol_mode() == 2 && ggml_metal_op_mul_mat_ptq1_extc_supported(op)) {
+        return ggml_metal_op_mul_mat_ptq1_extc(ctx, idx);
+    }
 
     if (ggml_metal_op_mul_mat_q1_0_pc_supported(op)) {
         const int32_t nblk = ne00/128;

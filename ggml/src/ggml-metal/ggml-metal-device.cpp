@@ -448,6 +448,30 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_pq2_0_few
     return res;
 }
 
+// PTQ1_0 at 2..8 rows (GGML_METAL_PTQ1_MULTICOL=2, GGML_METAL_PTQ1_COEF): mul_mv_ext's arithmetic over up to
+// nr1 columns per threadgroup (kernel_mul_mv_ptq1_0_f32_extc)
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ptq1_extc(ggml_metal_library_t lib, int nx, int nr1, int nrl, int nsg) {
+    char base[256];
+    char name[256];
+    snprintf(base, 256, "kernel_mul_mv_ptq1_0_f32_extc_x%d_c%d_r%d", nx, nr1, nrl);
+    snprintf(name, 256, "%s_nsg=%d", base, nsg);
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_int16(cv, nsg,          FC_MUL_MV + 0);
+        ggml_metal_cv_set_int16(cv, (int16_t) nx, FC_MUL_MV + 1);
+        ggml_metal_cv_set_int16(cv, (int16_t) 1,  FC_MUL_MV + 2);
+        ggml_metal_cv_set_int16(cv, (int16_t) 1,  FC_MUL_MV + 3);
+        ggml_metal_cv_set_int16(cv, (int16_t) 1,  FC_MUL_MV + 4);
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+        ggml_metal_cv_free(cv);
+    }
+    res.nr0 = (32/nx)*nrl;
+    res.nr1 = nr1;
+    res.nsg = nsg;
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_q1_0_pc(ggml_metal_library_t lib, const ggml_tensor * op, int nr1) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);

@@ -12523,6 +12523,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // PTQ1_0 at 9-16 rows (the mul_mm cut-off on Metal) and a row count that is not a multiple of the 4-row group
+    for (int64_t n = 9; n <= 16; ++n) {
+        for (int64_t k : {1024, 5120}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 67, n, k, {1, 1}, {1, 1}));
+        }
+    }
+
     // PQ2_0 at speculative verify widths (Metal few-row tensor tile): every n up to 32 plus
     // the mul_mm sizes past it, row counts with a partial 32-row block, and two K lengths
     for (int64_t n = 1; n <= 32; ++n) {
@@ -14256,6 +14263,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 5120, n, 17408, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 10240, n, 5120, {1, 1}, {1, 1}));
+        // same sweep for PTQ1_0
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 5120, n, 17408, {1, 1}, {1, 1}));
     }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands

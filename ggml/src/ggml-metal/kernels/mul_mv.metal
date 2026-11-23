@@ -1838,6 +1838,140 @@ template [[host_name("kernel_mul_mv_ext_ptq1_0_f32_r1_4")]] kernel mul_mv_ext_q4
 template [[host_name("kernel_mul_mv_ext_ptq1_0_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_ptq1_0, 128, dequantize_ptq1_0_t4>;
 template [[host_name("kernel_mul_mv_ext_pq2_0_f32_r1_5")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_pq2_0,  128, dequantize_pq2_0_t4>;
 
+// PTQ1_0 at 2..8 src1 rows for GGML_METAL_PTQ1_MULTICOL=2 and GGML_METAL_PTQ1_COEF=1. The stock path there is
+// mul_mv_ext (NX = nxpsg lanes per row: 16 at 2 rows when ne00 % 256 == 0, else 8), which re-reads every weight once
+// per group of r1ptg <= 5 columns and decodes every weight per column group. This kernel keeps its arithmetic exactly,
+// so the result is bit-identical: for each output, lane tx of an NX-lane group sums dot(w4, y4) over the chunks tx,
+// tx+NX, tx+2*NX, ... in ascending order, w4 = (trit - 1)*d with the trit taken from ptq1_0_lut as in ptq1_0_elem,
+// and the NX lane sums are combined by the same simd_shuffle_down tree. Only the scheduling changes: a threadgroup
+// covers up to R columns, each lane owns NR rows (each activation chunk is loaded once for NR rows, each row's four
+// weights are decoded once per chunk for all R columns), and a lane's byte/trit positions are fixed per chunk slot, so
+// the per-element branches of ptq1_0_elem are resolved once per lane.
+template<short NX, short R, short NR>
+kernel void kernel_mul_mv_ptq1_0_f32_extc(
+        constant ggml_metal_kargs_mul_mv_ext & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NY   = N_SIMDWIDTH/NX;
+    constexpr short CHPB = QK_PTQ1_0/4; // float4 chunks per block
+    constexpr short CPL  = CHPB/NX;     // chunks per lane per block
+
+    const short tx = tiisg%NX;
+    const short ty = tiisg/NX;
+
+    const int i0  = (tgpig.x*NSG + sgitg)*(NY*NR) + ty; // rows i0 + NY*r
+    const int i11 = tgpig.y*R;
+    const int nb  = args.ne00/QK_PTQ1_0;
+
+    device const block_ptq1_0 * xq[NR];
+    FOR_UNROLL (short r = 0; r < NR; ++r) {
+        xq[r] = (device const block_ptq1_0 *) (src0 + (uint64_t) min(i0 + NY*r, args.ne01 - 1)*args.nb01);
+    }
+
+    device const float4 * y4[R];
+    FOR_UNROLL (short c = 0; c < R; ++c) {
+        y4[c] = (device const float4 *) (src1 + (uint64_t) min(i11 + c, args.ne11 - 1)*args.nb11) + tx;
+    }
+
+    // the trit table in threadgroup memory: lanes index it divergently
+    threadgroup ushort lut[256];
+    for (short i = sgitg*N_SIMDWIDTH + tiisg; i < 256; i += NSG*N_SIMDWIDTH) {
+        lut[i] = ptq1_0_lut[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // where each element of this lane's chunks lives, as ptq1_0_elem maps element e = 4*chunk + j: the chunk's four
+    // bytes sit in one aligned 32-bit word of the block (qs[0..15] and qs[16..23]: four consecutive bytes, one trit
+    // position; qh: bytes qh[0], qh[1], qh[0], qh[1] at two trit positions), so each chunk is one word load
+    short wo[CPL];     // word index in the block (7 words: qs 0-3, qs 4-5, qh + d)
+    short bs[CPL][4];  // bit offset of the element's byte in the word
+    short ts[CPL][4];  // bit offset of the element's trit in the table entry
+    FOR_UNROLL (short ch = 0; ch < CPL; ++ch) {
+        const int e0 = 4*(tx + ch*NX);
+        if (e0 < 80) {
+            wo[ch] = (e0 & 15)/4;
+        } else if (e0 < 120) {
+            wo[ch] = 4 + ((e0 - 80) & 7)/4;
+        } else {
+            wo[ch] = 6;
+        }
+        FOR_UNROLL (short j = 0; j < 4; ++j) {
+            const int e = e0 + j;
+            int bo, n;
+            if (e < 80)       { bo = e & 15;                n = e >> 4; }
+            else if (e < 120) { bo = 16 + ((e - 80) & 7);   n = (e - 80) >> 3; }
+            else              { bo = 24 + ((e - 120) & 1);  n = (e - 120) >> 1; }
+            bs[ch][j] = 8*(bo - 4*wo[ch]);
+            ts[ch][j] = 2*n;
+        }
+    }
+
+    float sumf[NR][R];
+    FOR_UNROLL (short r = 0; r < NR; ++r) {
+        FOR_UNROLL (short c = 0; c < R; ++c) {
+            sumf[r][c] = 0.0f;
+        }
+    }
+
+    for (int ib = 0; ib < nb; ++ib) {
+        FOR_UNROLL (short ch = 0; ch < CPL; ++ch) {
+            float4 lx[NR];
+            FOR_UNROLL (short r = 0; r < NR; ++r) {
+                device const block_ptq1_0 * xb = xq[r] + ib;
+                const uint  w = ((device const uint *) xb)[wo[ch]];
+                const float d = xb->d;
+                float4 reg_f;
+                FOR_UNROLL (short j = 0; j < 4; ++j) {
+                    reg_f[j] = (float) ((int) ((lut[(w >> bs[ch][j]) & 0xFF] >> ts[ch][j]) & 3) - 1) * d;
+                }
+                lx[r] = reg_f;
+            }
+            FOR_UNROLL (short c = 0; c < R; ++c) {
+                const float4 yv = y4[c][ib*CHPB + ch*NX];
+                FOR_UNROLL (short r = 0; r < NR; ++r) {
+                    sumf[r][c] += dot(lx[r], yv);
+                }
+            }
+        }
+    }
+
+    FOR_UNROLL (short r = 0; r < NR; ++r) {
+        FOR_UNROLL (short c = 0; c < R; ++c) {
+            if (NX >= 16) {
+                sumf[r][c] += simd_shuffle_down(sumf[r][c], 8);
+            }
+            sumf[r][c] += simd_shuffle_down(sumf[r][c], 4);
+            sumf[r][c] += simd_shuffle_down(sumf[r][c], 2);
+            sumf[r][c] += simd_shuffle_down(sumf[r][c], 1);
+        }
+    }
+
+    if (tx == 0) {
+        FOR_UNROLL (short r = 0; r < NR; ++r) {
+            const int i01 = i0 + NY*r;
+            FOR_UNROLL (short c = 0; c < R; ++c) {
+                if (i01 < args.ne01 && i11 + c < args.ne11) {
+                    ((device float *) dst)[(uint64_t) (i11 + c)*args.ne0 + i01] = sumf[r][c];
+                }
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mv_ptq1_0_f32_extc<8, 4, 4>) mul_mv_ptq1_0_extc_t;
+#define PTQ1_EXTC(X, C, N) template [[host_name("kernel_mul_mv_ptq1_0_f32_extc_x" #X "_c" #C "_r" #N)]] kernel mul_mv_ptq1_0_extc_t kernel_mul_mv_ptq1_0_f32_extc<X, C, N>;
+PTQ1_EXTC(16, 2, 2) PTQ1_EXTC(16, 2, 4) PTQ1_EXTC(16, 2, 8)
+PTQ1_EXTC(8, 2, 2)  PTQ1_EXTC(8, 2, 4)  PTQ1_EXTC(8, 2, 8)
+PTQ1_EXTC(8, 3, 2)  PTQ1_EXTC(8, 3, 4)  PTQ1_EXTC(8, 3, 8)
+PTQ1_EXTC(8, 4, 2)  PTQ1_EXTC(8, 4, 4)  PTQ1_EXTC(8, 4, 8)
+PTQ1_EXTC(8, 5, 2)  PTQ1_EXTC(8, 5, 4)
+#undef PTQ1_EXTC
+
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_2")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_q4_0,   32, dequantize_q4_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_3")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_q4_0,   32, dequantize_q4_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_4")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_q4_0,   32, dequantize_q4_0_t4>;
