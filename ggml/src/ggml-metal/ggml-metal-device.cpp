@@ -1143,16 +1143,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    // GGML_METAL_MM_W64=1: 64 x 64 output tile (kernel_mul_mm_w64) for PTQ1_0 / PQ2_0 / Q4_0 weights on GPUs
+    // without tensor units, ne00 % 32 == 0; each dequantized weight feeds 64 src1 columns instead of 32
+    static const bool w64_env = getenv("GGML_METAL_MM_W64") && atoi(getenv("GGML_METAL_MM_W64")) == 1;
+    const bool w64 = w64_env && !has_tensor && !bc_inp && tsrc1 == GGML_TYPE_F32 &&
+        (tsrc0 == GGML_TYPE_PTQ1_0 || tsrc0 == GGML_TYPE_PQ2_0 || tsrc0 == GGML_TYPE_Q4_0);
+    const bool bc_out_w = w64 ? (op->ne[0] % 64 != 0 || op->ne[1] % 64 != 0) : bc_out;
+
+    snprintf(base, 256, w64 ? "kernel_mul_mm_w64_%s_%s" : "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
     snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
-             base, bc_inp, bc_out, ne12, ne13, r2, r3);
+             base, bc_inp, bc_out_w, ne12, ne13, r2, r3);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
 
         ggml_metal_cv_set_bool(cv, bc_inp, FC_MUL_MM + 0);
-        ggml_metal_cv_set_bool(cv, bc_out, FC_MUL_MM + 1);
+        ggml_metal_cv_set_bool(cv, bc_out_w, FC_MUL_MM + 1);
         ggml_metal_cv_set_int16(cv, ne12,  FC_MUL_MM + 2);
         ggml_metal_cv_set_int16(cv, ne13,  FC_MUL_MM + 3);
         ggml_metal_cv_set_int16(cv, r2,    FC_MUL_MM + 4);
@@ -1169,6 +1176,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
         const size_t smem_a = NRA * N_MM_NK_TOTAL * sizeof(ggml_fp16_t);
         res.smem = smem_a;
+    } else if (w64) {
+        res.nr0 = 64;
+        res.nr1 = 64;
+
+        res.smem = bc_out_w ? 16384 : 8192;
     } else {
         res.nr0 = 64;
         res.nr1 = 32;
