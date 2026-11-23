@@ -82,6 +82,10 @@ void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_metal_pipeline_with_params pipeline);
 
+// per-op profiler (GGML_METAL_OP_PROFILE): record the pipeline names set on any encoder
+void         ggml_metal_prof_kernels_enable(bool enable);
+const char * ggml_metal_prof_kernels_take(void);
+
 void ggml_metal_encoder_set_bytes (ggml_metal_encoder_t encoder, void * data, size_t size, int idx);
 void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id buffer, int idx);
 

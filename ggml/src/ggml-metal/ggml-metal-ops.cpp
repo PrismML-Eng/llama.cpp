@@ -17,6 +17,10 @@
 #include <limits>
 #include <cmath>
 #include <unordered_set>
+#include <map>
+#include <string>
+#include <mutex>
+#include <cstdio>
 
 // threadgroups needed to fill the GPU
 // TODO: dedup
@@ -576,6 +580,54 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
     }
 
     return res;
+}
+
+// per-op GPU profiler (GGML_METAL_OP_PROFILE=<file>), driven by ggml_metal_graph_compute
+struct prof_ent { double us = 0; long n = 0; };
+static std::map<std::string, prof_ent> g_prof;
+static std::map<int, long> g_prof_graphs;
+static std::mutex g_prof_mtx;
+static int g_prof_cur_ntok = 0; // batch label of the graph being profiled
+
+void ggml_metal_op_prof_set_ntok(int n_tokens) { g_prof_cur_ntok = n_tokens; }
+
+const char * ggml_metal_op_prof_path(void) {
+    static const char * p = getenv("GGML_METAL_OP_PROFILE");
+    return p;
+}
+
+const struct ggml_tensor * ggml_metal_op_node(ggml_metal_op_t ctx, int idx) {
+    return ctx->node(idx);
+}
+
+static void prof_dump(void) {
+    const char * path = ggml_metal_op_prof_path();
+    FILE * f = fopen(path, "w");
+    if (!f) return;
+    for (auto & g : g_prof_graphs) fprintf(f, "#graphs ntok=%d count=%ld\n", g.first, g.second);
+    for (auto & e : g_prof) fprintf(f, "%.3f\t%ld\t%s\n", e.second.us, e.second.n, e.first.c_str());
+    fclose(f);
+}
+
+void ggml_metal_op_prof_add(const struct ggml_tensor * node, int n_fused, const char * kernels, double us) {
+    std::lock_guard<std::mutex> lk(g_prof_mtx);
+    static bool reg = false;
+    if (!reg) { atexit(prof_dump); reg = true; }
+    std::string name = node->name;
+    // strip layer index ("ffn_up-12" -> "ffn_up")
+    size_t dash = name.rfind('-');
+    if (dash != std::string::npos && dash + 1 < name.size() && isdigit((unsigned char) name[dash+1])) name = name.substr(0, dash);
+    char key[1536];
+    snprintf(key, sizeof(key), "g%d:ntok=%lld\t%s\t%s\t%s\tne=[%lld,%lld,%lld]\tfused=%d\t%s",
+        g_prof_cur_ntok, (long long) (node->src[1] ? node->src[1]->ne[1] : node->ne[1]),
+        ggml_op_desc(node), node->src[0] ? ggml_type_name(node->src[0]->type) : "-", name.c_str(),
+        (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], n_fused, kernels ? kernels : "");
+    auto & e = g_prof[key]; e.us += us; e.n += 1;
+}
+
+void ggml_metal_op_prof_graph_done(int n_tokens) {
+    std::lock_guard<std::mutex> lk(g_prof_mtx);
+    g_prof_graphs[n_tokens] += 1;
 }
 
 int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
