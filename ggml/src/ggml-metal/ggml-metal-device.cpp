@@ -1209,7 +1209,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 }
 
 bool ggml_metal_ptq1_multicol_enabled(const ggml_tensor * op) {
-    static const bool enabled = getenv("GGML_METAL_PTQ1_MULTICOL") && atoi(getenv("GGML_METAL_PTQ1_MULTICOL")) == 1;
+    // GGML_METAL_VERIFY_COLLAPSE=1: the base-3 collapse multi-column kernel at 2-4 rows while the bit-exact extc
+    // kernel keeps 5-8 rows. Same dot product as mul_mv_ext over the integers (proved exact in Lean); only the
+    // float accumulation order differs, so the logits are not bit-identical to mul_mv_ext. Opt-in.
+    static const bool enabled =
+        (getenv("GGML_METAL_PTQ1_MULTICOL") && atoi(getenv("GGML_METAL_PTQ1_MULTICOL")) == 1) ||
+        (getenv("GGML_METAL_VERIFY_COLLAPSE") && atoi(getenv("GGML_METAL_VERIFY_COLLAPSE")) != 0);
     return enabled && op->src[0]->type == GGML_TYPE_PTQ1_0 && op->src[1]->type == GGML_TYPE_F32 &&
            op->src[0]->ne[0] % ggml_blck_size(GGML_TYPE_PTQ1_0) == 0 && op->src[1]->nb[0] == sizeof(float) &&
            op->src[1]->ne[1] >= 2 && op->src[1]->ne[1] <= 4;
