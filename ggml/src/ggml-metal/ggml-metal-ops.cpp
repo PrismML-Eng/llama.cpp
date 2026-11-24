@@ -2861,13 +2861,23 @@ static int ggml_metal_op_mul_mat_ptq1_extc(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// GGML_METAL_VERIFY_OPT: the bit-exact PTQ1_0 verify path at 2-8 rows (GGML_METAL_PTQ1_MULTICOL=2 with
+// GGML_METAL_PTQ1_COEF=1), which measured faster with identical logits on M4 Pro and M5 Pro. Unset = on,
+// 0 = off. GGML_METAL_PTQ1_MULTICOL and GGML_METAL_PTQ1_COEF, when set, override it.
+static bool ggml_metal_verify_opt() {
+    static const bool on = [] { const char * e = getenv("GGML_METAL_VERIFY_OPT"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
 static int ggml_metal_ptq1_multicol_mode() {
-    static const int mode = getenv("GGML_METAL_PTQ1_MULTICOL") ? atoi(getenv("GGML_METAL_PTQ1_MULTICOL")) : 0;
+    static const int mode = getenv("GGML_METAL_PTQ1_MULTICOL") ? atoi(getenv("GGML_METAL_PTQ1_MULTICOL"))
+                                                               : (ggml_metal_verify_opt() ? 2 : 0);
     return mode;
 }
 
 static int ggml_metal_ptq1_coef_mode() {
-    static const int mode = getenv("GGML_METAL_PTQ1_COEF") ? atoi(getenv("GGML_METAL_PTQ1_COEF")) : 0;
+    static const int mode = getenv("GGML_METAL_PTQ1_COEF") ? atoi(getenv("GGML_METAL_PTQ1_COEF"))
+                                                           : (ggml_metal_verify_opt() ? 1 : 0);
     return mode;
 }
 
