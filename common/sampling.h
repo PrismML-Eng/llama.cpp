@@ -52,6 +52,11 @@ void                    common_sampler_copy  (const struct common_sampler * src,
 // arguments can be nullptr to skip printing
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl);
 
+// true if the top k of `shortlist` (the n largest raw logits, in descending order) after `penalties` (which only lower
+// logits) is the same, in entries and order, as the top k of the full vocabulary: no ties among the k + 1 largest
+// penalized values, and no token outside the shortlist can reach them. Otherwise the caller must use the full array.
+bool common_topk_shortlist_exact(struct llama_sampler * penalties, const llama_token_data * shortlist, size_t n, int32_t k);
+
 // get the underlying llama_sampler_chain
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 
