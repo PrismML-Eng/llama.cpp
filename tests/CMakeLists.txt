@@ -350,6 +350,10 @@ llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 llama_build_and_test(test-mtp-catchup-batch.cpp LABEL behavior)
 llama_build_and_test(test-ngram-cache-short.cpp LABEL behavior)
+# Shared-library allocation interposition is validated on Linux.
+if (NOT BUILD_SHARED_LIBS OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    llama_build_and_test(test-ngram-cache-draft.cpp LABEL behavior)
+endif()
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 
