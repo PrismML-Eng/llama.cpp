@@ -143,7 +143,9 @@ jobs:
     strategy:
       matrix:
         include:
-          # The ggml default list plus 75-real: Turing gets machine code, not only PTX (#332)
+          # The ggml default list plus 75-real: Turing gets machine code, not only PTX (#332).
+          # 13.x: also 80-real and 90-real, since a driver older than the toolkit cannot JIT its PTX (#443).
+          # 90-virtual stays so GPUs with no cubin here (sm_100, sm_103, sm_110) can still JIT.
           - cuda: '12.4'
             cuda_pkg: '12-4'
             cuda_archs: '50-virtual;61-virtual;70-virtual;75-real;80-virtual;86-real;89-real;90-virtual'
@@ -152,7 +154,7 @@ jobs:
             cuda_archs: '50-virtual;61-virtual;70-virtual;75-real;80-virtual;86-real;89-real;90-virtual;120a-real'
           - cuda: '13.3'
             cuda_pkg: '13-3'
-            cuda_archs: '75-real;80-virtual;86-real;89-real;90-virtual;120a-real;121a-real'
+            cuda_archs: '75-real;80-real;86-real;89-real;90-real;90-virtual;120a-real;121a-real'
 
     steps:
       - name: Clone
@@ -270,13 +272,13 @@ jobs:
     strategy:
       matrix:
         include:
-          # x64: the ggml default list plus 75-real (#332)
+          # x64: the ggml default list plus 75-real (#332); 13.x also 80-real and 90-real (#443)
           - cuda: '12.4'
             arch: x64
             defines: '-DCMAKE_CUDA_ARCHITECTURES="50-virtual;61-virtual;70-virtual;75-real;80-virtual;86-real;89-real;90-virtual"'
           - cuda: '13.3'
             arch: x64
-            defines: '-DCMAKE_CUDA_ARCHITECTURES="75-real;80-virtual;86-real;89-real;90-virtual;120a-real;121a-real"'
+            defines: '-DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;90-virtual;120a-real;121a-real"'
           - cuda: '13.4'
             arch: arm64
             defines: '-DCMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-msvc-cuda.cmake'
