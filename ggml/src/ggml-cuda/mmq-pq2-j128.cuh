@@ -224,26 +224,28 @@ static __device__ __forceinline__ void ggml_cuda_ptq1_j128_xload(ggml_cuda_pq2_j
 
 static __device__ __forceinline__ void ggml_cuda_ptq1_j128_lane(const uint32_t packed, const int lane, const uint32_t addr) {
     uint32_t v_lo = __byte_perm(packed, 0, 0x4140);
+    if (lane == 6) {
+#pragma unroll
+        for (int pair = 0; pair < 2; ++pair) {
+            const uint32_t first  = v_lo * 3;
+            const uint32_t second = (first & 0x00FF00FF) * 3;
+            v_lo                  = second & 0x00FF00FF;
+            const uint32_t digits = __byte_perm(first, second, 0x7531);
+            ggml_cuda_pq2_j128_sts_b32(addr + 4*(30 + pair), __vsub4(digits, 0x01010101));
+        }
+        return;
+    }
     uint32_t v_hi = __byte_perm(packed, 0, 0x4342);
-    const bool full_lane = lane < 6;
-    v_hi = full_lane ? v_hi : v_lo;
     const int dst_base   = lane < 4 ? lane : 16 + lane;
     const int dst_stride = lane < 4 ? 4 : 2;
-    int q[5];
 #pragma unroll
     for (int t = 0; t < 5; ++t) {
         const uint32_t w_lo = v_lo * 3;
         const uint32_t w_hi = v_hi * 3;
         v_lo = w_lo & 0x00FF00FF;
         v_hi = w_hi & 0x00FF00FF;
-        q[t] = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
-        if (full_lane) {
-            ggml_cuda_pq2_j128_sts_b32(addr + 4*(dst_base + t*dst_stride), q[t]);
-        }
-    }
-    if (!full_lane) {
-        ggml_cuda_pq2_j128_sts_b32(addr + 4*30, __byte_perm(q[0], q[1], 0x5410));
-        ggml_cuda_pq2_j128_sts_b32(addr + 4*31, __byte_perm(q[2], q[3], 0x5410));
+        const uint32_t digits = __byte_perm(w_lo, w_hi, 0x7531);
+        ggml_cuda_pq2_j128_sts_b32(addr + 4*(dst_base + t*dst_stride), __vsub4(digits, 0x01010101));
     }
 }
 
