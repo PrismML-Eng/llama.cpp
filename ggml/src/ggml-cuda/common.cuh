@@ -66,6 +66,21 @@
 #define GGML_CUDA_CC_OFFSET_MTHREADS 0x0100000
 #define GGML_CUDA_CC_IS_NVIDIA(cc)   (cc < GGML_CUDA_CC_OFFSET_MTHREADS)
 
+// Unset -> -1, "0" -> 0, any other number -> 1.
+static int ggml_cuda_env_tristate(const char * name) {
+    const char * e = getenv(name);
+    return e == nullptr ? -1 : (atoi(e) != 0 ? 1 : 0);
+}
+
+// GGML_CUDA_PREFILL_OPT: the prefill paths that measured faster with byte-identical output on Hopper
+// (GGML_CUDA_GDN_L8P, GGML_CUDA_PTQ1_J128, GGML_CUDA_FWHT_MMQ with GGML_CUDA_FWHT_MMQ_GLU).
+// Unset: on for NVIDIA Hopper (cc 900-999), off elsewhere. 0 = all off, 1 = all on where each path supports the GPU.
+// A per-path switch, when set, overrides this for that path.
+static bool ggml_cuda_prefill_opt(const int cc) {
+    static const int env = ggml_cuda_env_tristate("GGML_CUDA_PREFILL_OPT");
+    return env >= 0 ? env == 1 : GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_HOPPER && cc < 1000;
+}
+
 // AMD
 // GCN/CDNA, wave size is 64
 #define GGML_CUDA_CC_GCN4       (GGML_CUDA_CC_OFFSET_AMD + 0x803)  // Tonga, Fiji, Polaris, minimum for fast fp16

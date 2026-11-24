@@ -904,10 +904,11 @@ static bool ggml_cuda_pq2_j128_enabled(const int cc) {
     return env >= 0 ? env == 1 : cc >= GGML_CUDA_CC_HOPPER && cc < 1000;
 }
 
-// GGML_CUDA_PTQ1_J128 (prototype): 1 = run PTQ1_0 J=128 prefill through the same kernel on NVIDIA sm_90+; unset/0 = off.
-static bool ggml_cuda_ptq1_j128_enabled() {
-    static const bool on = [] { const char * e = getenv("GGML_CUDA_PTQ1_J128"); return e != nullptr && atoi(e) != 0; }();
-    return on;
+// GGML_CUDA_PTQ1_J128: 1 = run PTQ1_0 J=128 prefill through the same kernel on NVIDIA sm_90+, 0 = off,
+// unset = follow GGML_CUDA_PREFILL_OPT.
+static bool ggml_cuda_ptq1_j128_enabled(const int cc) {
+    static const int env = ggml_cuda_env_tristate("GGML_CUDA_PTQ1_J128");
+    return env >= 0 ? env == 1 : ggml_cuda_prefill_opt(cc);
 }
 
 // Same grid rule as launch_mul_mat_q for the PQ2_0 J=128 (stream-k) config on NVIDIA.

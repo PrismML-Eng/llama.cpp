@@ -3262,12 +3262,15 @@ static bool ggml_cuda_fwht_mmq_find_uses(const ggml_cgraph * cgraph, const int i
 // GGML_CUDA_FWHT_MMQ_GLU: GLU(swiglu, split gate/up, not swapped) -> MUL(signs) -> RESHAPE -> MUL_MAT(Hadamard) whose
 // uses are all MMQ mat-muls: one launch computes silu(gate)*up, rotates and quantizes. Returns nodes consumed (4) or 0.
 static int ggml_cuda_try_glu_fwht_mmq(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
-    static const bool on = getenv("GGML_CUDA_FWHT_MMQ") != nullptr && atoi(getenv("GGML_CUDA_FWHT_MMQ")) != 0 &&
-                           getenv("GGML_CUDA_FWHT_MMQ_GLU") != nullptr && atoi(getenv("GGML_CUDA_FWHT_MMQ_GLU")) != 0;
+    // GGML_CUDA_FWHT_MMQ and GGML_CUDA_FWHT_MMQ_GLU: 1 = on, 0 = off, unset = follow GGML_CUDA_PREFILL_OPT
+    static const int mmq_env = ggml_cuda_env_tristate("GGML_CUDA_FWHT_MMQ");
+    static const int glu_env = ggml_cuda_env_tristate("GGML_CUDA_FWHT_MMQ_GLU");
+    const int  cc  = ggml_cuda_info().devices[ctx.device].cc;
+    const bool def = ggml_cuda_prefill_opt(cc);
+    const bool on  = (mmq_env >= 0 ? mmq_env == 1 : def) && (glu_env >= 0 ? glu_env == 1 : def);
     if (!on || !ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_GLU, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { node_idx + 3 })) {
         return 0;
     }
-    const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_TURING) {
         return 0;
     }
@@ -3416,7 +3419,8 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
     // in the unsigned pattern it is the [n, rows] reshape
     ggml_cuda_fwht_q8_uses u;
     if (!ggml_cuda_fwht_q8_find_uses(cgraph, i_mm, cc, pq2_enabled, u)) {
-        static const bool fwht_mmq = getenv("GGML_CUDA_FWHT_MMQ") != nullptr && atoi(getenv("GGML_CUDA_FWHT_MMQ")) != 0;
+        static const int fwht_mmq_env = ggml_cuda_env_tristate("GGML_CUDA_FWHT_MMQ");
+        const bool fwht_mmq = fwht_mmq_env >= 0 ? fwht_mmq_env == 1 : ggml_cuda_prefill_opt(cc);
         if (!fwht_mmq || !ggml_cuda_fwht_mmq_find_uses(cgraph, i_mm, cc, u) || u.K % n != 0 ||
                 (signs && signs->ne[0] != u.K)) {
             return 0;

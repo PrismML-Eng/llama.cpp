@@ -1570,7 +1570,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     // Yukon cuda.fast Bonsai engine): same work partition, same fixup, same FP32 order. Default on for Hopper,
     // GGML_CUDA_PQ2_J128=0/1 overrides.
     if constexpr ((type == GGML_TYPE_PQ2_0 || type == GGML_TYPE_PTQ1_0) && J == 128 && !fallback) {
-        if (GGML_CUDA_CC_IS_NVIDIA(cc) && (type == GGML_TYPE_PTQ1_0 ? ggml_cuda_ptq1_j128_enabled() : ggml_cuda_pq2_j128_enabled(cc)) && cc >= GGML_CUDA_CC_HOPPER && warp_size == 32 &&
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && (type == GGML_TYPE_PTQ1_0 ? ggml_cuda_ptq1_j128_enabled(cc) : ggml_cuda_pq2_j128_enabled(cc)) && cc >= GGML_CUDA_CC_HOPPER && warp_size == 32 &&
                 ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_HOPPER &&
                 ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1).I == 128 && ggml_cuda_mmq_get_stream_k(type, J, fallback, cc, prec_src1) &&
                 ggml_cuda_mmq_pq2_j128_use(args, nsm)) {

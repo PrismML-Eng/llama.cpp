@@ -248,11 +248,12 @@ gated_delta_net_cuda(const float * q,
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-// GGML_CUDA_GDN_L8P: 0/unset = off, 1 = auto, else a config from the table in launch_gated_delta_net (T tokens per
-// stage, NW warps per block, CPL columns per lane). GGML_CUDA_GDN_L8P_SAB=1 breaks the reduction order (gate test).
-static int gdn_l8p_cfg() {
-    static const int cfg = getenv("GGML_CUDA_GDN_L8P") ? atoi(getenv("GGML_CUDA_GDN_L8P")) : 0;
-    return cfg;
+// GGML_CUDA_GDN_L8P: 0 = off, 1 = auto, else a config from the table in launch_gated_delta_net (T tokens per
+// stage, NW warps per block, CPL columns per lane); unset = auto when GGML_CUDA_PREFILL_OPT is on for this GPU.
+// GGML_CUDA_GDN_L8P_SAB=1 breaks the reduction order (gate test).
+static int gdn_l8p_cfg(const int cc) {
+    static const int cfg = getenv("GGML_CUDA_GDN_L8P") ? atoi(getenv("GGML_CUDA_GDN_L8P")) : -1;
+    return cfg >= 0 ? cfg : (ggml_cuda_prefill_opt(cc) ? 1 : 0);
 }
 template <int T, int NW, int CPL, int U, bool keep_rs_t, bool RAW>
 static void launch_gdn_l8p(const float * q_d, const float * k_d, const float * v_d, const float * g_d, const float * b_d,
@@ -329,7 +330,7 @@ static void launch_gated_delta_net(
             static const bool l8_enabled =
                 getenv("GGML_CUDA_GDN_L8") != nullptr && atoi(getenv("GGML_CUDA_GDN_L8")) != 0;
             if constexpr (!KDA && !G_PRECOMPUTED) {
-                const int l8p = gdn_l8p_cfg();
+                const int l8p = gdn_l8p_cfg(cc);
                 if (allow_l8p && l8p > 0 && GGML_CUDA_CC_IS_NVIDIA(cc) &&
                     ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE && warp_size == 32 &&
                     cols_per_warp == 4 && n_tokens >= GDN_L8P_MIN_TOKENS) {
@@ -687,7 +688,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
         CUDA_CHECK(cudaStreamSynchronize(stream));
         static unsigned long long calls = 0, toks = 0, bad_out = 0, bad_state = 0, eng = 0;
         calls++; toks += n_tokens; bad_out += h[0]; bad_state += h[1];
-        eng += (gdn_l8p_cfg() > 0 && n_tokens >= GDN_L8P_MIN_TOKENS) ? 1 : 0;
+        eng += (gdn_l8p_cfg(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) > 0 && n_tokens >= GDN_L8P_MIN_TOKENS) ? 1 : 0;
         if (h[0] || h[1] || calls % 200 == 0 || calls == 1 || getenv("GGML_CUDA_GDN_XCHECK")[0] == '2') {
             GGML_LOG_WARN("gdn xcheck: calls %llu (l8p %llu) tokens %llu | this call n %lld K %d raw %d: out diff %llu, state diff %llu | total out %llu state %llu\n",
                 calls, eng, toks, (long long) n_tokens, K, (int) raw, h[0], h[1], bad_out, bad_state);
