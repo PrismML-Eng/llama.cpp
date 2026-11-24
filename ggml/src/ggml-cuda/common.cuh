@@ -59,6 +59,7 @@
 #define GGML_CUDA_CC_HOPPER          900
 // While BW spans CC 1000, 1100 & 1200, we are integrating Tensor Core instructions available to 1200 family, see
 // https://docs.nvidia.com/cutlass/media/docs/cpp/blackwell_functionality.html#blackwell-sm120-gemms
+#define GGML_CUDA_CC_BLACKWELL_DC    1000  // B200 / GB200 (sm_100); GGML_CUDA_CC_BLACKWELL is consumer sm_120
 #define GGML_CUDA_CC_BLACKWELL       1200
 #define GGML_CUDA_CC_DGX_SPARK       1210
 #define GGML_CUDA_CC_RUBIN           1300
@@ -72,13 +73,18 @@ static int ggml_cuda_env_tristate(const char * name) {
     return e == nullptr ? -1 : (atoi(e) != 0 ? 1 : 0);
 }
 
-// GGML_CUDA_PREFILL_OPT: the prefill paths that measured faster with byte-identical output on Hopper
+// GGML_CUDA_PREFILL_OPT: the prefill paths that measured faster with byte-identical output
 // (GGML_CUDA_GDN_L8P, GGML_CUDA_PTQ1_J128, GGML_CUDA_FWHT_MMQ with GGML_CUDA_FWHT_MMQ_GLU).
-// Unset: on for NVIDIA Hopper (cc 900-999), off elsewhere. 0 = all off, 1 = all on where each path supports the GPU.
+// Unset: on for the NVIDIA architectures where it was measured (A100 cc 800, Hopper cc 900-999, B200 cc 1000,
+// RTX PRO 6000 / RTX 50 cc 1200-1299), off elsewhere (Ada and older are unmeasured).
+// 0 = all off, 1 = all on where each path supports the GPU.
 // A per-path switch, when set, overrides this for that path.
 static bool ggml_cuda_prefill_opt(const int cc) {
     static const int env = ggml_cuda_env_tristate("GGML_CUDA_PREFILL_OPT");
-    return env >= 0 ? env == 1 : GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_HOPPER && cc < 1000;
+    return env >= 0 ?
+               env == 1 :
+               GGML_CUDA_CC_IS_NVIDIA(cc) && (cc == GGML_CUDA_CC_AMPERE || (cc >= GGML_CUDA_CC_HOPPER && cc <= 1000) ||
+                                              (cc >= GGML_CUDA_CC_BLACKWELL && cc < 1300));
 }
 
 // AMD
