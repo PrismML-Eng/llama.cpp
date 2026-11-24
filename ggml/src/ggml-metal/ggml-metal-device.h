@@ -82,6 +82,10 @@ void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_metal_pipeline_with_params pipeline);
 
+// per-op profiler (GGML_METAL_OP_PROFILE): record the pipeline names set on any encoder
+void         ggml_metal_prof_kernels_enable(bool enable);
+const char * ggml_metal_prof_kernels_take(void);
+
 void ggml_metal_encoder_set_bytes (ggml_metal_encoder_t encoder, void * data, size_t size, int idx);
 void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id buffer, int idx);
 
@@ -128,11 +132,17 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cumsum_bl
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_pq2_0_fewrow (ggml_metal_library_t lib, int ncb, int nks);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_q1_0_planes         (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_q1_0_pc      (ggml_metal_library_t lib, const struct ggml_tensor * op, int nr1);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ptq1_extc    (ggml_metal_library_t lib, int nx, int nr1, int nrl, int nsg);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_coef_prepass        (ggml_metal_library_t lib, enum ggml_type t);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_pq2_coef     (ggml_metal_library_t lib, int nr0, int nr1, int nsg);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_pq2_extc     (ggml_metal_library_t lib, int nr1, int nrl, int nsg);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_q2_extc      (ggml_metal_library_t lib, int nx, int nr1, int nrl, int nsg);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cumsum_add        (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_tri               (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max          (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc           (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_rows     (ggml_metal_library_t lib, int32_t nc, bool use_silu);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv          (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t nc, bool use_silu);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched  (ggml_metal_library_t lib, const struct ggml_tensor * op, int ssm_conv_bs, int32_t nc, bool use_silu);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan          (ggml_metal_library_t lib, const struct ggml_tensor * op, bool tail);

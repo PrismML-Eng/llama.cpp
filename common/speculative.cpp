@@ -314,6 +314,9 @@ struct common_speculative_impl {
 
     virtual bool process(const common_batch & batch) = 0;
 
+    // (optional) LLAMA_MTP_PREFILL_LEAN: work that can start as soon as the target decode of `batch` is launched
+    virtual bool flush_lean(const common_batch & /*batch*/) { return true; }
+
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
@@ -2502,7 +2505,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         int32_t n_valid = 0;
         bool    pending = false;
         bool    catchup_failed = false;      // flush_deferred decode failed; do not draft this seq
+        // LLAMA_MTP_PREFILL_LEAN: a prompt batch held one batch behind. Its h rows stay in the target's nextn
+        // buffer of decode `lean_gen` (row k-1 pairs with token k); h0 pairs with token 0.
+        bool    lean     = false;
+        int64_t lean_gen = -1;
+        std::vector<float> h0;
     };
+
+    // LLAMA_MTP_PREFILL_LEAN=1 (default off): the head's prompt catch-up for a prompt batch without outputs runs one
+    // batch late, at the next process() call and before that call waits for the target, so it overlaps the target's
+    // next batch instead of stalling between batches. Same rows, positions and decode composition as the stock path.
+    static bool prefill_lean() {
+        static const bool v = [] { const char * e = getenv("LLAMA_MTP_PREFILL_LEAN"); return e && atoi(e) != 0; }();
+        return v;
+    }
     std::vector<deferred_rows> deferred;
 
     // ARC-LAB: chained drafts (LLAMA_MTP_CHAIN; independent implementation of the technique described by llamADALL).
@@ -2526,12 +2542,37 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             d.pending = false;
             return true;
         }
+        const float * lean_rows = nullptr;
+        if (d.lean) {
+            lean_rows = llama_get_embeddings_nextn_gen_data(params.ctx_tgt, d.lean_gen);
+            if (lean_rows == nullptr) {
+                // the target decoded twice since this batch: its rows are gone. Drafting stops for this task (the
+                // output does not depend on it).
+                SPC_WRN("MTP prefill-lean: rows of decode %lld no longer held; not drafting this task\n", (long long) d.lean_gen);
+                d.pending = false;
+                d.lean = false;
+                d.catchup_failed = true;
+                return false;
+            }
+        }
         batch.clear();
         for (int32_t k = 0; k < d.n_valid; ++k) {
             const int32_t idx = batch.add(d.tokens[k], d.pos[k], seq_id, false);
-            batch.set_embd_state(idx, { d.h.data() + (size_t) k * n_embd, 1, (size_t) n_embd });
+            // LLAMA_MTP_PREFILL_LEAN_SABOTAGE=1 pairs each token with its own row instead of the previous one: a wrong
+            // draft state on purpose, to prove the acceptance gate can fail (output must stay identical)
+            static const bool sabotage = getenv("LLAMA_MTP_PREFILL_LEAN_SABOTAGE") != nullptr;
+            const float * h_row = !d.lean ? d.h.data() + (size_t) k * n_embd
+                                : sabotage ? lean_rows + (size_t) k * n_embd
+                                : k == 0  ? d.h0.data()
+                                          : lean_rows + (size_t) (k - 1) * n_embd;
+            batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
         }
         const int32_t rc = llama_process(params.ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        if (d.lean) {
+            // the head's next input row is this batch's last target row
+            std::memcpy(pending_h[seq_id].data(), lean_rows + (size_t) (d.n_valid - 1) * n_embd, (size_t) n_embd * sizeof(float));
+            d.lean = false;
+        }
         if (rc != 0) {
             SPC_ERR("llama_process(ctx_dft) deferred catch-up failed rc=%d (pos=%d)\n", (int) rc, (int) d.pos[0]);
             d.catchup_failed = true;
@@ -2789,6 +2830,40 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    // LLAMA_MTP_PREFILL_LEAN: decode a held prompt batch that `batch_in` continues. Called by the server right after it
+    // launches the target decode of `batch_in` (before any wait for it), and again at the start of process().
+    bool flush_lean(const common_batch & batch_in) override {
+        if (!prefill_lean() || is_mem_shared || chain_heads) {
+            return true;
+        }
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & d = deferred[seq_id];
+            if (!d.pending || !d.lean) {
+                continue;
+            }
+            int32_t k0 = -1;
+            for (int32_t k = 0; k < batch_in.size(); ++k) {
+                if (batch_in.tokens[k].seq_id == seq_id) {
+                    k0 = k;
+                    break;
+                }
+            }
+            if (k0 < 0) {
+                continue;
+            }
+            const bool continues = d.n_valid > 0 && batch_in.tokens[k0].pos[0] == d.pos[d.n_valid - 1] + 1;
+            if (continues) {
+                if (!flush_deferred(seq_id) && !d.catchup_failed) {
+                    return false;
+                }
+            } else {
+                d.pending = false;
+                d.lean    = false;
+            }
+        }
+        return true;
+    }
+
     bool process(const common_batch & batch_in) override {
         if (batch_in.size() <= 0) {
             return true;
@@ -2821,6 +2896,58 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
+        if (!is_mem_shared && prefill_lean() && !chain_heads) {
+            int  n_seq_lean = 0;
+            bool ids_lean   = true;
+            bool any_output = false;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                n_seq_lean += i_batch_beg[seq_id] >= 0;
+            }
+            for (int k = 0; k < n_tokens; ++k) {
+                ids_lean   = ids_lean && batch_in.tokens[k].id != LLAMA_TOKEN_NULL;
+                any_output = any_output || batch_in.tokens[k].output;
+            }
+            // 1. a prompt batch held from the previous call: decode it now, before waiting for this batch
+            //    (the server normally did this already, right after launching the batch: flush_lean())
+            if (!flush_lean(batch_in)) {
+                return false;
+            }
+            // 2. this batch is a prompt batch without outputs: hold it (no wait for the target here)
+            const bool lean_batch = ids_lean && !any_output && n_seq_lean == 1 && n_tokens > this->params.n_max + 1 &&
+                                    i_batch_beg[batch_in.tokens[0].seq_id] == 0 &&
+                                    i_batch_end[batch_in.tokens[0].seq_id] == n_tokens - 1;
+            if (lean_batch) {
+                const llama_seq_id seq_id = batch_in.tokens[0].seq_id;
+                auto & d = deferred[seq_id];
+                if (d.pending) {
+                    // a non-lean stash (verify rows) that this batch continues: decode it first (waits for the target)
+                    const bool continues = d.n_valid > 0 && batch_in.tokens[0].pos[0] == d.pos[d.n_valid - 1] + 1;
+                    if (continues) {
+                        if (!flush_deferred(seq_id)) {
+                            return false;
+                        }
+                    } else {
+                        d.pending = false;
+                    }
+                }
+                if (!d.catchup_failed) {
+                    d.tokens.resize(n_tokens);
+                    d.pos.resize(n_tokens);
+                    for (int k = 0; k < n_tokens; ++k) {
+                        d.tokens[k] = batch_in.tokens[k].id;
+                        d.pos[k]    = batch_in.tokens[k].pos[0];
+                    }
+                    d.h0       = pending_h[seq_id];
+                    d.lean     = true;
+                    d.lean_gen = llama_get_embeddings_nextn_gen(ctx_tgt);
+                    d.n_valid  = n_tokens;
+                    d.pending  = true;
+                }
+                verify_h_rows[seq_id] = 0;
+                return true;
+            }
+        }
+
         if (!is_mem_shared) {
             const float * h_tgt_rows = llama_get_embeddings_nextn(ctx_tgt);
 
@@ -2953,6 +3080,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (deferred[seq_id].pending && deferred[seq_id].lean) {
+                flush_deferred(seq_id); // normally flushed by the prompt's last batch; failure sets catchup_failed
+            }
+        }
         g_mtp_dt.begin();
         draft_impl(dparams);
         g_mtp_dt.end(last_draft_chained);
@@ -4363,6 +4495,17 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
         result = result && impl->process(batch);
     }
 
+    return result;
+}
+
+bool common_speculative_flush_lean(common_speculative * spec, const common_batch & batch) {
+    bool result = true;
+    if (spec == nullptr) {
+        return result;
+    }
+    for (auto & impl : spec->impls) {
+        result = result && impl->flush_lean(batch);
+    }
     return result;
 }
 

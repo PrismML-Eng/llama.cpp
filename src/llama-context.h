@@ -92,6 +92,11 @@ struct llama_context {
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
 
+    // LLAMA_MTP_PREFILL_LEAN: unmasked nextn rows alternate between two host buffers, so the rows of the previous
+    // decode stay readable (without waiting for the current one) until the next decode
+    int64_t get_embeddings_nextn_gen() const { return nextn_gen; }
+    const float * get_embeddings_nextn_gen_data(int64_t gen);
+
     float * get_embeddings_layer_inp(uint32_t lid);
 
     // multi-layer hidden-state tap (EAGLE3 / dspark target-feature reuse).
@@ -489,6 +494,16 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+
+    // LLAMA_MTP_PREFILL_LEAN double buffer for unmasked nextn rows (see get_embeddings_nextn_gen_data)
+    ggml_backend_buffer_ptr buf_nextn_alt;
+    int64_t   nextn_gen      = 0;        // decodes that produced unmasked nextn rows
+    float   * nextn_cur      = nullptr;  // rows of decode nextn_gen
+    float   * nextn_prev     = nullptr;  // rows of decode nextn_gen - 1 (nullptr: gone)
+    ggml_backend_t       nextn_backend = nullptr;
+    ggml_backend_event_t nextn_ev[2]   = { nullptr, nullptr };
+    bool      nextn_ev_set[2] = { false, false };
+    const void * nextn_buf_seen = nullptr; // buf_output at the previous decode (a reallocation drops the old rows)
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;

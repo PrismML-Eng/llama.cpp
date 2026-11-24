@@ -66,6 +66,21 @@
 #define GGML_CUDA_CC_OFFSET_MTHREADS 0x0100000
 #define GGML_CUDA_CC_IS_NVIDIA(cc)   (cc < GGML_CUDA_CC_OFFSET_MTHREADS)
 
+// Unset -> -1, "0" -> 0, any other number -> 1.
+static int ggml_cuda_env_tristate(const char * name) {
+    const char * e = getenv(name);
+    return e == nullptr ? -1 : (atoi(e) != 0 ? 1 : 0);
+}
+
+// GGML_CUDA_PREFILL_OPT: the prefill paths that measured faster with byte-identical output on Hopper
+// (GGML_CUDA_GDN_L8P, GGML_CUDA_PTQ1_J128, GGML_CUDA_FWHT_MMQ with GGML_CUDA_FWHT_MMQ_GLU).
+// Unset: on for NVIDIA Hopper (cc 900-999), off elsewhere. 0 = all off, 1 = all on where each path supports the GPU.
+// A per-path switch, when set, overrides this for that path.
+static bool ggml_cuda_prefill_opt(const int cc) {
+    static const int env = ggml_cuda_env_tristate("GGML_CUDA_PREFILL_OPT");
+    return env >= 0 ? env == 1 : GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_HOPPER && cc < 1000;
+}
+
 // AMD
 // GCN/CDNA, wave size is 64
 #define GGML_CUDA_CC_GCN4       (GGML_CUDA_CC_OFFSET_AMD + 0x803)  // Tonga, Fiji, Polaris, minimum for fast fp16
@@ -1070,6 +1085,7 @@ enum ggml_cuda_q8_1_layout : int {
     GGML_CUDA_Q8_1_PT       = 2, // PTQ1_0, 2-8 columns or MoE ids: planar-transposed (mmvq-ptq1_0.cuh)
     GGML_CUDA_Q8_1_PQ2      = 3, // PQ2_0, 3-8 columns, plain 2D, Ada: permuted qs plus half2 (d, int sum) per block (mmvq-pq2_0.cuh)
     GGML_CUDA_Q8_1_Q1B      = 4, // Q1_0, one column: per 32-block, word j = elements j, 8+j, 16+j, 24+j (bit-serial dot), then half2 (d, exact int sum) per block
+    GGML_CUDA_Q8_1_MMQ_D4   = 5, // MMQ src1 (block_q8_1_mmq, d4 scales), written by the fused prefill rotation (GGML_CUDA_FWHT_MMQ)
 };
 
 // Column-count helper, not the layout decision. 2-8 columns and MoE (ids) take the planar

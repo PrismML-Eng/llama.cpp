@@ -78,6 +78,8 @@ void ggml_metal_cv_set_bool(ggml_metal_cv_t cv, bool value, int32_t idx) {
 
 struct ggml_metal_pipeline {
     id<MTLComputePipelineState> obj;
+
+    char name[128]; // pipeline name, reported by the per-op profiler
 };
 
 ggml_metal_pipeline_t ggml_metal_pipeline_init(void) {
@@ -816,6 +818,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
         res.pipeline = ggml_metal_pipeline_init();
         res.pipeline->obj = obj;
+        snprintf(res.pipeline->name, sizeof(res.pipeline->name), "%s", name);
 
         ggml_metal_pipelines_add(lib->pipelines, name, res.pipeline);
     }
@@ -864,12 +867,33 @@ void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder) {
     [encoder->obj popDebugGroup];
 }
 
+static bool g_prof_kernels_on = false;
+static char g_prof_kernels[1024];
+
 void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_metal_pipeline_with_params pipeline) {
     if (!pipeline.pipeline) {
         GGML_ABORT("%s: nil Metal pipeline (missing kernel; see compile_pipeline log above)\n", __func__);
     }
 
     [encoder->obj setComputePipelineState:pipeline.pipeline->obj];
+
+    if (g_prof_kernels_on) {
+        const size_t n = strlen(g_prof_kernels);
+        snprintf(g_prof_kernels + n, sizeof(g_prof_kernels) - n, "%s%s", n ? "," : "", pipeline.pipeline->name);
+    }
+}
+
+// per-op profiler: collect the names of the pipelines an op encodes (single-threaded profile mode only)
+void ggml_metal_prof_kernels_enable(bool enable) {
+    g_prof_kernels_on = enable;
+    g_prof_kernels[0] = 0;
+}
+
+const char * ggml_metal_prof_kernels_take(void) {
+    static char out[sizeof(g_prof_kernels)];
+    snprintf(out, sizeof(out), "%s", g_prof_kernels);
+    g_prof_kernels[0] = 0;
+    return out;
 }
 
 void ggml_metal_encoder_set_bytes(ggml_metal_encoder_t encoder, void * data, size_t size, int idx) {

@@ -7496,6 +7496,22 @@ static sycl_host_timing g_ht;
 // the kernel-group count. Printed every 64 such graphs. Timing-only: it slows the draft, never use it for speed runs.
 struct sycl_op_timing {
     bool on = getenv("GGML_SYCL_OP_TIMING") && atoi(getenv("GGML_SYCL_OP_TIMING"));
+    // GGML_SYCL_OP_TIMING=3 times the target's graphs (2000+ nodes) instead, one table per batch width
+    // (the largest weight mat-mul's column count: 1 = decode, 2..8 = verify, 9+ = prompt), mat-muls labelled by weight
+    const char * tag   = "";
+    int          every = 64;
+    static int mode() { const char * e = getenv("GGML_SYCL_OP_TIMING"); return e ? atoi(e) : 0; }
+    static int width(const ggml_cgraph * g) {
+        if (g->n_nodes < 2000) return 0;
+        int w = 0;
+        for (int i = 0; i < g->n_nodes; ++i) {
+            const ggml_tensor * n = g->nodes[i];
+            if (n->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(n, 1) != GGML_HINT_SRC0_IS_HADAMARD) {
+                w = std::max(w, (int) (n->src[1]->ne[1] * n->src[1]->ne[2]));
+            }
+        }
+        return w;
+    }
     using clk = std::chrono::steady_clock;
     int    graphs = 0;
     long   groups = 0, nodes = 0;
@@ -7527,25 +7543,30 @@ struct sycl_op_timing {
             if (ggml_get_op_params_i32(n, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
                 return "MUL_MAT hadamard";
             }
-            return std::string("MUL_MAT ") + ggml_type_name(n->src[0]->type);
+            std::string w = n->src[0]->name;  // blk.N.ffn_down.weight -> ffn_down
+            if (w.rfind("blk.", 0) == 0) { const size_t d = w.find('.', 4); if (d != std::string::npos) w = w.substr(d + 1); }
+            if (w.size() > 7 && w.compare(w.size() - 7, 7, ".weight") == 0) w = w.substr(0, w.size() - 7);
+            return std::string("MUL_MAT ") + ggml_type_name(n->src[0]->type) + (mode() >= 3 ? " " + w : std::string());
         }
         return ggml_op_desc(n);
     }
     void report() {
-        fprintf(stderr, "op-timing: %d draft-sized graphs, per graph: %.3f ms serialised over %.1f kernel groups (%.0f nodes)\n",
-                graphs, total / graphs, (double) groups / graphs, (double) nodes / graphs);
+        fprintf(stderr, "op-timing%s: %d graphs, per graph: %.3f ms serialised over %.1f kernel groups (%.0f nodes)\n",
+                tag, graphs, total / graphs, (double) groups / graphs, (double) nodes / graphs);
         std::vector<std::pair<double, std::string>> v;
         for (auto & kv : per_op) v.push_back({ kv.second.first, kv.first });
         std::sort(v.rbegin(), v.rend());
-        for (size_t i = 0; i < v.size() && i < 16; ++i) {
+        for (size_t i = 0; i < v.size() && i < 40; ++i) {
             const auto & a = per_op[v[i].second];
-            fprintf(stderr, "op-timing:   %-22s %.3f ms/graph (%.1f groups/graph, %.1f us each)\n", v[i].second.c_str(),
+            fprintf(stderr, "op-timing%s:   %-34s %.3f ms/graph (%.1f groups/graph, %.1f us each)\n", tag, v[i].second.c_str(),
                     a.first / graphs, (double) a.second / graphs, 1000.0 * a.first / std::max(1L, a.second));
         }
         graphs = 0; groups = 0; nodes = 0; total = 0; per_op.clear();
     }
 };
 static sycl_op_timing g_ot;
+static sycl_op_timing g_otw[10];  // [w] w = 1..8 columns, [9] = 9+ (prompt)
+static const char *   g_otw_tag[10] = { "", "[n1]", "[n2]", "[n3]", "[n4]", "[n5]", "[n6]", "[n7]", "[n8]", "[pp]" };
 
 static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
     GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
@@ -8544,7 +8565,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     const bool                       ht_on   = g_ht.on && cgraph->n_nodes > 500;
     sycl_host_timing::clk::time_point ht_prev = sycl_host_timing::clk::now();
     const char *                     ht_op   = nullptr;
-    const bool                       ot_on   = g_ot.on && sycl_op_timing::draft_sized(cgraph);
+    sycl_op_timing *                 otp     = nullptr;
+    if (g_ot.on) {
+        if (sycl_op_timing::mode() >= 3) {
+            const int w = sycl_op_timing::width(cgraph);
+            if (w > 0) {
+                otp        = &g_otw[std::min(w, 9)];
+                otp->tag   = g_otw_tag[std::min(w, 9)];
+                otp->every = w > 8 ? 2 : 16;
+            }
+        } else if (sycl_op_timing::draft_sized(cgraph)) {
+            otp = &g_ot;
+        }
+    }
+    const bool                       ot_on   = otp != nullptr;
     sycl_op_timing::clk::time_point  ot_prev{};
     std::string                      ot_op;
     auto ot_mark = [&](const std::string & next) {  // drain the queue, charge the time since the last mark to the op that ran
@@ -8552,11 +8586,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         const auto now = sycl_op_timing::clk::now();
         if (!ot_op.empty()) {
             const double ms = std::chrono::duration<double, std::milli>(now - ot_prev).count();
-            auto & a = g_ot.per_op[ot_op];
+            auto & a = otp->per_op[ot_op];
             a.first += ms;
             a.second++;
-            g_ot.total += ms;
-            g_ot.groups++;
+            otp->total += ms;
+            otp->groups++;
         }
         ot_prev = now;
         ot_op   = next;
@@ -8566,7 +8600,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     }
     if (ot_on) {
         ot_mark(std::string());  // inputs and earlier work are not charged
-        g_ot.nodes += cgraph->n_nodes;
+        otp->nodes += cgraph->n_nodes;
     }
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -8791,8 +8825,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     }
     if (ot_on) {
         ot_mark(std::string());
-        if (++g_ot.graphs == 64) {
-            g_ot.report();
+        if (++otp->graphs == otp->every) {
+            otp->report();
         }
     }
 }

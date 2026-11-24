@@ -27,12 +27,21 @@ int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
 
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 
+// per-op GPU timing (GGML_METAL_OP_PROFILE=<out file>)
+const char * ggml_metal_op_prof_path(void);
+const struct ggml_tensor * ggml_metal_op_node(ggml_metal_op_t ctx, int idx);
+void ggml_metal_op_prof_add(const struct ggml_tensor * node, int n_fused, const char * kernels, double us);
+void ggml_metal_op_prof_set_ntok(int n_tokens);
+void ggml_metal_op_prof_graph_done(int n_tokens);
+
 //
 // available ops:
 //
 
 // activation bit-planes for the Q1_0 word-parallel path
 size_t ggml_metal_op_mul_mat_extra_q1_0_planes(const struct ggml_tensor * op);
+// coefficient scratch for the PQ2_0 pre-pass verify path (GGML_METAL_PQ2_COEF)
+size_t ggml_metal_op_mul_mat_extra_pq2_coef(const struct ggml_tensor * op);
 
 // tokens per expert
 size_t ggml_metal_op_mul_mat_id_extra_tpe(const struct ggml_tensor * op);

@@ -248,16 +248,25 @@ void gemv(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const uint32_
                    Kern{ nullptr, (const signed char *) Aq, SA, B, SB, C, epi, M, N, K });
 }
 
-template <int MT_M, int MT_N, int WG_M, int WG_N>
+template <int MT_M, int MT_N, int WG_M, int WG_N, bool KSPLIT = false>
 void gemm_tile(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const uint32_t * B, const uint16_t * SB, float * C,
-               int M, int N, int K) {
+               int M, int N, int K, int ks = 1) {
     const size_t    tm = MT_M * WG_M, tn = MT_N * WG_N;
     const Epi       epi{ nullptr, nullptr, 0, 1 };
     const sycl::range<2> local(1, 16 * WG_M * WG_N);
     const sycl::range<2> global((M + tm - 1) / tm, (N + tn - 1) / tn * local[1]);
     q.parallel_for(sycl::nd_range<2>(global, local),
-                   int8dpas::GemmMT<false, 0, MT_M, MT_N, WG_M, WG_N, 0, true>{
-                       nullptr, (const signed char *) Aq, SA, B, SB, C, epi, M, N, K });
+                   int8dpas::GemmMT<false, 0, MT_M, MT_N, WG_M, WG_N, 0, true, KSPLIT>{
+                       nullptr, (const signed char *) Aq, SA, B, SB, C, epi, M, N, K, ks });
+}
+
+// GGML_SYCL_T2_VGEMM_MIN path: a 1..8-row batch on GemmMT (tile {8,64,1,8}: one 8-row block per work-group) that sums
+// K in the slices the GEMV would have used (ks = the GEMV's LS: 4 if N <= 8192 else 2, N = the largest member of the
+// same-input merge it replaces) and adds them in the GEMV's order, so the result is the GEMV's floats bit for bit.
+void vgemm(sycl::queue & q, const int8_t * Aq, const uint16_t * SA, const uint32_t * B, const uint16_t * SB, float * C,
+           int M, int N, int K, int ks) {
+    GGML_SYCL_DEBUG("[SYCL] t2 vgemm M=%d N=%d K=%d ks=%d\n", M, N, K, ks);
+    gemm_tile<8, 64, 1, 8, true>(q, Aq, SA, B, SB, C, M, N, K, ks);
 }
 
 // ARC-LAB lab knob GGML_SYCL_PTQ1_T2_TILE = index into TernSYCL's large-M tile table (mt_m, mt_n, wg_m, wg_n):
@@ -729,6 +738,15 @@ bool ggml_sycl_t2_add_norm_rot(sycl::queue & q, const float * a, const float * b
     return true;
 }
 
+// GGML_SYCL_T2_VGEMM_MIN = k (2..8; 0 = off, the default): batches of k..8 rows (speculative-decoding verify steps) go
+// to GemmMT in the GEMV's K-slice order (vgemm) instead of the GEMV, whose SGM = 4/8 tiles re-load the activations for
+// every 16 columns. Same-input merges keep their single quantization and run one GemmMT per member. On an Xe3 iGPU
+// GemmMT at 16 rows costs about what the GEMV costs at 1 row.
+static bool t2_vgemm(int64_t M) {
+    static const int mn = ggml_sycl_knob("GGML_SYCL_T2_VGEMM_MIN", 0);
+    return mn >= 2 && M >= mn && M <= 8;
+}
+
 void ggml_sycl_t2_mul_mat(sycl::queue & q, const void * w, const float * x, int64_t x_stride, float * dst, int64_t M,
                           int64_t N, int64_t K, const void * x_key) {
     // batches > 8 (n-gram verify, prompts): GemmMT reads each weight once per 64 rows (TernSYCL main: the 2D block I/O
@@ -749,6 +767,10 @@ void ggml_sycl_t2_mul_mat(sycl::queue & q, const void * w, const float * x, int6
     if (!x_key || !ggml_sycl_knob("GGML_SYCL_PTQ1_T2_QCACHE", 1) || !(g_quant_have == want)) {
         quant_a(q, x, x_stride, M, K, Aq, SA, QK);
         g_quant_have = x_key ? want : quant_key{};
+    }
+    if (t2_vgemm(M) && !gemm_off) {
+        vgemm(q, Aq, SA, B, SB, dst, (int) M, (int) N, (int) K, N <= 8192 ? 4 : 2);
+        return;
     }
     t2_dispatch(q, Aq, SA, B, SB, dst, (int) M, (int) N, (int) K, use_gemm);
 }
@@ -781,6 +803,12 @@ bool ggml_sycl_t2_mul_mat_multi(sycl::queue & q, int nm, const void * const * w,
     }
     const int  m_ = (int) M, k_ = (int) K;
     const bool ls4 = nmax <= 8192;
+    if (t2_vgemm(M) && !ggml_sycl_knob("GGML_SYCL_PTQ1_T2_GEMM_OFF", 0)) {  // one GemmMT per member, the merged GEMV's K slices
+        for (int m = 0; m < nm; ++m) {
+            vgemm(q, Aq, SA, B[m], SB[m], C[m], m_, Ni[m], k_, ls4 ? 4 : 2);
+        }
+        return true;
+    }
     if (t2_tuned(q, Aq, SA, nm, B, SB, C, Ni, m_, k_)) {
         return true;
     }
@@ -821,6 +849,9 @@ void t2_precompile(sycl::queue & q) {
     quant_a(q, x, K, M, K, aq, sa, QK);
     for (int m : { 1, 2, 4, 8, M }) {  // the N <= 8192 GEMV tiles + GemmMT (the N > 8192 ones are called below)
         t2_dispatch(q, aq, sa, B, SB, d, m, N, K, m > 8);
+    }
+    if (ggml_sycl_knob("GGML_SYCL_T2_VGEMM_MIN", 0) >= 2) {  // JIT the vgemm kernel now
+        vgemm(q, aq, sa, B, SB, d, 8, N, K, 1);
     }
     gemv<1, 2>(q, aq, sa, B, SB, d, 1, N, K);
     gemv<2, 2>(q, aq, sa, B, SB, d, 2, N, K);

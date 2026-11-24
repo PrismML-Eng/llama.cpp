@@ -223,6 +223,10 @@ private:
     std::vector<float>          embd_vec;     // owned embeddings built from llama_batch_ext
     std::vector<int8_t>         is_embd_vec;  // mixed batch only (= 1 if embd, 0 if text token)
     std::vector<float>          state_vec;    // owned state embeddings built from llama_batch_ext, llama_batch has no slot for them
+
+    // LLAMA_MTP_PREFILL_LEAN: ubatch data blocks no ubatch references any more, reused so that large embd rows are
+    // not reallocated (and page-faulted in) for every ubatch
+    std::vector<std::shared_ptr<llama_ubatch::data_t>> udata_pool;
     std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below
 
     std::vector<llama_pos>      pos;

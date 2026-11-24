@@ -141,6 +141,12 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+// LLAMA_MTP_PREFILL_LEAN=1 (default off): unmasked nextn rows alternate between two host buffers.
+// gen counts the decodes that produced them; gen_data returns the rows of decode `gen` while they are still held
+// (the current decode: waits for it; the previous one: waits only for its own copies), nullptr otherwise.
+LLAMA_API int64_t       llama_get_embeddings_nextn_gen     (struct llama_context * ctx);
+LLAMA_API const float * llama_get_embeddings_nextn_gen_data(struct llama_context * ctx, int64_t gen);
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 

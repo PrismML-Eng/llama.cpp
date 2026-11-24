@@ -6473,6 +6473,22 @@ struct test_arclab_glu_rot : public test_case {
 
 // [SWIGLU ->] MUL(signs) -> RESHAPE -> Hadamard MUL_MAT (width blk) -> mat-vec of weight type `type`: the
 // CUDA fused FWHT + q8_1 quantizer path (GGML_CUDA_FWHT_FUSION, GGML_CUDA_FWHT_FUSION_PQ2 for PQ2_0).
+// A rotation whose reshaped view is a graph output and also feeds an MMQ-width mat-mul: the view must keep the F32
+// values, so the fused rotation + q8_1 paths (GGML_CUDA_FWHT_MMQ) must leave it alone.
+struct test_rot_output_view : public test_case {
+    const ggml_type type; const int64_t blk, K, M, N;
+    std::vector<ggml_tensor *> outs;
+    test_rot_output_view(ggml_type type, int64_t blk, int64_t K, int64_t M, int64_t N)
+        : type(type), blk(blk), K(K), M(M), N(N) {}
+    std::string op_desc(ggml_tensor *) override { return "ROT_OUTPUT_VIEW"; }
+    std::string vars() override { return VARS_TO_STR5(type, blk, K, M, N); }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outs; }
+    double max_nmse_err() override { return 5e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override;
+    void initialize_tensors(ggml_context * ctx) override;
+};
+
 struct test_rot_matvec : public test_case {
     const ggml_type type; const int64_t blk, K, M, N; const bool swiglu;
     std::vector<ggml_tensor *> outs;
@@ -6502,6 +6518,25 @@ struct test_rot_matvec : public test_case {
     }
     void initialize_tensors(ggml_context * ctx) override { arclab_init(ctx); }
 };
+
+ggml_tensor * test_rot_output_view::build_graph(ggml_context * ctx) {
+    ggml_tensor * x   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M); ggml_set_name(x, "x");
+    ggml_tensor * sg  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, K); ggml_set_name(sg, "signs");
+    ggml_tensor * had = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, blk, blk); ggml_set_name(had, "hadamard");
+    ggml_tensor * w   = ggml_new_tensor_2d(ctx, type, K, N); ggml_set_name(w, "w");
+    ggml_tensor * ms  = ggml_mul(ctx, x, sg);
+    ggml_tensor * rs  = ggml_reshape_2d(ctx, ms, blk, K*M/blk);
+    ggml_tensor * mm  = ggml_mul_mat(ctx, had, rs);
+    ggml_mul_mat_set_hint(mm, GGML_HINT_SRC0_IS_HADAMARD);
+    ggml_tensor * view = ggml_reshape_2d(ctx, mm, K, M);
+    ggml_set_name(view, "rotated_view");
+    ggml_set_output(view);
+    ggml_tensor * out = ggml_mul_mat(ctx, w, view);
+    ggml_set_name(out, "out");
+    outs = { view, out };
+    return out;
+}
+void test_rot_output_view::initialize_tensors(ggml_context * ctx) { arclab_init(ctx); }
 
 // ADD -> RMS_NORM -> MUL(w) -> MUL(signs) -> RESHAPE -> Hadamard MUL_MAT -> T2 mat-vec (GGML_SYCL_PTQ1_T2_NORMQ). The
 // far variant (GGML_SYCL_NORM_ROT_FAR: cache ops between norm and rotation) cannot be built here: a single-output graph
@@ -12347,6 +12382,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rot_matvec(t, 4096, 8192, M, 512,  true));
         }
     }
+    // GGML_CUDA_FWHT_MMQ (+_GLU): the rotation writes block_q8_1_mmq rows once for MMQ consumers. The cases above use
+    // 1-2 columns (mat-vec), which never reach it; 64 and 512 columns take MMQ. swiglu=1 is the _GLU fold.
+    for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0}) {
+        for (int64_t M : {64, 512}) {
+            test_cases.emplace_back(new test_rot_matvec(t, 512,  1024,  M, 3072, false));
+            test_cases.emplace_back(new test_rot_matvec(t, 512,  3072,  M, 1024, true));
+            test_cases.emplace_back(new test_rot_matvec(t, 4096, 4096,  M, 1024, false));
+            test_cases.emplace_back(new test_rot_matvec(t, 1024, 5120,  M, 1024, false));
+            test_cases.emplace_back(new test_rot_matvec(t, 1024, 17408, M, 512,  true));
+        }
+    }
+    for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0}) {
+        test_cases.emplace_back(new test_rot_output_view(t, 1024, 5120, 64, 1024));
+    }
     // ARC-LAB fusion tests (arctune): Bonsai 27B shapes and token counts, 3 seeds each
     for (int seed = 0; seed < 3; ++seed) {
         for (int64_t M : {1, 4, 5, 8}) {
@@ -12462,6 +12511,53 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 64, n, 2048, {1, 2}, {2, 1}));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 4, 2, false, 70, n, 2048));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 4, 2, false, 70, n, 2048));
+    }
+    // PTQ1_0 1..8-row batches on shapes the SYCL T2 path takes (N % 16 == 0, K % 128 == 0): with GGML_SYCL_PTQ1_T2=all
+    // they run on the GEMV, and with GGML_SYCL_T2_VGEMM_MIN=k the k..8-row ones on GemmMT in the GEMV's K-slice order
+    // (N <= 8192: 4 slices, N > 8192: 2)
+    for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 1024,  n, 5120,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 5120,  n, 17408, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 10240, n, 5120,  {1, 1}, {1, 1}));
+    }
+
+    // GGML_CUDA_PTQ1_J128 (Hopper) and GGML_CUDA_J128_ADA (Ada): the J=128 MMQ kernel needs a row count that is a
+    // multiple of 128, K a multiple of 256, no batch dims and an MMQ-sized column count. None of the PTQ1_0 cases above
+    // has 128-aligned rows, so they never reach it. Bonsai 2 projection widths, full and partial 128-column tiles.
+    for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0}) {
+        for (int64_t n : {64, 200, 512}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 256,  n, 1024, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 1024, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
+
+    // PTQ1_0 at 9-16 rows (the mul_mm cut-off on Metal) and a row count that is not a multiple of the 4-row group
+    for (int64_t n = 9; n <= 16; ++n) {
+        for (int64_t k : {1024, 5120}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 67, n, k, {1, 1}, {1, 1}));
+        }
+    }
+
+    // PTQ1_0 at 1-8 rows (Metal GGML_METAL_PTQ1_COEF / _MULTICOL=2 at 2-8): 132 rows leave a partial row tile,
+    // K = 17408 is the longest 27B row
+    for (int64_t n = 1; n <= 8; ++n) {
+        for (int64_t k : {1024, 5120, 17408}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 132, n, k, {1, 1}, {1, 1}));
+        }
+    }
+
+    // the same for PQ2_0 (Metal GGML_METAL_PQ2_COEF; pre-pass nr0 2, 4, 8)
+    for (int64_t n = 1; n <= 8; ++n) {
+        for (int64_t k : {1024, 5120, 17408}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 132, n, k, {1, 1}, {1, 1}));
+        }
+    }
+    // and for mainline Q2_0 at verify widths (Metal GGML_METAL_Q2_COEF): a K that is a multiple of the 64-wide
+    // block but not of 128, and the 27B row lengths (5120, 6144, 17408)
+    for (int64_t n = 1; n <= 8; ++n) {
+        for (int64_t k : {576, 2560, 9728, 5120, 6144, 17408}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_0, GGML_TYPE_F32, 132, n, k, {1, 1}, {1, 1}));
+        }
     }
 
     // PQ2_0 at speculative verify widths (Metal few-row tensor tile): every n up to 32 plus
@@ -14197,6 +14293,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 5120, n, 17408, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 10240, n, 5120, {1, 1}, {1, 1}));
+        // same sweep for PTQ1_0
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 5120, n, 17408, {1, 1}, {1, 1}));
     }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands

@@ -251,6 +251,57 @@ static __global__ void rms_norm_f32(const float * x,
     }
 }
 
+// GGML_CUDA_ARN_PRE: add_rms_norm_f32 with every load of the row issued before the first store (at most MAXI columns
+// per thread). The column order of the sum of squares, the reduction and the output expression are the same, so the
+// results are bit-identical; the loop of the original kernel waits for each load because the store may alias it.
+template <int block_size, int MAXI>
+static __global__ void add_rms_norm_pre_f32(
+        const float * a, const float * b, const float * weight, float * sum, float * dst,
+        const int ncols, const float eps) {
+    const int64_t row = (int64_t) blockIdx.z*gridDim.y*gridDim.x +
+                        (int64_t) blockIdx.y*gridDim.x + blockIdx.x;
+    const int tid = threadIdx.x;
+    a   += row*ncols;
+    b   += row*ncols;
+    sum += row*ncols;
+    dst += row*ncols;
+
+    float xa[MAXI], xb[MAXI], w[MAXI];
+#pragma unroll
+    for (int i = 0; i < MAXI; ++i) {
+        const int col = tid + i*block_size;
+        if (col < ncols) {
+            xa[i] = a[col];
+            xb[i] = b[col];
+            w[i]  = weight[col];
+        }
+    }
+    float tmp = 0.0f;
+    float xs[MAXI];
+#pragma unroll
+    for (int i = 0; i < MAXI; ++i) {
+        const int col = tid + i*block_size;
+        if (col < ncols) {
+            const float xi = __fadd_rn(xa[i], xb[i]);
+            xs[i] = xi;
+            sum[col] = xi;
+            tmp += xi*xi;
+        }
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float scale = rsqrtf(tmp/ncols + eps);
+
+#pragma unroll
+    for (int i = 0; i < MAXI; ++i) {
+        const int col = tid + i*block_size;
+        if (col < ncols) {
+            dst[col] = scale*xs[i]*w[i];
+        }
+    }
+}
+
 template <int block_size>
 static __global__ void add_rms_norm_f32(
         const float * a, const float * b, const float * weight, float * sum, float * dst,
@@ -719,6 +770,13 @@ void ggml_cuda_op_add_rms_norm_fused(
     const int ncols = add->ne[0];
     const dim3 grid(add->ne[1], add->ne[2], add->ne[3]);
     cudaStream_t stream = ctx.stream();
+    static const bool arn_pre = getenv("GGML_CUDA_ARN_PRE") != nullptr && atoi(getenv("GGML_CUDA_ARN_PRE")) != 0;
+    if (arn_pre && ncols >= 1024 && ncols <= 8*1024) {
+        add_rms_norm_pre_f32<1024, 8><<<grid, 1024, 32*sizeof(float), stream>>>(
+            (const float *) a->data, (const float *) b->data, (const float *) weight->data,
+            (float *) add->data, (float *) mul->data, ncols, eps);
+        return;
+    }
     if (ncols < 1024) {
         add_rms_norm_f32<256><<<grid, 256, 32*sizeof(float), stream>>>(
             (const float *) a->data, (const float *) b->data, (const float *) weight->data,

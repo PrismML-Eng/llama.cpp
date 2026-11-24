@@ -494,6 +494,48 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     // keep the memory wired
     ggml_metal_device_rsets_keep_alive(ctx->dev);
 
+    if (ggml_metal_op_prof_path()) {
+        // GGML_METAL_OP_PROFILE=<file>: one command buffer per (fused) op, committed and waited on
+        // synchronously, timed with the GPU timestamps; per-op totals are written at exit
+        @autoreleasepool {
+            id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+            if (ctx->cmd_buf_last) { [ctx->cmd_buf_last waitUntilCompleted]; ctx->cmd_buf_last = nil; }
+            // label the graph by its batch width: src1 rows of the first PTQ1_0/PQ2_0 mat-mul,
+            // +1000 when the first one is Q4_0 (the MTP head graph)
+            int ntok = 0;
+            for (int i = 0; i < gf->n_nodes; ++i) {
+                const struct ggml_tensor * t = gf->nodes[i];
+                if (t->op == GGML_OP_MUL_MAT && t->src[1] && (t->src[0]->type == GGML_TYPE_PTQ1_0 || t->src[0]->type == GGML_TYPE_PQ2_0 || t->src[0]->type == GGML_TYPE_Q4_0)) { ntok = (int) t->src[1]->ne[1] + (t->src[0]->type == GGML_TYPE_Q4_0 ? 1000 : 0); break; }
+            }
+            ggml_metal_op_prof_set_ntok(ntok);
+            ggml_metal_prof_kernels_enable(true);
+            int pos = 0;
+            while (pos < gf->n_nodes) {
+                id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+                ggml_metal_op_t ctx_op = ggml_metal_op_init(ctx->dev, cmd_buf, gf, ctx->finfo, pos, gf->n_nodes,
+                        false, false, 0);
+                if (ggml_metal_op_n_nodes(ctx_op) == 0) { ggml_metal_op_free(ctx_op); break; }
+                const struct ggml_tensor * node = ggml_metal_op_node(ctx_op, 0);
+                int res = ggml_metal_op_encode(ctx_op, 0);
+                // advance past res non-empty nodes (empty ones are skipped by the op ctx)
+                int adv = 0, cnt = 0;
+                for (int i = pos; i < gf->n_nodes; ++i) {
+                    adv++;
+                    if (!ggml_op_is_empty(gf->nodes[i]->op) && !ggml_is_empty(gf->nodes[i])) { if (++cnt == res) break; }
+                }
+                ggml_metal_op_free(ctx_op);
+                [cmd_buf commit];
+                [cmd_buf waitUntilCompleted];
+                ggml_metal_op_prof_add(node, res, ggml_metal_prof_kernels_take(), (cmd_buf.GPUEndTime - cmd_buf.GPUStartTime)*1e6);
+                pos += adv;
+                if (res == 0) break;
+            }
+            ggml_metal_prof_kernels_enable(false);
+            ggml_metal_op_prof_graph_done(ntok);
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+
     // submit the ggml compute graph to the GPU by creating command buffers and encoding the ops in them
     // the first n_nodes_0 are encoded and submitted for processing directly by the calling thread
     // while these nodes are processing, we start n_cb threads to enqueue the rest of the nodes

@@ -1283,6 +1283,131 @@ kernel void kernel_mul_mv_pq2_0_f32(
     kernel_mul_mv_pq2_0_f32_impl<N_R0_PQ2_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
+// 2-bit coefficient pre-pass (GGML_METAL_PQ2_COEF, 1..3 rows): the activations are staged once per column as base-4
+// collapse coefficients, the same float arithmetic as the stock PQ2_0 kernels at 1..3 rows.
+// Layout per column and block: [it*16 + j] the 16 base-4 collapse coefficients of thread it (il = 16*it),
+// [QK + it] its sumy; stride QK + QK/16 floats.
+template<typename block_t, int QK>
+kernel void kernel_q2x_coef(
+        constant ggml_metal_kargs_q1_0_planes & args,
+        device const char * src1,
+        device       float * coef,
+        uint2  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]]) {
+    constexpr short TPB = QK/16;
+    constexpr int STRIDE = QK + TPB;
+    const int g  = tgpig.x*32 + tiitg;
+    const int ib = g/TPB;
+    const short it = g%TPB;
+    if (ib >= args.nblk) return;
+    const int col = tgpig.y;
+    device const float * yb = (device const float *) (src1 + (uint64_t) col*args.nb11) + ib*QK + 16*it;
+    device float * out = coef + ((uint64_t) col*args.nblk + ib)*STRIDE;
+    float yl[16];
+    float sumy = 0.f;
+    FOR_UNROLL (short j = 0; j < 4; j++) {
+        const float y0 = yb[4*j + 0];
+        const float y1 = yb[4*j + 1];
+        const float y2 = yb[4*j + 2];
+        const float y3 = yb[4*j + 3];
+        sumy += (y0 + y1) + (y2 + y3);
+        yl[4*j + 0] = y3 - 4.0f*y2;
+        yl[4*j + 1] = y2 - 4.0f*y1;
+        yl[4*j + 2] = y1 - 4.0f*y0;
+        yl[4*j + 3] = y0;
+    }
+    device float4 * o4 = (device float4 *) (out + it*16);
+    o4[0] = float4(yl[0],  yl[1],  yl[2],  yl[3]);
+    o4[1] = float4(yl[4],  yl[5],  yl[6],  yl[7]);
+    o4[2] = float4(yl[8],  yl[9],  yl[10], yl[11]);
+    o4[3] = float4(yl[12], yl[13], yl[14], yl[15]);
+    out[QK + it] = sumy;
+}
+
+template<typename block_t, int QK, int nr0, int nr1>
+kernel void kernel_mul_mv_q2x_coefmv(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const float * coef,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short TPB = QK/16;
+    constexpr int STRIDE = QK + TPB;
+    const int nb = args.ne00/QK;
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y * nr1;
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+    const int ncol = min(nr1, args.ne11 - r1);
+
+    device const block_t * ax[nr0];
+    for (int row = 0; row < nr0; ++row) {
+        ax[row] = (device const block_t *) (src0 + (uint64_t) min(first_row + row, args.ne01 - 1)*args.nb01);
+    }
+
+    float yl[nr1][16];
+    float sumf[nr0][nr1] = {};
+
+    const short ix = (tiisg/TPB);
+    const short it = (tiisg%TPB);
+    const short il = it*16;
+
+    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/TPB) {
+        float sumy[nr1];
+        FOR_UNROLL (short col = 0; col < nr1; ++col) {
+            device const float * cp = coef + ((uint64_t) (r1 + min((int) col, ncol - 1))*nb + ib)*STRIDE;
+            device const float4 * c4 = (device const float4 *) (cp + it*16);
+            FOR_UNROLL (short q = 0; q < 4; ++q) {
+                const float4 v = c4[q];
+                yl[col][4*q + 0] = v[0]; yl[col][4*q + 1] = v[1]; yl[col][4*q + 2] = v[2]; yl[col][4*q + 3] = v[3];
+            }
+            sumy[col] = cp[QK + it];
+        }
+
+        FOR_UNROLL (short row = 0; row < nr0; row++) {
+            device const block_t * qb = ax[row] + ib;
+            device const uint8_t * qs = qb->qs + (il / 4);
+            float acc[nr1] = {};
+            FOR_UNROLL (short j = 0; j < 4; j++) {
+                const float b = (float) qs[j];
+                const float u = b * (1.0f/256.0f);
+                const float g1 = floor( 4.0f*u), g2 = floor(16.0f*u), g3 = floor(64.0f*u);
+                FOR_UNROLL (short col = 0; col < nr1; ++col) {
+                    acc[col] += g1*yl[col][4*j + 0];
+                    acc[col] += g2*yl[col][4*j + 1];
+                    acc[col] += g3*yl[col][4*j + 2];
+                    acc[col] +=  b*yl[col][4*j + 3];
+                }
+            }
+            const float d = qb->d;
+            FOR_UNROLL (short col = 0; col < nr1; ++col) {
+                sumf[row][col] += d * (acc[col] - sumy[col]);
+            }
+        }
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)r1*args.ne0;
+    for (int row = 0; row < nr0; ++row) {
+        FOR_UNROLL (short col = 0; col < nr1; ++col) {
+            const float tot = simd_sum(sumf[row][col]);
+            if (tiisg == 0 && first_row + row < args.ne01 && col < ncol) {
+                dst_f32[(uint64_t) col*args.ne0 + first_row + row] = tot;
+            }
+        }
+    }
+}
+
+template [[host_name("kernel_pq2_0_coef")]] kernel void kernel_q2x_coef<block_pq2_0, QK_PQ2_0>(constant ggml_metal_kargs_q1_0_planes &, device const char *, device float *, uint2, ushort);
+typedef decltype(kernel_mul_mv_q2x_coefmv<block_pq2_0, QK_PQ2_0, 4, 2>) mul_mv_q2x_coefmv_t;
+#define PQ2_COEFMV(R, C) template [[host_name("kernel_mul_mv_pq2_0_f32_coef_c" #C "_r" #R)]] kernel mul_mv_q2x_coefmv_t kernel_mul_mv_q2x_coefmv<block_pq2_0, QK_PQ2_0, R, C>;
+PQ2_COEFMV(8, 1) PQ2_COEFMV(4, 1)
+PQ2_COEFMV(2, 2) PQ2_COEFMV(4, 2) PQ2_COEFMV(8, 2)
+PQ2_COEFMV(2, 3) PQ2_COEFMV(4, 3)
+PQ2_COEFMV(2, 4) PQ2_COEFMV(4, 4)
+
 // PQ2_0 multi-column mat-vec for small verify batches (2..4 src1 columns per threadgroup).
 // The generic mul_mv_ext path re-decodes every weight per column. Here each byte's three
 // floors are computed once and reused for all nr1 columns, and each weight block is read
@@ -1837,6 +1962,244 @@ template [[host_name("kernel_mul_mv_ext_ptq1_0_f32_r1_3")]] kernel mul_mv_ext_q4
 template [[host_name("kernel_mul_mv_ext_ptq1_0_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_ptq1_0, 128, dequantize_ptq1_0_t4>;
 template [[host_name("kernel_mul_mv_ext_ptq1_0_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_ptq1_0, 128, dequantize_ptq1_0_t4>;
 template [[host_name("kernel_mul_mv_ext_pq2_0_f32_r1_5")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_pq2_0,  128, dequantize_pq2_0_t4>;
+
+// PTQ1_0 at 2..8 src1 rows for GGML_METAL_PTQ1_MULTICOL=2 and GGML_METAL_PTQ1_COEF=1. The stock path there is
+// mul_mv_ext (NX = nxpsg lanes per row: 16 at 2 rows when ne00 % 256 == 0, else 8), which re-reads every weight once
+// per group of r1ptg <= 5 columns and decodes every weight per column group. This kernel keeps its arithmetic exactly,
+// so the result is bit-identical: for each output, lane tx of an NX-lane group sums dot(w4, y4) over the chunks tx,
+// tx+NX, tx+2*NX, ... in ascending order, w4 = (trit - 1)*d with the trit taken from ptq1_0_lut as in ptq1_0_elem,
+// and the NX lane sums are combined by the same simd_shuffle_down tree. Only the scheduling changes: a threadgroup
+// covers up to R columns, each lane owns NR rows (each activation chunk is loaded once for NR rows, each row's four
+// weights are decoded once per chunk for all R columns), and a lane's byte/trit positions are fixed per chunk slot, so
+// the per-element branches of ptq1_0_elem are resolved once per lane.
+template<short NX, short R, short NR>
+kernel void kernel_mul_mv_ptq1_0_f32_extc(
+        constant ggml_metal_kargs_mul_mv_ext & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NY   = N_SIMDWIDTH/NX;
+    constexpr short CHPB = QK_PTQ1_0/4; // float4 chunks per block
+    constexpr short CPL  = CHPB/NX;     // chunks per lane per block
+
+    const short tx = tiisg%NX;
+    const short ty = tiisg/NX;
+
+    const int i0  = (tgpig.x*NSG + sgitg)*(NY*NR) + ty; // rows i0 + NY*r
+    const int i11 = tgpig.y*R;
+    const int nb  = args.ne00/QK_PTQ1_0;
+
+    device const block_ptq1_0 * xq[NR];
+    FOR_UNROLL (short r = 0; r < NR; ++r) {
+        xq[r] = (device const block_ptq1_0 *) (src0 + (uint64_t) min(i0 + NY*r, args.ne01 - 1)*args.nb01);
+    }
+
+    device const float4 * y4[R];
+    FOR_UNROLL (short c = 0; c < R; ++c) {
+        y4[c] = (device const float4 *) (src1 + (uint64_t) min(i11 + c, args.ne11 - 1)*args.nb11) + tx;
+    }
+
+    // the trit table in threadgroup memory: lanes index it divergently
+    threadgroup ushort lut[256];
+    for (short i = sgitg*N_SIMDWIDTH + tiisg; i < 256; i += NSG*N_SIMDWIDTH) {
+        lut[i] = ptq1_0_lut[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // where each element of this lane's chunks lives, as ptq1_0_elem maps element e = 4*chunk + j: the chunk's four
+    // bytes sit in one aligned 32-bit word of the block (qs[0..15] and qs[16..23]: four consecutive bytes, one trit
+    // position; qh: bytes qh[0], qh[1], qh[0], qh[1] at two trit positions), so each chunk is one word load
+    short wo[CPL];     // word index in the block (7 words: qs 0-3, qs 4-5, qh + d)
+    short bs[CPL][4];  // bit offset of the element's byte in the word
+    short ts[CPL][4];  // bit offset of the element's trit in the table entry
+    FOR_UNROLL (short ch = 0; ch < CPL; ++ch) {
+        const int e0 = 4*(tx + ch*NX);
+        if (e0 < 80) {
+            wo[ch] = (e0 & 15)/4;
+        } else if (e0 < 120) {
+            wo[ch] = 4 + ((e0 - 80) & 7)/4;
+        } else {
+            wo[ch] = 6;
+        }
+        FOR_UNROLL (short j = 0; j < 4; ++j) {
+            const int e = e0 + j;
+            int bo, n;
+            if (e < 80)       { bo = e & 15;                n = e >> 4; }
+            else if (e < 120) { bo = 16 + ((e - 80) & 7);   n = (e - 80) >> 3; }
+            else              { bo = 24 + ((e - 120) & 1);  n = (e - 120) >> 1; }
+            bs[ch][j] = 8*(bo - 4*wo[ch]);
+            ts[ch][j] = 2*n;
+        }
+    }
+
+    float sumf[NR][R];
+    FOR_UNROLL (short r = 0; r < NR; ++r) {
+        FOR_UNROLL (short c = 0; c < R; ++c) {
+            sumf[r][c] = 0.0f;
+        }
+    }
+
+    for (int ib = 0; ib < nb; ++ib) {
+        FOR_UNROLL (short ch = 0; ch < CPL; ++ch) {
+            float4 lx[NR];
+            FOR_UNROLL (short r = 0; r < NR; ++r) {
+                device const block_ptq1_0 * xb = xq[r] + ib;
+                const uint  w = ((device const uint *) xb)[wo[ch]];
+                const float d = xb->d;
+                float4 reg_f;
+                FOR_UNROLL (short j = 0; j < 4; ++j) {
+                    reg_f[j] = (float) ((int) ((lut[(w >> bs[ch][j]) & 0xFF] >> ts[ch][j]) & 3) - 1) * d;
+                }
+                lx[r] = reg_f;
+            }
+            FOR_UNROLL (short c = 0; c < R; ++c) {
+                const float4 yv = y4[c][ib*CHPB + ch*NX];
+                FOR_UNROLL (short r = 0; r < NR; ++r) {
+                    sumf[r][c] += dot(lx[r], yv);
+                }
+            }
+        }
+    }
+
+    FOR_UNROLL (short r = 0; r < NR; ++r) {
+        FOR_UNROLL (short c = 0; c < R; ++c) {
+            if (NX >= 16) {
+                sumf[r][c] += simd_shuffle_down(sumf[r][c], 8);
+            }
+            sumf[r][c] += simd_shuffle_down(sumf[r][c], 4);
+            sumf[r][c] += simd_shuffle_down(sumf[r][c], 2);
+            sumf[r][c] += simd_shuffle_down(sumf[r][c], 1);
+        }
+    }
+
+    if (tx == 0) {
+        FOR_UNROLL (short r = 0; r < NR; ++r) {
+            const int i01 = i0 + NY*r;
+            FOR_UNROLL (short c = 0; c < R; ++c) {
+                if (i01 < args.ne01 && i11 + c < args.ne11) {
+                    ((device float *) dst)[(uint64_t) (i11 + c)*args.ne0 + i01] = sumf[r][c];
+                }
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mv_ptq1_0_f32_extc<8, 4, 4>) mul_mv_ptq1_0_extc_t;
+#define PTQ1_EXTC(X, C, N) template [[host_name("kernel_mul_mv_ptq1_0_f32_extc_x" #X "_c" #C "_r" #N)]] kernel mul_mv_ptq1_0_extc_t kernel_mul_mv_ptq1_0_f32_extc<X, C, N>;
+PTQ1_EXTC(16, 2, 2) PTQ1_EXTC(16, 2, 4) PTQ1_EXTC(16, 2, 8)
+PTQ1_EXTC(8, 2, 2)  PTQ1_EXTC(8, 2, 4)  PTQ1_EXTC(8, 2, 8)
+PTQ1_EXTC(8, 3, 2)  PTQ1_EXTC(8, 3, 4)  PTQ1_EXTC(8, 3, 8)
+PTQ1_EXTC(8, 4, 2)  PTQ1_EXTC(8, 4, 4)  PTQ1_EXTC(8, 4, 8)
+PTQ1_EXTC(8, 5, 2)  PTQ1_EXTC(8, 5, 4)
+#undef PTQ1_EXTC
+
+// 2-bit formats (PQ2_0, Q2_0) where the stock path is mul_mv_ext. Written for GGML_METAL_PQ2_COEF at 4..8 src1 rows
+// (nxpsg = 8 there) and below for NX = 8; the template takes NX (mul_mv_ext's nxpsg: 4, 8 or 16) for Q2_0.
+// The stock path there is mul_mv_ext (chunks of 4 weights), which
+// re-reads every weight once per group of r1ptg <= 5 columns. This kernel keeps that arithmetic exactly, so the result
+// is bit-identical: for each output, lane tx of an 8-lane group sums dot(w4, y4) over the chunks tx, tx+8, tx+16, ...
+// in ascending order, w4 decoded as in dequantize_pq2_0_t4, and the 8 lane sums are combined by the same
+// simd_shuffle_down(4, 2, 1) tree. Only the scheduling changes: a threadgroup covers R columns (all of them up to 5,
+// so each weight is read once; half of them at 6..8, where more columns per lane spill registers), each lane owns NR rows (each activation chunk is loaded once for NR rows), and the per-lane walk goes
+// block by block instead of carrying a chunk cursor. Each row's 4 weights are decoded once per chunk and reused for all
+// R columns, one activation chunk in registers at a time.
+template<typename block_t, short QK, void (*deq_t4)(device const block_t *, short, thread float4 &), short NX, short R, short NR>
+kernel void kernel_mul_mv_q2x_extc(
+        constant ggml_metal_kargs_mul_mv_ext & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NY = N_SIMDWIDTH/NX;
+    constexpr short CHPB = QK/4;       // float4 chunks per block
+
+    const short tx = tiisg%NX;
+    const short ty = tiisg/NX;
+
+    const int i0  = (tgpig.x*NSG + sgitg)*(NY*NR) + ty; // rows i0 + NY*r
+    const int i11 = tgpig.y*R;
+    const int nb  = args.ne00/QK;
+
+    device const block_t * xq[NR];
+    FOR_UNROLL (short r = 0; r < NR; ++r) {
+        xq[r] = (device const block_t *) (src0 + (uint64_t) min(i0 + NY*r, args.ne01 - 1)*args.nb01);
+    }
+
+    device const float4 * y4[R];
+    FOR_UNROLL (short c = 0; c < R; ++c) {
+        y4[c] = (device const float4 *) (src1 + (uint64_t) min(i11 + c, args.ne11 - 1)*args.nb11) + tx;
+    }
+
+    float sumf[NR][R];
+    FOR_UNROLL (short r = 0; r < NR; ++r) {
+        FOR_UNROLL (short c = 0; c < R; ++c) {
+            sumf[r][c] = 0.0f;
+        }
+    }
+
+    for (int ib = 0; ib < nb; ++ib) {
+        FOR_UNROLL (short ch = 0; ch < CHPB/NX; ++ch) {
+            float4 lx[NR];
+            FOR_UNROLL (short r = 0; r < NR; ++r) {
+                deq_t4(xq[r] + ib, tx + ch*NX, lx[r]);
+            }
+            FOR_UNROLL (short c = 0; c < R; ++c) {
+                const float4 yv = y4[c][ib*CHPB + ch*NX];
+                FOR_UNROLL (short r = 0; r < NR; ++r) {
+                    sumf[r][c] += dot(lx[r], yv);
+                }
+            }
+        }
+    }
+
+    FOR_UNROLL (short r = 0; r < NR; ++r) {
+        FOR_UNROLL (short c = 0; c < R; ++c) {
+            if (NX >= 16) {
+                sumf[r][c] += simd_shuffle_down(sumf[r][c], 8);
+            }
+            if (NX >= 8) {
+                sumf[r][c] += simd_shuffle_down(sumf[r][c], 4);
+            }
+            sumf[r][c] += simd_shuffle_down(sumf[r][c], 2);
+            sumf[r][c] += simd_shuffle_down(sumf[r][c], 1);
+        }
+    }
+
+    if (tx == 0) {
+        FOR_UNROLL (short r = 0; r < NR; ++r) {
+            const int i01 = i0 + NY*r;
+            FOR_UNROLL (short c = 0; c < R; ++c) {
+                if (i01 < args.ne01 && i11 + c < args.ne11) {
+                    ((device float *) dst)[(uint64_t) (i11 + c)*args.ne0 + i01] = sumf[r][c];
+                }
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mv_q2x_extc<block_pq2_0, QK_PQ2_0, dequantize_pq2_0_t4, 8, 4, 4>) mul_mv_q2x_extc_t;
+// PQ2_0 at 4..8 rows: mul_mv_ext's nxpsg is 8 there (ne00 % 128 == 0, ne11 >= 3)
+#define PQ2_EXTC(C, N) template [[host_name("kernel_mul_mv_pq2_0_f32_extc_c" #C "_r" #N)]] kernel mul_mv_q2x_extc_t kernel_mul_mv_q2x_extc<block_pq2_0, QK_PQ2_0, dequantize_pq2_0_t4, 8, C, N>;
+PQ2_EXTC(2, 4) PQ2_EXTC(3, 4)
+PQ2_EXTC(4, 2) PQ2_EXTC(5, 2) PQ2_EXTC(6, 2) PQ2_EXTC(7, 2) PQ2_EXTC(8, 2)
+PQ2_EXTC(4, 4) PQ2_EXTC(5, 4) PQ2_EXTC(6, 4) PQ2_EXTC(7, 4) PQ2_EXTC(8, 4)
+PQ2_EXTC(4, 8) PQ2_EXTC(5, 8) PQ2_EXTC(6, 8) PQ2_EXTC(7, 8) PQ2_EXTC(8, 8)
+#undef PQ2_EXTC
+
+// Q2_0 (GGML_METAL_Q2_COEF) where the stock path is mul_mv_ext: 2 rows, or 2..8 rows on GPUs without the few-row MMA
+// kernels. NX = mul_mv_ext's nxpsg: 16 at 2 rows when ne00 % 256 == 0, 8 when ne00 % 128 == 0, else 4.
+#define Q2_EXTC(X, C, N) template [[host_name("kernel_mul_mv_q2_0_f32_extc_x" #X "_c" #C "_r" #N)]] kernel mul_mv_q2x_extc_t kernel_mul_mv_q2x_extc<block_q2_0, QK2_0, dequantize_q2_0_t4, X, C, N>;
+Q2_EXTC(16, 2, 2) Q2_EXTC(16, 2, 4) Q2_EXTC(16, 2, 8)
+Q2_EXTC(8, 2, 2)  Q2_EXTC(8, 2, 4)  Q2_EXTC(8, 2, 8)  Q2_EXTC(8, 3, 4)  Q2_EXTC(8, 4, 4)  Q2_EXTC(8, 5, 4)
+Q2_EXTC(4, 2, 2)  Q2_EXTC(4, 2, 4)  Q2_EXTC(4, 2, 8)  Q2_EXTC(4, 3, 4)  Q2_EXTC(4, 4, 4)  Q2_EXTC(4, 5, 4)
+#undef Q2_EXTC
 
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_2")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_q4_0,   32, dequantize_q4_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_3")]]   kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_q4_0,   32, dequantize_q4_0_t4>;

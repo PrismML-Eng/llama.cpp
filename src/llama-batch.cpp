@@ -866,7 +866,28 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
     assert(n_tokens%n_seqs == 0);
 
-    auto udata = std::make_shared<llama_ubatch::data_t>();
+    static const bool reuse_udata = [] { const char * e = getenv("LLAMA_MTP_PREFILL_LEAN"); return e && atoi(e) != 0; }();
+    std::shared_ptr<llama_ubatch::data_t> udata;
+    if (reuse_udata) {
+        for (auto & p : udata_pool) {
+            if (p.use_count() == 1) {
+                udata = p;
+                // same state as a fresh block (clear keeps the capacity)
+                udata->token.clear(); udata->embd.clear(); udata->embd_state.clear(); udata->pos.clear();
+                udata->n_seq_id.clear(); udata->seq_id.clear(); udata->seq_id_unq.clear(); udata->seq_idx.clear();
+                udata->output.clear(); udata->type.clear(); udata->batch_idxs.clear(); udata->decision_order.clear();
+                udata->seq_id_data.clear();
+                break;
+            }
+        }
+        if (!udata && udata_pool.size() < 16) {
+            udata = std::make_shared<llama_ubatch::data_t>();
+            udata_pool.push_back(udata);
+        }
+    }
+    if (!udata) {
+        udata = std::make_shared<llama_ubatch::data_t>();
+    }
 
     const bool mixed_batch = !is_embd_vec.empty();
 

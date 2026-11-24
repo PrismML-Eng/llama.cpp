@@ -1030,6 +1030,174 @@ kernel void kernel_mul_mm_id(
 // matrix-matrix multiplication
 //
 
+// 64 x 64 output tile (GGML_METAL_MM_W64=1). Same A tile and dequantize as
+// kernel_mul_mm (64 weight rows x 32 K, 16 elements per thread), but 64 src1 columns, so each
+// dequantized weight feeds twice as many multiply-accumulates. Every simdgroup owns 32 x 32
+// outputs (mc[16]). Accumulation order per output is unchanged (8-wide K chunks, in order), so the
+// result is bit-identical to kernel_mul_mm. Quantized src0 only, ne00 % 32 == 0 (no bc_inp).
+#if !defined(GGML_METAL_HAS_TENSOR)
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &), short NR1>
+kernel void kernel_mul_mm_w64(
+        constant ggml_metal_kargs_mul_mm & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr short TPC = 128/NR1;      // B-loader threads per column (2 or 1)
+    constexpr short NB  = NR1/16;       // 8-wide column subtiles per simdgroup
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+
+    const int im = tgpig.z;
+    const int r0 = tgpig.y*NR0;
+    const int r1 = tgpig.x*NR1;
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+    const short nr1 = (args.ne1 - r1 < NR1) ? (args.ne1 - r1) : NR1;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    // B loader: TPC threads per column, 32/TPC K values each
+    const short bc  = (short)tiitg/TPC;
+    const short bkh = (short)tiitg%TPC;
+    const short lr1 = bc < nr1 ? bc : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+
+    const int i12 = im % FC_mul_mm_ne12;
+    const int i13 = im / FC_mul_mm_ne12;
+
+    const uint64_t offset0 = (i12/FC_mul_mm_r2)*args.nb02 + (i13/FC_mul_mm_r3)*args.nb03;
+    const short    offset1 = il0/nl;
+
+    device const block_q * x = (device const block_q *)(src0 + args.nb01*(r0 + lr0) + offset0) + offset1;
+
+    device const float * y = (device const float *)(src1
+        + args.nb13*i13
+        + args.nb12*i12
+        + args.nb11*(r1 + lr1)
+        + args.nb10*((32/TPC)*bkh));
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[NB];
+
+    simdgroup_float8x8 mc[4*NB];
+    for (short i = 0; i < 4*NB; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        half4x4 temp_a;
+        dequantize_func(x, il, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (tiitg/NL0)/8;
+            const short lx = (tiitg/NL0)%8;
+            const short ly = i%8;
+            const short ib = 8*sx + sy;
+            *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+        }
+
+        // sb block (kchunk, colgroup) at 64*(8*kchunk + colgroup); row ly = column within the group
+        FOR_UNROLL (short j = 0; j < 4/TPC; j++) {
+            const short kchunk = (4/TPC)*bkh + j;
+            const short ib = (NR1/8)*kchunk + bc/8;
+            const short ly = bc%8;
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = (half2x4)(*((device float2x4 *) (y + 8*j)));
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + (2 + nl - 1)/nl : x;
+
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + NB*64*(sgitg/2));
+
+        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < NB; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 4*NB; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+
+            lsma += 8*64;
+            lsmb += (NR1/8)*64;
+        }
+    }
+
+    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
+        device float * C = (device float *) dst +
+            (r0 + 32*(sgitg &  1)) +
+            (r1 + (NR1/2)*(sgitg >> 1)) * args.ne0 + im*args.ne1*args.ne0;
+
+        for (short i = 0; i < 4*NB; i++) {
+            simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + ((NR1/2)*(sgitg >> 1))*NR0;
+
+        for (short i = 0; i < 4*NB; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sgitg == 0) {
+            for (int j = tiitg; j < nr1; j += 32) {
+                device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
+                device float4 * D4 = (device float4 *) D;
+
+                threadgroup float  * Cs  = ((threadgroup float *) shmem) + (j*NR0);
+                threadgroup float4 * C4 = (threadgroup float4 *) Cs;
+
+                int i = 0;
+                for (; i < nr0/4; i++) {
+                    *(D4 + i) = *(C4 + i);
+                }
+
+                i *= 4;
+                for (; i < nr0; i++) {
+                    *(D + i) = *(Cs + i);
+                }
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_w64<block_q4_0, 2, dequantize_q4_0, 64>) mul_mm_w64_t;
+template [[host_name("kernel_mul_mm_w64_ptq1_0_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<block_ptq1_0, 8, dequantize_ptq1_0, 64>;
+template [[host_name("kernel_mul_mm_w64_pq2_0_f32")]]  kernel mul_mm_w64_t kernel_mul_mm_w64<block_pq2_0,  8, dequantize_pq2_0, 64>;
+template [[host_name("kernel_mul_mm_w64_q4_0_f32")]]   kernel mul_mm_w64_t kernel_mul_mm_w64<block_q4_0,   2, dequantize_q4_0, 64>;
+#endif
+
 typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) mul_mm_t;
 
 template [[host_name("kernel_mul_mm_f32_f32")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   float4x4,      1,     dequantize_f32,     float,  float4x4,  float, float2x4>;

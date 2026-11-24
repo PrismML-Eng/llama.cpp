@@ -196,6 +196,16 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(!norm_weight || (!ids && !gate && norm_weight->type == GGML_TYPE_F32 &&
                 ((norm_scale && norm_scale->type == GGML_TYPE_F32) || external_norm_scale)));
 
+    // GGML_CUDA_FWHT_MMQ: src1 already quantized by its rotation (block_q8_1_mmq, D4)
+    if (!external_q8 && !ids && !gate && !norm_weight) {
+        const ggml_cuda_fwht_q8 * pre = ctx.fwht_q8().find(src1);
+        if (pre && pre->layout == GGML_CUDA_Q8_1_MMQ_D4) {
+            GGML_ASSERT(pre->ne0 == src1->ne[0] && pre->ncols == src1->ne[1]);
+            external_q8       = const_cast<void *>(pre->data);
+            quantize_external = false;
+        }
+    }
+
     // Fused gate/up/GLU: src0 is the up weight, dst the GLU output.
     const ggml_tensor * gate_weight = fusion ? fusion->gate : nullptr;
     if (fusion) {

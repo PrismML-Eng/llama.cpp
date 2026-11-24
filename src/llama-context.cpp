@@ -627,6 +627,12 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    for (auto & ev : nextn_ev) {
+        if (ev) {
+            ggml_backend_event_free(ev);
+            ev = nullptr;
+        }
+    }
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -1195,6 +1201,28 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     }
 
     return it->second.data();
+}
+
+static bool llama_mtp_prefill_lean() {
+    static const bool v = [] { const char * e = getenv("LLAMA_MTP_PREFILL_LEAN"); return e && atoi(e) != 0; }();
+    return v;
+}
+
+const float * llama_context::get_embeddings_nextn_gen_data(int64_t gen) {
+    if (gen == nextn_gen) {
+        synchronize();
+        return nextn_cur;
+    }
+    if (gen == nextn_gen - 1 && nextn_prev != nullptr) {
+        const int k = (int) (gen & 1);
+        if (nextn_ev[k] && nextn_ev_set[k]) {
+            ggml_backend_event_synchronize(nextn_ev[k]);
+        } else {
+            synchronize();
+        }
+        return nextn_prev;
+    }
+    return nullptr;
 }
 
 float * llama_context::get_embeddings_nextn() {
@@ -1849,6 +1877,7 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -2367,6 +2396,33 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -2;
     };
 
+    // LLAMA_MTP_PREFILL_LEAN: odd decodes write the unmasked nextn rows into a second buffer, so a reader can still
+    // take the previous decode's rows while this one runs (the MTP head's prompt catch-up, one batch behind)
+    const bool nextn_dbuf = llama_mtp_prefill_lean() && cparams.embeddings_nextn && !cparams.embeddings_nextn_masked &&
+                            embd_nextn.data != nullptr && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP;
+    if (nextn_dbuf) {
+        float * main_rows = embd_nextn.data;
+        const size_t bytes = embd_nextn.size * sizeof(float);
+        if (!buf_nextn_alt || ggml_backend_buffer_get_size(buf_nextn_alt.get()) < bytes) {
+            synchronize();
+            buf_nextn_alt.reset(ggml_backend_buft_alloc_buffer(ggml_backend_buffer_get_type(buf_output.get()), bytes));
+            nextn_prev = nullptr;
+            nextn_cur  = nullptr;
+        }
+        float * alt_rows = buf_nextn_alt ? (float *) ggml_backend_buffer_get_base(buf_nextn_alt.get()) : nullptr;
+        // the previous rows survive only if their buffer was not reallocated by output_reserve
+        const bool main_same = nextn_buf_seen == (const void *) buf_output.get();
+        nextn_buf_seen = buf_output.get();
+        nextn_prev = (nextn_cur != nullptr && (nextn_cur == alt_rows || (main_same && nextn_cur == main_rows))) ? nextn_cur : nullptr;
+        nextn_gen++;
+        nextn_cur = (alt_rows && (nextn_gen & 1)) ? alt_rows : main_rows;
+        if (nextn_cur == nextn_prev) {
+            nextn_prev = nullptr; // no alternate buffer: the previous rows are overwritten
+        }
+        embd_nextn.data = nextn_cur;
+        nextn_ev_set[nextn_gen & 1] = false;
+    }
+
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
         llama_sampler_backend_begin(entry.second);
@@ -2588,6 +2644,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                nextn_backend = backend_h;
                 extract_all_idxs = extract_all_idxs || !masked;
             }
         }
@@ -2612,6 +2669,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+
+    if (nextn_dbuf && nextn_backend) {
+        const int k = (int) (nextn_gen & 1);
+        if (!nextn_ev[k]) {
+            nextn_ev[k] = ggml_backend_event_new(ggml_backend_get_device(nextn_backend));
+        }
+        if (nextn_ev[k]) {
+            ggml_backend_event_record(nextn_ev[k], nextn_backend);
+            nextn_ev_set[k] = true;
+        }
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -4774,6 +4842,14 @@ float * llama_get_embeddings_nextn(llama_context * ctx) {
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn();
+}
+
+int64_t llama_get_embeddings_nextn_gen(llama_context * ctx) {
+    return ctx->get_embeddings_nextn_gen();
+}
+
+const float * llama_get_embeddings_nextn_gen_data(llama_context * ctx, int64_t gen) {
+    return ctx->get_embeddings_nextn_gen_data(gen);
 }
 
 float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {

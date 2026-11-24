@@ -92,6 +92,9 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
+// LLAMA_MTP_PREFILL_LEAN=1: call right after launching the target decode of `batch`, before waiting for it
+bool common_speculative_flush_lean(common_speculative * spec, const common_batch & batch);
+
 // true if any implementation requires the target's multi-layer tap capture
 // (see llama_set_capture_layers / llama_get_embeddings_capture_ith) -- used by
 // dspark, which conditions on several intermediate target layers concatenated
