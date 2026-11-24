@@ -14,6 +14,8 @@ concurrency:
 
 env:
   BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+  # Pin the prebuilt web UI: upstream "latest" changed its file layout and fails scripts/ui-assets.cmake validation
+  HF_UI_VERSION: b12017
   CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
 
 jobs:
