@@ -1359,7 +1359,9 @@ static inline int ggml_cuda_pq2_mc_min(int cc) {
     if (env > 0) {
         return env;
     }
-    return cc == GGML_CUDA_CC_HOPPER ? 1 : 3;
+    // A100 (cc 800) and B200 (cc 1000): one-column decode measured +23% / +17%. On B200 the summation order differs
+    // from the generic kernel (KL ~1e-4). RTX PRO 6000 (cc 1200) and RTX 4090 (Ada) were neutral, so they keep 3.
+    return (cc == GGML_CUDA_CC_HOPPER || cc == GGML_CUDA_CC_AMPERE || cc == GGML_CUDA_CC_BLACKWELL_DC) ? 1 : 3;
 }
 
 static inline bool ggml_cuda_pq2_multicol(int ncols_dst) {
@@ -1369,7 +1371,9 @@ static inline bool ggml_cuda_pq2_multicol(int ncols_dst) {
 #else
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     return !ggml_cuda_batch_invariant() && GGML_CUDA_CC_IS_NVIDIA(cc) &&
-        (cc == GGML_CUDA_CC_ADA_LOVELACE || cc == GGML_CUDA_CC_HOPPER) && ncols_dst >= ggml_cuda_pq2_mc_min(cc) && ncols_dst <= 8;
+           (cc == GGML_CUDA_CC_ADA_LOVELACE || cc == GGML_CUDA_CC_HOPPER || cc == GGML_CUDA_CC_AMPERE ||
+            cc == GGML_CUDA_CC_BLACKWELL_DC) &&
+           ncols_dst >= ggml_cuda_pq2_mc_min(cc) && ncols_dst <= 8;
 #endif
 }
 
