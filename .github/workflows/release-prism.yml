@@ -233,6 +233,11 @@ jobs:
       - name: Install Ninja
         run: choco install ninja
 
+      - name: Install LLVM
+        run: |
+          choco install llvm --version=22.1.8
+          echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
+
       - name: Build
         shell: cmd
         run: |
@@ -244,6 +249,7 @@ jobs:
             -DGGML_BACKEND_DL=ON ^
             -DGGML_CPU_ALL_VARIANTS=${{ matrix.arch == 'x64' && 'ON' || 'OFF' }} ^
             -DGGML_OPENMP=ON ^
+            -DGGML_OPENMP_FETCH=ON ^
             ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release
 
@@ -253,13 +259,7 @@ jobs:
 
       - name: Pack artifacts
         run: |
-          # Resolve the LLVM OpenMP runtime DLL by glob: the MSVC redist version
-          # directory (and VS product dir) changes with runner-image updates, so a
-          # hardcoded path rots (upstream pins it and bumps it by hand each time).
-          $OmpDll = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\*\Enterprise\VC\Redist\MSVC\*\debug_nonredist\${{ matrix.arch }}\Microsoft.VC14*.OpenMP.LLVM\libomp140.${{ matrix.arch == 'x64' && 'x86_64' || 'aarch64' }}.dll" -ErrorAction SilentlyContinue | Sort-Object FullName | Select-Object -Last 1
-          if (-not $OmpDll) { throw "libomp140 DLL not found under any MSVC redist version" }
-          Write-Host "Using OpenMP runtime: $($OmpDll.FullName)"
-          Copy-Item $OmpDll.FullName .\build\bin\Release\
+          # libomp.dll and its license are copied next to the binaries by GGML_OPENMP_FETCH
           7z a -snl llama-${{ steps.tag.outputs.name }}-bin-win-cpu-${{ matrix.arch }}.zip .\build\bin\Release\*
 
       - name: Upload artifacts
