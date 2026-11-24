@@ -61,7 +61,9 @@
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
 #define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled
+#define cudaEventCreate hipEventCreate
 #define cudaEventCreateWithFlags hipEventCreateWithFlags
+#define cudaEventElapsedTime hipEventElapsedTime
 #define cudaEventDisableTiming hipEventDisableTiming
 #define cudaEventRecord hipEventRecord
 #define cudaEventSynchronize hipEventSynchronize
