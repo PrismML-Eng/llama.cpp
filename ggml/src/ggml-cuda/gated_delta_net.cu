@@ -645,16 +645,23 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
     // GGML_CUDA_GDN_XCHECK=1 (needs GGML_CUDA_DISABLE_GRAPHS=1): run the stock kernel into temporaries, then the selected
     // kernel, and count bitwise differences in the attention output and the written state slots.
-    static const bool xcheck = getenv("GGML_CUDA_GDN_XCHECK") && atoi(getenv("GGML_CUDA_GDN_XCHECK")) != 0;
     ggml_cuda_pool_alloc<float> x_out(ctx.pool());
     ggml_cuda_pool_alloc<float> x_state(ctx.pool());
     const int64_t x_D      = S_v * S_v * H * n_seqs;
     const int     x_slots  = keep_rs ? (int) std::min<int64_t>(K, n_tokens) : 1;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    static const bool xcheck = getenv("GGML_CUDA_GDN_XCHECK") && atoi(getenv("GGML_CUDA_GDN_XCHECK")) != 0;
     cudaStreamCaptureStatus x_cap = cudaStreamCaptureStatusNone;
     if (xcheck) {
         CUDA_CHECK(cudaStreamIsCapturing(stream, &x_cap));
     }
-    const bool do_x = xcheck && x_cap == cudaStreamCaptureStatusNone && !kda && !g_precomputed && S_v == 128;
+    const bool x_idle = x_cap == cudaStreamCaptureStatusNone;
+#else
+    // the cross-check is for the L8P kernel, which is CUDA only
+    const bool xcheck = false;
+    const bool x_idle = false;
+#endif
+    const bool do_x = xcheck && x_idle && !kda && !g_precomputed && S_v == 128;
     if (do_x) {
         x_out.alloc(S_v * H * n_tokens * n_seqs);
         x_state.alloc(x_D * (keep_rs ? K : 1));
@@ -688,7 +695,9 @@ static void ggml_cuda_op_gated_delta_net_impl(
         CUDA_CHECK(cudaStreamSynchronize(stream));
         static unsigned long long calls = 0, toks = 0, bad_out = 0, bad_state = 0, eng = 0;
         calls++; toks += n_tokens; bad_out += h[0]; bad_state += h[1];
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         eng += (gdn_l8p_cfg(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) > 0 && n_tokens >= GDN_L8P_MIN_TOKENS) ? 1 : 0;
+#endif
         if (h[0] || h[1] || calls % 200 == 0 || calls == 1 || getenv("GGML_CUDA_GDN_XCHECK")[0] == '2') {
             GGML_LOG_WARN("gdn xcheck: calls %llu (l8p %llu) tokens %llu | this call n %lld K %d raw %d: out diff %llu, state diff %llu | total out %llu state %llu\n",
                 calls, eng, toks, (long long) n_tokens, K, (int) raw, h[0], h[1], bad_out, bad_state);

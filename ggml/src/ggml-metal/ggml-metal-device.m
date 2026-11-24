@@ -87,6 +87,7 @@ ggml_metal_pipeline_t ggml_metal_pipeline_init(void) {
 
     *res = (struct ggml_metal_pipeline) {
         /*.obj  =*/ nil,
+        /*.name =*/ {0},
     };
 
     return res;
