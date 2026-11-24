@@ -9497,7 +9497,7 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_SET_ROWS:
             {
-                if (op->type == GGML_TYPE_TQ2_0 || op->type == GGML_TYPE_TQ1_0) {
+                if (op->type == GGML_TYPE_TQ2_0 || op->type == GGML_TYPE_TQ1_0 || op->type == GGML_TYPE_PQ1_0) {
                     return false;
                 }
                 auto res = (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 ||
@@ -9531,6 +9531,10 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
             {
                 ggml_type src0_type = op->src[0]->type;
                 ggml_type src1_type = op->src[1]->type;
+
+                if (src0_type == GGML_TYPE_PQ1_0 || src1_type == GGML_TYPE_PQ1_0) {
+                    return false;
+                }
 
                 // Quantizing a float row into PTQ1_0 or PQ2_0 has no kernel: both are
                 // produced offline by the converter, which also applies the Hadamard
