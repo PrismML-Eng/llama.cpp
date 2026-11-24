@@ -306,8 +306,8 @@ static __host__ size_t ptq1_0_pt_smem_bytes(const int blocks_per_row, const int 
     return (size_t) ncols_dst * rows_per_cta * (blocks_per_row + 1) * sizeof(float) * (has_gate ? 2 : 1);
 }
 
-template <int ncols, int ROWS, bool has_fusion, bool has_gate>
-__launch_bounds__(PTQ1_0_PT_THREADS, (ncols <= 2 ? 4 : (ncols <= 4 ? PTQ1_0_PT_MINB_34 : 2)))
+template <int ncols, int ROWS, bool has_fusion, bool has_gate, int threads = PTQ1_0_PT_THREADS>
+__launch_bounds__(threads, (ncols <= 2 ? (threads == 256 ? 2 : 4) : (ncols <= 4 ? PTQ1_0_PT_MINB_34 : 2)))
 static __global__ void mul_mat_vec_ptq1_0_pt(
         const void * vx_, const void * vy_, const ggml_cuda_mm_fusion_args_device fusion,
         float * dst_,
@@ -341,7 +341,7 @@ static __global__ void mul_mat_vec_ptq1_0_pt(
     }
 
     const int n_items = (rows_per_cta / ROWS) * bpr;
-    for (int idx = tid; idx < n_items; idx += PTQ1_0_PT_THREADS) {
+    for (int idx = tid; idx < n_items; idx += threads) {
         const int rg  = fastdiv((uint32_t) idx, bpr_fd); // row group within the CTA
         const int kbx = idx - rg*bpr;
 
@@ -388,7 +388,7 @@ static __global__ void mul_mat_vec_ptq1_0_pt(
         // accumulator path below is faster and can diverge (5080 bisect: 5300cd1).
         const int warp = tid / WARP_SIZE;
         const int lane = tid % WARP_SIZE;
-        for (int w = warp; w < rows_per_cta*ncols; w += PTQ1_0_PT_THREADS / WARP_SIZE) {
+        for (int w = warp; w < rows_per_cta*ncols; w += threads / WARP_SIZE) {
             const int j   = w / rows_per_cta;
             const int r   = w - j*rows_per_cta;
             const int row = row0 + r;
@@ -442,7 +442,7 @@ static __global__ void mul_mat_vec_ptq1_0_pt(
     // One thread per (row, column): four interleaved accumulators (k mod 4), then (s0+s1)+(s2+s3).
     // Faster than the warp path (~3% decode). Association depends on column count enough to break
     // MTP-on vs MTP-off identity. GGML_CUDA_BATCH_INVARIANT takes the warp path above.
-    for (int p = tid; p < rows_per_cta*ncols; p += PTQ1_0_PT_THREADS) {
+    for (int p = tid; p < rows_per_cta*ncols; p += threads) {
         const int j   = fastdiv((uint32_t) p, rpc_fd); // column
         const int r   = p - j*rows_per_cta;             // row within the CTA
         const int row = row0 + r;
@@ -507,6 +507,41 @@ static void mul_mat_vec_ptq1_0_pt_launch(
     const int bpr = ncols_x / QK_PTQ1_0;
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
     const bool has_gate   = fusion.gate != nullptr;
+
+    if constexpr (ncols == 1 && ROWS == 1) {
+        static const bool ffn_down_enabled = [] {
+            const char * value = std::getenv("GGML_CUDA_PTQ1_0_FFN_DOWN");
+            return value == nullptr || std::atoi(value) != 0;
+        }();
+        // Same 16-row tile as the 128-thread launcher. 256 threads halve that
+        // tile's block-dot queue, which is the SM86 win at 136 blocks/row
+        // (K = 17408: 17 iterations -> 9). Require at least that queue:
+        // 16*bpr/256 > 8, so bpr > 128. The grid is exact, so M must be a
+        // multiple of 16. cc 870 and 890 stay on the 128-thread path; only
+        // SM86 was timed. Shared memory grows with K, so a row that would
+        // exceed smpb keeps the generic launcher.
+        constexpr int rows = 16;
+        const int device = ggml_cuda_get_device();
+        const int cc = ggml_cuda_info().devices[device].cc;
+        const size_t smem = (size_t) rows * (bpr + 1) * sizeof(float);
+        if (ffn_down_enabled && bpr > 128 && nrows_x % rows == 0 && !has_gate &&
+                !ggml_cuda_batch_invariant() && GGML_CUDA_CC_IS_NVIDIA(cc) && cc == 860 &&
+                smem <= ggml_cuda_info().devices[device].smpb) {
+            const uint3 bpr_fd = init_fastdiv_values((uint32_t) bpr);
+            const uint3 rpc_fd = init_fastdiv_values((uint32_t) rows);
+            const ggml_cuda_kernel_launch_params lp(dim3(nrows_x / rows), dim3(256), smem, stream);
+            if (has_fusion) {
+                ggml_cuda_kernel_launch(mul_mat_vec_ptq1_0_pt<1, 1, true, false, 256>, lp,
+                        vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                        rows, bpr_fd, rpc_fd, false);
+            } else {
+                ggml_cuda_kernel_launch(mul_mat_vec_ptq1_0_pt<1, 1, false, false, 256>, lp,
+                        vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                        rows, bpr_fd, rpc_fd, false);
+            }
+            return;
+        }
+    }
 
     const int rows_per_cta = ptq1_0_pt_rows_per_cta(bpr, ncols, nrows_x, ROWS);
     const uint3 bpr_fd = init_fastdiv_values((uint32_t) bpr);
