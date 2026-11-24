@@ -168,7 +168,8 @@ void common_ngram_cache_draft(
 
         // cd = context + dynamic
         std::vector<common_ngram> ngrams_cd;
-        for (int ngram_size_cd = ngram_min; ngram_size_cd <= ngram_max; ++ngram_size_cd) {
+        const int ngram_max_cd = std::min(ngram_max, inp_size + (int) draft.size() - 1);
+        for (int ngram_size_cd = ngram_min; ngram_size_cd <= ngram_max_cd; ++ngram_size_cd) {
             const int ngram_start_cd = inp_size-ngram_size_cd + draft.size()-1;
             common_ngram ngram_cd;
             for (int j = ngram_start_cd; j < ngram_start_cd + ngram_size_cd; ++j) {
