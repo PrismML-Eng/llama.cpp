@@ -100,6 +100,13 @@ if (Vulkan_FOUND)
         "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/integer_dot.comp"
         "GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT"
     )
+    if (NOT GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+        message(WARNING "glslc (${Vulkan_GLSLC_EXECUTABLE}) does not support GL_EXT_integer_dot_product: "
+                        "the integer dot product mat-vec shaders are not built, and PTQ1_0 and other "
+                        "quantized mat-vecs fall back to slower dequantize paths (about 10x slower decode "
+                        "measured for PTQ1_0). Use a newer glslc (shaderc 2024 or later) via "
+                        "-DVulkan_GLSLC_EXECUTABLE and reconfigure from a clean build directory.")
+    endif()
 
     test_shader_extension_support(
         "GL_EXT_bfloat16"
