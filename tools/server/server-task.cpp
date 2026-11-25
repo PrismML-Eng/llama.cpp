@@ -1905,6 +1905,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             }
         }
 
+        SRV_TRC(" - found better prompt with length %zu\n", it_best->prompt.tokens.size());
         prompt = std::move(it_best->prompt);
 
         states.erase(it_best);
