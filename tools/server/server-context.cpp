@@ -1814,23 +1814,23 @@ private:
     }
 
     void cache_idle_slots(int32_t id_slot_keep = -1) {
-    if (params_base.cache_idle_slots) {
-        for (auto & slot : slots) {
-            if (slot.id != id_slot_keep && !slot.is_processing()) {
-                SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
+        if (params_base.cache_idle_slots) {
+            for (auto & slot : slots) {
+                if (slot.id != id_slot_keep && !slot.is_processing()) {
+                    SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                if (slot.prompt_save(*prompt_cache)) {
-                    SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
-                    prompt_cache->update();
-                }
+                    if (slot.prompt_save(*prompt_cache)) {
+                        SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
+                        prompt_cache->update();
+                    }
 
-                if (params_base.kv_unified) {
-                    // [TAG_IDLE_SLOT_CLEAR]
-                    slot.prompt_clear();
+                    if (params_base.kv_unified) {
+                        // [TAG_IDLE_SLOT_CLEAR]
+                        slot.prompt_clear();
+                    }
                 }
             }
         }
-    }
     }
 
     server_slot * get_available_slot(const server_task & task) {
