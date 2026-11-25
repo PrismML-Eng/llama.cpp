@@ -1905,7 +1905,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             }
         }
 
-        SRV_TRC(" - found better prompt with length %zu\n", it_best->prompt.tokens.size());
+        const int lcp = it_best->prompt.tokens.get_common_prefix(tokens_new);
+        const float f_keep = float(lcp) / it_best->prompt.tokens.size();
+        const float f_sim = float(lcp) / tokens_new.size();
+        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep, f_sim);
         prompt = std::move(it_best->prompt);
 
         states.erase(it_best);
