@@ -6880,13 +6880,16 @@ void ggml_gemv_pq2_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
 
         // sum(q) depends only on (l,k), not on the output-column tile: compute it once per call.
         const int nq = nb * (QK_PQ2_0 / QK8_0);
-        static thread_local std::vector<__m512i> sqv;
+        struct sum_block {
+            __m512i lanes;
+        };
+        static thread_local std::vector<sum_block> sqv;
         sqv.resize(nq);
         for (int l = 0; l < nb; l++) {
             for (int k = 0; k < QK_PQ2_0 / QK8_0; ++k) {
                 const block_q8_0 * a_blk = a_ptr + l * (QK_PQ2_0 / QK8_0) + k;
                 const __m512i qa = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i *) a_blk->qs));
-                sqv[l * (QK_PQ2_0 / QK8_0) + k] = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, qa);
+                sqv[l * (QK_PQ2_0 / QK8_0) + k].lanes = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, qa);
             }
         }
 
@@ -6908,7 +6911,7 @@ void ggml_gemv_pq2_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
                     __q2_0_expand_x4((const uint8_t *) b_ptr[l].qs + 32 * k, &w01, &w23);
 
                     const __m512i qa  = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i *) a_blk->qs));
-                    const __m512i sq  = sqv[l * (QK_PQ2_0 / QK8_0) + k];
+                    const __m512i sq  = sqv[l * (QK_PQ2_0 / QK8_0) + k].lanes;
                     const __m512i i01 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w01, qa);
                     const __m512i i23 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w23, qa);
 
