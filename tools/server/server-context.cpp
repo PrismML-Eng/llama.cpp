@@ -1869,7 +1869,8 @@ private:
             }
 
             if (ret != nullptr) {
-                const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+                const float f_keep = ret->prompt.tokens.size() > 0 ?
+                    (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size() : 0.0f;
 
                 if (task.id_slot == -1) {
                     SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
@@ -1897,10 +1898,8 @@ private:
         }
 
         if (ret) {
-            update_cache = update_cache && prompt_cache;
-
-            // cache prompts only for the tasks that reuse them
-            update_cache = update_cache && !task.is_stateless();
+            update_cache = prompt_cache && !task.is_stateless() &&
+                (update_cache || prompt_cache->has_better(ret->prompt, task.tokens));
 
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
