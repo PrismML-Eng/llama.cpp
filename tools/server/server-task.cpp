@@ -1825,7 +1825,11 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+std::list<server_prompt_cache_state>::const_iterator server_prompt_cache::find_better(const server_prompt & prompt, const server_tokens & tokens_new) const {
+    if (tokens_new.empty()) {
+        return states.cend();
+    }
+
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1833,10 +1837,14 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
-    auto it_best = states.end();
+    auto it_best = states.cend();
 
     // find the most similar cached prompt, that would also preserve the most context
-    for (auto it = states.begin(); it != states.end(); ++it) {
+    for (auto it = states.cbegin(); it != states.cend(); ++it) {
+        if (it->prompt.tokens.empty()) {
+            continue;
+        }
+
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
@@ -1857,11 +1865,20 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
-    if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    return it_best;
+}
 
+bool server_prompt_cache::has_better(const server_prompt & prompt, const server_tokens & tokens_new) const {
+    return find_better(prompt, tokens_new) != states.cend();
+}
+
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    const auto found = find_better(prompt, tokens_new);
+    auto it_best = states.erase(found, found);
+
+    if (it_best != states.end()) {
         {
-            auto & data = it_best->data.main;
+            const auto & data = it_best->data.main;
 
             const size_t size = data.size();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
@@ -1870,13 +1887,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                 return false;
             }
-
-            data.clear();
-            data.shrink_to_fit();
         }
 
         {
-            auto & data = it_best->data.drft;
+            const auto & data = it_best->data.drft;
 
             if (!data.empty()) {
                 GGML_ASSERT(ctx_dft);
@@ -1888,12 +1902,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                     return false;
                 }
-
-                data.clear();
-                data.shrink_to_fit();
             }
         }
 
+        const int lcp = it_best->prompt.tokens.get_common_prefix(tokens_new);
+        const float f_keep = float(lcp) / it_best->prompt.tokens.size();
+        const float f_sim = float(lcp) / tokens_new.size();
+        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep, f_sim);
         prompt = std::move(it_best->prompt);
 
         states.erase(it_best);
