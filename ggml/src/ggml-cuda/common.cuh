@@ -75,15 +75,16 @@ static int ggml_cuda_env_tristate(const char * name) {
 
 // GGML_CUDA_PREFILL_OPT: the prefill paths that measured faster with byte-identical output
 // (GGML_CUDA_GDN_L8P, GGML_CUDA_PTQ1_J128, GGML_CUDA_FWHT_MMQ with GGML_CUDA_FWHT_MMQ_GLU).
-// Unset: on for the NVIDIA architectures where it was measured (A100 cc 800, Hopper cc 900-999, B200 cc 1000,
-// RTX PRO 6000 / RTX 50 cc 1200-1299), off elsewhere (Ada and older are unmeasured).
+// Unset: on for the NVIDIA architectures where it was measured (A100 cc 800, Ada cc 890, Hopper cc 900-999,
+// B200 cc 1000, RTX PRO 6000 / RTX 50 cc 1200-1299), off elsewhere (Turing and the other Ampere parts are unmeasured).
 // 0 = all off, 1 = all on where each path supports the GPU.
 // A per-path switch, when set, overrides this for that path.
 static bool ggml_cuda_prefill_opt(const int cc) {
     static const int env = ggml_cuda_env_tristate("GGML_CUDA_PREFILL_OPT");
     return env >= 0 ?
                env == 1 :
-               GGML_CUDA_CC_IS_NVIDIA(cc) && (cc == GGML_CUDA_CC_AMPERE || (cc >= GGML_CUDA_CC_HOPPER && cc <= 1000) ||
+               GGML_CUDA_CC_IS_NVIDIA(cc) && (cc == GGML_CUDA_CC_AMPERE || cc == GGML_CUDA_CC_ADA_LOVELACE ||
+                                              (cc >= GGML_CUDA_CC_HOPPER && cc <= 1000) ||
                                               (cc >= GGML_CUDA_CC_BLACKWELL && cc < 1300));
 }
 
