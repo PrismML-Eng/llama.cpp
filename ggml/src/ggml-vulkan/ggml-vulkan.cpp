@@ -1335,6 +1335,11 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
     FaCodePath path = device->coopmat2 ? FA_COOPMAT2 :
                       device->coopmat1_fa_support ? FA_COOPMAT1 : FA_SCALAR;
 
+    // coopmat2 decoders have no PQ2_0M case; use coopmat1 (dequantize4 is correct)
+    if (path == FA_COOPMAT2 && (k_type == GGML_TYPE_PQ2_0M || v_type == GGML_TYPE_PQ2_0M)) {
+        path = FA_COOPMAT1;
+    }
+
     if (path == FA_COOPMAT2 && k_type == GGML_TYPE_BF16 && !device->coopmat2_bf16_support) {
         path = FA_COOPMAT1;
     }
@@ -1656,17 +1661,26 @@ static bool ggml_vk_fa_type_needs_shmem(ggml_type type) {
     }
 }
 
-static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type, ggml_type v_type) {
+static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type, ggml_type v_type, bool shmem_staging) {
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    // PQ2_0M's shared-memory staging path (NVIDIA, head dims < 256) is not
+    // exercised on other vendors, so gate the MMQ path off there until it is
+    // tested on an NVIDIA Vulkan device with integer dot. The non-MMQ scalar path
+    // supports PQ2_0M (via dequantize4), so this falls back to it safely.
+    if (k_type == GGML_TYPE_PQ2_0M && shmem_staging) {
+        return false;
+    }
     return device->integer_dot_product && device->subgroup_clustered &&
            !ggml_vk_fa_type_needs_shmem(v_type) &&
            (k_type == GGML_TYPE_Q4_0 || k_type == GGML_TYPE_Q4_1 ||
             k_type == GGML_TYPE_Q5_0 || k_type == GGML_TYPE_Q5_1 ||
-            k_type == GGML_TYPE_Q8_0);
+            k_type == GGML_TYPE_Q8_0 ||
+            k_type == GGML_TYPE_PQ2_0M);
 #else
     GGML_UNUSED(device);
     GGML_UNUSED(k_type);
     GGML_UNUSED(v_type);
+    GGML_UNUSED(shmem_staging);
     return false;
 #endif
 }
@@ -2039,7 +2053,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const bool fa_ds = fa.first.subgroup_size == 0;
 
         const bool bf16_kv = fa.first.k_type == GGML_TYPE_BF16;
-        const bool use_mmq = ggml_vk_fa_scalar_uses_mmq(device, fa.first.k_type, fa.first.v_type);
+        const bool use_mmq = ggml_vk_fa_scalar_uses_mmq(device, fa.first.k_type, fa.first.v_type, fa.first.shmem_staging);
         const void * spv_data = nullptr;
         size_t spv_size = 0;
         const char *name = nullptr;
@@ -8182,7 +8196,7 @@ bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_f
     // BF16 uses the fp32 shader (FLOAT_TYPE=float)
     const uint32_t float_type_size = (device->fp16 && k_type != GGML_TYPE_BF16) ? sizeof(ggml_fp16_t) : sizeof(float);
 
-    const bool mmq = ggml_vk_fa_scalar_uses_mmq(device, k_type, v_type);
+    const bool mmq = ggml_vk_fa_scalar_uses_mmq(device, k_type, v_type, params.shmem_staging);
 
     // tmpsh is overestimated slightly
     const uint32_t tmpsh = wg_size * sizeof(float);

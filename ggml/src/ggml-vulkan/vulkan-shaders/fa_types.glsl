@@ -23,8 +23,9 @@ uint fa_block_elems(uint ty) {
 }
 
 // QUANT_R_MMQ for FA-eligible K types. Q4_*/Q5_* store two nibbles per byte
-// (R==2); Q8_0 stores one byte per element (R==1). Used to derive the number
-// of int32s per 32-element block on the MMQ K path: ints_per_block == 8 / R.
+// (R==2); Q8_0 stores one byte per element (R==1). PQ2_0M stores two bits per
+// element (4 elem/byte), i.e. 8 elem per int like Q4_*/Q5_*. Used to derive the
+// number of int32s per 32-element block on the MMQ K path: ints_per_block == 8 / R.
 uint fa_quant_r_mmq(uint ty) {
     switch (ty) {
         case GGML_TYPE_Q4_0: return uint(QUANT_R_Q4_0);
@@ -32,6 +33,7 @@ uint fa_quant_r_mmq(uint ty) {
         case GGML_TYPE_Q5_0: return uint(QUANT_R_Q5_0);
         case GGML_TYPE_Q5_1: return uint(QUANT_R_Q5_1);
         case GGML_TYPE_Q8_0: return uint(QUANT_R_Q8_0);
+        case GGML_TYPE_PQ2_0M: return uint(2);
         default:           return 1u;
     }
 }
