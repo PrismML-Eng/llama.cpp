@@ -6270,9 +6270,10 @@ static bool ggml_sycl_mul_mat_glu_fused(ggml_backend_sycl_context & ctx, ggml_cg
     }
 
     // quant pairs the reorder kernel does not serve (mixed gate/up types, q5_K off BMG) take the
-    // standard-layout fused path instead; same-type q4_K / q5_K keep the reorder path below
+    // standard-layout fused path instead; same-type q4_K / q5_K / pq2_0 / ptq1_0 keep the reorder path below
     const bool reorder_pair = wg->type == wu->type &&
-        (wu->type == GGML_TYPE_Q4_K || (wu->type == GGML_TYPE_Q5_K && ggml_sycl_q5_k_mmvq_reuse(ctx.device)));
+        (wu->type == GGML_TYPE_Q4_K || (wu->type == GGML_TYPE_Q5_K && ggml_sycl_q5_k_mmvq_reuse(ctx.device)) ||
+         wu->type == GGML_TYPE_PQ2_0 || wu->type == GGML_TYPE_PTQ1_0);
     if (!reorder_pair) {
         const auto is_plain_type = [](ggml_type type) {
             return type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS;
