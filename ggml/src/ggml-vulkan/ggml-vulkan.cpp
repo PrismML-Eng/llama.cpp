@@ -4355,6 +4355,11 @@ vk_device ggml_vk_get_device(size_t idx) {
         }
 
         device->integer_dot_product = device->integer_dot_product && shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated;
+        // Adreno 6xx (measured on an Adreno 622): the integer dot product shaders give wrong results for every
+        // multi-column Q2_0 mat-vec and most Q4_0 cases in test-backend-ops; with them off, Q2_0 MUL_MAT passes.
+        if (device->vendor_id == VK_VENDOR_ID_QUALCOMM && strstr(device->properties.deviceName, "Adreno (TM) 6") != nullptr) {
+            device->integer_dot_product = false;
+        }
 
         device->min_imported_host_pointer_alignment = external_memory_host_props.minImportedHostPointerAlignment;
 
