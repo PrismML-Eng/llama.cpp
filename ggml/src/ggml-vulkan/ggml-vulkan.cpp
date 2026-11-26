@@ -15859,6 +15859,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (!fa_kv_ok(op->src[1]->type) || !fa_kv_ok(op->src[2]->type)) {
                     return false;
                 }
+                // a K/V row must be whole blocks of its type (PQ2_0M blocks are 128 wide, HSK % 8 is not enough)
+                if ((HSK % ggml_blck_size(op->src[1]->type)) != 0 || (HSV % ggml_blck_size(op->src[2]->type)) != 0) {
+                    return false;
+                }
                 if ((op->src[1]->type == GGML_TYPE_BF16) != (op->src[2]->type == GGML_TYPE_BF16)) {
                     return false;
                 }
