@@ -674,6 +674,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
+    // a K/V row must be whole blocks of its type (PQ2_0 / PQ2_0M blocks are 128 wide, D = 64 is half a block)
+    if (K->ne[0] % ggml_blck_size(K->type) != 0 || V->ne[0] % ggml_blck_size(V->type) != 0) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
     if (mask && mask->ne[2] != 1) {
         return BEST_FATTN_KERNEL_NONE;
     }
