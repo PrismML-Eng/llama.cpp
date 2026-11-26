@@ -71,7 +71,7 @@ FLOAT_TYPEV2 get_k_scale(uint ib, uint a_offset) {
     }
 }
 
-void k_block_to_shmem(const uint buf_ib, const uint global_ib, const uint iqs, const uint a_offset) {
+void k_block_to_shmem(const uint buf_ib, const uint global_ib, const uint byte_off, const uint iqs, const uint a_offset) {
     // kblocksh[].qs is int32_t for the unified MMQ struct; uint sources need
     // explicit casts. The bit pattern is what we care about here -- the actual
     // signed/unsigned interpretation happens downstream in the dot product.
@@ -107,18 +107,17 @@ void k_block_to_shmem(const uint buf_ib, const uint global_ib, const uint iqs, c
             break;
         }
         case GGML_TYPE_PQ2_0M: {
-            // 2-bit codec: 4 elements per byte. The MMQ dot (dotPacked4x8EXT)
-            // reads one element per byte and splits each int32 into low + high
-            // nibbles (8 elements total), so pack 2 codes per byte (each code
-            // 2 bits, stored in a nibble) — same shape as Q4_0's 2 nibbles/byte.
-            // From 2 raw bytes (8 codes) build 4 bytes: byte 0 = codes 0,1,
-            // byte 1 = codes 2,3, byte 2 = codes 4,5, byte 3 = codes 6,7.
-            uint b0 = k_packed_pq2_0m.data[a_offset + global_ib].qs[iqs * 2];
-            uint b1 = k_packed_pq2_0m.data[a_offset + global_ib].qs[iqs * 2 + 1];
-            uint byte0 = (b0 & 0x03) | (((b0 >> 2) & 0x03) << 4);
-            uint byte1 = ((b0 >> 4) & 0x03) | (((b0 >> 6) & 0x03) << 4);
-            uint byte2 = (b1 & 0x03) | (((b1 >> 2) & 0x03) << 4);
-            uint byte3 = ((b1 >> 4) & 0x03) | (((b1 >> 6) & 0x03) << 4);
+            // 2-bit codec: 4 elements per raw byte. The MMQ dot (dotPacked4x8EXT)
+            // splits each int32 into low + high nibbles (4 elements each), so pack
+            // all 4 codes from one raw byte into the low nibbles and all 4 codes
+            // from the raw byte 4 positions later into the high nibbles — mirroring
+            // the non-staging block8 reader (get_k_qs_block8).
+            uint b0 = k_packed_pq2_0m.data[a_offset + global_ib].qs[byte_off + iqs];
+            uint b1 = k_packed_pq2_0m.data[a_offset + global_ib].qs[byte_off + iqs + 4];
+            uint byte0 = (b0 & 0x03) | (((b1 & 0x03) << 4));
+            uint byte1 = ((b0 >> 2) & 0x03) | (((b1 >> 2) & 0x03) << 4);
+            uint byte2 = ((b0 >> 4) & 0x03) | (((b1 >> 4) & 0x03) << 4);
+            uint byte3 = ((b0 >> 6) & 0x03) | (((b1 >> 6) & 0x03) << 4);
             kblocksh[buf_ib].qs[iqs] = int32_t(byte0 | (byte1 << 8) | (byte2 << 16) | (byte3 << 24));
             break;
         }

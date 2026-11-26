@@ -282,8 +282,11 @@ void main() {
                     const uint buf_ib = c * qf_stride + block;
                     uint32_t kcol;
                     if (fa_kv_index(j * Bc + c, kcol)) {
-                        const uint global_ib = kcol * k_stride + block;
-                        k_block_to_shmem(buf_ib, global_ib, iqs, k_offset);
+                        // PQ2_0M raw blocks are 128 elements; the loop indexes 32-elem
+                        // sub-blocks, so convert to the raw block index and byte offset.
+                        const uint raw_block = (FaTypeK == GGML_TYPE_PQ2_0M) ? (kcol * k_stride + block / 4) : (kcol * k_stride + block);
+                        const uint byte_off  = (FaTypeK == GGML_TYPE_PQ2_0M) ? ((block % 4) * 8) : 0;
+                        k_block_to_shmem(buf_ib, raw_block, byte_off, iqs, k_offset);
                     } else {
                         k_block_to_shmem_zero(buf_ib, iqs);
                     }
