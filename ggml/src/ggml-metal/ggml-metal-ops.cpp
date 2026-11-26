@@ -1974,8 +1974,8 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
         }
     }
 
-    // GGML_METAL_SSM_CONV_ROWS=1: one thread per row (256-row threadgroups) for 1..8 tokens (decode and verify)
-    static const bool rows_env = getenv("GGML_METAL_SSM_CONV_ROWS") && atoi(getenv("GGML_METAL_SSM_CONV_ROWS")) == 1;
+    // one thread per row for 1..8 tokens (GGML_METAL_SSM_CONV_ROWS=0 to disable)
+    static const bool rows_env = !getenv("GGML_METAL_SSM_CONV_ROWS") || atoi(getenv("GGML_METAL_SSM_CONV_ROWS")) != 0;
     if (rows_env && ne1 <= 8 && ne10 % 4 == 0) {
         auto pipeline = ggml_metal_library_get_pipeline_ssm_conv_rows(lib, (int32_t) ne10, use_silu);
 
