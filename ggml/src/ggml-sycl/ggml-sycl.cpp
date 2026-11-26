@@ -7129,7 +7129,8 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             ggml_sycl_l2_norm(ctx, dst);
             break;
         case GGML_OP_MUL_MAT:
-            if (dst->src[0]->ne[3] != dst->src[1]->ne[3]) {
+            // Hadamard-hinted ops with src1 broadcast over ne[3] go to ggml_sycl_op_fwht
+            if (dst->src[0]->ne[3] != dst->src[1]->ne[3] && !ggml_sycl_fwht_supported(dst)) {
                 return false;
             }
             /* ggml_sycl_mul_mat_id is dependent on ggml_sycl_mul_mat */
@@ -9410,7 +9411,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
 
-                if (a->ne[3] != b->ne[3]) {
+                // llama_mul_mat_hadamard (quantized KV) gives src1 [n, d/n, heads, n_tokens] vs a 2-D rotation; the FWHT kernel handles it
+                if (a->ne[3] != b->ne[3] && !(op->op == GGML_OP_MUL_MAT && ggml_sycl_fwht_supported(op))) {
                     return false;
                 }
 

@@ -394,6 +394,35 @@ static bool ggml_sycl_op_fwht_impl(ggml_backend_sycl_context & ctx, const ggml_t
     }
 }
 
+// same checks and widths as ggml_sycl_op_fwht(), so an op accepted here never reaches the generic mat-mul
+bool ggml_sycl_fwht_supported(const ggml_tensor * dst) {
+    if (dst->op != GGML_OP_MUL_MAT || ggml_get_op_params_i32(dst, 1) != GGML_HINT_SRC0_IS_HADAMARD) {
+        return false;
+    }
+    const ggml_tensor * rot = dst->src[0];
+    const ggml_tensor * src = dst->src[1];
+    if (rot == nullptr || src == nullptr || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16) {
+        return false;
+    }
+    // 2-D n x n rotation applied to rows of width n
+    if (rot->ne[0] != src->ne[0] || rot->ne[1] != rot->ne[0] || rot->ne[2] != 1 || rot->ne[3] != 1) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst) || !ggml_are_same_shape(src, dst)) {
+        return false;
+    }
+    switch (src->ne[0]) {
+        case 64: case 128: case 256: case 512: case 384: case 768: case 640: case 1280:
+        case 1024: case 2048: case 4096: case 8192:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
     if (dst->type != GGML_TYPE_F32) {
         return false;
