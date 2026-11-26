@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -97,7 +98,8 @@ static llama_model_ptr build_model(struct gguf_context * gguf_ctx, size_t seed) 
 
 // builds a context on top of an existing model; returns nullptr if llama_init_from_model rejects
 // the configuration (e.g. the --kv-mean-center / GGML_TYPE_Q4_0 gate)
-static llama_context_ptr build_context(llama_model * model, ggml_type type_k, const char * path_kv_mean_center = nullptr) {
+static llama_context_ptr build_context(llama_model * model, ggml_type type_k, const char * path_kv_mean_center = nullptr,
+        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr) {
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx               = 0; // from model
     ctx_params.n_batch             = 32;
@@ -106,6 +108,8 @@ static llama_context_ptr build_context(llama_model * model, ggml_type type_k, co
     ctx_params.n_threads_batch     = 2;
     ctx_params.type_k              = type_k;
     ctx_params.path_kv_mean_center = path_kv_mean_center;
+    ctx_params.cb_eval             = cb_eval;
+    ctx_params.cb_eval_user_data   = cb_eval_user_data;
 
     // quantized K cache types in this codebase are exercised together with flash attention
     if (ggml_is_quantized(type_k)) {
@@ -326,10 +330,108 @@ static void test_softmax_invariance() {
     LOG_INF("%s: OK\n", __func__);
 }
 
+// (c) the calibration tool records the K basis from the graph (common_kv_mean_center_k_rotated).
+// the rotation matrix is not always the "attn_inp_k_rot" input: with LLAMA_SYNC_TRIM bit 2 the
+// cache keeps a device copy named "attn_rot_dev_<n>", which a name-only check missed and tagged
+// rotated calibrations as unrotated.
+static ggml_tensor * hadamard_rotate(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * rot) {
+    const int64_t n = rot->ne[0];
+    ggml_tensor * res = ggml_reshape_4d(ctx, cur, n, cur->ne[0]/n, cur->ne[1], cur->ne[2]*cur->ne[3]);
+    res = ggml_mul_mat(ctx, rot, res);
+    ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
+    return ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+}
+
+static void test_k_rot_detection_graph() {
+    ggml_init_params params = {
+        /*.mem_size   =*/ 64*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    TEST_ASSERT(ctx != nullptr);
+
+    const int64_t n_embd_head = 128;
+    const int64_t n_head      = 2;
+    const int64_t n_tokens    = 4;
+
+    for (const char * rot_name : { "attn_inp_k_rot", "attn_rot_dev_128", "renamed_rotation" }) {
+        ggml_tensor * rot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_head, n_embd_head);
+        ggml_set_name(rot, rot_name);
+        ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd_head, n_head, n_tokens);
+        ggml_tensor * k_in = hadamard_rotate(ctx, k, rot);
+        ggml_format_name(k_in, "k_cache_in-%d", 0);
+        TEST_ASSERT(common_kv_mean_center_k_rotated(k_in));
+    }
+
+    // unrotated K whose projection input went through a Hadamard-latent weight rotation: the
+    // cached K is not in the rotated basis
+    {
+        ggml_tensor * rot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 256);
+        ggml_set_name(rot, "blk.0.hdmd_rot");
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, n_tokens);
+        ggml_tensor * wk = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, n_embd_head*n_head);
+        ggml_tensor * k  = ggml_mul_mat(ctx, wk, hadamard_rotate(ctx, x, rot));
+        k = ggml_reshape_3d(ctx, k, n_embd_head, n_head, n_tokens);
+        k = ggml_rms_norm(ctx, k, 1e-6f);
+        ggml_format_name(k, "k_cache_in-%d", 0);
+        TEST_ASSERT(!common_kv_mean_center_k_rotated(k));
+    }
+
+    ggml_free(ctx);
+
+    LOG_INF("%s: OK\n", __func__);
+}
+
+struct k_rot_probe {
+    int n_seen    = 0;
+    int n_rotated = 0;
+};
+
+static bool k_rot_probe_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    if (strncmp(t->name, "k_cache_in-", 11) != 0) {
+        return false;
+    }
+    if (!ask) {
+        auto * probe = (k_rot_probe *) user_data;
+        probe->n_seen++;
+        probe->n_rotated += common_kv_mean_center_k_rotated(t) ? 1 : 0;
+    }
+    return true;
+}
+
+// the detector agrees with the cache's actual rotation state on a real graph
+static void test_k_rot_detection_model() {
+    gguf_context_ptr gguf_ctx = build_llama_gguf_ctx();
+    llama_model_ptr  model    = build_model(gguf_ctx.get(), /*seed=*/ 4321);
+
+    const std::vector<llama_token> tokens = make_tokens(16, k_n_vocab, /*seed=*/ 11);
+
+    for (ggml_type type_k : { GGML_TYPE_Q4_0, GGML_TYPE_F16 }) {
+        k_rot_probe probe;
+        llama_context_ptr ctx = build_context(model.get(), type_k, nullptr, k_rot_probe_cb, &probe);
+        TEST_ASSERT(ctx != nullptr);
+        decode_and_get_logits(ctx.get(), tokens);
+
+        // 128-wide K heads: a quantized K cache turns the rotation on, F16 leaves it off
+        const bool active = ggml_is_quantized(type_k);
+
+        LOG_INF("%s: type_k = %s, rotation %s, k_cache_in seen %d, detected rotated %d\n", __func__,
+                ggml_type_name(type_k), active ? "active" : "inactive", probe.n_seen, probe.n_rotated);
+
+        TEST_ASSERT(probe.n_seen > 0);
+        TEST_ASSERT(probe.n_rotated == (active ? probe.n_seen : 0));
+    }
+
+    LOG_INF("%s: OK\n", __func__);
+}
+
 int main() {
     test_regression_safety();
     test_q4_0_gate();
     test_softmax_invariance();
+    test_k_rot_detection_graph();
+    test_k_rot_detection_model();
 
     return 0;
 }

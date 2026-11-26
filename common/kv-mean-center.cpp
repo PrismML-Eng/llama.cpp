@@ -74,3 +74,46 @@ bool common_kv_mean_center_write(
 
     return ok;
 }
+
+static bool kv_mean_center_is_view_op(enum ggml_op op) {
+    return op == GGML_OP_RESHAPE || op == GGML_OP_VIEW || op == GGML_OP_PERMUTE ||
+           op == GGML_OP_TRANSPOSE || op == GGML_OP_CONT;
+}
+
+// fallback: the rotation matrix input by name, within a few links of the captured tensor.
+// matched as a substring: views append a suffix ("attn_inp_k_rot (reshaped)") and the backend
+// scheduler decorates split inputs with a backend prefix and split index ("MTL0#attn_inp_k_rot#0")
+static bool kv_mean_center_has_k_rot_input(const struct ggml_tensor * t, int depth) {
+    if (t == nullptr || depth < 0) {
+        return false;
+    }
+    if (strstr(t->name, "attn_inp_k_rot") != nullptr || strstr(t->name, "attn_rot_dev_") != nullptr) {
+        return true;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (t->src[i] && kv_mean_center_has_k_rot_input(t->src[i], depth - 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool common_kv_mean_center_k_rotated(const struct ggml_tensor * t) {
+    // only look through views: a Hadamard MUL_MAT further up (e.g. a Hadamard-latent weight
+    // rotating the input of wk) does not put the cached K in the rotated basis
+    const struct ggml_tensor * cur = t;
+    for (int i = 0; cur != nullptr && i < 4; ++i) {
+        if (cur->op == GGML_OP_MUL_MAT) {
+            if (cur->op_params[1] == GGML_HINT_SRC0_IS_HADAMARD) { // see ggml_mul_mat_set_hint
+                return true;
+            }
+            break;
+        }
+        if (!kv_mean_center_is_view_op(cur->op)) {
+            break;
+        }
+        cur = cur->src[0];
+    }
+
+    return kv_mean_center_has_k_rot_input(t, 8);
+}

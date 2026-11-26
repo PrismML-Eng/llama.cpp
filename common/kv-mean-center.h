@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+struct ggml_tensor;
+
 // Shared GGUF file format for the K-cache mean-centering bias vectors produced by
 // tools/kv-mean-center and consumed by llama_kv_cache::load_kv_mean_center() (see
 // docs/kv-mean-center.md).
@@ -28,3 +30,11 @@ bool common_kv_mean_center_write(
         const std::string & fname,
         const std::vector<common_kv_mean_center_layer> & layers,
         bool k_rot = false);
+
+// whether a captured "k_cache_in-<il>" tensor (the K about to be written into the cache) was
+// produced with the Hadamard K-cache rotation applied. detected from the graph structure: the
+// rotation is a MUL_MAT hinted GGML_HINT_SRC0_IS_HADAMARD whose result is reshaped back into
+// the captured tensor (see llama_mul_mat_hadamard). the rotation matrix input is named
+// "attn_inp_k_rot", or "attn_rot_dev_<n>" when it is kept on the cache's device
+// (LLAMA_SYNC_TRIM bit 2), so the name alone is not a reliable signal.
+bool common_kv_mean_center_k_rotated(const struct ggml_tensor * t);
