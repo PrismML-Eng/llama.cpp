@@ -496,6 +496,22 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_q2_extc(g
 }
 
 // GGML_METAL_PQ2_COEF at 4..8 rows: mul_mv_ext's arithmetic over all columns at once (kernel_mul_mv_pq2_0_f32_extc)
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_pq2_sn(ggml_metal_library_t lib, int nr0, int nsg) {
+    char base[256];
+    char name[256];
+    snprintf(base, 256, "kernel_mul_mv_pq2_0_f32_sn_r%d", nr0);
+    snprintf(name, 256, "%s", base);
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+    res.nr0  = nr0;
+    res.nr1  = 1;
+    res.nsg  = nsg;
+    res.smem = (size_t) nr0*nsg*sizeof(float);
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_pq2_extc(ggml_metal_library_t lib, int nr1, int nrl, int nsg) {
     char base[256];
     char name[256];

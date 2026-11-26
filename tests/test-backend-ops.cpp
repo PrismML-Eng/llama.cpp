@@ -12512,6 +12512,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 4, 2, false, 70, n, 2048));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 4, 2, false, 70, n, 2048));
     }
+    // PQ2_0 decode at the real Ternary-Bonsai-2-27B shapes (m = output rows, k = input width): ffn_up/gate, ffn_down,
+    // DeltaNet qkv, z, and the 248320-row output head. The Metal decode kernel takes these.
+    for (auto mk : std::vector<std::array<int64_t, 2>>{{10240, 5120}, {17408, 5120}, {5120, 17408}, {6144, 5120}, {5120, 6144}, {248320, 5120}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, mk[0], 1, mk[1], {1, 1}, {1, 1}));
+    }
     // PTQ1_0 1..8-row batches on shapes the SYCL T2 path takes (N % 16 == 0, K % 128 == 0): with GGML_SYCL_PTQ1_T2=all
     // they run on the GEMV, and with GGML_SYCL_T2_VGEMM_MIN=k the k..8-row ones on GemmMT in the GEMV's K-slice order
     // (N <= 8192: 4 slices, N > 8192: 2)
@@ -14278,6 +14283,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 5120, 1, 17408, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1}));
     }
+    // PQ2_0 decode: the remaining Ternary-Bonsai-2-27B mat-vec shapes (z / attn out and the output head)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 6144, 1, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 5120, 1, 6144, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1}));
     // ARC-LAB: prompt-sized GEMM ceilings at the Bonsai FFN shape - ternary vs f16 and tuned quants
     for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, 512, 5120, {1, 1}, {1, 1}));
