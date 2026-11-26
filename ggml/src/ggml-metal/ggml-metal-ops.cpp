@@ -3169,6 +3169,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     }
 
     if ((ggml_metal_ptq1_multicol_mode() == 2 || ggml_metal_ptq1_coef_mode() != 0) &&
+        !ggml_metal_ptq1_multicol_enabled(op) &&  // 2-4 rows taken by the collapse kernel when it is enabled
         ggml_metal_op_mul_mat_ptq1_extc_supported(op)) {
         return ggml_metal_op_mul_mat_ptq1_extc(ctx, idx);
     }
