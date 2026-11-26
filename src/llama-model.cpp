@@ -2173,6 +2173,7 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
             case LLM_ARCH_QWEN3NEXT:
             case LLM_ARCH_DSPARK:
             case LLM_ARCH_GEMMA4:
+            case LLM_ARCH_DFLASH: // dflash.cpp reads fc, attn/ffn conv_proj and the attn/ffn weights only through build_lora_mm
                 break;
             default:
                 throw std::runtime_error(format(
@@ -2182,7 +2183,10 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
 
         // a folded weight W_f = W*D*H is the weight W with the +1/-1 signs D and the normalized block Hadamard H folded in
         // H*H = I and D*D = I, so W*x = W_f*(H*(D*x)): the graph applies D, then H, to the matmul input
-        const auto is_foldable_weight = [](const std::string & name) {
+        const auto is_foldable_weight = [this](const std::string & name) {
+            if (arch == LLM_ARCH_DFLASH && name == "fc.weight") {
+                return true;
+            }
             static const char * kinds[] = {
                 "attn_q", "attn_k", "attn_v", "attn_qkv", "attn_gate", "attn_output",
                 "ffn_gate", "ffn_up", "ffn_down",
@@ -2204,6 +2208,11 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
                 return false;
             }
             pos++;
+            if (arch == LLM_ARCH_DFLASH &&
+                (name.compare(pos, std::string::npos, "attn_conv_proj.weight") == 0 ||
+                 name.compare(pos, std::string::npos, "ffn_conv_proj.weight") == 0)) {
+                return true;
+            }
             for (const char * kind : kinds) {
                 const std::string suffix = std::string(kind) + ".weight";
                 if (name.compare(pos, std::string::npos, suffix) == 0) {
