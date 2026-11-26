@@ -1951,6 +1951,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort_merge(gg
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_add_norm_fwht(ggml_metal_library_t lib, int n_blk) {
+    char name[256];
+    snprintf(name, 256, "kernel_add_rms_norm_fwht_1024_b%d", n_blk);
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht(ggml_metal_library_t lib, int n, ggml_type tsrc, bool swiglu) {
     char base[256];
     char name[256];
