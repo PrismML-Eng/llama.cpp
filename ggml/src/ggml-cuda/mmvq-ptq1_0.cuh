@@ -41,10 +41,10 @@
 
 // L2 prefetch of the next mat-vec's weights by the last CTAs of the running kernel (see mul_mat_vec_ptq1_0_pt and
 // ggml_cuda_l2_hint_for_node): percent of the next tensor and upper bound in bytes. One CTA per SM prefetches.
-// 8 MiB costs nothing on an RTX 4070 (36 MiB L2, measured). Other GPUs get 2 MiB, not measured there.
+// Ada (cc 8.9) only: 8 MiB costs nothing on an RTX 4070 (36 MiB L2, measured). Turing (RTX 2060 SUPER) and
+// Hopper (H200) measured neutral, so other GPUs do not prefetch.
 #define PTQ1_0_L2_PREFETCH_PCT       50
 #define PTQ1_0_L2_PREFETCH_BYTES_ADA (8u << 20)
-#define PTQ1_0_L2_PREFETCH_BYTES     (2u << 20)
 
 // the PT path is CUDA only; HIP keeps the block_q8_1 layout and the old vec_dot
 static constexpr __host__ __device__ bool ptq1_0_pt_enabled() {
@@ -396,7 +396,11 @@ static __global__ void mul_mat_vec_ptq1_0_pt(
     if (pf_ptr != nullptr && (int) blockIdx.x + pf_ctas >= (int) gridDim.x) {
         const char * pf = pf_ptr + (size_t) ((int) blockIdx.x - ((int) gridDim.x - pf_ctas)) * pf_lines_per_cta * 128;
         for (int i = tid; i < pf_lines_per_cta; i += PTQ1_0_PT_THREADS) {
+#if defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
             asm volatile("prefetch.global.L2 [%0];" :: "l"(pf + (size_t) i * 128));
+#else
+            GGML_UNUSED(pf);
+#endif // defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         }
     }
 
@@ -542,9 +546,8 @@ static void mul_mat_vec_ptq1_0_pt_launch(
     int pf_lines_per_cta = 0;
     const auto & pf_dev = ggml_cuda_info().devices[ggml_cuda_get_device()];
     const int pf_ctas = std::min(pf_dev.nsm, (int) block_nums.x);
-    if (g_ggml_cuda_l2_hint.ptr != nullptr) {
-        const size_t pf_cap = pf_dev.cc == GGML_CUDA_CC_ADA_LOVELACE ? PTQ1_0_L2_PREFETCH_BYTES_ADA : PTQ1_0_L2_PREFETCH_BYTES;
-        const size_t pf_bytes = std::min(g_ggml_cuda_l2_hint.bytes / 100 * PTQ1_0_L2_PREFETCH_PCT, pf_cap);
+    if (g_ggml_cuda_l2_hint.ptr != nullptr && GGML_CUDA_CC_IS_NVIDIA(pf_dev.cc) && pf_dev.cc == GGML_CUDA_CC_ADA_LOVELACE) {
+        const size_t pf_bytes = std::min(g_ggml_cuda_l2_hint.bytes / 100 * PTQ1_0_L2_PREFETCH_PCT, (size_t) PTQ1_0_L2_PREFETCH_BYTES_ADA);
         pf_lines_per_cta = (int) (pf_bytes / 128 / pf_ctas);
         if (pf_lines_per_cta > 0) {
             pf_ptr = g_ggml_cuda_l2_hint.ptr;
