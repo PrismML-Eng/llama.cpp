@@ -15,6 +15,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <cstdlib>
+#include <deque>
 #include <forward_list>
 #include <limits>
 #include <map>
@@ -273,7 +274,6 @@ struct llm_bigram_bpe {
     using queue = llama_priority_queue<llm_bigram_bpe, queue_storage, comparator>;
     llm_symbol::index left;
     llm_symbol::index right;
-    std::string text;
     int rank;
     size_t size;
 };
@@ -741,13 +741,9 @@ struct llm_tokenizer_bpe_session {
                 auto & left_symbol = symbols[bigram.left];
                 auto & right_symbol = symbols[bigram.right];
 
-                if (left_symbol.n == 0 || right_symbol.n == 0) {
+                if (left_symbol.n == 0 || right_symbol.n == 0 ||
+                    left_symbol.n + right_symbol.n != bigram.size) {
                     continue;
-                }
-                std::string left_token = std::string(left_symbol.text, left_symbol.n);
-                std::string right_token = std::string(right_symbol.text, right_symbol.n);
-                if (left_token + right_token != bigram.text) {
-                    continue;  // Skip this bigram if it's outdated
                 }
 
                 // merge the right sym into the left one
@@ -821,12 +817,9 @@ private:
         if (left == -1 || right == -1) {
             return;
         }
-        std::string left_token  = std::string(symbols[left].text,  symbols[left].n);
-        std::string right_token = std::string(symbols[right].text, symbols[right].n);
-
-        int rank_found = -1;
-
-        rank_found = vocab.find_bpe_rank(left_token, right_token);
+        int rank_found = vocab.find_bpe_rank(
+                std::string_view(symbols[left].text,  symbols[left].n),
+                std::string_view(symbols[right].text, symbols[right].n));
 
         if (rank_found < 0) {
             return;
@@ -836,8 +829,7 @@ private:
 
         bigram.left  = left;
         bigram.right = right;
-        bigram.text  = left_token + right_token;
-        bigram.size  = left_token.size() + right_token.size();
+        bigram.size  = symbols[left].n + symbols[right].n;
         bigram.rank  = rank_found;
 
         work_queue.push(bigram);
@@ -2140,13 +2132,15 @@ struct llama_vocab::impl {
 
     std::vector<llama_token> cache_special_tokens;
     std::vector<std::string> cache_token_to_piece; // llama_token_to_piece(special = true);
+    using bpe_rank_key = std::pair<std::string_view, std::string_view>;
     struct pair_hash {
-        size_t operator()(const std::pair<std::string, std::string> & p) const {
-            return std::hash<std::string>{}(p.first) ^  //create some hash for pair
-                   (std::hash<std::string>{}(p.second) << 1);
+        size_t operator()(const bpe_rank_key & p) const {
+            return std::hash<std::string_view>{}(p.first) ^
+                   (std::hash<std::string_view>{}(p.second) << 1);
         }
     };
-    std::unordered_map<std::pair<std::string, std::string>, int, pair_hash> bpe_ranks;
+    std::deque<std::string> bpe_rank_strs; // stable backing storage for bpe_ranks keys
+    std::unordered_map<bpe_rank_key, int, pair_hash> bpe_ranks;
 
     // set of all tokens that cause "end of generation"
     std::set<llama_token> special_eog_ids;
@@ -2160,9 +2154,12 @@ struct llama_vocab::impl {
     impl(const llama_vocab & vocab) : vocab(vocab) {
     }
 
+    impl(const impl &) = delete;
+
     ~impl() = default;
 
     void load(llama_model_loader & ml, const LLM_KV & kv);
+    bool load_bpe_ranks(const gguf_context * ctx, const LLM_KV & kv);
 
     enum llama_vocab_type get_type() const;
 
@@ -2231,6 +2228,31 @@ private:
     const llama_vocab & vocab;
 };
 
+bool llama_vocab::impl::load_bpe_ranks(const gguf_context * ctx, const LLM_KV & kv) {
+    const int merges_keyidx = gguf_find_key(ctx, kv(LLM_KV_TOKENIZER_MERGES).c_str());
+    if (merges_keyidx == -1) {
+        return false;
+    }
+
+    if (gguf_get_kv_type(ctx, merges_keyidx) != GGUF_TYPE_ARRAY ||
+        gguf_get_arr_type(ctx, merges_keyidx) != GGUF_TYPE_STRING) {
+        throw std::runtime_error(format("invalid gguf type for %s", kv(LLM_KV_TOKENIZER_MERGES).c_str()));
+    }
+
+    const int n_merges = gguf_get_arr_n(ctx, merges_keyidx);
+    bpe_ranks.reserve(n_merges);
+    for (int i = 0; i < n_merges; i++) {
+        const char * word = gguf_get_arr_str(ctx, merges_keyidx, i);
+
+        const char * sep = *word ? strchr(word + 1, ' ') : nullptr;
+
+        auto & left  = bpe_rank_strs.emplace_back(word, sep ? sep - word : 0);
+        auto & right = bpe_rank_strs.emplace_back(sep ? sep + 1 : "");
+        bpe_ranks.emplace(bpe_rank_key(left, right), i);
+    }
+    return true;
+}
+
 void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
     struct gguf_context * ctx = ml.metadata;
 
@@ -2288,40 +2310,11 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
         } else if (tokenizer_model == "gpt2" || tokenizer_model == "hybriddna" || tokenizer_model == "whitespace") {
             type = LLAMA_VOCAB_TYPE_BPE;
 
-            // read bpe merges and populate bpe ranks
-            const int merges_keyidx = gguf_find_key(ctx, kv(LLM_KV_TOKENIZER_MERGES).c_str());
-            // Kimi-K2 uses custom tokenization without traditional BPE merges
-            const bool is_kimi_k2 = (tokenizer_pre == "kimi-k2");
-
-            if (merges_keyidx == -1) {
-                if (!is_kimi_k2) {
+            if (!load_bpe_ranks(ctx, kv)) {
+                if (tokenizer_pre != "kimi-k2") {
                     throw std::runtime_error("cannot find tokenizer merges in model file\n");
                 }
-                // Kimi-K2 doesn't need merges, skip
                 LLAMA_LOG_INFO("%s: Kimi-K2 tokenizer detected, skipping BPE merges\n", __func__);
-            } else {
-                if (gguf_get_kv_type(ctx, merges_keyidx) != GGUF_TYPE_ARRAY ||
-                    gguf_get_arr_type(ctx, merges_keyidx) != GGUF_TYPE_STRING) {
-                    throw std::runtime_error(format("invalid gguf type for %s", kv(LLM_KV_TOKENIZER_MERGES).c_str()));
-                }
-                const int n_merges = gguf_get_arr_n(ctx, merges_keyidx);
-                bpe_ranks.reserve(n_merges);
-                for (int i = 0; i < n_merges; i++) {
-                    const char * word = gguf_get_arr_str(ctx, merges_keyidx, i);
-                    //GGML_ASSERT(unicode_cpts_from_utf8(word).size() > 0);
-
-                    std::string first;
-                    std::string second;
-
-                    const char * sep = *word ? strchr(word + 1, ' ') : nullptr;
-
-                    if (sep) {
-                        first.assign(word, sep - word);
-                        second.assign(sep + 1);
-                    }
-
-                    bpe_ranks.emplace(std::make_pair(std::move(first), std::move(second)), i);
-                }
             }
 
             // default special tokens
@@ -2406,33 +2399,8 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
         } else if (tokenizer_model == "gemma4") {
             type = LLAMA_VOCAB_TYPE_BPE;
 
-            // read bpe merges and populate bpe ranks
-            const int merges_keyidx = gguf_find_key(ctx, kv(LLM_KV_TOKENIZER_MERGES).c_str());
-            if (merges_keyidx == -1) {
+            if (!load_bpe_ranks(ctx, kv)) {
                 throw std::runtime_error("cannot find tokenizer merges in model file\n");
-            }
-            {
-                if (gguf_get_kv_type(ctx, merges_keyidx) != GGUF_TYPE_ARRAY ||
-                    gguf_get_arr_type(ctx, merges_keyidx) != GGUF_TYPE_STRING) {
-                    throw std::runtime_error(format("invalid gguf type for %s", kv(LLM_KV_TOKENIZER_MERGES).c_str()));
-                }
-                const int n_merges = gguf_get_arr_n(ctx, merges_keyidx);
-                bpe_ranks.reserve(n_merges);
-                for (int i = 0; i < n_merges; i++) {
-                    const char * word = gguf_get_arr_str(ctx, merges_keyidx, i);
-
-                    std::string first;
-                    std::string second;
-
-                    const char * sep = *word ? strchr(word + 1, ' ') : nullptr;
-
-                    if (sep) {
-                        first.assign(word, sep - word);
-                        second.assign(sep + 1);
-                    }
-
-                    bpe_ranks.emplace(std::make_pair(std::move(first), std::move(second)), i);
-                }
             }
 
             // default special tokens (to be read from GGUF)
@@ -4599,9 +4567,9 @@ int llama_vocab::max_token_len() const {
     return pimpl->max_token_len;
 }
 
-int llama_vocab::find_bpe_rank(const std::string & token_left, const std::string & token_right) const {
-    GGML_ASSERT(token_left.find(' ')   == std::string::npos);
-    GGML_ASSERT(token_right.find(' ')  == std::string::npos);
+int llama_vocab::find_bpe_rank(std::string_view token_left, std::string_view token_right) const {
+    GGML_ASSERT(token_left.find(' ')  == std::string_view::npos);
+    GGML_ASSERT(token_right.find(' ') == std::string_view::npos);
 
     auto it = pimpl->bpe_ranks.find(std::make_pair(token_left, token_right));
     if (it == pimpl->bpe_ranks.end()) {
@@ -4619,7 +4587,7 @@ std::vector<std::string> llama_vocab::get_bpe_merges() const {
     std::vector<std::string> result(max_rank + 1);
 
     for (const auto & pair : pimpl->bpe_ranks) {
-        result[pair.second] = pair.first.first + " " + pair.first.second;
+        result[pair.second] = std::string(pair.first.first) + " " + std::string(pair.first.second);
     }
 
     return result;
