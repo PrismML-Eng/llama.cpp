@@ -645,17 +645,28 @@ struct llm_tokenizer_bpe_session {
     virtual void tokenize(const std::string & text, std::vector<llama_token> & output) {
         auto tok_pre = vocab.get_pre_type();
 
+        std::string canonical;
+        const bool normalize_nfc = vocab.get_normalizer_opts().nfc &&
+            std::any_of(text.begin(), text.end(), [](unsigned char c) { return c >= 0x80; });
+        if (normalize_nfc) {
+            canonical.reserve(text.size());
+            for (const uint32_t cpt : unicode_cpts_normalize_nfc(unicode_cpts_from_utf8(text))) {
+                canonical += unicode_cpt_to_utf8(cpt);
+            }
+        }
+        const std::string & input = normalize_nfc ? canonical : text;
+
         std::vector<std::string> word_collection;
         if (tok_pre == LLAMA_VOCAB_PRE_TYPE_NEMOTRON_3_5_EMBD) {
             static const std::string zwnj = "\xe2\x80\x8c";
-            std::string normalized_text = text;
+            std::string normalized_text = input;
             replace_all(normalized_text, "[" + zwnj, "[");
             replace_all(normalized_text, "<" + zwnj, "<");
             word_collection = unicode_regex_split(normalized_text, tokenizer.regex_exprs, tokenizer.byte_encode);
         } else if (tok_pre == LLAMA_VOCAB_PRE_TYPE_SOPRANO) {
             std::string normalized_text;
             bool space = false;
-            for (uint32_t cpt : unicode_cpts_from_utf8(text)) {
+            for (uint32_t cpt : unicode_cpts_from_utf8(input)) {
                 if (unicode_cpt_flags_from_cpt(cpt).is_whitespace) {
                     if (!space) {
                         normalized_text += ' ';
@@ -669,7 +680,7 @@ struct llm_tokenizer_bpe_session {
             }
             word_collection = unicode_regex_split(normalized_text, tokenizer.regex_exprs, tokenizer.byte_encode);
         } else {
-            word_collection = unicode_regex_split(text, tokenizer.regex_exprs, tokenizer.byte_encode);
+            word_collection = unicode_regex_split(input, tokenizer.regex_exprs, tokenizer.byte_encode);
         }
 
         int final_prev_index = -1;
@@ -2930,6 +2941,27 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
 
     // special tokens
     {
+        // Presence selects an authoritative policy, including an explicitly empty set.
+        // EOG membership is independent of lexical token attributes.
+        const int eog_idx = gguf_find_key(ctx, kv(LLM_KV_TOKENIZER_EOG_IDS).c_str());
+        const bool has_explicit_eog = eog_idx != -1;
+        if (has_explicit_eog) {
+            if (gguf_get_kv_type(ctx, eog_idx) != GGUF_TYPE_ARRAY ||
+                gguf_get_arr_type(ctx, eog_idx) != GGUF_TYPE_UINT32) {
+                throw std::runtime_error(format("invalid gguf type for %s", kv(LLM_KV_TOKENIZER_EOG_IDS).c_str()));
+            }
+            const size_t n = gguf_get_arr_n(ctx, eog_idx);
+            const uint32_t * ids = (const uint32_t *) gguf_get_arr_data(ctx, eog_idx);
+            special_eog_ids.clear();
+            for (size_t i = 0; i < n; ++i) {
+                if (ids[i] >= id_to_token.size()) {
+                    throw std::runtime_error(format("token id %u out of range for %s",
+                        ids[i], kv(LLM_KV_TOKENIZER_EOG_IDS).c_str()));
+                }
+                special_eog_ids.insert((llama_token) ids[i]);
+            }
+        }
+
         const std::vector<std::pair<enum llm_kv, int32_t &>> special_token_types = {
             { LLM_KV_TOKENIZER_BOS_ID,     special_bos_id     },
             { LLM_KV_TOKENIZER_EOS_ID,     special_eos_id     },
@@ -3068,7 +3100,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                         || t.first == "<end_of_utterance>" // smoldocling
                    ) {
                     special_eot_id = t.second;
-                    if ((attr & LLAMA_TOKEN_ATTR_CONTROL) == 0) {
+                    if (!has_explicit_eog && (attr & LLAMA_TOKEN_ATTR_CONTROL) == 0) {
                         LLAMA_LOG_WARN("%s: control-looking token: %6d '%s' was not control-type; this is probably a bug in the model. its type will be overridden\n",
                                 __func__, t.second, t.first.c_str());
                         attr = (llama_token_attr) (attr | LLAMA_TOKEN_ATTR_CONTROL);
@@ -3082,7 +3114,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                         || t.first == "<|eom_id|>"
                         ) {
                     special_eom_id = t.second;
-                    if ((attr & LLAMA_TOKEN_ATTR_CONTROL) == 0) {
+                    if (!has_explicit_eog && (attr & LLAMA_TOKEN_ATTR_CONTROL) == 0) {
                         LLAMA_LOG_WARN("%s: control-looking token: %6d '%s' was not control-type; this is probably a bug in the model. its type will be overridden\n",
                                 __func__, t.second, t.first.c_str());
                         attr = (llama_token_attr) (attr | LLAMA_TOKEN_ATTR_CONTROL);
@@ -3091,6 +3123,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
             }
 
             // find FIM_PRE token: "<|fim_prefix|>", "<fim-prefix>", "<PRE>", etc.
+            // Preserve USER_DEFINED for added tokens that are not special tokens.
             if (special_fim_pre_id == LLAMA_TOKEN_NULL) {
                 if (false
                         || t.first == "<|fim_prefix|>"  // Qwen
@@ -3104,7 +3137,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                         || t.first == "<|plamo:fim_prefix|>" // PLaMo-3
                         ) {
                     special_fim_pre_id = t.second;
-                    if ((attr & LLAMA_TOKEN_ATTR_CONTROL) == 0) {
+                    if (!has_explicit_eog && (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) == 0) {
                         LLAMA_LOG_WARN("%s: control-looking token: %6d '%s' was not control-type; this is probably a bug in the model. its type will be overridden\n",
                                 __func__, t.second, t.first.c_str());
                         attr = (llama_token_attr) (attr | LLAMA_TOKEN_ATTR_CONTROL);
@@ -3126,7 +3159,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                         || t.first == "<|plamo:fim_suffix|>" // PLaMo-3
                         ) {
                     special_fim_suf_id = t.second;
-                    if ((attr & LLAMA_TOKEN_ATTR_CONTROL) == 0) {
+                    if (!has_explicit_eog && (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) == 0) {
                         LLAMA_LOG_WARN("%s: control-looking token: %6d '%s' was not control-type; this is probably a bug in the model. its type will be overridden\n",
                                 __func__, t.second, t.first.c_str());
                         attr = (llama_token_attr) (attr | LLAMA_TOKEN_ATTR_CONTROL);
@@ -3148,7 +3181,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                         || t.first == "<|plamo:fim_middle|>" // PLaMo-3
                         ) {
                     special_fim_mid_id = t.second;
-                    if ((attr & LLAMA_TOKEN_ATTR_CONTROL) == 0) {
+                    if (!has_explicit_eog && (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) == 0) {
                         LLAMA_LOG_WARN("%s: control-looking token: %6d '%s' was not control-type; this is probably a bug in the model. its type will be overridden\n",
                                 __func__, t.second, t.first.c_str());
                         attr = (llama_token_attr) (attr | LLAMA_TOKEN_ATTR_CONTROL);
@@ -3166,7 +3199,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                         || t.first == "[PAD]" // Kimi-K2
                         ) {
                     special_fim_pad_id = t.second;
-                    if ((attr & LLAMA_TOKEN_ATTR_CONTROL) == 0) {
+                    if (!has_explicit_eog && (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) == 0) {
                         LLAMA_LOG_WARN("%s: control-looking token: %6d '%s' was not control-type; this is probably a bug in the model. its type will be overridden\n",
                                 __func__, t.second, t.first.c_str());
                         attr = (llama_token_attr) (attr | LLAMA_TOKEN_ATTR_CONTROL);
@@ -3184,7 +3217,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                         || t.first == "<reponame>"    // Granite
                         ) {
                     special_fim_rep_id = t.second;
-                    if ((attr & LLAMA_TOKEN_ATTR_CONTROL) == 0) {
+                    if (!has_explicit_eog && (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) == 0) {
                         LLAMA_LOG_WARN("%s: control-looking token: %6d '%s' was not control-type; this is probably a bug in the model. its type will be overridden\n",
                                 __func__, t.second, t.first.c_str());
                         attr = (llama_token_attr) (attr | LLAMA_TOKEN_ATTR_CONTROL);
@@ -3199,7 +3232,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                         || t.first == "<|plamo:file_separator|>" // PLaMo-2/3
                         ) {
                     special_fim_sep_id = t.second;
-                    if ((attr & LLAMA_TOKEN_ATTR_CONTROL) == 0) {
+                    if (!has_explicit_eog && (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) == 0) {
                         LLAMA_LOG_WARN("%s: control-looking token: %6d '%s' was not control-type; this is probably a bug in the model. its type will be overridden\n",
                                 __func__, t.second, t.first.c_str());
                         attr = (llama_token_attr) (attr | LLAMA_TOKEN_ATTR_CONTROL);
@@ -3234,173 +3267,176 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
             LLAMA_LOG_INFO("%s: %u unused tokens\n", __func__, n_unused);
         }
 
-        // maintain a list of tokens that cause end-of-generation
-        // this is currently determined based on the token text, which is obviously not ideal
-        // ref: https://github.com/ggml-org/llama.cpp/issues/9606
-        special_eog_ids.clear();
-        if (special_fim_pad_id != LLAMA_TOKEN_NULL && special_eog_ids.count(special_fim_pad_id) == 0) {
-            special_eog_ids.insert(special_fim_pad_id);
-        }
+        // Legacy inference is retained only when no explicit EOG policy was supplied.
+        if (!has_explicit_eog) {
+            // maintain a list of tokens that cause end-of-generation
+            // this is currently determined based on the token text, which is obviously not ideal
+            // ref: https://github.com/ggml-org/llama.cpp/issues/9606
+            special_eog_ids.clear();
+            if (special_fim_pad_id != LLAMA_TOKEN_NULL && (id_to_token[special_fim_pad_id].attr & LLAMA_TOKEN_ATTR_CONTROL)) {
+                special_eog_ids.insert(special_fim_pad_id);
+            }
 
-        if (special_fim_rep_id != LLAMA_TOKEN_NULL && special_eog_ids.count(special_fim_rep_id) == 0) {
-            special_eog_ids.insert(special_fim_rep_id);
-        }
+            if (special_fim_rep_id != LLAMA_TOKEN_NULL && (id_to_token[special_fim_rep_id].attr & LLAMA_TOKEN_ATTR_CONTROL)) {
+                special_eog_ids.insert(special_fim_rep_id);
+            }
 
-        if (special_fim_sep_id != LLAMA_TOKEN_NULL && special_eog_ids.count(special_fim_sep_id) == 0) {
-            special_eog_ids.insert(special_fim_sep_id);
-        }
+            if (special_fim_sep_id != LLAMA_TOKEN_NULL && (id_to_token[special_fim_sep_id].attr & LLAMA_TOKEN_ATTR_CONTROL)) {
+                special_eog_ids.insert(special_fim_sep_id);
+            }
 
-        for (const auto & t : token_to_id) {
-            auto & attr = id_to_token[t.second].attr;
+            for (const auto & t : token_to_id) {
+                auto & attr = id_to_token[t.second].attr;
 
-            if (false
-                    || t.first == "<|eot_id|>"
-                    || t.first == "<|eot|>"    // muse-spark
-                    || t.first == "<|im_end|>"
-                    || t.first == "<|end|>"
-                    || t.first == "<|return|>" // o200k_harmony
-                    || t.first == "<|call|>"   // o200k_harmony
-                    || t.first == "<|flush|>"  // solar-open
-                    || t.first == "<|calls|>"  // solar-open
-                    || t.first == "<end_of_turn>"
-                    || t.first == "<|endoftext|>"
-                    || t.first == "</s>"      // paddleocr
-                    || t.first == "<|eom_id|>"
-                    || t.first == "<EOT>"
-                    || t.first == "_<EOT>"
-                    || t.first == "[EOT]" // Kimi-K2
-                    || t.first == "[EOS]" // Kimi-K2
-                    || t.first == "<|end_of_text|>"
-                    || (pre_type == LLAMA_VOCAB_PRE_TYPE_FLINT && (t.first == "<|user|>" || t.first == "<|observation|>"))
-                    || t.first == "<end_of_utterance>" // smoldocling
-                    || t.first == "<eos>"            // gemma4
-                    || t.first == "<turn|>"          // gemma4
-                    || t.first == "<|tool_response>" // gemma4
-                    || t.first == "<｜end▁of▁sentence｜>" // deepseek-ocr
-                    || t.first == "[e~[" // minimax-m2/m3
-                    || t.first == "<|ifm|im_end|>" // k2-horizon
-               ) {
-                special_eog_ids.insert(t.second);
-                if ((attr & LLAMA_TOKEN_ATTR_CONTROL) == 0) {
-                    LLAMA_LOG_WARN("%s: control-looking token: %6d '%s' was not control-type; this is probably a bug in the model. its type will be overridden\n",
-                            __func__, t.second, t.first.c_str());
-                    attr = (llama_token_attr) (attr | LLAMA_TOKEN_ATTR_CONTROL);
-                }
-            } else {
-                if (attr & LLAMA_TOKEN_ATTR_CONTROL && !(attr & LLAMA_TOKEN_ATTR_UNUSED)) {
-                    // token is control, but not marked as EOG -> print a debug log
-                    if (special_eog_ids.count(t.second) == 0) {
-                        LLAMA_LOG_DEBUG("%s: control token: %6d '%s' is not marked as EOG\n",
+                if (false
+                        || t.first == "<|eot_id|>"
+                        || t.first == "<|eot|>"    // muse-spark
+                        || t.first == "<|im_end|>"
+                        || t.first == "<|end|>"
+                        || t.first == "<|return|>" // o200k_harmony
+                        || t.first == "<|call|>"   // o200k_harmony
+                        || t.first == "<|flush|>"  // solar-open
+                        || t.first == "<|calls|>"  // solar-open
+                        || t.first == "<end_of_turn>"
+                        || t.first == "<|endoftext|>"
+                        || t.first == "</s>"      // paddleocr
+                        || t.first == "<|eom_id|>"
+                        || t.first == "<EOT>"
+                        || t.first == "_<EOT>"
+                        || t.first == "[EOT]" // Kimi-K2
+                        || t.first == "[EOS]" // Kimi-K2
+                        || t.first == "<|end_of_text|>"
+                        || (pre_type == LLAMA_VOCAB_PRE_TYPE_FLINT && (t.first == "<|user|>" || t.first == "<|observation|>"))
+                        || t.first == "<end_of_utterance>" // smoldocling
+                        || t.first == "<eos>"            // gemma4
+                        || t.first == "<turn|>"          // gemma4
+                        || t.first == "<|tool_response>" // gemma4
+                        || t.first == "<｜end▁of▁sentence｜>" // deepseek-ocr
+                        || t.first == "[e~[" // minimax-m2/m3
+                        || t.first == "<|ifm|im_end|>" // k2-horizon
+                   ) {
+                    special_eog_ids.insert(t.second);
+                    if ((attr & LLAMA_TOKEN_ATTR_CONTROL) == 0) {
+                        LLAMA_LOG_WARN("%s: control-looking token: %6d '%s' was not control-type; this is probably a bug in the model. its type will be overridden\n",
                                 __func__, t.second, t.first.c_str());
+                        attr = (llama_token_attr) (attr | LLAMA_TOKEN_ATTR_CONTROL);
+                    }
+                } else {
+                    if (attr & LLAMA_TOKEN_ATTR_CONTROL && !(attr & LLAMA_TOKEN_ATTR_UNUSED)) {
+                        // token is control, but not marked as EOG -> print a debug log
+                        if (special_eog_ids.count(t.second) == 0) {
+                            LLAMA_LOG_DEBUG("%s: control token: %6d '%s' is not marked as EOG\n",
+                                    __func__, t.second, t.first.c_str());
+                        }
                     }
                 }
             }
-        }
 
-        // @ngxson : quick hack for gpt-oss, always render these tokens
-        for (const auto & t : token_to_id) {
-            auto & attr = id_to_token[t.second].attr;
+            // @ngxson : quick hack for gpt-oss, always render these tokens
+            for (const auto & t : token_to_id) {
+                auto & attr = id_to_token[t.second].attr;
 
-            if (t.first == "<|channel|>" || t.first == "<|message|>" || t.first == "<|start|>" || t.first == "<|constrain|>") {
-                LLAMA_LOG_WARN("%s: setting token '%s' (%d) attribute to USER_DEFINED (%u), old attributes: %u\n",
-                        __func__, t.first.c_str(), t.second, LLAMA_TOKEN_ATTR_USER_DEFINED, attr);
+                if (t.first == "<|channel|>" || t.first == "<|message|>" || t.first == "<|start|>" || t.first == "<|constrain|>") {
+                    LLAMA_LOG_WARN("%s: setting token '%s' (%d) attribute to USER_DEFINED (%u), old attributes: %u\n",
+                            __func__, t.first.c_str(), t.second, LLAMA_TOKEN_ATTR_USER_DEFINED, attr);
 
-                attr = LLAMA_TOKEN_ATTR_USER_DEFINED;
-            }
-        }
-
-        if (pre_type == LLAMA_VOCAB_PRE_TYPE_SOPRANO) {
-            special_eog_ids.insert(special_eos_id);
-        }
-
-        // sanity checks
-        if (special_eos_id != LLAMA_TOKEN_NULL && special_eog_ids.count(special_eos_id) == 0) {
-            special_eog_ids.insert(special_eos_id);
-            LLAMA_LOG_WARN("%s: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect\n", __func__);
-        }
-
-        if (special_eot_id != LLAMA_TOKEN_NULL && special_eog_ids.count(special_eot_id) == 0) {
-            special_eog_ids.insert(special_eot_id);
-            LLAMA_LOG_WARN("%s: special_eot_id is not in special_eog_ids - the tokenizer config may be incorrect\n", __func__);
-        }
-
-        if (special_eom_id != LLAMA_TOKEN_NULL && special_eog_ids.count(special_eom_id) == 0) {
-            special_eog_ids.insert(special_eom_id);
-            LLAMA_LOG_WARN("%s: special_eom_id is not in special_eog_ids - the tokenizer config may be incorrect\n", __func__);
-        }
-
-        // TODO: workaround for o200k_harmony and solar-open tokenizer: the "<|end|>" token should not be EOG
-        //       we don't have a good way to detect this, so for now, if we have "<|return|>" and "<|call|>" tokens ("<|calls|>" and "<|flush|>" for solar-open),
-        //       we remove the "<|end|>" token from the EOG list
-        {
-            bool has_return = false;
-            bool has_call   = false;
-            bool has_end    = false;
-            bool has_flush  = false;
-
-            llama_token end_id = LLAMA_TOKEN_NULL;
-
-            LLAMA_LOG_INFO("%s: printing all EOG tokens:\n", __func__);
-            for (auto tid : special_eog_ids) {
-                if (tid < 0 || tid >= (llama_token) id_to_token.size()) {
-                    LLAMA_LOG_WARN("%s: EOG token id %d is out of range (vocab size %zu), skipping\n",
-                            __func__, tid, id_to_token.size());
-                    continue;
-                }
-                auto & text = id_to_token[tid].text;
-
-                LLAMA_LOG_INFO("%s:   - %d ('%s')\n", __func__, tid, text.c_str());
-
-                if (text == "<|return|>") {
-                    has_return = true;
-                } else if (text == "<|call|>" || text == "<|calls|>") {
-                    has_call = true;
-                } else if (text == "<|flush|>") {
-                    has_flush = true;
-                } else if (text == "<|end|>") {
-                    has_end = true;
-                    end_id = tid;
+                    attr = LLAMA_TOKEN_ATTR_USER_DEFINED;
                 }
             }
 
-            if ((has_return && has_call && has_end) || (has_call && has_flush && has_end)) {
-                special_eog_ids.erase(end_id);
-
-                auto & attr = id_to_token[end_id].attr;
-                attr = LLAMA_TOKEN_ATTR_USER_DEFINED;
-
-                LLAMA_LOG_WARN("%s: special_eog_ids contains both '<|return|>' and '<|call|>', or '<|calls|>' and '<|flush|>' tokens, removing '<|end|>' token from EOG list\n", __func__);
-            }
-        }
-
-        // gemma4, plamo and beam have a normal </s> token, unlike paddleocr
-        {
-            // beam's tool call marker is not an EOG token, so it is looked up in the whole vocab
-            bool has_normal_s_marker = token_to_id.count("<rfl:parameter name=\"") > 0;
-            bool has_s = false;
-
-            llama_token s_id = LLAMA_TOKEN_NULL;
-
-            for (auto tid : special_eog_ids) {
-                if (tid < 0 || tid >= (llama_token) id_to_token.size()) {
-                    continue;
-                }
-                const auto & text = id_to_token[tid].text;
-                if (text == "<|tool_response>" || text == "<|plamo:eos|>") {
-                    has_normal_s_marker = true;
-                } else if (text == "</s>") {
-                    has_s = true;
-                    s_id = tid;
-                }
+            if (pre_type == LLAMA_VOCAB_PRE_TYPE_SOPRANO) {
+                special_eog_ids.insert(special_eos_id);
             }
 
-            if (has_normal_s_marker && has_s) {
-                special_eog_ids.erase(s_id);
+            // sanity checks
+            if (special_eos_id != LLAMA_TOKEN_NULL && special_eog_ids.count(special_eos_id) == 0) {
+                special_eog_ids.insert(special_eos_id);
+                LLAMA_LOG_WARN("%s: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect\n", __func__);
+            }
 
-                auto & attr = id_to_token[s_id].attr;
-                attr = LLAMA_TOKEN_ATTR_NORMAL;
+            if (special_eot_id != LLAMA_TOKEN_NULL && special_eog_ids.count(special_eot_id) == 0) {
+                special_eog_ids.insert(special_eot_id);
+                LLAMA_LOG_WARN("%s: special_eot_id is not in special_eog_ids - the tokenizer config may be incorrect\n", __func__);
+            }
 
-                LLAMA_LOG_WARN("%s: '</s>' is a normal token here, removing it from EOG list\n", __func__);
+            if (special_eom_id != LLAMA_TOKEN_NULL && special_eog_ids.count(special_eom_id) == 0) {
+                special_eog_ids.insert(special_eom_id);
+                LLAMA_LOG_WARN("%s: special_eom_id is not in special_eog_ids - the tokenizer config may be incorrect\n", __func__);
+            }
+
+            // TODO: workaround for o200k_harmony and solar-open tokenizer: the "<|end|>" token should not be EOG
+            //       we don't have a good way to detect this, so for now, if we have "<|return|>" and "<|call|>" tokens ("<|calls|>" and "<|flush|>" for solar-open),
+            //       we remove the "<|end|>" token from the EOG list
+            {
+                bool has_return = false;
+                bool has_call   = false;
+                bool has_end    = false;
+                bool has_flush  = false;
+
+                llama_token end_id = LLAMA_TOKEN_NULL;
+
+                LLAMA_LOG_INFO("%s: printing all EOG tokens:\n", __func__);
+                for (auto tid : special_eog_ids) {
+                    if (tid < 0 || tid >= (llama_token) id_to_token.size()) {
+                        LLAMA_LOG_WARN("%s: EOG token id %d is out of range (vocab size %zu), skipping\n",
+                                __func__, tid, id_to_token.size());
+                        continue;
+                    }
+                    auto & text = id_to_token[tid].text;
+
+                    LLAMA_LOG_INFO("%s:   - %d ('%s')\n", __func__, tid, text.c_str());
+
+                    if (text == "<|return|>") {
+                        has_return = true;
+                    } else if (text == "<|call|>" || text == "<|calls|>") {
+                        has_call = true;
+                    } else if (text == "<|flush|>") {
+                        has_flush = true;
+                    } else if (text == "<|end|>") {
+                        has_end = true;
+                        end_id = tid;
+                    }
+                }
+
+                if ((has_return && has_call && has_end) || (has_call && has_flush && has_end)) {
+                    special_eog_ids.erase(end_id);
+
+                    auto & attr = id_to_token[end_id].attr;
+                    attr = LLAMA_TOKEN_ATTR_USER_DEFINED;
+
+                    LLAMA_LOG_WARN("%s: special_eog_ids contains both '<|return|>' and '<|call|>', or '<|calls|>' and '<|flush|>' tokens, removing '<|end|>' token from EOG list\n", __func__);
+                }
+            }
+
+            // gemma4, plamo and beam have a normal </s> token, unlike paddleocr
+            {
+                // beam's tool call marker is not an EOG token, so it is looked up in the whole vocab
+                bool has_normal_s_marker = token_to_id.count("<rfl:parameter name=\"") > 0;
+                bool has_s = false;
+
+                llama_token s_id = LLAMA_TOKEN_NULL;
+
+                for (auto tid : special_eog_ids) {
+                    if (tid < 0 || tid >= (llama_token) id_to_token.size()) {
+                        continue;
+                    }
+                    const auto & text = id_to_token[tid].text;
+                    if (text == "<|tool_response>" || text == "<|plamo:eos|>") {
+                        has_normal_s_marker = true;
+                    } else if (text == "</s>") {
+                        has_s = true;
+                        s_id = tid;
+                    }
+                }
+
+                if (has_normal_s_marker && has_s) {
+                    special_eog_ids.erase(s_id);
+
+                    auto & attr = id_to_token[s_id].attr;
+                    attr = LLAMA_TOKEN_ATTR_NORMAL;
+
+                    LLAMA_LOG_WARN("%s: '</s>' is a normal token here, removing it from EOG list\n", __func__);
+                }
             }
         }
     }
@@ -4589,6 +4625,10 @@ bool llama_vocab::get_treat_whitespace_as_suffix() const {
 
 const llama_vocab::normalizer_options & llama_vocab::get_normalizer_opts() const {
     return pimpl->normalizer_opts;
+}
+
+const std::set<llama_token> & llama_vocab::get_eog_tokens() const {
+    return pimpl->special_eog_ids;
 }
 
 const std::vector<llama_token> & llama_vocab::get_suppress_tokens() const {

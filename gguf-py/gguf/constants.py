@@ -377,6 +377,7 @@ class Keys:
         MERGES               = "tokenizer.ggml.merges"
         BOS_ID               = "tokenizer.ggml.bos_token_id"
         EOS_ID               = "tokenizer.ggml.eos_token_id"
+        EOG_IDS              = "tokenizer.ggml.eog_token_ids"
         EOT_ID               = "tokenizer.ggml.eot_token_id"
         EOM_ID               = "tokenizer.ggml.eom_token_id"
         UNK_ID               = "tokenizer.ggml.unknown_token_id"

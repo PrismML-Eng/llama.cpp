@@ -3,6 +3,7 @@ import numpy as np
 import pytest
 
 from gguf.gguf_reader import GGUFReader
+from gguf.constants import GGUFValueType
 
 
 def _write_gguf(path, n_dims_field, dims):
@@ -35,3 +36,27 @@ def test_dims_product_no_uint64_wraparound(tmp_path):
     _write_gguf(p, len(dims), dims)
     with pytest.raises(ValueError):
         GGUFReader(p)
+
+
+def _write_empty_array(path, element_type):
+    key = b'tokenizer.ggml.eog_token_ids'
+    data = b'GGUF' + struct.pack('<IQQ', 3, 0, 1)
+    data += struct.pack('<Q', len(key)) + key
+    data += struct.pack('<IIQ', GGUFValueType.ARRAY, element_type, 0)
+    data += b'\x00' * (-len(data) % 32)
+    path.write_bytes(data)
+
+
+def test_empty_integer_array_retains_element_type(tmp_path):
+    path = tmp_path / 'empty_eog.gguf'
+    _write_empty_array(path, GGUFValueType.UINT32)
+    field = GGUFReader(path).fields['tokenizer.ggml.eog_token_ids']
+    assert field.types == [GGUFValueType.ARRAY, GGUFValueType.UINT32]
+    assert field.contents() == []
+
+
+def test_empty_array_rejects_unknown_element_type(tmp_path):
+    path = tmp_path / 'invalid_empty_array.gguf'
+    _write_empty_array(path, 99)
+    with pytest.raises(ValueError):
+        GGUFReader(path)

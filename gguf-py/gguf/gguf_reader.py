@@ -258,6 +258,8 @@ class GGUFReader:
             offs += int(alen.nbytes)
             aparts: list[npt.NDArray[Any]] = [raw_itype, alen]
             data_idxs: list[int] = []
+            if alen[0] == 0:
+                types.append(GGUFValueType(raw_itype[0]))
             # FIXME: Handle multi-dimensional arrays properly instead of flattening
             for idx in range(alen[0]):
                 curr_size, curr_parts, curr_idxs, curr_types = self._get_field_parts(offs, raw_itype[0])

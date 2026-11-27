@@ -1339,6 +1339,14 @@ class GGUFWriter:
     def add_eos_token_id(self, id: int) -> None:
         self.add_uint32(Keys.Tokenizer.EOS_ID, id)
 
+    def add_eog_token_ids(self, ids: Sequence[int]) -> None:
+        """Set the complete EOG set; an empty array explicitly disables natural stops.
+
+        This policy is independent of token types and replaces legacy text-based
+        EOG inference. Omitting the key retains that inference.
+        """
+        self.add_key_value(Keys.Tokenizer.EOG_IDS, ids, GGUFValueType.ARRAY, GGUFValueType.UINT32)
+
     def add_unk_token_id(self, id: int) -> None:
         self.add_uint32(Keys.Tokenizer.UNK_ID, id)
 
@@ -1818,8 +1826,8 @@ class GGUFWriter:
             if not isinstance(val, Sequence):
                 raise ValueError("Invalid GGUF metadata array, expecting sequence")
 
-            if len(val) == 0:
-                raise ValueError("Invalid GGUF metadata array. Empty array")
+            if len(val) == 0 and sub_type is None:
+                raise ValueError("Invalid GGUF metadata array. Empty array requires an explicit type")
 
             if sub_type is not None:
                 ltype = sub_type
