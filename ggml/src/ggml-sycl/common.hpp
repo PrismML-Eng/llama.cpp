@@ -317,7 +317,7 @@ inline dpct::err0 ggml_sycl_set_device(const int device) try {
 //////////////////////
 struct optimize_feature {
     bool reorder=false;
-    bool xmx_pq2=false; // PQ2_0 rewritten into the XMX layout (pq2_xmx.hpp); only that path can read it
+    bool xmx_pq2=false; // PQ2_0/PTQ1_0 rewritten into the XMX layout (pq2_xmx.hpp); only that path can read it
     bool t2=false;  // ARC-LAB: PTQ1_0 repacked to the TernSYCL 2-bit layout (ptq1-t2.cpp)
     bool onednn_optimized_gemm=false;
 };
@@ -557,12 +557,17 @@ struct ggml_backend_sycl_context {
 
     std::unique_ptr<ggml_sycl_pool> host_pools[GGML_SYCL_MAX_DEVICES];
 
+    // XMX activations shared across mat-muls are freed out of order, which the VMM pool does not allow
+    std::unique_ptr<ggml_sycl_pool> xmx_act_pools[GGML_SYCL_MAX_DEVICES];
+
     std::vector<mmid_row_mapping> mmid_row_mapping_host;
     std::vector<ggml_sycl_gg_tile> mmid_tile_schedule_host;
 
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_device(queue_ptr qptr, int device);
 
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_host(queue_ptr qptr, int device);
+
+    static std::unique_ptr<ggml_sycl_pool> new_unordered_pool_for_device(queue_ptr qptr, int device);
 
     ggml_sycl_pool & pool(int device) {
         if (pools[device] == nullptr) {
@@ -573,6 +578,13 @@ struct ggml_backend_sycl_context {
 
     ggml_sycl_pool & pool() {
         return pool(device);
+    }
+
+    ggml_sycl_pool & xmx_act_pool() {
+        if (xmx_act_pools[device] == nullptr) {
+            xmx_act_pools[device] = new_unordered_pool_for_device(stream(device, 0), device);
+        }
+        return *xmx_act_pools[device];
     }
 
 #ifdef GGML_SYCL_GRAPH
