@@ -1334,9 +1334,9 @@ struct tinygemm_kernel_avx<float, ggml_fp16_t, float, BLOCK_M, BLOCK_N, BLOCK_K>
 
 #define LAUNCH_TINYGEMM_KERNEL_AVX(MB_SIZE, NB_SIZE)                                \
     tinygemm_kernel_avx<float, type, float, MB_SIZE, NB_SIZE, blck_size>::apply(    \
-        K, (const float *)src1->data + src1_offset + mb_start * K,                  \
-        (const type *)src0->data + src0_offset + nb_start * K,                      \
-        (float *)dst->data + dst_offset + mb_start * ldc + nb_start, ldc)
+        K, (const float *)((const char *)src1->data + src1_offset) + mb_start * K,  \
+        (const type *)((const char *)src0->data + src0_offset) + nb_start * K,      \
+        (float *)((char *)dst->data + dst_offset) + mb_start * ldc + nb_start, ldc)
 
 
 // re-organize in the format {NB, KB, TILE_SIZE}:
@@ -1987,7 +1987,7 @@ struct tinygemm_kernel_vnni<block_q8_K, block_iq4_xs, float, BLOCK_M, BLOCK_N, B
     tinygemm_kernel_vnni<vec_dot_type, type, float, 1, NB_SIZE, blck_size>::apply(             \
         KB, wdata_batch,                                                                       \
         (const char *)src0->data + src0_offset + PACKED_INDEX(nb * kTilesN, 0, KB, TILE_SIZE), \
-        (float *) dst->data + dst_offset + nb_start, ldc)
+        (float *) ((char *) dst->data + dst_offset) + nb_start, ldc)
 
 template <typename TA, typename TB, typename TC, int BLOCK_K,
           typename std::enable_if<!is_type_qkk<TB>::value, int>::type = 0>
@@ -2502,7 +2502,7 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
                     mb_size, nb_size, KB,
                     wdata_batch + mb_start * row_size_A,
                     (const char *)src0->data + src0_offset + PACKED_INDEX(nb * 2, 0, KB, TILE_SIZE),
-                    (float *) dst->data + dst_offset + mb_start * N + nb_start, ldc);
+                    (float *) ((char *) dst->data + dst_offset) + mb_start * N + nb_start, ldc);
             }
         });
     });

@@ -142,7 +142,8 @@ static size_t ggml_backend_amx_buffer_type_get_alignment(ggml_backend_buffer_typ
 
 namespace ggml::cpu::amx {
 class extra_buffer_type : ggml::cpu::extra_buffer_type {
-    bool supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) override {
+    // the shapes the AMX / AVX-512 kernels in mmq.cpp handle
+    static bool kernel_supports(const struct ggml_tensor * op) {
         if (op->op != GGML_OP_MUL_MAT) {
             return false;
         }
@@ -189,9 +190,24 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
         return true;
     }
 
+    bool supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) override {
+        if (kernel_supports(op)) {
+            return true;
+        }
+        // F16 weights are stored unconverted (set_tensor only repacks qtype_has_amx_kernels types),
+        // so the regular CPU matmul can take shapes the kernels do not, e.g. a permuted src1 with more
+        // than one token. Without this nothing accepts the node and the scheduler aborts.
+        const struct ggml_tensor * src0 = op->src[0];
+        const struct ggml_tensor * src1 = op->src[1];
+        return op->op == GGML_OP_MUL_MAT && src0->buffer && src0->buffer->buft == ggml_backend_amx_buffer_type() &&
+               src0->type == GGML_TYPE_F16 && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) &&
+               (!src1->buffer || ggml_backend_buft_is_host(src1->buffer->buft));
+    }
+
     ggml::cpu::tensor_traits * get_tensor_traits(const struct ggml_tensor * op) override {
+        // only claim the shapes the kernels handle; anything else falls through to the CPU path
         if (op->op == GGML_OP_MUL_MAT && op->src[0]->buffer &&
-            op->src[0]->buffer->buft == ggml_backend_amx_buffer_type()) {
+            op->src[0]->buffer->buft == ggml_backend_amx_buffer_type() && kernel_supports(op)) {
             return (ggml::cpu::tensor_traits *) op->src[0]->extra;
         }
 
