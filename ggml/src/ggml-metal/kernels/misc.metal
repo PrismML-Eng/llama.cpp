@@ -938,3 +938,107 @@ kernel void kernel_dsv4_hc_post_f32(
         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
     }
 }
+
+// ADD + RMS_NORM + MUL + sign MUL + FWHT (1024 blocks) on one row, one threadgroup. Same order of operations as the unfused kernels.
+// All reads of a and b come before the first barrier and dst_rot is written last, so outputs may alias dead inputs.
+template<int NBLK>
+kernel void kernel_add_rms_norm_fwht_1024(
+        constant ggml_metal_kargs_add_norm_fwht & args,
+        device const float4 * a,
+        device const float4 * b,
+        device const float4 * w,
+        device const float  * signs,
+        device       float4 * dst_sum,
+        device       float4 * dst_norm,
+        device       float  * dst_rot,
+        threadgroup  float  * shmem [[threadgroup(0)]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+    constexpr int NT  = 1024;
+    constexpr int NW  = N_SIMDWIDTH;
+    constexpr int MX4 = 2; // float4s per thread: rows up to 8192
+
+    threadgroup float * shred = shmem;      // 32 partial sums
+    threadgroup float * shrow = shmem + 32; // the row, then the butterfly exchanges
+
+    if (sgitg == 0) {
+        shred[tiisg] = 0.0f;
+    }
+
+    float4 x[MX4];
+    float sumf = 0.0f;
+    for (int k = 0; k < MX4; ++k) {
+        const int i4 = tid + k*NT;
+        if (i4 < args.n4) {
+            x[k] = a[i4] + b[i4];
+            sumf += dot(x[k], x[k]);
+        }
+    }
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shred[sgitg] = sumf;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = shred[tiisg];
+    sumf = simd_sum(sumf);
+
+    const float mean  = sumf/args.n;
+    const float scale = 1.0f/sqrt(mean + args.eps);
+
+    for (int k = 0; k < MX4; ++k) {
+        const int i4 = tid + k*NT;
+        if (i4 < args.n4) {
+            const float4 y = (x[k]*scale)*w[i4];
+            dst_sum[i4]  = x[k];
+            dst_norm[i4] = y;
+            ((threadgroup float4 *) shrow)[i4] = y;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+    const float hscale = 1.0f / sqrt((float) NT);
+
+    // NBLK is a template parameter: with a runtime bound reg[] spills to memory
+    float reg[NBLK];
+    FOR_UNROLL (int j = 0; j < NBLK; ++j) {
+        reg[j] = shrow[j*NT + tid]*signs[j*NT + tid]*hscale;
+    }
+
+    for (int i = 1; i < NW; i *= 2) {
+        FOR_UNROLL (int j = 0; j < NBLK; ++j) {
+            const float val  = reg[j];
+            const float val2 = simd_shuffle_xor(val, i);
+            reg[j] = (tid & i) == 0 ? val2 + val : val2 - val;
+        }
+    }
+
+    for (int i = NW; i < NT; i *= 2) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        FOR_UNROLL (int j = 0; j < NBLK; ++j) {
+            shrow[j*NT + tid] = reg[j];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        FOR_UNROLL (int j = 0; j < NBLK; ++j) {
+            const float val  = reg[j];
+            const float val2 = shrow[j*NT + (tid ^ i)];
+            reg[j] = (tid & i) == 0 ? val2 + val : val2 - val;
+        }
+    }
+
+    FOR_UNROLL (int j = 0; j < NBLK; ++j) {
+        dst_rot[j*NT + tid] = reg[j];
+    }
+}
+
+typedef decltype(kernel_add_rms_norm_fwht_1024<5>) kernel_add_rms_norm_fwht_t;
+template [[host_name("kernel_add_rms_norm_fwht_1024_b4")]] kernel kernel_add_rms_norm_fwht_t kernel_add_rms_norm_fwht_1024<4>;
+template [[host_name("kernel_add_rms_norm_fwht_1024_b5")]] kernel kernel_add_rms_norm_fwht_t kernel_add_rms_norm_fwht_1024<5>;
+template [[host_name("kernel_add_rms_norm_fwht_1024_b6")]] kernel kernel_add_rms_norm_fwht_t kernel_add_rms_norm_fwht_1024<6>;
+template [[host_name("kernel_add_rms_norm_fwht_1024_b8")]] kernel kernel_add_rms_norm_fwht_t kernel_add_rms_norm_fwht_1024<8>;
