@@ -1753,6 +1753,27 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     return res;
 }
 
+// Publisher Scion correction graph: sky-is-green/prism-ml-llama.cpp, 3a25590406e8.
+ggml_tensor * llm_graph_context::build_lora_branch(const ggml_tensor * anchor, ggml_tensor * cur) const {
+    ggml_tensor * result = nullptr;
+    for (const auto & lora : *loras) {
+        const auto * lw = lora.first->get_weight_for_anchor(anchor);
+        if (!lw) {
+            continue;
+        }
+        const float scale = lw->get_scale(lora.first->alpha, lora.second);
+        if (scale == 0.0f) {
+            continue;
+        }
+        ggml_tensor * delta = ggml_mul_mat(ctx0, lw->b, ggml_mul_mat(ctx0, lw->a, cur));
+        if (scale != 1.0f) {
+            delta = ggml_scale(ctx0, delta, scale);
+        }
+        result = result ? ggml_add(ctx0, result, delta) : delta;
+    }
+    return result;
+}
+
 llm_graph_amax_src1 llm_graph_context::build_amax_src1_f16(
           ggml_tensor * cur) const {
     llm_graph_amax_src1 result = {

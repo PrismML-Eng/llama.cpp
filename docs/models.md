@@ -24,3 +24,11 @@ The Hugging Face platform provides a variety of online tools for converting, qua
 - Use the [GGUF-my-LoRA space](https://huggingface.co/spaces/ggml-org/gguf-my-lora) to convert LoRA adapters to GGUF format (more info: https://github.com/ggml-org/llama.cpp/discussions/10123)
 - Use the [GGUF-editor space](https://huggingface.co/spaces/CISCai/gguf-editor) to edit GGUF meta data in the browser (more info: https://github.com/ggml-org/llama.cpp/discussions/9268)
 - Use the [Inference Endpoints](https://ui.endpoints.huggingface.co/) to directly host `llama.cpp` in the cloud (more info: https://github.com/ggml-org/llama.cpp/discussions/9669)
+
+## Embedded Qwen35MoE corrections
+
+A GGUF model containing `.lora_a`/`.lora_b` correction tensors must declare `adapter.embedded = true`, `adapter.type = "lora"`, and compatible adapter metadata. The loader validates factor pairs and loads them as model-owned weights. These corrections are always active at scale 1 in every context; clearing or scaling external adapters does not remove them. Conditional aLoRA invocation sequences are not supported for embedded corrections.
+
+For Qwen35MoE, `blk.N.ffn_moe_out.weight.lora_a` and `.lora_b` describe a virtual output branch, not a stored base matrix. It computes `B(Ah)` from the normalized FFN input and adds the result after routed and gated shared experts. Ordinary router adapters still apply before softmax/top-k. Other architectures reject this virtual target. Model saving retains the trained factors and typed `adapter.*` metadata; `no_alloc` memory accounting includes the correction buffers.
+
+`test-embedded-lora` uses a tiny synthetic model to check router selection, normalized-input branch arithmetic, multiple contexts, external-adapter coexistence, save/load, and malformed factors. It requires internal C++ symbols and is therefore registered only for non-Windows or static-library builds.

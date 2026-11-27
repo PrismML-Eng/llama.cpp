@@ -298,6 +298,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
 
     llama_build_and_test(test-kv-mean-center.cpp LABEL behavior)
+    llama_build_and_test(test-embedded-lora.cpp LABEL behavior)
     llama_build(test-fusion.cpp)
 endif()
 

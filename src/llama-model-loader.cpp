@@ -1,4 +1,5 @@
 #include "llama-model-loader.h"
+#include "llama-adapter.h"
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -729,6 +730,23 @@ llama_model_loader::llama_model_loader(
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
 
+    // Embedded factors are loaded by the adapter, never instantiated as base weights.
+    if (files.empty()) {
+        for (int64_t i = 0; i < gguf_get_n_tensors(metadata); ++i) {
+            n_embedded_tensors += llama_adapter_lora_is_tensor(gguf_get_tensor_name(metadata, i));
+        }
+    } else {
+        for (const auto & it : weights_map) {
+            n_embedded_tensors += llama_adapter_lora_is_tensor(it.first.c_str());
+        }
+        n_tensors -= n_embedded_tensors;
+    }
+    bool embedded = false;
+    get_key("adapter.embedded", embedded, false);
+    if (embedded != (n_embedded_tensors != 0)) {
+        throw std::runtime_error("adapter.embedded must be true exactly when embedded LoRA tensors are present");
+    }
+
     fver = (enum llama_fver) gguf_get_version(metadata);
 
     LLAMA_LOG_INFO("%s: loaded meta data with %d key-value pairs and %d tensors from %s (version %s)\n",
@@ -743,6 +761,9 @@ llama_model_loader::llama_model_loader(
         enum ggml_type type_max = GGML_TYPE_F32;
 
         for (const auto & it : weights_map) {
+            if (llama_adapter_lora_is_tensor(it.first.c_str())) {
+                continue;
+            }
             const llama_tensor_weight & w = it.second;
             const ggml_tensor * tensor = w.tensor;
 
@@ -1467,6 +1488,9 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
     // compute the total size of all tensors for progress reporting
     for (const auto & it : weights_map) {
+        if (llama_adapter_lora_is_tensor(it.first.c_str())) {
+            continue;
+        }
         size_data += ggml_nbytes(it.second.tensor);
     }
 }

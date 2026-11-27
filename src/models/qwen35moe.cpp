@@ -492,6 +492,8 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
+    // Both the routed/shared experts and the trained output branch read normalized h.
+    ggml_tensor * ffn_inp = cur;
 
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
@@ -540,6 +542,14 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
         cb(cur, "ffn_out", il);
     } else {
         cur = moe_out;
+    }
+
+    if (!loras->empty()) {
+        if (ggml_tensor * delta = build_lora_branch(model.layers[il].ffn_gate_inp, ffn_inp)) {
+            cb(delta, "ffn_moe_corr", il);
+            cur = ggml_add(ctx0, cur, delta);
+            cb(cur, "ffn_out_corrected", il);
+        }
     }
 
     return cur;
@@ -672,6 +682,7 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     ggml_tensor * ffn_residual = cur;
     cur = build_norm(cur, layer.attn_post_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_post_norm", il);
+    ggml_tensor * ffn_inp = cur;
 
     // MoE FFN — routed experts plus gated shared expert (mirrors qwen35moe).
     ggml_tensor * moe_out =
@@ -711,6 +722,12 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
     } else {
         cur = moe_out;
+    }
+    if (!loras->empty()) {
+        if (ggml_tensor * delta = build_lora_branch(layer.ffn_gate_inp, ffn_inp)) {
+            cb(delta, "mtp_ffn_moe_corr", il);
+            cur = ggml_add(ctx0, cur, delta);
+        }
     }
     cb(cur, "mtp_ffn_out", il);
 
