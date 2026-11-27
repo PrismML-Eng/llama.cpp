@@ -3901,13 +3901,33 @@ static bool ggml_cuda_try_gdn_gather_skip(ggml_backend_cuda_context & ctx, const
             // ggml-alloc sees the GET_ROWS as the last reader of ids, so a later node can reuse ids memory before the GDN kernel reads it
             const char * ids_beg = (const char *) ids->data;
             const char * ids_end = ids_beg + ggml_nbytes(ids);
+
+            // the same hazard applies to the gathered-from state cache: skipping the GET_ROWS removes its
+            // only visible reader too, so a later node may reuse the cache's memory while the GDN kernel
+            // still reads it through gather.base. that is what happens when the state cache is a copy in
+            // a reusable compute buffer (e.g. the host copy made by the scheduler with --no-kv-offload).
+            const char * cache_beg = (const char *) cache->data;
+            const char * cache_end = cache_beg + ggml_nbytes(cache);
+
             for (int k = node_idx + 1; k <= j; ++k) {
                 const ggml_tensor * t = cgraph->nodes[k];
                 const char *        b = (const char *) t->data;
-                if (b != nullptr && b < ids_end && ids_beg < b + ggml_nbytes(t)) {
+                if (b == nullptr) {
+                    continue;
+                }
+                if (b < ids_end && ids_beg < b + ggml_nbytes(t)) {
+                    return false;
+                }
+                if (b < cache_end && cache_beg < b + ggml_nbytes(t)) {
                     return false;
                 }
             }
+
+            // a cache living in a reusable compute buffer can be overwritten by any later node
+            if (cache->buffer && ggml_backend_buffer_get_usage(cache->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+                return false;
+            }
+
             // on a concurrent stream, other nodes can run at the same time as the GDN op
             for (const auto & [fork_node, event] : ctx.stream_context().concurrent_events) {
                 if (event.stream_mapping.find(n) != event.stream_mapping.end()) {
