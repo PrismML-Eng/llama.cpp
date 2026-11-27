@@ -86,6 +86,7 @@
 #include <cfloat>
 #include <initializer_list>
 #include <limits>
+#include <list>
 #include <map>
 #include <functional>
 #include <memory>
@@ -94,6 +95,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <tuple>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -928,6 +930,7 @@ struct ggml_backend_cuda_buffer_type_context {
     // same virtual range. vram_frac >= 1 is an ordinary device buffer.
     double vram_frac = 1.0;
     int    n_parts   = 1;
+    std::string group; // tiered buffers of the same device and group share their staging buffers
 };
 
 static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_type_t buft, size_t size);
@@ -940,6 +943,11 @@ static const char * ggml_backend_cuda_buffer_type_get_name(ggml_backend_buffer_t
 
 static bool ggml_backend_buft_is_cuda(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_buffer_type_get_name;
+}
+
+// plain or tiered buffer type of this device
+static bool ggml_backend_buft_is_cuda_device(ggml_backend_buffer_type_t buft, int device) {
+    return ggml_backend_buft_is_cuda(buft) && ((ggml_backend_cuda_buffer_type_context *) buft->context)->device == device;
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -1034,69 +1042,83 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
 // read over PCIe only once a sequence is that deep. Nothing in the attention kernels changes.
 //
 // Staging: each tiered buffer also gets a second virtual range that maps the same VRAM head pages and, in
-// place of each host run, a VRAM staging buffer shared by all tiered buffers (one per part: K, V). An
+// place of each host run, a VRAM staging buffer (one per part: K, V). An
 // attention op whose K/V range reaches the host tail copies the used host rows into staging with the copy
 // engine and reads the all-VRAM alias (ggml_cuda_tier_stage). GGML_CUDA_KV_TIER_STAGING=0 disables it.
+// The tiered buffers of one device and group (one KV cache) share the staging buffers: their ops must run one at a time, on one stream.
 #if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 struct ggml_cuda_tier_entry {
+    int         device;
     CUdeviceptr va, va2;
     size_t      total;
     std::vector<std::pair<size_t, size_t>> host_runs; // (offset, length) of the host-backed runs
 };
-static std::mutex                        g_tier_mutex;
-static std::vector<ggml_cuda_tier_entry> g_tier_entries;
+static std::mutex                      g_tier_mutex;
+static std::list<ggml_cuda_tier_entry> g_tier_entries; // a list: ggml_cuda_tier_stage uses an entry while other threads add buffers
 
-static void ggml_cuda_tier_register(CUdeviceptr va, CUdeviceptr va2, size_t total, const std::vector<std::pair<size_t, size_t>> & host_runs) {
+static void ggml_cuda_tier_register(int device, CUdeviceptr va, CUdeviceptr va2, size_t total, const std::vector<std::pair<size_t, size_t>> & host_runs) {
     std::lock_guard<std::mutex> lock(g_tier_mutex);
-    g_tier_entries.push_back({ va, va2, total, host_runs });
+    g_tier_entries.push_back({ device, va, va2, total, host_runs });
 }
 
 static void ggml_cuda_tier_unregister(CUdeviceptr va) {
     std::lock_guard<std::mutex> lock(g_tier_mutex);
-    for (size_t i = 0; i < g_tier_entries.size(); ++i) {
-        if (g_tier_entries[i].va == va) {
-            g_tier_entries.erase(g_tier_entries.begin() + i);
-            return;
-        }
-    }
+    g_tier_entries.remove_if([va](const ggml_cuda_tier_entry & e) { return e.va == va; });
 }
 
-// VRAM staging buffers shared by every tiered buffer: slot i backs the i-th host run (K tail, V tail).
-// Created at the first request and kept for the life of the process; a later, longer run gets no alias.
-static bool ggml_cuda_tier_staging_handle(int physical, int slot, size_t len, CUmemGenericAllocationHandle * out) {
-    static std::mutex m;
-    static std::map<int, std::pair<CUmemGenericAllocationHandle, size_t>> handles;
-    std::lock_guard<std::mutex> lock(m);
-    auto it = handles.find(slot);
-    if (it == handles.end()) {
+// VRAM staging buffers, one per (device, group, host run): run 0 is the K tail, run 1 is the V tail.
+// Each tiered buffer that maps one holds a reference. The last release frees the VRAM.
+struct ggml_cuda_tier_staging {
+    CUmemGenericAllocationHandle h;
+    size_t len;
+    int    n_ref;
+};
+static std::map<std::tuple<int, std::string, int>, ggml_cuda_tier_staging> g_tier_staging;
+
+static bool ggml_cuda_tier_staging_acquire(int device, const std::string & group, int slot, size_t len, CUmemGenericAllocationHandle * out) {
+    std::lock_guard<std::mutex> lock(g_tier_mutex);
+    const auto key = std::make_tuple(device, group, slot);
+    auto it = g_tier_staging.find(key);
+    if (it == g_tier_staging.end()) {
         CUmemAllocationProp pd = {};
         pd.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
         pd.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        pd.location.id   = physical;
+        pd.location.id   = ggml_cuda_get_physical_device(device);
         CUmemGenericAllocationHandle h;
         if (cuMemCreate(&h, len, &pd, 0) != CUDA_SUCCESS) {
             return false;
         }
-        GGML_LOG_INFO("%s: staging buffer %d: %.2f MiB VRAM\n", __func__, slot, len/1048576.0);
-        it = handles.emplace(slot, std::make_pair(h, len)).first;
+        GGML_LOG_INFO("%s: device %d, %s: staging buffer %d: %.2f MiB VRAM\n", __func__, device, group.c_str(), slot, len/1048576.0);
+        it = g_tier_staging.emplace(key, ggml_cuda_tier_staging{ h, len, 0 }).first;
     }
-    if (it->second.second < len) {
+    // a run longer than the staging buffer gets no alias
+    if (it->second.len < len) {
         return false;
     }
-    *out = it->second.first;
+    it->second.n_ref++;
+    *out = it->second.h;
     return true;
+}
+
+static void ggml_cuda_tier_staging_release(int device, const std::string & group, int slot) {
+    std::lock_guard<std::mutex> lock(g_tier_mutex);
+    auto it = g_tier_staging.find(std::make_tuple(device, group, slot));
+    if (it != g_tier_staging.end() && --it->second.n_ref == 0) {
+        cuMemRelease(it->second.h);
+        g_tier_staging.erase(it);
+    }
 }
 
 // For a tensor range [ptr, ptr + nbytes) inside a tiered buffer with a staging alias: copy its host-backed
 // bytes into the staging buffers (stream-ordered) and return the same range in the alias, whose pages are
 // all VRAM. nullptr when ptr is not in such a buffer or no byte of the range is host-backed.
-void * ggml_cuda_tier_stage(const void * ptr, size_t nbytes, cudaStream_t stream) {
+void * ggml_cuda_tier_stage(int device, const void * ptr, size_t nbytes, cudaStream_t stream) {
     const CUdeviceptr p = (CUdeviceptr) ptr;
     const ggml_cuda_tier_entry * e = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_tier_mutex);
         for (auto & it : g_tier_entries) {
-            if (p >= it.va && p < it.va + it.total) {
+            if (it.device == device && p >= it.va && p < it.va + it.total) {
                 e = &it;
                 break;
             }
@@ -1153,6 +1175,8 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
     const size_t total = GGML_PAD(size, gran);
     const int    parts = std::max(1, bctx->n_parts);
     const size_t part  = size / parts;
+    // the caller puts one tensor of the same size in each part, with no bytes left over
+    GGML_ASSERT(size % parts == 0);
 
     // page p is VRAM when its start lies in the head of its part
     const size_t n_pages = total / gran;
@@ -1224,22 +1248,23 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
 
     // staging alias (see the comment above ggml_cuda_tier_entry)
     CUdeviceptr va2 = 0;
+    int n_staging = 0; // staging buffers that this buffer holds a reference to
     std::vector<std::pair<size_t, size_t>> host_runs;
     {
         static const bool staging = [] { const char * e = getenv("GGML_CUDA_KV_TIER_STAGING"); return !e || atoi(e) != 0; }();
         if (staging && cuMemAddressReserve(&va2, total, gran, 0, 0) == CUDA_SUCCESS) {
             bool ok = true;
-            int  ih = 0;
             std::vector<CUdeviceptr> mapped;
             for (auto & rr : runs) {
                 const size_t off = rr.ptr - va;
                 CUmemGenericAllocationHandle h = rr.h;
                 if (!in_vram[off / gran]) {
                     CUmemGenericAllocationHandle bh;
-                    if (!ggml_cuda_tier_staging_handle(physical, ih++, rr.len, &bh)) {
+                    if (!ggml_cuda_tier_staging_acquire(device, bctx->group, n_staging, rr.len, &bh)) {
                         ok = false;
                         break;
                     }
+                    n_staging++;
                     h = bh;
                     host_runs.push_back({ off, rr.len });
                 }
@@ -1257,15 +1282,18 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
                 cuMemAddressFree(va2, total);
                 va2 = 0;
                 host_runs.clear();
+                for (; n_staging > 0; --n_staging) {
+                    ggml_cuda_tier_staging_release(device, bctx->group, n_staging - 1);
+                }
                 GGML_LOG_WARN("%s: no staging alias for %s: its host tail is read over PCIe in place\n", __func__, bctx->name.c_str());
             } else {
-                ggml_cuda_tier_register(va, va2, total, host_runs);
+                ggml_cuda_tier_register(device, va, va2, total, host_runs);
             }
         }
     }
 
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(device, (void *) va);
-    ctx->release = [runs, va, va2, total, device]() {
+    ctx->release = [runs, va, va2, total, device, n_staging, group = bctx->group]() {
         ggml_cuda_set_device(device);
         cudaDeviceSynchronize();
         if (va2) {
@@ -1274,6 +1302,9 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
                 cuMemUnmap(va2 + (rr.ptr - va), rr.len);
             }
             cuMemAddressFree(va2, total);
+            for (int i = 0; i < n_staging; ++i) {
+                ggml_cuda_tier_staging_release(device, group, i);
+            }
         }
         for (auto & rr : runs) {
             cuMemUnmap(rr.ptr, rr.len);
@@ -1284,8 +1315,8 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }
 #else
-void * ggml_cuda_tier_stage(const void * ptr, size_t nbytes, cudaStream_t stream) {
-    GGML_UNUSED(ptr); GGML_UNUSED(nbytes); GGML_UNUSED(stream);
+void * ggml_cuda_tier_stage(int device, const void * ptr, size_t nbytes, cudaStream_t stream) {
+    GGML_UNUSED(device); GGML_UNUSED(ptr); GGML_UNUSED(nbytes); GGML_UNUSED(stream);
     return nullptr;
 }
 
@@ -1300,7 +1331,9 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
 // A device buffer type whose buffers keep vram_frac of each of n_parts equal parts in VRAM and the rest in
 // pinned host memory mapped into the same device range. `tag` makes the name unique so a caller can ask
 // for one buffer per tensor group. Returns nullptr when the device has no VMM.
-ggml_backend_buffer_type_t ggml_backend_cuda_tier_buffer_type(int device, double vram_frac, int n_parts, const char * tag) {
+// Buffers of types with the same device and `group` share their staging buffers.
+// Lifetime: a type is never freed (one small context for each new name). The staging buffers are freed with the last buffer of their group.
+ggml_backend_buffer_type_t ggml_backend_cuda_tier_buffer_type(int device, double vram_frac, int n_parts, const char * group, const char * tag) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     static std::map<std::string, ggml_backend_buffer_type *> cache;
@@ -1308,7 +1341,7 @@ ggml_backend_buffer_type_t ggml_backend_cuda_tier_buffer_type(int device, double
     if (device < 0 || device >= ggml_backend_cuda_get_device_count() || !ggml_cuda_info().devices[device].vmm) {
         return nullptr;
     }
-    const std::string name = std::string(GGML_CUDA_NAME) + std::to_string(device) + "_tier_" + (tag ? tag : "") +
+    const std::string name = std::string(GGML_CUDA_NAME) + std::to_string(device) + "_tier_" + (group ? group : "") + "_" + (tag ? tag : "") +
         "_" + std::to_string((int) (vram_frac * 1e6)) + "_" + std::to_string(n_parts);
     auto it = cache.find(name);
     if (it != cache.end()) {
@@ -1317,6 +1350,7 @@ ggml_backend_buffer_type_t ggml_backend_cuda_tier_buffer_type(int device, double
     auto * ctx = new ggml_backend_cuda_buffer_type_context{device, name};
     ctx->vram_frac = std::max(0.0, std::min(1.0, vram_frac));
     ctx->n_parts   = std::max(1, n_parts);
+    ctx->group     = group ? group : "";
     auto * buft = new ggml_backend_buffer_type{
         /* .iface    = */ ggml_backend_cuda_buffer_type_interface,
         /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
@@ -3088,7 +3122,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(ggml_backend_buft_is_cuda(buf->buft) && ((ggml_backend_cuda_buffer_type_context *) buf->buft->context)->device == cuda_ctx->device && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_buft_is_cuda_device(buf->buft, cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -3097,7 +3131,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(ggml_backend_buft_is_cuda(buf->buft) && ((ggml_backend_cuda_buffer_type_context *) buf->buft->context)->device == cuda_ctx->device && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_buft_is_cuda_device(buf->buft, cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
@@ -3107,7 +3141,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(ggml_backend_buft_is_cuda(buf->buft) && ((ggml_backend_cuda_buffer_type_context *) buf->buft->context)->device == cuda_ctx->device && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_buft_is_cuda_device(buf->buft, cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
@@ -3118,7 +3152,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(ggml_backend_buft_is_cuda(buf->buft) && ((ggml_backend_cuda_buffer_type_context *) buf->buft->context)->device == cuda_ctx->device && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_buft_is_cuda_device(buf->buft, cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
@@ -7359,12 +7393,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
                 // node's output on the host-visible buffer, which the compute path
                 // handles. Allow that here, mirroring the src-tensor check below.
-                assert(ggml_backend_buft_is_cuda(node->buffer->buft) ||
+                assert(ggml_backend_buft_is_cuda_device(node->buffer->buft, cuda_ctx->device) ||
                        (integrated && ggml_backend_buft_is_cuda_host(node->buffer->buft)));
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
-                        assert(ggml_backend_buft_is_cuda(node->src[j]->buffer->buft) ||
+                        assert(ggml_backend_buft_is_cuda_device(node->src[j]->buffer->buft, cuda_ctx->device) ||
                                (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
                     }
                 }

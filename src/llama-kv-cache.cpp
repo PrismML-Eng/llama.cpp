@@ -13,6 +13,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -166,13 +167,38 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
-    const uint32_t tier_cells = GGML_PAD(n_kv_vram_cells, n_pad);
-    // tier buffer type -> the plain device buffer type, used when the tiered allocation fails
-    std::map<ggml_backend_buffer_type_t, ggml_backend_buffer_type_t> tier_fallback;
-    if (tier_cells > 0 && tier_cells < kv_size) {
-        LLAMA_LOG_INFO("%s: tiered KV: cells [0, %u) in VRAM, [%u, %u) in host memory\n",
-                __func__, tier_cells, tier_cells, kv_size);
+    // tiered KV (n_kv_vram_cells): tier_off is the reason when a layer does not use it
+    tier_cells = n_kv_vram_cells < kv_size ? GGML_PAD(n_kv_vram_cells, n_pad) : kv_size;
+    const char * tier_off = nullptr;
+    uint32_t n_tier_layers = 0;
+    uint32_t n_own_layers  = 0;
+    if (n_kv_vram_cells == 0) {
+        tier_off = "n_kv_vram_cells is 0"; // not logged
+    } else if (tier_cells >= kv_size) {
+        tier_off = "the VRAM cells cover the whole cache";
+    } else if (!offload) {
+        tier_off = "the KV cache is not offloaded";
+    } else if (v_trans) {
+        tier_off = "it needs flash attention (-fa on)";
+    } else if (n_stream > 1) {
+        tier_off = "it needs a unified KV cache (--kv-unified) or one sequence";
+    } else if (is_mla) {
+        tier_off = "MLA caches are not supported";
+    } else if (type_k != type_v) {
+        tier_off = "the K and V cache types are different";
+    } else {
+        // the staging buffers are for one device with one stream
+        std::set<ggml_backend_dev_t> devs;
+        for (uint32_t il = 0; il < n_layer; il++) {
+            if (hparams.has_kv(il) && (!filter || filter(il)) && ggml_backend_dev_type(model.dev_layer(il)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                devs.insert(model.dev_layer(il));
+            }
+        }
+        if (devs.size() > 1) {
+            tier_off = "the layers are on more than one device";
+        }
     }
+    const bool tier_on = tier_off == nullptr;
 
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
@@ -236,9 +262,8 @@ llama_kv_cache::llama_kv_cache(
             // window can exceed VRAM and the extra positions cost PCIe reads only once a sequence reaches
             // them. Kernels are unchanged and results are identical to an all-VRAM cache. Backends without
             // ggml_backend_cuda_tier_buffer_type (or without VMM) keep the ordinary device buffer.
-            if (tier_cells > 0 && tier_cells < kv_size && n_stream == 1 && !is_mla &&
-                    n_embd_k_gqa == n_embd_v_gqa && type_k == type_v) {
-                using tier_fn_t = ggml_backend_buffer_type_t (*)(int, double, int, const char *);
+            if (tier_on) {
+                using tier_fn_t = ggml_backend_buffer_type_t (*)(int, double, int, const char *, const char *);
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
                 auto * fn = reg ? (tier_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_tier_buffer_type") : nullptr;
                 const char * dn = ggml_backend_dev_name(dev);
@@ -246,17 +271,25 @@ llama_kv_cache::llama_kv_cache(
                 if (dn && strncmp(dn, "CUDA", 4) == 0) {
                     dev_idx = atoi(dn + 4);
                 }
-                if (fn && dev_idx >= 0) {
-                    char tag[32];
-                    snprintf(tag, sizeof(tag), "kv%p_l%u", (void *) this, il);
-                    ggml_backend_buffer_type_t tb = fn(dev_idx, (double) tier_cells / (double) kv_size, 2, tag);
-                    if (tb) {
-                        tier_fallback[tb] = buft;
-                        buft = tb;
-                    }
+                ggml_backend_buffer_type_t tb = nullptr;
+                if (fn && dev_idx >= 0 && n_embd_k_gqa == n_embd_v_gqa) {
+                    // one staging group for each cache: two caches can run at the same time
+                    char group[32];
+                    char tag[16];
+                    snprintf(group, sizeof(group), "kv%p", (void *) this);
+                    snprintf(tag, sizeof(tag), "l%u", il);
+                    tb = fn(dev_idx, (double) tier_cells / (double) kv_size, 2, group, tag);
+                }
+                if (tb) {
+                    tier_bufts[tb] = buft;
+                    buft = tb;
+                    n_tier_layers++;
+                } else {
+                    tier_off = n_embd_k_gqa != n_embd_v_gqa ? "K and V have different sizes" : "the layer is not on a CUDA device with VMM";
                 }
             }
         }
+        n_own_layers++;
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 
@@ -321,10 +354,20 @@ llama_kv_cache::llama_kv_cache(
             }
         } else {
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
-            const auto it = tier_fallback.find(buft);
-            if (!buf && it != tier_fallback.end()) {
-                LLAMA_LOG_WARN("%s: the tiered KV buffer could not be allocated, using the plain device buffer (the whole cache in VRAM)\n", __func__);
+            const auto it = tier_bufts.find(buft);
+            if (buf && it != tier_bufts.end()) {
+                // the tiered buffer has two equal parts: K must fill the first part and V the second part
+                ggml_tensor * k = ggml_get_first_tensor(ctx.get());
+                ggml_tensor * v = ggml_get_next_tensor(ctx.get(), k);
+                GGML_ASSERT(ggml_nbytes(k) == ggml_nbytes(v));
+                GGML_ASSERT((char *) k->data == (char *) ggml_backend_buffer_get_base(buf));
+                GGML_ASSERT((char *) v->data == (char *) k->data + ggml_backend_buffer_get_size(buf)/2);
+            }
+            if (!buf && it != tier_bufts.end()) {
+                // the whole layer goes in VRAM
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), it->second);
+                tier_off = "the tiered buffer could not be allocated";
+                n_tier_layers--;
             }
         }
         if (!buf) {
@@ -335,6 +378,19 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    if (n_kv_vram_cells > 0) {
+        if (n_tier_layers > 0) {
+            LLAMA_LOG_INFO("%s: tiered KV: cells [0, %u) in VRAM, [%u, %u) in host memory (%u of %u layers)\n",
+                    __func__, tier_cells, tier_cells, kv_size, n_tier_layers, n_own_layers);
+        }
+        if (tier_off && n_tier_layers < n_own_layers) {
+            // a cache that fits in the VRAM cells is not a fault
+            llama_log_internal(tier_cells >= kv_size ? GGML_LOG_LEVEL_INFO : GGML_LOG_LEVEL_WARN,
+                    "%s: tiered KV: n_kv_vram_cells = %u is not applied to %u of %u layers: %s\n",
+                    __func__, n_kv_vram_cells, n_own_layers - n_tier_layers, n_own_layers, tier_off);
+        }
     }
 
     {
@@ -777,16 +833,36 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
+    ggml_backend_buffer_type_t buft_stage = nullptr;
+    size_t                     size_stage = 0;
     for (const auto & [ctx, buf] : ctxs_bufs) {
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
 
+        size_t size;
         if (hparams.no_alloc) {
             GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
-            ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+            size = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
         } else {
             // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
-            ret[buft] += ggml_backend_buffer_get_size(buf.get());
+            size = ggml_backend_buffer_get_size(buf.get());
         }
+
+        if (tier_bufts.count(buft) > 0) {
+            // tiered KV: only the VRAM head is device memory, the tail is host memory
+            const size_t size_host = size - (size_t) ((double) size*tier_cells/get_size());
+            ret[ggml_backend_cpu_buffer_type()] += size_host;
+            size -= size_host;
+            if (size_host > size_stage) {
+                size_stage = size_host;
+                buft_stage = buft;
+            }
+        }
+        ret[buft] += size;
+    }
+
+    // tiered KV: the VRAM staging buffers of the cache hold the host tail of one layer
+    if (buft_stage) {
+        ret[buft_stage] += size_stage;
     }
 
     return ret;

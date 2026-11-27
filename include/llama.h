@@ -445,6 +445,7 @@ extern "C" {
         // device memory and the rest in pinned host memory mapped into the same device range (CUDA VMM), so
         // the context can be larger than what fits in VRAM. Positions past the line are read over PCIe, only
         // once a sequence is that deep. Output is identical to an all-device cache. 0 = all in device memory.
+        // Needs flash attention, the same type for K and V, one stream and all offloaded layers on one device.
         uint32_t n_kv_vram_cells;
     };
 

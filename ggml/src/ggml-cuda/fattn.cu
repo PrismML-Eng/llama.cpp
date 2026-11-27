@@ -951,7 +951,7 @@ static void ggml_cuda_flash_attn_ext_pad72(ggml_backend_cuda_context & ctx, ggml
 }
 
 // ggml-cuda.cu: host-tail staging of tiered buffers (ggml_backend_cuda_tier_buffer_type)
-void * ggml_cuda_tier_stage(const void * ptr, size_t nbytes, cudaStream_t stream);
+void * ggml_cuda_tier_stage(int device, const void * ptr, size_t nbytes, cudaStream_t stream);
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
@@ -972,10 +972,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     void * K_data = K ? K->data : nullptr;
     void * V_data = V ? V->data : nullptr;
     if (K && V && V != K) {
-        if (void * a = ggml_cuda_tier_stage(K->data, ggml_nbytes(K), ctx.stream())) {
+        if (void * a = ggml_cuda_tier_stage(ctx.device, K->data, ggml_nbytes(K), ctx.stream())) {
             K->data = a;
         }
-        if (void * a = ggml_cuda_tier_stage(V->data, ggml_nbytes(V), ctx.stream())) {
+        if (void * a = ggml_cuda_tier_stage(ctx.device, V->data, ggml_nbytes(V), ctx.stream())) {
             V->data = a;
         }
     }

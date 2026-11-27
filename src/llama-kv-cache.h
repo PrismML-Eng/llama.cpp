@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -326,6 +327,11 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    // tiered KV: cells [0, tier_cells) of a layer in a tiered buffer are in VRAM, the other cells are in host memory
+    uint32_t tier_cells = 0;
+    // tiered buffer type of a layer -> plain buffer type of its device
+    std::map<ggml_backend_buffer_type_t, ggml_backend_buffer_type_t> tier_bufts;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
