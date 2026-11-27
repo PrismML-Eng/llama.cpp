@@ -451,6 +451,9 @@ static __global__ void mul_mat_vec_ptq1_0_pt(
                             case GGML_GLU_OP_SWIGLU_OAI:
                                 result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
                                 break;
+                            case GGML_GLU_OP_SWIGLU_CLAMP:
+                                result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, fusion.glu_limit);
+                                break;
                             default:
                                 result = result * gate_value;
                                 break;
@@ -512,6 +515,9 @@ static __global__ void mul_mat_vec_ptq1_0_pt(
                         case GGML_GLU_OP_SWIGLU_OAI:
                             result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
                             break;
+                        case GGML_GLU_OP_SWIGLU_CLAMP:
+                            result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, fusion.glu_limit);
+                            break;
                         default:
                             result = result * gate_value;
                             break;
@@ -560,7 +566,7 @@ static void mul_mat_vec_ptq1_0_pt_launch(
         ggml_cuda_batch_invariant(), pf_ptr, pf_lines_per_cta, pf_ctas)
 
     if (has_fusion) {
-        GGML_ASSERT(ncols == 1 && "fusion only supported for ncols_dst=1");
+        GGML_ASSERT(ncols <= 4 && "fusion only supported for ncols_dst <= 4");
         if (has_gate) {
             PTQ1_0_PT_LAUNCH(true, true);
         } else {
