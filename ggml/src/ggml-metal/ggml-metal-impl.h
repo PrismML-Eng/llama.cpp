@@ -968,6 +968,15 @@ typedef struct {
 } ggml_metal_kargs_ssm_conv;
 
 typedef struct {
+    int32_t  nr;    // channels
+    uint64_t nbs0;  // state: time stride
+    uint64_t nbs1;  // state: channel stride
+    uint64_t nbx1;  // x: channel stride
+    uint64_t nbw1;  // conv weight: channel stride
+    uint64_t nb0;   // output: channel stride
+} ggml_metal_kargs_ssm_conv_fold;
+
+typedef struct {
     int64_t  d_state;
     int64_t  d_inner;
     int64_t  n_head;

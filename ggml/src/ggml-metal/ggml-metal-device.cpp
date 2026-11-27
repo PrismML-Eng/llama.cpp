@@ -738,6 +738,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_fold4(ggml_metal_library_t lib, bool use_silu) {
+    const char * base = "kernel_ssm_conv_fold4";
+    char name[256];
+    snprintf(name, 256, "%s_silu=%d", base, use_silu ? 1 : 0);
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_bool(cv, use_silu, FC_SSM_CONV + 1);
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+        ggml_metal_cv_free(cv);
+    }
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_rows(ggml_metal_library_t lib, int32_t nc, bool use_silu) {
     const char * base = "kernel_ssm_conv_f32_f32_4_rows";
     char name[256];

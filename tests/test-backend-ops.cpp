@@ -4755,6 +4755,47 @@ struct test_ssm_conv : public test_case {
     }
 };
 
+// Decode conv of a DeltaNet layer, as in build_conv_state: CONCAT(state, x^T) -> CPY(last d_conv-1 columns -> state cache) -> SSM_CONV -> SILU.
+struct test_ssm_conv_state : public test_case {
+    const int64_t n_channels;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_STATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VAR_TO_STR(n_channels);
+    }
+
+    test_ssm_conv_state(int64_t n_channels = 10240) : n_channels(n_channels) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t d_conv = 4;
+
+        ggml_tensor * cache = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (d_conv - 1)*n_channels);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_channels, 1);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, n_channels);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * state = ggml_reshape_3d(ctx, ggml_cont(ctx, cache), d_conv - 1, n_channels, 1);
+        ggml_tensor * conv_input = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
+
+        ggml_tensor * state_last = ggml_view_3d(ctx, conv_input, d_conv - 1, n_channels, 1, conv_input->nb[1], conv_input->nb[2], ggml_row_size(conv_input->type, 1));
+        ggml_tensor * state_new = ggml_cpy(ctx, state_last, cache);
+
+        ggml_tensor * conv_out = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, w));
+
+        ggml_tensor * out = ggml_concat(ctx, ggml_reshape_1d(ctx, conv_out, n_channels), state_new, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV + GGML_OP_ADD (channel-wise bias, optional) + GGML_OP_UNARY(SILU) (fused operation)
 struct test_ssm_conv_bias_silu : public test_case {
     const ggml_type type;
@@ -12326,6 +12367,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
 
+    for (int64_t n_channels : {10240, 1000}) {
+        test_cases.emplace_back(new test_ssm_conv_state(n_channels));
+    }
     test_cases.emplace_back(new test_fwht_signed(1024, 5120, 1));
     for (int64_t n : {1024, 2048, 4096}) {
         for (int64_t n_tokens : {1, 4, 8, 33}) {
