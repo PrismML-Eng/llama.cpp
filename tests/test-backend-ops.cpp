@@ -2933,6 +2933,9 @@ struct test_rms_norm_mul_rope : public test_case {
     const bool broadcast; // multiply by a 1D [ne0] weight, as model norm weights are
     const ggml_type set_rows_type;
     int mode;
+    const bool yarn;
+    const ggml_type type; // type of a, the weights are F32
+    const int n_rot;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -2942,17 +2945,26 @@ struct test_rms_norm_mul_rope : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR9(ne, eps, multi_add, mul, rope, set_rows, broadcast, mode, set_rows_type);
+        std::string s = VARS_TO_STR10(ne, eps, multi_add, mul, rope, set_rows, broadcast, mode, set_rows_type, yarn);
+        if (type != GGML_TYPE_F32) {
+            s += "," + VAR_TO_STR(type);
+        }
+        if (n_rot > 0) {
+            s += "," + VAR_TO_STR(n_rot);
+        }
+        return s;
     }
 
     test_rms_norm_mul_rope(std::array<int64_t, 4> ne, float eps = 1e-6f, bool multi_add = false,
                            bool set_rows = false, bool broadcast = false, int mode = GGML_ROPE_TYPE_NORMAL,
-                           bool mul = true, bool rope = true, ggml_type set_rows_type = GGML_TYPE_F16)
+                           bool mul = true, bool rope = true, ggml_type set_rows_type = GGML_TYPE_F16,
+                           bool yarn = false, ggml_type type = GGML_TYPE_F32,
+                           int n_rot = 0)
         : ne(ne), eps(eps), multi_add(multi_add), mul(mul), rope(rope), set_rows(set_rows), broadcast(broadcast),
-          set_rows_type(set_rows_type), mode(mode) {}
+          set_rows_type(set_rows_type), mode(mode), yarn(yarn), type(type), n_rot(n_rot) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, type, ne[0], ne[1], ne[2], ne[3]);
 
         ggml_tensor * b = nullptr;
         ggml_tensor * c = nullptr;
@@ -2982,12 +2994,25 @@ struct test_rms_norm_mul_rope : public test_case {
             const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
             ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne[2] * (is_mrope ? 4 : 1));
 
+            const int n_ctx_orig = yarn ? 4096 : 0;
+            const float freq_base = yarn ? 1000000.0f : 10000.0f;
+            const float freq_scale = yarn ? 1.0f/256 : 1.0f;
+            const float ext_factor = yarn ? 1.0f : 0.0f;
+            const int n_dims = n_rot > 0 ? n_rot : (int) ne[0];
+
             if (is_mrope) {
-                const int n_dims = ne[0];
-                int sections[4] = { n_dims/3, n_dims/3, n_dims/3, 0 };
-                a = ggml_rope_multi(ctx, a, pos, nullptr, n_dims, sections, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+                const int pairs = n_dims / 2;
+                int sections[4] = {
+                    n_rot > 0 ? pairs - 2 * (pairs / 3) : n_dims / 3,
+                    n_rot > 0 ? pairs / 3               : n_dims / 3,
+                    n_rot > 0 ? pairs / 3               : n_dims / 3,
+                    0
+                };
+                a = ggml_rope_multi(ctx, a, pos, nullptr, n_dims, sections, mode, n_ctx_orig, freq_base, freq_scale, ext_factor, 1.0f, 32.0f, 1.0f);
+            } else if (yarn) {
+                a = ggml_rope_ext(ctx, a, pos, nullptr, n_dims, mode, n_ctx_orig, freq_base, freq_scale, ext_factor, 1.0f, 32.0f, 1.0f);
             } else {
-                a = ggml_rope(ctx, a, pos, ne[0], mode);
+                a = ggml_rope(ctx, a, pos, n_dims, mode);
             }
         }
 
@@ -12170,7 +12195,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (auto multi_add : {false, true}) {
         for (auto set_rows : {false, true}) {
             for (auto broadcast : {false, true}) {
-                for (auto rope : {GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_IMROPE}) {
+                for (auto rope : {GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE}) {
                     test_cases.emplace_back(new test_rms_norm_mul_rope({768, 1, 1, 1}, 1e-6f, multi_add, set_rows, broadcast, rope));
                     test_cases.emplace_back(new test_rms_norm_mul_rope({768, 3, 1, 1}, 1e-6f, multi_add, set_rows, broadcast, rope));
                     test_cases.emplace_back(new test_rms_norm_mul_rope({768, 3, 5, 1}, 1e-6f, multi_add, set_rows, broadcast, rope));
@@ -12184,9 +12209,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    test_cases.emplace_back(new test_rms_norm_mul_rope({128, 8, 1, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_NEOX));
+    test_cases.emplace_back(new test_rms_norm_mul_rope({128, 8, 1, 1}, 1e-6f, false, true,  true, GGML_ROPE_TYPE_NEOX));
+    test_cases.emplace_back(new test_rms_norm_mul_rope({256, 8, 1, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_NEOX));
+    test_cases.emplace_back(new test_rms_norm_mul_rope({256, 8, 1, 1}, 1e-6f, false, true,  true, GGML_ROPE_TYPE_NEOX));
+
     // ne[2] > 65535 exceeds the CUDA gridDim.y limit (#27901)
     test_cases.emplace_back(new test_rms_norm_mul_rope({4, 1, 65536, 1}, 1e-6f, false, false, false, GGML_ROPE_TYPE_NORMAL));
     test_cases.emplace_back(new test_rms_norm_mul_rope({4, 1, 65536, 1}, 1e-6f, false, true,  false, GGML_ROPE_TYPE_NEOX));
+
+    for (int mode : {GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE}) {
+        for (int64_t n : {64, 128, 256, 1024}) {
+            test_cases.emplace_back(new test_rms_norm_mul_rope({n, 2, 3, 1}, 1e-6f, false, false, true, mode, true, true, GGML_TYPE_F16, true));
+            for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+                test_cases.emplace_back(new test_rms_norm_mul_rope({n, 2, 3, 1}, 1e-6f, false, true, true, mode, true, true, type, true));
+            }
+        }
+        // partial rotation (e.g. Qwen3.5 rotates 64 of 256 or 128 head dims)
+        for (int64_t n : {128, 256}) {
+            test_cases.emplace_back(new test_rms_norm_mul_rope({n, 8, 5, 1}, 1e-6f, false, false, true, mode, true, true, GGML_TYPE_F16, false, GGML_TYPE_F32, 64));
+            test_cases.emplace_back(new test_rms_norm_mul_rope({n, 8, 5, 1}, 1e-6f, false, true,  true, mode, true, true, GGML_TYPE_F16, false, GGML_TYPE_F32, 64));
+        }
+    }
+
     for (int64_t d_conv : {3, 4, 7, 9}) {
         for (int64_t d_inner: {1024, 1536, 2048}) {
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
