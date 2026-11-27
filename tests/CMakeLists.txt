@@ -370,6 +370,7 @@ endif()
 llama_build_and_test(test-prism-hadamard-skip.cpp  LABEL "main behavior")
 
 llama_build(test-backend-ops.cpp LINK ggml)
+llama_build_and_test(test-flash-attn-precision.cpp LABEL "main behavior backend" LINK ggml)
 
 llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model behavior")
