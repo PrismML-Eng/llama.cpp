@@ -153,6 +153,14 @@ llama_test(test-tokenizer-0 NAME test-tokenizer-0-qwen35          LABEL behavior
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-refact          LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-refact.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-starcoder       LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-starcoder.gguf)
 
+if (WIN32)
+    # Exercise the real internal mapping code without exporting its C++ types from llama.dll.
+    llama_build_and_test(test-mmap-win32.cpp ../src/llama-mmap.cpp ../src/llama-impl.cpp
+        LABEL behavior LINK ggml)
+    target_include_directories(test-mmap-win32 PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
+    target_link_libraries(test-mmap-win32 PRIVATE psapi)
+endif()
+
 if (NOT WIN32)
     llama_test_cmd(
         ${CMAKE_CURRENT_SOURCE_DIR}/test-tokenizers-repo.sh
